@@ -513,7 +513,12 @@
             }
         });
 
-        async function pyConfigToJson() {
+        async function pyConfigToJson(endpoint) {
+            // /md and /llm do not use the advanced crawl/browser config. Skip the
+            // /config/dump preflight for them: this UI POSTs {code} but the 0.8.7+
+            // server requires {type,params}, so the preflight 400s and aborts the
+            // run before /md or /llm is ever called. (Patched in derived image.)
+            if (endpoint === 'md' || endpoint === 'llm') return {};
             const code = cm.getValue().trim();
             if (!code) return {};
 
@@ -618,7 +623,7 @@
             // 1) grab python from CodeMirror, validate via /config/dump
             let advConfig = {};
             try {
-                const cfgJson = await pyConfigToJson(); // may throw
+                const cfgJson = await pyConfigToJson(endpoint); // may throw
                 if (Object.keys(cfgJson).length) {
                     const cfgType = document.getElementById('cfg-type').value;
                     advConfig = cfgType === 'CrawlerRunConfig'
