@@ -51,6 +51,7 @@ from utils import (
     scrub_browser_extra_args,
 )
 from webhook import WebhookDeliveryService
+from crawl_job_queue import CrawlJobQueue, CrawlJobQueueFull
 
 import psutil, time
 
@@ -81,6 +82,32 @@ def _enforce_proxy_safety(browser_config, crawler_config=None):
     except ValueError:
         # opaque: do not echo the resolved internal address
         raise HTTPException(status_code=400, detail="Proxy destination blocked (SSRF protection)")
+
+
+def _apply_browser_resource_policy(browser_config, config):
+    """Apply server-owned browser limits to every caller-supplied configuration."""
+    browser_defaults = config["crawler"]["browser"].get("kwargs", {})
+
+    if browser_defaults.get("memory_saving_mode", False):
+        browser_config.memory_saving_mode = True
+
+    recycle_limit = browser_defaults.get("max_pages_before_recycle", 0)
+    requested_recycle_limit = browser_config.max_pages_before_recycle
+    if recycle_limit > 0 and (
+        not isinstance(requested_recycle_limit, int)
+        or isinstance(requested_recycle_limit, bool)
+        or requested_recycle_limit <= 0
+        or requested_recycle_limit > recycle_limit
+    ):
+        browser_config.max_pages_before_recycle = recycle_limit
+
+    return browser_config
+
+
+def _project_crawl_result(result, result_fields):
+    if not result_fields:
+        return result
+    return {field: result[field] for field in result_fields if field in result}
 
 # --- Helper to get memory ---
 def _get_memory_mb():
@@ -576,6 +603,7 @@ async def handle_crawl_request(
     config: dict,
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
+    result_fields: Optional[List[str]] = None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
     # Track request start
@@ -600,11 +628,14 @@ async def handle_crawl_request(
         for url in urls:
             validate_url_destination(url)
         browser_config = BrowserConfig.load(browser_config)
+        _apply_browser_resource_policy(browser_config, config)
         crawler_config = CrawlerRunConfig.load(crawler_config)
         _enforce_proxy_safety(browser_config, crawler_config)
 
         dispatcher = MemoryAdaptiveDispatcher(
+            max_session_permit=config["crawler"]["pool"]["max_pages"],
             memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+            recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
             rate_limiter=RateLimiter(
                 base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
             ) if config["crawler"]["rate_limiter"]["enabled"] else None
@@ -693,6 +724,9 @@ async def handle_crawl_request(
                 # If PDF exists, encode it to base64
                 if result_dict.get('pdf') is not None and isinstance(result_dict.get('pdf'), bytes):
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
+
+                if result_fields:
+                    result_dict = _project_crawl_result(result_dict, result_fields)
                     
                 processed_results.append(result_dict)
             except Exception as e:
@@ -790,6 +824,7 @@ async def handle_stream_crawl_request(
     crawler = None
     try:
         browser_config = BrowserConfig.load(browser_config)
+        _apply_browser_resource_policy(browser_config, config)
         # browser_config.verbose = True # Set to False or remove for production stress testing
         browser_config.verbose = False
         crawler_config = CrawlerRunConfig.load(crawler_config)
@@ -834,7 +869,9 @@ async def handle_stream_crawl_request(
         else:
             # Default multi-URL streaming via arun_many
             dispatcher = MemoryAdaptiveDispatcher(
+                max_session_permit=config["crawler"]["pool"]["max_pages"],
                 memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+                recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
                 rate_limiter=RateLimiter(
                     base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
                 )
@@ -866,77 +903,22 @@ async def handle_stream_crawl_request(
         
 async def handle_crawl_job(
     redis,
-    background_tasks: BackgroundTasks,
     urls: List[str],
     browser_config: Dict,
     crawler_config: Dict,
     config: Dict,
+    result_fields: Optional[List[str]] = None,
     webhook_config: Optional[Dict] = None,
 ) -> Dict:
-    """
-    Fire-and-forget version of handle_crawl_request.
-    Creates a task in Redis, runs the heavy work in a background task,
-    lets /crawl/job/{task_id} polling fetch the result.
-    """
-    task_id = f"crawl_{uuid4().hex[:8]}"
-
-    # Store task data in Redis
-    task_data = {
-        "status": TaskStatus.PROCESSING,         # <-- keep enum values consistent
-        "created_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-        "url": json.dumps(urls),                 # store list as JSON string
-        "result": "",
-        "error": "",
-    }
-
-    # Store webhook config if provided
-    if webhook_config:
-        task_data["webhook_config"] = json.dumps(webhook_config)
-
-    await hset_with_ttl(redis, f"task:{task_id}", task_data, config)
-
-    # Initialize webhook service
-    webhook_service = WebhookDeliveryService(config)
-
-    async def _runner():
-        try:
-            result = await handle_crawl_request(
-                urls=urls,
-                browser_config=browser_config,
-                crawler_config=crawler_config,
-                config=config,
-            )
-            await hset_with_ttl(redis, f"task:{task_id}", {
-                "status": TaskStatus.COMPLETED,
-                "result": json.dumps(result),
-            }, config)
-
-            # Send webhook notification on successful completion
-            await webhook_service.notify_job_completion(
-                task_id=task_id,
-                task_type="crawl",
-                status="completed",
-                urls=urls,
-                webhook_config=webhook_config,
-                result=result
-            )
-
-            await asyncio.sleep(5)  # Give Redis time to process the update
-        except Exception as exc:
-            await hset_with_ttl(redis, f"task:{task_id}", {
-                "status": TaskStatus.FAILED,
-                "error": str(exc),
-            }, config)
-
-            # Send webhook notification on failure
-            await webhook_service.notify_job_completion(
-                task_id=task_id,
-                task_type="crawl",
-                status="failed",
-                urls=urls,
-                webhook_config=webhook_config,
-                error=str(exc)
-            )
-
-    background_tasks.add_task(_runner)
+    """Persist a crawl request for the supervised Redis Stream workers."""
+    try:
+        task_id = await CrawlJobQueue(redis, config).enqueue(
+            urls=urls,
+            browser_config=browser_config,
+            crawler_config=crawler_config,
+            result_fields=result_fields,
+            webhook_config=webhook_config,
+        )
+    except CrawlJobQueueFull as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
     return {"task_id": task_id}

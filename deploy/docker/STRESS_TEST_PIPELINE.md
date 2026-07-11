@@ -144,12 +144,12 @@ Permanent browser now matches endpoint config signatures
 
 **Run Pattern**:
 ```bash
-cd deploy/docker/tests
-pip install -r requirements.txt
+cd /path/to/repo
+uv sync --locked --no-dev --no-editable --group server
 # Rebuild after code changes:
 cd /path/to/repo && docker buildx build -t crawl4ai-local:latest --load .
 # Run test:
-python test_N_name.py
+uv run python deploy/docker/tests/test_N_name.py
 ```
 
 ## Architecture Decisions

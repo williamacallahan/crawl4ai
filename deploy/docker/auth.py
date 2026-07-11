@@ -1,15 +1,12 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
-from jwt import JWT, jwk_from_dict
-from jwt.utils import get_int_from_datetime
+import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import EmailStr
 from pydantic.main import BaseModel
-import base64
 
-instance = JWT()
 security = HTTPBearer(auto_error=False)
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -44,19 +41,12 @@ def _resolve_secret_key() -> str:
 
 SECRET_KEY = _resolve_secret_key()
 
-def get_jwk_from_secret(secret: str):
-    """Convert a secret string into a JWK object."""
-    secret_bytes = secret.encode('utf-8')
-    b64_secret = base64.urlsafe_b64encode(secret_bytes).rstrip(b'=').decode('utf-8')
-    return jwk_from_dict({"kty": "oct", "k": b64_secret})
-
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create a JWT access token with an expiration."""
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": get_int_from_datetime(expire)})
-    signing_key = get_jwk_from_secret(SECRET_KEY)
-    return instance.encode(to_encode, signing_key, alg='HS256')
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
 
 def verify_token(credentials: HTTPAuthorizationCredentials) -> Dict:
     """Verify the JWT token from the Authorization header."""
@@ -69,11 +59,10 @@ def verify_token(credentials: HTTPAuthorizationCredentials) -> Dict:
         )
     
     token = credentials.credentials
-    verifying_key = get_jwk_from_secret(SECRET_KEY)
     try:
-        payload = instance.decode(token, verifying_key, do_time_check=True, algorithms='HS256')
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
         return payload
-    except Exception as e:
+    except jwt.PyJWTError as e:
         raise HTTPException(
             status_code=401, 
             detail=f"Invalid or expired token: {str(e)}",

@@ -3720,6 +3720,10 @@ def get_true_memory_usage_percent() -> float:
     Returns:
         float: Memory usage percentage (0-100)
     """
+    cgroup_percent = get_cgroup_memory_usage_percent()
+    if cgroup_percent is not None:
+        return cgroup_percent
+
     vm = psutil.virtual_memory()
     total_gb = vm.total / (1024**3)
     available_gb = get_true_available_memory_gb()
@@ -3729,6 +3733,28 @@ def get_true_memory_usage_percent() -> float:
     
     # Ensure it's within valid range
     return max(0.0, min(100.0, used_percent))
+
+
+def get_cgroup_memory_usage_percent() -> Optional[float]:
+    """Return bounded-container memory usage, or None outside a limited cgroup."""
+    for usage_path, limit_path in (
+        (Path("/sys/fs/cgroup/memory.current"), Path("/sys/fs/cgroup/memory.max")),
+        (
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        ),
+    ):
+        try:
+            usage = int(usage_path.read_text())
+            raw_limit = limit_path.read_text().strip()
+            if raw_limit == "max":
+                continue
+            limit = int(raw_limit)
+            if 0 < limit < 10**18:
+                return max(0.0, min(100.0, 100.0 * usage / limit))
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+    return None
 
 
 def get_memory_stats() -> Tuple[float, float, float]:

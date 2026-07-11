@@ -768,7 +768,7 @@ Under load (10 concurrent):
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+uv sync --locked --no-dev --no-editable --group server
 
 # Configure
 cp .llm.env.example .llm.env
@@ -1048,18 +1048,17 @@ crawler:
 **Run All Tests:**
 
 ```bash
-cd deploy/docker/tests
-pip install -r requirements.txt
+cd /path/to/repo
+uv sync --locked --no-dev --no-editable --group server
 
 # Build image first
 cd /path/to/repo
 docker build -t crawl4ai-local:latest .
 
-# Run tests
-cd deploy/docker/tests
-for test in test_*.py; do
+# Run tests from the locked environment
+for test in deploy/docker/tests/test_*.py; do
     echo "Running $test..."
-    python $test || break
+    uv run python "$test" || break
 done
 ```
 

@@ -5,7 +5,6 @@ app:
   host: "0.0.0.0"
   port: 11235
   reload: False
-  workers: 1
   timeout_keep_alive: 300
 
 # Default LLM Configuration
@@ -29,6 +28,17 @@ redis:
   ssl_ca_certs: None
   ssl_certfile: None
   ssl_keyfile: None
+
+# Redis Stream settings for durable /crawl/job execution. Queued and leased
+# state persists until a terminal completion, which uses task_ttl_seconds.
+crawl_jobs:
+  stream: "crawl-jobs"
+  group: "crawl-workers"
+  lease_seconds: 20
+  heartbeat_seconds: 5
+  read_block_ms: 1000
+  max_attempts: 3
+  max_pending_jobs: 1000
 
 # Rate Limiting Configuration
 rate_limiting:
@@ -58,7 +68,8 @@ security:
 crawler:
   base_config:
     simulate_user: true
-  memory_threshold_percent: 95.0
+  memory_threshold_percent: 80.0
+  recovery_threshold_percent: 65.0
   rate_limiter:
     enabled: true
     base_delay: [1.0, 2.0]
@@ -66,12 +77,15 @@ crawler:
     stream_init: 30.0  # Timeout for stream initialization
     batch_process: 300.0  # Timeout for batch processing
   pool:
-    max_pages: 40                          # ← GLOBAL_SEM permits
+    max_pages: 12                          # ← Per-worker GLOBAL_SEM and dispatcher permits
+    max_browser_instances: 12              # ← Per-worker browser-process ceiling
     idle_ttl_sec: 300                     # ← 30 min janitor cutoff
   browser:
     kwargs:
       headless: true
       text_mode: true
+      memory_saving_mode: true
+      max_pages_before_recycle: 500
     extra_args:
       # - "--single-process"
       - "--no-sandbox"

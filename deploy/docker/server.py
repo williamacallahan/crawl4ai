@@ -37,6 +37,7 @@ from schemas import (
 from utils import (
     FilterType, load_config, setup_logging, verify_email_domain,
     validate_output_path, write_output_file, validate_webhook_url, validate_url_destination,
+    build_redis_url,
 )
 import os
 import sys
@@ -218,18 +219,7 @@ async def root():
     return RedirectResponse("/playground")
 
 # ─────────────────── infra / middleware  ─────────────────────
-def _build_redis_url(config: dict) -> str:
-    """Build Redis URL from config fields and environment variables."""
-    rc = config.get("redis", {})
-    host = os.environ.get("REDIS_HOST", rc.get("host", "localhost"))
-    port = os.environ.get("REDIS_PORT", rc.get("port", 6379))
-    password = os.environ.get("REDIS_PASSWORD", rc.get("password", ""))
-    db = rc.get("db", 0)
-    scheme = "rediss" if rc.get("ssl", False) else "redis"
-    auth = f":{password}@" if password else ""
-    return f"{scheme}://{auth}{host}:{port}/{db}"
-
-redis = aioredis.from_url(_build_redis_url(config))
+redis = aioredis.from_url(build_redis_url(config))
 
 limiter = Limiter(
     key_func=get_remote_address,

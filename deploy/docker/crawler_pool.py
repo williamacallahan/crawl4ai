@@ -20,6 +20,11 @@ LOCK = asyncio.Lock()
 # Config
 MEM_LIMIT = CONFIG.get("crawler", {}).get("memory_threshold_percent", 95.0)
 BASE_IDLE_TTL = CONFIG.get("crawler", {}).get("pool", {}).get("idle_ttl_sec", 300)
+MAX_ACTIVE_REQUESTS = CONFIG.get("crawler", {}).get("pool", {}).get("max_pages", 30)
+MAX_BROWSER_INSTANCES = CONFIG.get("crawler", {}).get("pool", {}).get(
+    "max_browser_instances", MAX_ACTIVE_REQUESTS
+)
+ADMISSION_SEM = asyncio.Semaphore(MAX_ACTIVE_REQUESTS)
 DEFAULT_CONFIG_SIG = None  # Cached sig for default config
 
 
@@ -52,8 +57,42 @@ def _is_default_config(sig: str) -> bool:
     """Check if config matches default."""
     return sig == DEFAULT_CONFIG_SIG
 
+
+async def _make_browser_capacity() -> None:
+    """Evict one idle browser before admitting a new configuration."""
+    browser_count = (1 if PERMANENT else 0) + len(HOT_POOL) + len(COLD_POOL)
+    if browser_count < MAX_BROWSER_INSTANCES:
+        return
+
+    idle_browser = [
+        (LAST_USED.get(sig, 0), sig, pool)
+        for pool in (COLD_POOL, HOT_POOL)
+        for sig, crawler in pool.items()
+        if getattr(crawler, "active_requests", 0) == 0
+    ]
+    if not idle_browser:
+        raise RuntimeError("Crawler browser pool is at capacity")
+
+    _, idle_sig, idle_pool = min(idle_browser, key=lambda candidate: candidate[0])
+    crawler = idle_pool.pop(idle_sig)
+    with suppress(Exception):
+        await crawler.close()
+    LAST_USED.pop(idle_sig, None)
+    USAGE_COUNT.pop(idle_sig, None)
+    logger.info(f"🧹 Replaced idle browser at pool capacity (sig={idle_sig[:8]})")
+
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Get crawler from pool with tiered strategy."""
+    await ADMISSION_SEM.acquire()
+    try:
+        return await _get_admitted_crawler(cfg)
+    except BaseException:
+        ADMISSION_SEM.release()
+        raise
+
+
+async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
+    """Resolve a crawler after request admission has bounded pool growth."""
     sig = _sig(cfg)
     async with LOCK:
         # Check permanent browser for default config
@@ -109,6 +148,7 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             raise MemoryError(f"Memory at {mem_pct:.1f}%, refusing new browser")
 
         # Create new in cold pool
+        await _make_browser_capacity()
         logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]}, mem={mem_pct:.1f}%)")
         crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
         await crawler.start()
@@ -125,9 +165,12 @@ async def release_crawler(crawler: AsyncWebCrawler):
     obtained via get_crawler() so the janitor knows when it's safe
     to close idle browsers.
     """
-    async with LOCK:
-        if hasattr(crawler, 'active_requests'):
-            crawler.active_requests = max(0, crawler.active_requests - 1)
+    try:
+        async with LOCK:
+            if hasattr(crawler, 'active_requests'):
+                crawler.active_requests = max(0, crawler.active_requests - 1)
+    finally:
+        ADMISSION_SEM.release()
 
 async def init_permanent(cfg: BrowserConfig):
     """Initialize permanent default browser."""

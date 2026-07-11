@@ -49,7 +49,7 @@ cd tests
 
 #### Step 2: Environment Setup
 - Activates your existing virtual environment
-- Installs dependencies from `deploy/docker/requirements.txt`
+- Syncs the locked `server` dependency group from `pyproject.toml`
 - Installs Flask for the webhook receiver
 
 #### Step 3: Service Startup

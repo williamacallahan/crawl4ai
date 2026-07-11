@@ -40,6 +40,15 @@ DEFAULT_CONFIG = {
         "task_ttl_seconds": 3600,
         "ssl": False,
     },
+    "crawl_jobs": {
+        "stream": "crawl-jobs",
+        "group": "crawl-workers",
+        "lease_seconds": 20,
+        "heartbeat_seconds": 5,
+        "read_block_ms": 1000,
+        "max_attempts": 3,
+        "max_pending_jobs": 1000,
+    },
     "rate_limiting": {
         "enabled": True,
         "default_limit": "1000/minute",
@@ -182,6 +191,18 @@ def setup_logging(config: Dict) -> None:
 def get_base_url(request: Request) -> str:
     """Get base URL including scheme and host."""
     return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def build_redis_url(config: Dict) -> str:
+    """Build the shared Redis connection URL from config and environment."""
+    redis_config = config.get("redis", {})
+    host = os.environ.get("REDIS_HOST", redis_config.get("host", "localhost"))
+    port = os.environ.get("REDIS_PORT", redis_config.get("port", 6379))
+    password = os.environ.get("REDIS_PASSWORD", redis_config.get("password", ""))
+    database = redis_config.get("db", 0)
+    scheme = "rediss" if redis_config.get("ssl", False) else "redis"
+    auth = f":{password}@" if password else ""
+    return f"{scheme}://{auth}{host}:{port}/{database}"
 
 def is_task_id(value: str) -> bool:
     """Check if the value matches task ID pattern."""

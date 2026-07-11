@@ -1,4 +1,5 @@
 FROM python:3.12-slim-bookworm AS build
+COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /uvx /bin/
 
 # C4ai version
 ARG C4AI_VER=0.8.9
@@ -7,10 +8,6 @@ LABEL c4ai.version=$C4AI_VER
 
 # Set build arguments
 ARG APP_HOME=/app
-ARG GITHUB_REPO=https://github.com/unclecode/crawl4ai.git
-ARG GITHUB_BRANCH=main
-ARG USE_LOCAL=true
-
 ENV PYTHONFAULTHANDLER=1 \
     PYTHONHASHSEED=random \
     PYTHONUNBUFFERED=1 \
@@ -20,7 +17,9 @@ ENV PYTHONFAULTHANDLER=1 \
     PIP_DEFAULT_TIMEOUT=100 \
     DEBIAN_FRONTEND=noninteractive \
     REDIS_HOST=localhost \
-    REDIS_PORT=6379
+    REDIS_PORT=6379 \
+    UV_PROJECT_ENVIRONMENT=/usr/local \
+    UV_LINK_MODE=copy
 
 ARG PYTHON_VERSION=3.12
 ARG INSTALL_TYPE=default
@@ -38,6 +37,11 @@ LABEL version="1.0"
 
 # Install curl and gnupg first (needed to add Redis repo)
 RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade the base image before installing version-pinned third-party packages below. Running a
+# distribution upgrade after the Redis install silently replaces the requested version.
+RUN apt-get update && apt-get dist-upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Add official Redis repository for security-patched versions
@@ -60,6 +64,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     && apt-get clean \ 
     && rm -rf /var/lib/apt/lists/*
+
+RUN if [ -n "$REDIS_VERSION" ]; then \
+        test "$(dpkg-query -W -f='${Version}' redis-server)" = "$REDIS_VERSION"; \
+    fi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
@@ -84,9 +92,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libatspi2.0-0 \
     && apt-get clean \ 
-    && rm -rf /var/lib/apt/lists/*
-
-RUN apt-get update && apt-get dist-upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN if [ "$ENABLE_GPU" = "true" ] && [ "$TARGETARCH" = "amd64" ] ; then \
@@ -120,61 +125,31 @@ RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 # Create and set permissions for appuser home directory
 RUN mkdir -p /home/appuser && chown -R appuser:appuser /home/appuser
 
-WORKDIR ${APP_HOME}
-
-RUN echo '#!/bin/bash\n\
-if [ "$USE_LOCAL" = "true" ]; then\n\
-    echo "📦 Installing from local source..."\n\
-    pip install --no-cache-dir /tmp/project/\n\
-else\n\
-    echo "🌐 Installing from GitHub..."\n\
-    for i in {1..3}; do \n\
-        git clone --branch ${GITHUB_BRANCH} ${GITHUB_REPO} /tmp/crawl4ai && break || \n\
-        { echo "Attempt $i/3 failed! Taking a short break... ☕"; sleep 5; }; \n\
-    done\n\
-    pip install --no-cache-dir /tmp/crawl4ai\n\
-fi' > /tmp/install.sh && chmod +x /tmp/install.sh
-
+WORKDIR /tmp/project
 COPY . /tmp/project/
 
-# Copy supervisor config first (might need root later, but okay for now)
-COPY deploy/docker/supervisord.conf .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    case "$INSTALL_TYPE" in \
+      default) uv sync --locked --no-dev --no-editable --group server ;; \
+      torch) uv sync --locked --no-dev --no-editable --group server --extra torch ;; \
+      transformer) uv sync --locked --no-dev --no-editable --group server --extra transformer \
+        && python -m crawl4ai.model_loader ;; \
+      all) uv sync --locked --no-dev --no-editable --group server --extra all \
+        && python -m nltk.downloader punkt stopwords \
+        && python -m crawl4ai.model_loader ;; \
+      *) echo "Unsupported INSTALL_TYPE: $INSTALL_TYPE"; exit 64 ;; \
+    esac
 
-COPY deploy/docker/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-RUN if [ "$INSTALL_TYPE" = "all" ] ; then \
-        pip install --no-cache-dir \
-            torch \
-            torchvision \
-            torchaudio \
-            scikit-learn \
-            nltk \
-            transformers \
-            tokenizers && \
-        python -m nltk.downloader punkt stopwords ; \
-    fi
-
-RUN if [ "$INSTALL_TYPE" = "all" ] ; then \
-        pip install "/tmp/project/[all]" && \
-        python -m crawl4ai.model_loader ; \
-    elif [ "$INSTALL_TYPE" = "torch" ] ; then \
-        pip install "/tmp/project/[torch]" ; \
-    elif [ "$INSTALL_TYPE" = "transformer" ] ; then \
-        pip install "/tmp/project/[transformer]" && \
-        python -m crawl4ai.model_loader ; \
-    else \
-        pip install "/tmp/project" ; \
-    fi
-
-RUN pip install --no-cache-dir --upgrade pip && \
-    /tmp/install.sh && \
-    python -c "import crawl4ai; print('✅ crawl4ai is ready to rock!')" && \
-    python -c "from playwright.sync_api import sync_playwright; print('✅ Playwright is feeling dramatic!')"
+RUN python -c "import crawl4ai, fastapi, gunicorn, mcp, redis, websockets"
 
 RUN crawl4ai-setup
 
-RUN playwright install --with-deps
+RUN python -c "from patchright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=['--no-sandbox']); b.close(); p.stop()"
+
+WORKDIR ${APP_HOME}
+
+# Copy supervisor config first (might need root later, but okay for now)
+COPY deploy/docker/supervisord.conf .
 
 RUN mkdir -p /home/appuser/.cache/ms-playwright \
     && cp -r /root/.cache/ms-playwright/chromium-* /home/appuser/.cache/ms-playwright/ \

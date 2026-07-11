@@ -3,7 +3,7 @@ Job endpoints (enqueue + poll) for long-running LL​M extraction and raw crawl.
 Relies on the existing Redis task helpers in api.py
 """
 
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, HttpUrl
 
@@ -47,6 +47,9 @@ class CrawlJobPayload(BaseModel):
     urls:           list[HttpUrl]
     browser_config: Dict = {}
     crawler_config: Dict = {}
+    result_fields: Optional[list[Literal[
+        "url", "success", "error_message", "status_code", "markdown", "links", "metadata"
+    ]]] = None
     webhook_config: Optional[WebhookConfig] = None
 
 
@@ -96,7 +99,6 @@ async def llm_job_status(
 @router.post("/crawl/job", status_code=202)
 async def crawl_job_enqueue(
         payload: CrawlJobPayload,
-        background_tasks: BackgroundTasks,
         _td: Dict = Depends(lambda: _token_dep()),
 ):
     webhook_config = None
@@ -110,11 +112,11 @@ async def crawl_job_enqueue(
 
     return await handle_crawl_job(
         _redis,
-        background_tasks,
         [str(u) for u in payload.urls],
         payload.browser_config,
         payload.crawler_config,
         config=_config,
+        result_fields=payload.result_fields,
         webhook_config=webhook_config,
     )
 
