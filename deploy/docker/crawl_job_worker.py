@@ -9,6 +9,7 @@ import socket
 from contextlib import suppress
 from typing import Any, Awaitable, Callable, Optional
 
+from fastapi import HTTPException, status
 from redis import asyncio as aioredis
 
 from crawl_job_queue import CrawlJobEntry, CrawlJobLeaseLost, CrawlJobQueue
@@ -130,8 +131,12 @@ class CrawlJobWorker:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            error_message = str(error)
-            if attempt >= self.queue.settings.max_attempts:
+            error_message = str(error.detail if isinstance(error, HTTPException) else error)
+            terminal_input = isinstance(error, HTTPException) and error.status_code in {
+                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+            }
+            if terminal_input or attempt >= self.queue.settings.max_attempts:
                 await self.queue.complete(entry, payload, error=error_message)
                 return "failed", None, error_message
             else:

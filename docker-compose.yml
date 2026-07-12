@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Shared configuration for all environments
 x-base-config: &base-config
   ports:
@@ -36,15 +34,17 @@ x-base-config: &base-config
 
 services:
   crawl4ai:
-    # 1. Default: Pull multi-platform test image from Docker Hub
-    # 2. Override with local image via: IMAGE=local-test docker compose up
-    image: ${IMAGE:-unclecode/crawl4ai:${TAG:-latest}}
+    # 1. Default: Build the checked-out fork under a version-pinned local tag
+    # 2. Override with a published immutable image via: IMAGE=registry/image@sha256:digest
+    image: ${IMAGE:-crawl4ai-local:${TAG:-0.8.9}}
     
     # Local build config (used with --build)
     build:
       context: .
       dockerfile: Dockerfile
       args:
+        C4AI_VER: ${C4AI_VER:-0.8.9}
+        C4AI_GIT_SHA: ${C4AI_GIT_SHA:?set C4AI_GIT_SHA to the exact checkout commit}
         INSTALL_TYPE: ${INSTALL_TYPE:-default}
         ENABLE_GPU: ${ENABLE_GPU:-false}
     

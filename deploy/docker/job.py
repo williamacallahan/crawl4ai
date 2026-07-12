@@ -48,7 +48,14 @@ class CrawlJobPayload(BaseModel):
     browser_config: Dict = {}
     crawler_config: Dict = {}
     result_fields: Optional[list[Literal[
-        "url", "success", "error_message", "status_code", "markdown", "links", "metadata"
+        "url",
+        "redirected_url",
+        "success",
+        "error_message",
+        "status_code",
+        "markdown",
+        "links",
+        "metadata",
     ]]] = None
     webhook_config: Optional[WebhookConfig] = None
 

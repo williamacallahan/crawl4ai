@@ -3,8 +3,13 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /uvx /bin/
 
 # C4ai version
 ARG C4AI_VER=0.8.9
-ENV C4AI_VERSION=$C4AI_VER
-LABEL c4ai.version=$C4AI_VER
+ARG C4AI_GIT_SHA
+RUN test -n "$C4AI_GIT_SHA"
+ENV C4AI_VERSION=$C4AI_VER \
+    C4AI_GIT_SHA=$C4AI_GIT_SHA
+LABEL c4ai.version=$C4AI_VER \
+      org.opencontainers.image.version=$C4AI_VER \
+      org.opencontainers.image.revision=$C4AI_GIT_SHA
 
 # Set build arguments
 ARG APP_HOME=/app
