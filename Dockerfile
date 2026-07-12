@@ -1,9 +1,12 @@
+# syntax=docker/dockerfile:1
+
 FROM python:3.12-slim-bookworm AS build
 COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /uvx /bin/
 
 # C4ai version
 ARG C4AI_VER=0.8.9
-ARG C4AI_GIT_SHA
+ARG SOURCE_COMMIT
+ARG C4AI_GIT_SHA=${SOURCE_COMMIT}
 RUN test -n "$C4AI_GIT_SHA"
 ENV C4AI_VERSION=$C4AI_VER \
     C4AI_GIT_SHA=$C4AI_GIT_SHA
