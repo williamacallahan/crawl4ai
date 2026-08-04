@@ -39,6 +39,9 @@ crawl_jobs:
   read_block_ms: 1000
   max_attempts: 3
   max_pending_jobs: 1000
+  # Upper bound on a single attempt. The heartbeat renews the lease for as long as
+  # an attempt runs, so without this a hung crawl holds its consumer forever.
+  max_attempt_seconds: 600
 
 # Rate Limiting Configuration
 rate_limiting:

@@ -48,6 +48,7 @@ DEFAULT_CONFIG = {
         "read_block_ms": 1000,
         "max_attempts": 3,
         "max_pending_jobs": 1000,
+        "max_attempt_seconds": 600,
     },
     "rate_limiting": {
         "enabled": True,

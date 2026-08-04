@@ -58,6 +58,7 @@ class CrawlJobQueueSettings:
     read_block_ms: int
     max_attempts: int
     max_pending_jobs: int
+    max_attempt_seconds: int
 
     @classmethod
     def from_config(cls, config: dict) -> "CrawlJobQueueSettings":
@@ -83,6 +84,7 @@ class CrawlJobQueueSettings:
             read_block_ms=positive_int("read_block_ms"),
             max_attempts=positive_int("max_attempts"),
             max_pending_jobs=positive_int("max_pending_jobs"),
+            max_attempt_seconds=positive_int("max_attempt_seconds"),
         )
 
 

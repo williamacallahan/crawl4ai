@@ -379,3 +379,49 @@ def test_worker_heartbeats_during_a_long_crawl():
     asyncio.run(worker.process(entry))
 
     assert redis.claims == [entry.stream_id]
+
+
+def test_worker_releases_an_attempt_that_outlives_its_budget():
+    """A hung crawl must not hold its consumer: the heartbeat would renew its lease forever."""
+    redis = FakeRedis()
+    config = queue_config(max_attempt_seconds=1, max_attempts=2)
+    queue, task_id = enqueue(redis, config)
+    entry = asyncio.run(queue.read_new("worker-a"))[0]
+
+    async def crawl(_payload):
+        await asyncio.sleep(3600)
+
+    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook())
+    asyncio.run(worker.process(entry))
+
+    # Left pending and un-acked so another worker reclaims it once the lease goes stale.
+    assert entry.stream_id in redis.pending
+    assert redis.acks == []
+    task = redis.hashes[queue.task_key(task_id)]
+    assert task["status"] == "processing"
+    assert "attempt budget" in task["last_error"]
+
+
+def test_worker_fails_a_stalled_attempt_once_the_retry_budget_is_gone():
+    redis = FakeRedis()
+    config = queue_config(max_attempt_seconds=1, max_attempts=1)
+    queue, task_id = enqueue(redis, config)
+    entry = asyncio.run(queue.read_new("worker-a"))[0]
+
+    async def crawl(_payload):
+        await asyncio.sleep(3600)
+
+    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook())
+    asyncio.run(worker.process(entry))
+
+    task = redis.hashes[queue.task_key(task_id)]
+    assert task["status"] == "failed"
+    assert "attempt budget" in task["error"]
+    # Acked and removed, so the stream stops counting it against max_pending_jobs.
+    assert redis.acks == [(queue.settings.stream, entry.stream_id)]
+    assert redis.deleted == [(queue.settings.stream, entry.stream_id)]
+
+
+def test_settings_reject_a_non_positive_attempt_budget():
+    with pytest.raises(ValueError, match="max_attempt_seconds"):
+        CrawlJobQueue(FakeRedis(), queue_config(max_attempt_seconds=0))

@@ -104,7 +104,10 @@ class CrawlJobWorker:
             done, _pending = await asyncio.wait(
                 {operation_task, heartbeat_task},
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=self.queue.settings.max_attempt_seconds,
             )
+            if not done:
+                return await self._release_stalled_attempt(entry, payload, attempt)
             if operation_task in done:
                 return operation_task.result()
 
@@ -119,6 +122,40 @@ class CrawlJobWorker:
                 await operation_task
             with suppress(asyncio.CancelledError, Exception):
                 await heartbeat_task
+
+    async def _release_stalled_attempt(
+        self,
+        entry: CrawlJobEntry,
+        payload: dict,
+        attempt: int,
+    ) -> Optional[tuple[str, Optional[dict], Optional[str]]]:
+        """Give up on an attempt that outlived its budget so its consumer is freed.
+
+        The heartbeat renews the lease for as long as an attempt runs, which means a crawl
+        that never returns keeps proving it is alive: its entry never goes idle, XAUTOCLAIM
+        can never reclaim it, and that consumer is occupied permanently. With few workers a
+        couple of hung jobs starve the whole group — the stream stops being drained, XLEN
+        stays at max_pending_jobs, and every new submission is rejected with a queue-full
+        503 even though the service looks healthy. Bounding the attempt is what makes the
+        existing reclaim path reachable.
+        """
+        error_message = (
+            "Crawl job exceeded its "
+            f"{self.queue.settings.max_attempt_seconds}s attempt budget and was released"
+        )
+        logger.error(
+            "Crawl job %s exceeded its attempt budget on attempt %s/%s; releasing its lease",
+            entry.task_id,
+            attempt,
+            self.queue.settings.max_attempts,
+        )
+        if attempt >= self.queue.settings.max_attempts:
+            await self.queue.complete(entry, payload, error=error_message)
+            return "failed", None, error_message
+        # Leave the entry pending: cancelling the heartbeat lets its idle time pass
+        # lease_seconds so another worker reclaims it through claim_stale.
+        await self.queue.mark_retry(entry, payload, self.consumer, attempt, error_message)
+        return None
 
     async def _process_attempt(
         self,
