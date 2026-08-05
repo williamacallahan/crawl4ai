@@ -197,7 +197,11 @@ EXPOSE 6379
 USER appuser
 
 # Set environment variables to ptoduction
-ENV PYTHON_ENV=production 
+ENV PYTHON_ENV=production
+
+# Default to the embedded Redis; deployments with a Redis sidecar override this
+# and supervisord then skips the embedded redis-server entirely.
+ENV REDIS_HOST=localhost
 
 # Start the application using supervisord
 CMD ["supervisord", "-c", "supervisord.conf"]

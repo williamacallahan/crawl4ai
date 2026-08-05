@@ -1,0 +1,36 @@
+# Coolify blue/green deployment topology: the routed crawl4ai service is
+# stateless (external Redis, tmpfs shm) so it can color-swap, while the Redis
+# sidecar keeps the durable crawl-job stream state on its own volume and is
+# never re-rolled. Domains, ports, and env come from Coolify — do not add
+# ports:, env_file:, or Traefik labels here.
+services:
+  crawl4ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_HOST=redis
+    shm_size: 1gb
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11235/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --dir /data --appendonly yes --appendfsync always --loglevel notice
+    volumes:
+      - crawl4ai-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  crawl4ai-redis:
