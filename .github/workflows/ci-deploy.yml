@@ -1,0 +1,108 @@
+name: CI & Deploy
+
+# Self-hosted runner + public repo: push/dispatch only, never pull_request,
+# so a fork PR can never execute on popos-sf3.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: crawl4ai-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: docker.iocloudhost.net/crawl4ai
+  APPLICATION_ID: YTAj7y39GXOkUtoHpYYXw
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, X64, williamacallahan]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Build test env
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv venv .venv
+          uv pip install -q --python .venv/bin/python -e . pytest pytest-asyncio
+          uv pip install -q --python .venv/bin/python -r deploy/docker/requirements.txt
+
+      - name: Unit gate
+        run: |
+          PYTHONPATH="$PWD:$PWD/deploy/docker" .venv/bin/python -m pytest -q --no-header \
+            deploy/docker/tests/test_auth.py \
+            deploy/docker/tests/test_crawl_job_queue.py \
+            deploy/docker/tests/test_crawl_job_contract.py \
+            deploy/docker/tests/test_resource_policy.py \
+            tests/test_memory_cgroup.py
+
+  build:
+    needs: test
+    runs-on: [self-hosted, Linux, X64, williamacallahan]
+    steps:
+      - uses: actions/checkout@v6
+
+      # The default `docker` driver cannot emit a multi-platform manifest list;
+      # docker-container can. qemu-aarch64 binfmt is already registered on sf3.
+      - name: Prepare multi-arch builder
+        run: |
+          docker buildx inspect c4ai-multiarch >/dev/null 2>&1 \
+            || docker buildx create --name c4ai-multiarch --driver docker-container --bootstrap
+
+      - name: Registry login
+        run: echo "${{ secrets.NEXUS_DOCKER_PASSWORD }}" \
+          | docker login docker.iocloudhost.net -u "${{ secrets.NEXUS_DOCKER_USERNAME }}" --password-stdin
+
+      - name: Build and push amd64 + arm64
+        run: |
+          docker buildx build --builder c4ai-multiarch \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg C4AI_VER=0.8.9 \
+            --build-arg C4AI_GIT_SHA=${{ github.sha }} \
+            --build-arg SOURCE_COMMIT=${{ github.sha }} \
+            --build-arg INSTALL_TYPE=default \
+            --build-arg ENABLE_GPU=false \
+            -t ${IMAGE}:${{ github.sha }} \
+            --push .
+
+      # A single-arch push would schedule fine and then sit Pending forever on
+      # the arm64 swarm node, so fail loudly here instead.
+      - name: Assert both architectures published
+        run: |
+          docker manifest inspect ${IMAGE}:${{ github.sha }} \
+            | python3 -c 'import json,sys; a={m["platform"]["architecture"] for m in json.load(sys.stdin)["manifests"]}; print("published:",a); sys.exit(0 if {"amd64","arm64"} <= a else 1)'
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, Linux, X64, williamacallahan]
+    steps:
+      - name: Point Dokploy at the new image and deploy
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST "$DOKPLOY_URL/api/application.update" \
+            -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
+            -d "{\"applicationId\":\"${APPLICATION_ID}\",\"dockerImage\":\"${IMAGE}:${{ github.sha }}\"}" >/dev/null
+          curl -fsS -X POST "$DOKPLOY_URL/api/application.deploy" \
+            -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
+            -d "{\"applicationId\":\"${APPLICATION_ID}\"}" >/dev/null
+          echo "deploy queued for ${IMAGE}:${{ github.sha }}"
+
+      - name: Wait for the service to serve the new build
+        run: |
+          for i in $(seq 1 40); do
+            if curl -fsS --max-time 10 https://crawl4ai.haiku.host/health >/dev/null 2>&1; then
+              echo "healthy after $((i*15))s"; exit 0
+            fi
+            sleep 15
+          done
+          echo "endpoint did not return healthy within 10 minutes"; exit 1
