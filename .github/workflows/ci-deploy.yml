@@ -1,7 +1,7 @@
 name: CI & Deploy
 
-# Self-hosted runner + public repo: push/dispatch only, never pull_request,
-# so a fork PR can never execute on popos-sf3.
+# Self-hosted runners + public repo: push/dispatch only, never pull_request,
+# so a fork PR can never execute on our machines.
 on:
   push:
     branches: [main]
@@ -22,7 +22,7 @@ jobs:
   test:
     runs-on: [self-hosted, Linux, X64, williamacallahan]
     steps:
-      # persist-credentials:false — the runner is long-lived, so the default
+      # persist-credentials:false — the runners are long-lived, so the default
       # would leave a usable GITHUB_TOKEN in .git/config after the job ends.
       - uses: actions/checkout@v6
         with:
@@ -48,20 +48,24 @@ jobs:
             deploy/docker/tests/test_resource_policy.py \
             tests/test_memory_cgroup.py
 
+  # Each architecture builds on a runner of that architecture. QEMU emulation is
+  # NOT viable here: the Dockerfile launches Chromium as a build-time smoke test
+  # and emulated Chromium dies with SIGSEGV.
   build:
     needs: test
-    runs-on: [self-hosted, Linux, X64, williamacallahan]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner_arch: X64
+          - arch: arm64
+            runner_arch: ARM64
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}", williamacallahan]
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      # The default `docker` driver cannot emit a multi-platform manifest list;
-      # docker-container can. qemu-aarch64 binfmt is already registered on sf3.
-      - name: Prepare multi-arch builder
-        run: |
-          docker buildx inspect c4ai-multiarch >/dev/null 2>&1 \
-            || docker buildx create --name c4ai-multiarch --driver docker-container --bootstrap
 
       # Secrets arrive via env, never interpolated into the shell line, so they
       # cannot land in the command string or a trace.
@@ -71,21 +75,49 @@ jobs:
           REGISTRY_PASS: ${{ secrets.NEXUS_DOCKER_PASSWORD }}
         run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
 
-      - name: Build and push amd64 + arm64
+      # --provenance/--sbom off: with attestations the result is an OCI index,
+      # and `docker manifest create` refuses to nest one index inside another,
+      # which silently drops the arch from the final list.
+      - name: Build and push ${{ matrix.arch }}
         env:
           GIT_SHA: ${{ github.sha }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          docker buildx build --builder c4ai-multiarch \
-            --platform linux/amd64,linux/arm64 \
+          docker build --provenance=false --sbom=false \
             --build-arg C4AI_VER=0.8.9 \
             --build-arg "C4AI_GIT_SHA=${GIT_SHA}" \
             --build-arg "SOURCE_COMMIT=${GIT_SHA}" \
             --build-arg INSTALL_TYPE=default \
             --build-arg ENABLE_GPU=false \
-            -t "${IMAGE}:${GIT_SHA}" \
-            --push .
+            -t "${IMAGE}:${GIT_SHA}-${ARCH}" .
+          docker push "${IMAGE}:${GIT_SHA}-${ARCH}"
 
-      # A single-arch push would schedule fine and then sit Pending forever on
+      # The runners are long-lived and shared; without this the Nexus credential
+      # stays in ~/.docker/config.json for whatever job lands here next.
+      - name: Drop registry credentials
+        if: always()
+        run: docker logout docker.iocloudhost.net || true
+
+  merge:
+    needs: build
+    runs-on: [self-hosted, Linux, X64, williamacallahan]
+    steps:
+      - name: Registry login
+        env:
+          REGISTRY_USER: ${{ secrets.NEXUS_DOCKER_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.NEXUS_DOCKER_PASSWORD }}
+        run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
+
+      - name: Publish multi-arch manifest
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          docker manifest rm "${IMAGE}:${GIT_SHA}" 2>/dev/null || true
+          docker manifest create "${IMAGE}:${GIT_SHA}" \
+            "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"
+          docker manifest push "${IMAGE}:${GIT_SHA}"
+
+      # A single-arch list would schedule fine and then sit Pending forever on
       # the arm64 swarm node, so fail loudly here instead.
       - name: Assert both architectures published
         env:
@@ -94,14 +126,12 @@ jobs:
           docker manifest inspect "${IMAGE}:${GIT_SHA}" \
             | python3 -c 'import json,sys; a={m["platform"]["architecture"] for m in json.load(sys.stdin)["manifests"]}; print("published:",a); sys.exit(0 if {"amd64","arm64"} <= a else 1)'
 
-      # The runner is long-lived and shared; without this the Nexus credential
-      # stays in ~/.docker/config.json for whatever job lands here next.
       - name: Drop registry credentials
         if: always()
         run: docker logout docker.iocloudhost.net || true
 
   deploy:
-    needs: build
+    needs: merge
     runs-on: [self-hosted, Linux, X64, williamacallahan]
     steps:
       - name: Point Dokploy at the new image and deploy
