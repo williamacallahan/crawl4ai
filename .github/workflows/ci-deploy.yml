@@ -5,6 +5,12 @@ name: CI & Deploy
 on:
   push:
     branches: [main]
+    # A full run rebuilds two architectures and rolls production. Documentation
+    # and agent-config changes must not cost that.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.claude/**'
   workflow_dispatch:
 
 concurrency:
