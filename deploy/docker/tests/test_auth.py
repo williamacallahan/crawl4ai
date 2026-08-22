@@ -2,9 +2,8 @@ import os
 import sys
 from datetime import timedelta
 
+import jwt
 import pytest
-from fastapi import HTTPException
-from fastapi.security import HTTPAuthorizationCredentials
 
 DOCKER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if DOCKER_DIR not in sys.path:
@@ -13,14 +12,15 @@ if DOCKER_DIR not in sys.path:
 import auth
 
 
-def credentials(token: str) -> HTTPAuthorizationCredentials:
-    return HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-
-
+# These two pin the fork's GehirnInc-jwt -> PyJWT migration. Upstream 0.9.x made
+# the same migration and replaced verify_token(HTTPAuthorizationCredentials),
+# which raised HTTPException, with decode_token(str), which raises
+# jwt.InvalidTokenError - enforcement now lives in AuthGateMiddleware. Same
+# intent, retargeted at the surviving owner.
 def test_access_token_round_trip_uses_locked_pyjwt():
     token = auth.create_access_token({"sub": "test@example.com"})
 
-    assert auth.verify_token(credentials(token))["sub"] == "test@example.com"
+    assert auth.decode_token(token)["sub"] == "test@example.com"
 
 
 def test_expired_access_token_is_rejected():
@@ -29,7 +29,5 @@ def test_expired_access_token_is_rejected():
         expires_delta=timedelta(seconds=-1),
     )
 
-    with pytest.raises(HTTPException, match="Invalid or expired token") as error:
-        auth.verify_token(credentials(token))
-
-    assert error.value.status_code == 401
+    with pytest.raises(jwt.ExpiredSignatureError):
+        auth.decode_token(token)

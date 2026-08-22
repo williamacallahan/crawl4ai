@@ -38,8 +38,10 @@ def test_public_submit_accepts_every_supported_result_field(monkeypatch):
         config,
         result_fields,
         webhook_config,
+        owner=None,
     ):
         submitted["result_fields"] = result_fields
+        submitted["owner"] = owner
         return {"task_id": "crawl_contract"}
 
     monkeypatch.setattr(job, "handle_crawl_job", accept_job)

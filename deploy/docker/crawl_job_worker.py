@@ -14,7 +14,8 @@ from redis import asyncio as aioredis
 
 from crawl_job_queue import CrawlJobEntry, CrawlJobLeaseLost, CrawlJobQueue
 from crawler_pool import close_all
-from utils import build_redis_url, load_config, setup_logging
+from redis_config import build_redis_url
+from utils import load_config, setup_logging
 from webhook import WebhookDeliveryService
 
 logger = logging.getLogger(__name__)
