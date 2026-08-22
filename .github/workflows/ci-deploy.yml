@@ -35,8 +35,9 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           uv venv .venv
-          # The docker-server deps live in the `server` extra, not a requirements.txt.
-          uv pip install -q --python .venv/bin/python -e ".[server]" pytest pytest-asyncio
+          # The docker-server deps are a PEP 735 [dependency-groups] entry, not an
+          # optional-dependencies extra, so this is --group and not ".[server]".
+          uv pip install -q --python .venv/bin/python -e . --group server pytest pytest-asyncio
 
       - name: Unit gate
         run: |
