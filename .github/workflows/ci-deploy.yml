@@ -22,7 +22,11 @@ jobs:
   test:
     runs-on: [self-hosted, Linux, X64, williamacallahan]
     steps:
+      # persist-credentials:false — the runner is long-lived, so the default
+      # would leave a usable GITHUB_TOKEN in .git/config after the job ends.
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -31,8 +35,8 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           uv venv .venv
-          uv pip install -q --python .venv/bin/python -e . pytest pytest-asyncio
-          uv pip install -q --python .venv/bin/python -r deploy/docker/requirements.txt
+          # The docker-server deps live in the `server` extra, not a requirements.txt.
+          uv pip install -q --python .venv/bin/python -e ".[server]" pytest pytest-asyncio
 
       - name: Unit gate
         run: |
@@ -48,6 +52,8 @@ jobs:
     runs-on: [self-hosted, Linux, X64, williamacallahan]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       # The default `docker` driver cannot emit a multi-platform manifest list;
       # docker-container can. qemu-aarch64 binfmt is already registered on sf3.
@@ -56,28 +62,42 @@ jobs:
           docker buildx inspect c4ai-multiarch >/dev/null 2>&1 \
             || docker buildx create --name c4ai-multiarch --driver docker-container --bootstrap
 
+      # Secrets arrive via env, never interpolated into the shell line, so they
+      # cannot land in the command string or a trace.
       - name: Registry login
-        run: echo "${{ secrets.NEXUS_DOCKER_PASSWORD }}" \
-          | docker login docker.iocloudhost.net -u "${{ secrets.NEXUS_DOCKER_USERNAME }}" --password-stdin
+        env:
+          REGISTRY_USER: ${{ secrets.NEXUS_DOCKER_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.NEXUS_DOCKER_PASSWORD }}
+        run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
 
       - name: Build and push amd64 + arm64
+        env:
+          GIT_SHA: ${{ github.sha }}
         run: |
           docker buildx build --builder c4ai-multiarch \
             --platform linux/amd64,linux/arm64 \
             --build-arg C4AI_VER=0.8.9 \
-            --build-arg C4AI_GIT_SHA=${{ github.sha }} \
-            --build-arg SOURCE_COMMIT=${{ github.sha }} \
+            --build-arg "C4AI_GIT_SHA=${GIT_SHA}" \
+            --build-arg "SOURCE_COMMIT=${GIT_SHA}" \
             --build-arg INSTALL_TYPE=default \
             --build-arg ENABLE_GPU=false \
-            -t ${IMAGE}:${{ github.sha }} \
+            -t "${IMAGE}:${GIT_SHA}" \
             --push .
 
       # A single-arch push would schedule fine and then sit Pending forever on
       # the arm64 swarm node, so fail loudly here instead.
       - name: Assert both architectures published
+        env:
+          GIT_SHA: ${{ github.sha }}
         run: |
-          docker manifest inspect ${IMAGE}:${{ github.sha }} \
+          docker manifest inspect "${IMAGE}:${GIT_SHA}" \
             | python3 -c 'import json,sys; a={m["platform"]["architecture"] for m in json.load(sys.stdin)["manifests"]}; print("published:",a); sys.exit(0 if {"amd64","arm64"} <= a else 1)'
+
+      # The runner is long-lived and shared; without this the Nexus credential
+      # stays in ~/.docker/config.json for whatever job lands here next.
+      - name: Drop registry credentials
+        if: always()
+        run: docker logout docker.iocloudhost.net || true
 
   deploy:
     needs: build
@@ -87,15 +107,16 @@ jobs:
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           curl -fsS -X POST "$DOKPLOY_URL/api/application.update" \
             -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
-            -d "{\"applicationId\":\"${APPLICATION_ID}\",\"dockerImage\":\"${IMAGE}:${{ github.sha }}\"}" >/dev/null
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s"}' "$APPLICATION_ID" "$IMAGE" "$GIT_SHA")" >/dev/null
           curl -fsS -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
-            -d "{\"applicationId\":\"${APPLICATION_ID}\"}" >/dev/null
-          echo "deploy queued for ${IMAGE}:${{ github.sha }}"
+            --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
+          echo "deploy queued for ${IMAGE}:${GIT_SHA}"
 
       - name: Wait for the service to serve the new build
         run: |
