@@ -89,8 +89,13 @@ jobs:
           GIT_SHA: ${{ github.sha }}
           ARCH: ${{ matrix.arch }}
         run: |
+          # Read the version from the package instead of hardcoding it. A literal
+          # here goes stale on every release bump and silently mislabels the image.
+          C4AI_VER=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' crawl4ai/__version__.py)
+          test -n "$C4AI_VER"
+          echo "building C4AI_VER=${C4AI_VER}"
           docker build --provenance=false --sbom=false \
-            --build-arg C4AI_VER=0.8.9 \
+            --build-arg "C4AI_VER=${C4AI_VER}" \
             --build-arg "C4AI_GIT_SHA=${GIT_SHA}" \
             --build-arg "SOURCE_COMMIT=${GIT_SHA}" \
             --build-arg INSTALL_TYPE=default \
