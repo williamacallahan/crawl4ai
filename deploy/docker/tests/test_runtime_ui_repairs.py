@@ -460,6 +460,8 @@ async def test_health_uses_effective_redis_client_when_lifespan_is_active(
             return True
 
     monkeypatch.setattr(server_module, "redis", ReadyRedis())
+    monkeypatch.setenv("C4AI_GIT_SHA", "0123456789abcdef")
+    monkeypatch.setenv("HOSTNAME", "crawl4ai.1.test")
     server_module.app.state.readiness_checks_active = True
     try:
         async with httpx.AsyncClient(
@@ -470,7 +472,10 @@ async def test_health_uses_effective_redis_client_when_lifespan_is_active(
     finally:
         server_module.app.state.readiness_checks_active = False
     assert response.status_code == 200
-    assert response.json()["components"]["redis"] == "ready"
+    payload = response.json()
+    assert payload["components"]["redis"] == "ready"
+    assert payload["revision"] == "0123456789abcdef"
+    assert payload["instance"] == "crawl4ai.1.test"
 
 
 @pytest.mark.asyncio
