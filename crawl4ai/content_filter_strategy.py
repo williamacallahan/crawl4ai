@@ -1,33 +1,33 @@
+import hashlib
 import inspect
+import json
+import math
 import re
 import time
-from bs4 import BeautifulSoup, Tag
-from typing import List, Tuple, Dict, Optional
-from rank_bm25 import BM25Okapi
-from collections import deque
-from bs4 import NavigableString, Comment
-
-from .utils import (
-    clean_tokens,
-    perform_completion_with_backoff,
-    escape_json_string,
-    sanitize_html,
-    get_home_folder,
-    extract_xml_data,
-    merge_chunks,
-)
-from .types import LLMConfig
-from .config import DEFAULT_PROVIDER, OVERLAP_RATE, WORD_TOKEN_RATE
 from abc import ABC, abstractmethod
-import math
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from rank_bm25 import BM25Okapi
 from snowballstemmer import stemmer
+
+from .async_logger import AsyncLogger, LogColor, LogLevel
+from .config import DEFAULT_PROVIDER, OVERLAP_RATE, WORD_TOKEN_RATE
 from .models import TokenUsage
 from .prompts import PROMPT_FILTER_CONTENT
-import json
-import hashlib
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-from .async_logger import AsyncLogger, LogLevel, LogColor
+from .types import LLMConfig
+from .utils import (
+    clean_tokens,
+    escape_json_string,
+    extract_xml_data,
+    get_home_folder,
+    merge_chunks,
+    perform_completion_with_backoff,
+    sanitize_html,
+)
 
 
 class RelevantContentFilter(ABC):
@@ -698,7 +698,7 @@ class PruningContentFilter(RelevantContentFilter):
                 return True
         return False
 
-    def _prune_tree(self, node):
+    def _prune_tree(self, node, preserved_ancestors=None):
         """
         Prunes the tree starting from the given node.
 
@@ -707,6 +707,16 @@ class PruningContentFilter(RelevantContentFilter):
         """
         if not node or not hasattr(node, "name") or node.name is None:
             return
+
+        if preserved_ancestors is None:
+            preserved_ancestors = set()
+            if self.preserve_classes or self.preserve_tags:
+                preserved_ancestors = {
+                    id(ancestor)
+                    for descendant in node.find_all(True)
+                    if self._is_preserved(descendant)
+                    for ancestor in descendant.parents
+                }
 
         # Skip pruning for preserved nodes — always keep them
         if self._is_preserved(node):
@@ -747,12 +757,15 @@ class PruningContentFilter(RelevantContentFilter):
 
             should_remove = score < threshold
 
-        if should_remove:
+        # A low-scoring wrapper cannot be decomposed when it is the only path
+        # to a whitelisted descendant. Keep that path, then continue pruning
+        # its non-preserved siblings normally.
+        if should_remove and id(node) not in preserved_ancestors:
             node.decompose()
         else:
             children = [child for child in node.children if hasattr(child, "name")]
             for child in children:
-                self._prune_tree(child)
+                self._prune_tree(child, preserved_ancestors)
 
     def _compute_composite_score(self, metrics, text_len, tag_len, link_text_len):
         """Computes the composite score"""

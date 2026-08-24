@@ -704,8 +704,14 @@ class HTML2Text(html.parser.HTMLParser):
                     attr_str = ""
                     if attrs:
                         attr_str = "".join(
-                            ' {}="{}"'.format(k, v) if v is not None else " {}".format(k)
+                            ' {}="{}"'.format(
+                                html.escape(str(k), quote=True),
+                                html.escape(str(v), quote=True),
+                            )
+                            if v is not None
+                            else " {}".format(html.escape(str(k), quote=True))
                             for k, v in attrs.items()
+                            if not str(k).lower().startswith("on")
                         )
                     if tag in ["td", "th"]:
                         self.o("<{}{}>\n\n".format(tag, attr_str))

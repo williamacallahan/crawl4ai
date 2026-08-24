@@ -1,22 +1,23 @@
 import asyncio
-import time
-from typing import Dict, List, Optional, Tuple
+import hashlib
 import os
-import sys
+import shlex
 import shutil
-import tempfile
-import psutil  
 import signal
 import subprocess
-import shlex
-from playwright.async_api import BrowserContext
-import hashlib
-from .js_snippet import load_js_script
-from .config import DOWNLOAD_PAGE_TIMEOUT
-from .async_configs import BrowserConfig, CrawlerRunConfig
-from .utils import get_chromium_path
+import sys
+import tempfile
+import time
 import warnings
+from typing import Dict, List, Optional, Tuple
 
+import psutil
+from playwright.async_api import BrowserContext
+
+from .async_configs import BrowserConfig, CrawlerRunConfig
+from .config import DOWNLOAD_PAGE_TIMEOUT
+from .js_snippet import load_js_script
+from .utils import get_chromium_path
 
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
@@ -70,14 +71,11 @@ class ManagedBrowser:
     def build_browser_flags(config: BrowserConfig) -> List[str]:
         """Common CLI flags for launching Chromium"""
         flags = [
-            "--no-sandbox",
             "--disable-dev-shm-usage",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
             "--window-position=0,0",
-            "--ignore-certificate-errors",
-            "--ignore-certificate-errors-spki-list",
             "--disable-blink-features=AutomationControlled",
             "--window-position=400,0",
             "--disable-renderer-backgrounding",
@@ -90,6 +88,13 @@ class ManagedBrowser:
             "--disable-component-update",
             "--disable-domain-reliability",
         ]
+        if config.ignore_https_errors:
+            flags.extend([
+                "--ignore-certificate-errors",
+                "--ignore-certificate-errors-spki-list",
+            ])
+        # --no-sandbox is an operator policy, supplied explicitly through
+        # BrowserConfig.extra_args when the runtime cannot use Chromium's sandbox.
         # GPU flags disable WebGL which anti-bot sensors detect as headless.
         # Keep WebGL working (via SwiftShader) when stealth mode is active.
         if not config.enable_stealth:
@@ -839,6 +844,7 @@ class BrowserManager:
             launch_kwargs = {
                 "headless": self.config.headless,
                 "args": list(dict.fromkeys(cli_args)),  # dedupe
+                "chromium_sandbox": "--no-sandbox" not in cli_args,
                 "viewport": {
                     "width": self.config.viewport_width,
                     "height": self.config.viewport_height,
@@ -1018,12 +1024,13 @@ class BrowserManager:
         - HTTP URLs with query params: http://localhost:9222?browser_id=XXX
         - WebSocket URLs: ws://localhost:9222/devtools/browser/XXX
         """
-        import aiohttp
         from urllib.parse import urlparse, urlunparse
+
+        import aiohttp
 
         # If WebSocket URL, Playwright handles connection directly - skip HTTP verification
         if cdp_url.startswith(('ws://', 'wss://')):
-            self.logger.debug(f"WebSocket CDP URL provided, skipping HTTP verification", tag="BROWSER")
+            self.logger.debug("WebSocket CDP URL provided, skipping HTTP verification", tag="BROWSER")
             return True
 
         # Parse HTTP URL and properly construct /json/version endpoint
@@ -1051,7 +1058,7 @@ class BrowserManager:
             delay = 0.5 * (1.4 ** attempt)
             self.logger.debug(f"Waiting {delay:.2f}s before next CDP check...", tag="BROWSER")
             await asyncio.sleep(delay)
-        self.logger.debug(f"CDP verification failed after 5 attempts", tag="BROWSER")
+        self.logger.debug("CDP verification failed after 5 attempts", tag="BROWSER")
         return False
 
     def _build_browser_args(self) -> dict:
@@ -1060,14 +1067,11 @@ class BrowserManager:
             "--disable-gpu",
             "--disable-gpu-compositing",
             "--disable-software-rasterizer",
-            "--no-sandbox",
             "--disable-dev-shm-usage",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
             "--window-position=0,0",
-            "--ignore-certificate-errors",
-            "--ignore-certificate-errors-spki-list",
             "--disable-blink-features=AutomationControlled",
             "--window-position=400,0",
             "--disable-renderer-backgrounding",
@@ -1082,6 +1086,12 @@ class BrowserManager:
             # "--single-process",
             f"--window-size={self.config.viewport_width},{self.config.viewport_height}",
         ]
+
+        if self.config.ignore_https_errors:
+            args.extend([
+                "--ignore-certificate-errors",
+                "--ignore-certificate-errors-spki-list",
+            ])
 
         if self.config.memory_saving_mode:
             args.extend([
@@ -1111,6 +1121,8 @@ class BrowserManager:
         args = list(dict.fromkeys(args))
         
         browser_args = {"headless": self.config.headless, "args": args}
+        if self.config.browser_type == "chromium":
+            browser_args["chromium_sandbox"] = "--no-sandbox" not in args
 
         # On Windows, passing channel='chromium' (the default) causes Playwright
         # to look for a system Chrome installation instead of using the bundled
