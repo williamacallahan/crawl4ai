@@ -79,6 +79,11 @@ def _is_exact_health(health: Any, revision: str) -> bool:
     )
 
 
+def _has_task_error(task: dict[str, Any]) -> bool:
+    error = str(task.get("error", "")).strip()
+    return bool(error.removeprefix("Error:").strip())
+
+
 def verify_rollout(
     *,
     dokploy_url: str,
@@ -146,7 +151,7 @@ def verify_rollout(
             for task in tasks
             if str(task.get("currentState", "")).startswith("Running ")
             and task.get("node")
-            and not task.get("error")
+            and not _has_task_error(task)
         )
         desired_running_tasks = frozenset(
             task["containerId"] for task in tasks if task.get("state") == "running"
