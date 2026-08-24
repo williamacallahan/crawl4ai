@@ -63,7 +63,7 @@ Our latest stable release is `0.9.2`. Images are built with multi-arch manifests
 
 ```bash
 # Pull the latest stable version (0.9.2)
-docker pull unclecode/crawl4ai:0.8.6
+docker pull unclecode/crawl4ai:0.9.2
 
 # Or use the latest tag
 docker pull unclecode/crawl4ai:latest

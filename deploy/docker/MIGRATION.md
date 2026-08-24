@@ -14,30 +14,29 @@ How much you have to do scales with how much you drove through the API. A plain
 
 ---
 
-## Everyone (2 steps)
+## Everyone
 
 ### 1. Set an API token
 
 The server no longer serves an unauthenticated API on `0.0.0.0`. It binds
 loopback by default and will not expose itself without a credential.
 
-```bash
-export CRAWL4AI_API_TOKEN="$(openssl rand -hex 32)"
-```
+Provide the existing operator-managed credential through
+`CRAWL4AI_API_TOKEN` (or the `/run/secrets/api_token` mount). Credential
+lifecycle remains owned by the operator and secret manager; this migration
+makes no credential-lifecycle changes.
 
 - With a token set, you may expose the server (put a TLS-terminating reverse
   proxy in front) and must send `Authorization: Bearer <token>` on every
   request except `GET /health`.
-- With **no** token set, the server binds `127.0.0.1` only and prints a one-off
-  token at startup for local use.
+- With **no** token set, the server binds `127.0.0.1` only and protected routes
+  remain unavailable until the operator supplies an existing credential.
 
-WebSocket clients (MCP, monitor) that can't set headers may pass `?token=...`.
-
-### 2. Re-issue any tokens
-
-The JWT implementation changed; tokens issued by older versions are no longer
-valid. Re-mint via `POST /token` (which now requires the server to have an
-`api_token` configured).
+Non-browser WebSocket clients should use the same `Authorization` header.
+Browser WebSockets use the dashboard's `crawl4ai.bearer.<base64url-token>`
+subprotocol so credentials do not appear in query strings, URLs, or access
+logs. Tokens that fail the current HS256 verification are rejected; credential
+lifecycle decisions remain with the operator.
 
 ---
 
@@ -123,10 +122,15 @@ Custom webhook headers must be well-formed names with no control characters and
 may not set hop-by-hop / sensitive headers (`Host`, `Content-Length`,
 `Transfer-Encoding`, `Authorization`, `Cookie`, …). Invalid headers → 422.
 
-### Redis requires a password
+### Redis authentication follows the selected topology
 
 Redis runs in-container, loopback-only, password-protected, and its port is no
-longer published. For an **external** redis, set `REDIS_PASSWORD`.
+longer published. Provide the embedded instance's existing operator-managed
+`REDIS_PASSWORD` through the environment or `/run/secrets/redis_password`; the
+entrypoint does not create credentials. For a protected **external** Redis, provide its existing
+`REDIS_USERNAME` / `REDIS_PASSWORD`. An intentionally unprotected private
+sidecar may leave them empty; the entrypoint does not fabricate a client-only
+password that the sidecar does not know.
 
 ### Resource limits (all configurable; `0` = unbounded)
 
@@ -174,6 +178,8 @@ messages are unchanged.
 - The hardened `docker-compose.yml` uses `read_only: true` + tmpfs, `cap_drop:
   [ALL]`, `no-new-privileges`, and `shm_size` instead of a host `/dev/shm` bind.
   Mirror these in a custom compose file.
-- The `/dashboard` and `/playground` UIs get baseline headers
-  (`nosniff`, `X-Frame-Options: DENY`) and are auth-gated; a stricter CSP for
-  the UIs is planned in a follow-up.
+- The `/dashboard` and `/playground` shells are public so a browser can load
+  them, but every data/action endpoint remains auth-gated. Their operator token
+  is held only in page memory and is cleared on reload; it is not persisted in
+  Web Storage. Third-party runtime assets are version-pinned; assets served
+  with cross-origin support also carry integrity metadata.

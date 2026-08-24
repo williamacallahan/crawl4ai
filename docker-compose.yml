@@ -3,9 +3,18 @@ x-base-config: &base-config
   ports:
     - "11235:11235"  # Gunicorn port
   env_file:
-    - .llm.env       # API keys (create from .llm.env.example)
+    # Optional LLM provider keys; a fresh checkout does not need this file.
+    - path: .llm.env
+      required: false
+  environment:
+    # Forward host-shell overrides through staging names. entrypoint.sh applies
+    # non-empty values without replacing credentials already supplied by the
+    # optional env_file or mounted secrets with an empty Compose default.
+    - CRAWL4AI_API_TOKEN_FROM_HOST=${CRAWL4AI_API_TOKEN:-}
+    - CRAWL4AI_JWT_ENABLED_FROM_HOST=${CRAWL4AI_JWT_ENABLED:-}
+    - REDIS_PASSWORD_FROM_HOST=${REDIS_PASSWORD:-}
   # Uncomment to set default environment variables (will overwrite .llm.env)
-  # environment:
+  # environment additions:
   #   - OPENAI_API_KEY=${OPENAI_API_KEY:-}
   #   - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
   #   - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -22,7 +31,6 @@ x-base-config: &base-config
     - ALL
   security_opt:
     - no-new-privileges:true
-  pids_limit: 512
   # Read-only root filesystem; only these paths are writable.
   read_only: true
   # Redis state is a NAMED VOLUME, not tmpfs: /crawl/job durability depends on the
@@ -41,6 +49,8 @@ x-base-config: &base-config
     resources:
       limits:
         memory: 4G
+        # Compose v5 rejects service-level pids_limit beside this limits block.
+        pids: 512
       reservations:
         memory: 1G
   restart: unless-stopped

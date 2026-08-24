@@ -14,7 +14,7 @@ Accepted credentials:
   * the static operator API token (constant-time compared) -> admin scope, or
   * a valid HS256 JWT minted by this server -> the token's own scope claim.
 
-Public paths (the health check and the token-issuing endpoint) pass through.
+Public paths (health, token issuance, and exact UI redirects) pass through.
 Public prefixes (the UI static shells) also pass through - they serve no data.
 On failure: HTTP 401 JSON, or WebSocket close 4401.
 On success: the validated principal is attached at scope["state"]["principal"]
@@ -23,12 +23,11 @@ On success: the validated principal is attached at scope["state"]["principal"]
 
 from __future__ import annotations
 
+import base64
 import json
-from typing import Callable, Dict, Iterable, Optional
-from urllib.parse import parse_qs
+from collections.abc import Callable, Iterable
 
 import jwt
-
 from auth import constant_time_eq, decode_token
 
 
@@ -56,9 +55,22 @@ class AuthGateMiddleware:
         if path in self.public_paths:
             await self.app(scope, receive, send)
             return
-        if self.public_prefixes and path.startswith(self.public_prefixes):
+        if any(
+            path == prefix or path.startswith(prefix.rstrip("/") + "/")
+            for prefix in self.public_prefixes
+        ):
             await self.app(scope, receive, send)
             return
+
+        # A real CORS preflight carries both headers.  Let CORSMiddleware
+        # decide whether the origin/method is allowlisted; no endpoint data is
+        # executed or returned by that middleware.  Bare OPTIONS requests stay
+        # behind authentication.
+        if scope["type"] == "http" and scope.get("method") == "OPTIONS":
+            header_names = {name.lower() for name, _ in scope.get("headers", [])}
+            if b"origin" in header_names and b"access-control-request-method" in header_names:
+                await self.app(scope, receive, send)
+                return
 
         principal = self._authenticate(scope)
         if principal is None:
@@ -71,7 +83,7 @@ class AuthGateMiddleware:
         await self.app(scope, receive, send)
 
     # ──────────────────────────── helpers ─────────────────────────────
-    def _authenticate(self, scope) -> Optional[Dict]:
+    def _authenticate(self, scope) -> dict | None:
         token = self._extract_token(scope)
         if not token:
             return None
@@ -81,16 +93,19 @@ class AuthGateMiddleware:
         if static_token and constant_time_eq(token, static_token):
             return {"sub": "operator", "scope": "admin", "via": "api_token"}
 
-        # 2) HS256 JWT minted by this server
+        # 2) A valid HS256 JWT.  The effective JWT flag controls whether this
+        # server issues new JWTs and whether a JWT-only deployment may expose
+        # its socket.  Verification remains compatible with already-issued
+        # credentials when issuance is disabled.
         try:
             claims = decode_token(token)
-        except jwt.InvalidTokenError:
+        except (jwt.InvalidTokenError, RuntimeError):
             return None
         claims.setdefault("scope", "data")
         return claims
 
     @staticmethod
-    def _extract_token(scope) -> Optional[str]:
+    def _extract_token(scope) -> str | None:
         # Authorization: Bearer <token>
         for name, value in scope.get("headers", []):
             if name == b"authorization":
@@ -98,12 +113,26 @@ class AuthGateMiddleware:
                 if raw[:7].lower() == "bearer ":
                     return raw[7:].strip()
                 return None
-        # WebSocket clients that cannot set headers may pass ?token=
+        # Browsers cannot set Authorization on WebSocket upgrades.  Carry a
+        # base64url-encoded bearer token in a WebSocket subprotocol instead;
+        # unlike a query parameter it does not enter URLs, access logs, browser
+        # history, or referrer telemetry.  Non-browser clients should keep
+        # using the Authorization header above.
         if scope["type"] == "websocket":
-            qs = parse_qs(scope.get("query_string", b"").decode("latin-1"))
-            vals = qs.get("token")
-            if vals:
-                return vals[0]
+            prefix = "crawl4ai.bearer."
+            for name, value in scope.get("headers", []):
+                if name.lower() != b"sec-websocket-protocol":
+                    continue
+                for protocol in value.decode("latin-1").split(","):
+                    protocol = protocol.strip()
+                    if not protocol.startswith(prefix):
+                        continue
+                    encoded = protocol[len(prefix):]
+                    try:
+                        padding = "=" * (-len(encoded) % 4)
+                        return base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+                    except (ValueError, UnicodeDecodeError):
+                        return None
         return None
 
     async def _reject(self, scope, receive, send):

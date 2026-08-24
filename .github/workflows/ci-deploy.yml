@@ -40,10 +40,7 @@ jobs:
       - name: Build test env
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          uv venv .venv
-          # The docker-server deps are a PEP 735 [dependency-groups] entry, not an
-          # optional-dependencies extra, so this is --group and not ".[server]".
-          uv pip install -q --python .venv/bin/python -e . --group server pytest pytest-asyncio
+          uv sync --locked --no-dev --group server --group test
 
       - name: Unit gate
         run: |

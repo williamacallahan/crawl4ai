@@ -23,6 +23,7 @@ Design notes
 """
 
 import importlib
+import os
 import socket
 import sys
 from pathlib import Path
@@ -44,6 +45,20 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "cve: regression test for a specific reported vulnerability"
     )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def test_signing_key():
+    """Keep Docker auth tests independent of operator credentials."""
+    previous = os.environ.get("SECRET_KEY")
+    os.environ["SECRET_KEY"] = "test-only-secret-key-value-000000"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("SECRET_KEY", None)
+        else:
+            os.environ["SECRET_KEY"] = previous
 
 
 @pytest.fixture(scope="session")

@@ -5,16 +5,15 @@ Adversarial security tests for all eval/exec paths in crawl4ai.
 Tests three attack surfaces:
 1. _compute_field expression path (extraction_strategy.py) - MUST be fully disabled
 2. _safe_eval_config (deploy/docker/server.py) - MUST block all escapes
-3. hook_manager exec (deploy/docker/hook_manager.py) - MUST restrict builtins
+3. declarative hook registry (deploy/docker/hook_registry.py) - MUST reject arbitrary code
 
 Each section tries progressively creative bypass techniques.
 """
 
 import ast
-import sys
 import os
+import sys
 import unittest
-import logging
 
 # Ensure crawl4ai is importable
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -184,7 +183,6 @@ class TestSafeEvalConfigAdversarial(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import crawl4ai as _c4
-        from crawl4ai import CrawlerRunConfig, BrowserConfig
 
         _SAFE_CONFIG_ALLOWED_NAMES = {
             "CrawlerRunConfig", "BrowserConfig", "HTTPCrawlerConfig",
@@ -402,46 +400,24 @@ class TestSafeEvalExpressionDeleted(unittest.TestCase):
 
 
 # ============================================================================
-# PART 4: hook_manager builtins - verify getattr/setattr are gone
+# PART 4: declarative hooks - verify arbitrary code is not an action
 # ============================================================================
 
-class TestHookManagerBuiltins(unittest.TestCase):
-    """Verify hook_manager no longer provides getattr/setattr."""
+class TestDeclarativeHookRegistry(unittest.TestCase):
+    """Verify hooks select fixed server-authored actions."""
 
-    def test_getattr_removed_from_source(self):
-        """Read hook_manager.py and verify getattr not in allowed_builtins."""
-        hook_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..",
-            "deploy", "docker", "hook_manager.py"
-        )
-        with open(hook_path, "r") as f:
-            source = f.read()
+    def test_registry_rejects_arbitrary_code_action(self):
+        from hook_registry import HookValidationError, build_declarative_hooks
 
-        # Parse the source and find the allowed_builtins list
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "allowed_builtins":
-                        if isinstance(node.value, ast.List):
-                            values = [
-                                elt.value for elt in node.value.elts
-                                if isinstance(elt, ast.Constant)
-                            ]
-                            # Batch 2 hardening: hasattr, type, __build_class__ also removed
-                            self.assertNotIn("getattr", values,
-                                "getattr must not be in hook allowed_builtins (sandbox escape)")
-                            self.assertNotIn("setattr", values,
-                                "setattr must not be in hook allowed_builtins (sandbox escape)")
-                            self.assertNotIn("hasattr", values,
-                                "hasattr removed in batch 2 (info disclosure via probing)")
-                            self.assertNotIn("type", values,
-                                "type removed in batch 2 (__subclasses__ MRO chain escape)")
-                            self.assertNotIn("__build_class__", values,
-                                "__build_class__ removed in batch 2 (__init_subclass__ abuse)")
-                            return
+        with self.assertRaises(HookValidationError):
+            build_declarative_hooks([{"action": "run_python", "params": {"code": "x"}}])
 
-        self.fail("Could not find allowed_builtins in hook_manager.py")
+    def test_registry_actions_have_no_code_parameter(self):
+        from hook_registry import HOOK_REGISTRY
+
+        self.assertTrue(HOOK_REGISTRY)
+        for entry in HOOK_REGISTRY.values():
+            self.assertNotIn("code", entry["params_model"].model_fields)
 
 
 # ============================================================================
@@ -482,8 +458,6 @@ class TestNoUnprotectedEval(unittest.TestCase):
         known_safe = {
             # server.py _safe_eval_config - hardened with allowlist
             ("deploy/docker/server.py", "eval"),
-            # hook_manager.py - restricted namespace, hooks gated behind env var
-            ("deploy/docker/hook_manager.py", "exec"),
             # NOTE: extraction_strategy.py eval was DELETED, not just disabled
         }
 
@@ -511,227 +485,7 @@ class TestNoUnprotectedEval(unittest.TestCase):
 
 
 # ============================================================================
-# PART 6: Hook manager sandbox escape tests
-# ============================================================================
-
-class TestHookManagerSandboxEscapes(unittest.TestCase):
-    """Try every trick to escape the hook_manager exec() sandbox.
-    Hooks are the most dangerous surface: exec() on user-supplied code."""
-
-    @classmethod
-    def setUpClass(cls):
-        """Build the hook sandbox exactly as hook_manager.py does."""
-        import builtins
-        import types
-
-        safe_builtins = {}
-        allowed_builtins = [
-            'print', 'len', 'str', 'int', 'float', 'bool',
-            'list', 'dict', 'set', 'tuple', 'range', 'enumerate',
-            'zip', 'map', 'filter', 'any', 'all', 'sum', 'min', 'max',
-            'sorted', 'reversed', 'abs', 'round', 'isinstance', 'type',
-            'hasattr', 'callable', 'iter', 'next',
-            '__build_class__'
-        ]
-        for name in allowed_builtins:
-            if hasattr(builtins, name):
-                safe_builtins[name] = getattr(builtins, name)
-
-        cls.safe_builtins = safe_builtins
-
-    def _make_namespace(self):
-        """Create a fresh hook namespace with sanitized imports (as hook_manager does).
-        Mirrors the actual hook_manager.py injection approach: import in our scope,
-        sanitize, then inject into namespace. exec("import X", ns) doesn't work
-        because ns lacks __import__."""
-        import asyncio as _asyncio_mod
-        import json as _json_mod
-        import re as _re_mod
-        import types
-        from typing import Dict, List, Optional
-
-        namespace = {
-            '__name__': 'test_hook',
-            '__builtins__': dict(self.safe_builtins),
-        }
-
-        # Sanitize asyncio: strip subprocess access
-        safe_asyncio = types.ModuleType("asyncio")
-        for attr in dir(_asyncio_mod):
-            if attr not in ("subprocess", "create_subprocess_exec",
-                            "create_subprocess_shell"):
-                try:
-                    setattr(safe_asyncio, attr, getattr(_asyncio_mod, attr))
-                except (AttributeError, TypeError):
-                    pass
-
-        namespace["asyncio"] = safe_asyncio
-        namespace["json"] = _json_mod
-        namespace["re"] = _re_mod
-        namespace["Dict"] = Dict
-        namespace["List"] = List
-        namespace["Optional"] = Optional
-
-        return namespace
-
-    def _exec_hook(self, code):
-        """Execute hook code in sandbox, return namespace."""
-        ns = self._make_namespace()
-        exec(code, ns)
-        return ns
-
-    # -- The original RCE that was proven exploitable --
-
-    def test_asyncio_subprocess_blocked(self):
-        """asyncio.subprocess must not be accessible (was RCE vector)."""
-        ns = self._make_namespace()
-        self.assertFalse(
-            hasattr(ns["asyncio"], "subprocess"),
-            "asyncio.subprocess must be stripped from hook namespace"
-        )
-
-    def test_asyncio_create_subprocess_shell_blocked(self):
-        """asyncio.create_subprocess_shell must not be accessible."""
-        ns = self._make_namespace()
-        self.assertFalse(
-            hasattr(ns["asyncio"], "create_subprocess_shell"),
-            "asyncio.create_subprocess_shell must be stripped"
-        )
-
-    def test_asyncio_create_subprocess_exec_blocked(self):
-        """asyncio.create_subprocess_exec must not be accessible."""
-        ns = self._make_namespace()
-        self.assertFalse(
-            hasattr(ns["asyncio"], "create_subprocess_exec"),
-            "asyncio.create_subprocess_exec must be stripped"
-        )
-
-    def test_asyncio_subprocess_rce_attempt(self):
-        """Actually try the RCE via asyncio.subprocess -- must fail."""
-        code = '''
-async def evil(page, ctx):
-    sp = asyncio.subprocess
-    proc = await sp.create_subprocess_shell('id', stdout=sp.PIPE)
-    out, _ = await proc.communicate()
-    return out.decode()
-'''
-        with self.assertRaises(AttributeError):
-            ns = self._exec_hook(code)
-            import asyncio
-            asyncio.get_event_loop().run_until_complete(ns['evil'](None, None))
-
-    # -- asyncio useful functions still work --
-
-    def test_asyncio_sleep_still_works(self):
-        """asyncio.sleep must still be available for hooks."""
-        ns = self._make_namespace()
-        self.assertTrue(hasattr(ns["asyncio"], "sleep"))
-
-    def test_asyncio_gather_still_works(self):
-        """asyncio.gather must still be available."""
-        ns = self._make_namespace()
-        self.assertTrue(hasattr(ns["asyncio"], "gather"))
-
-    def test_asyncio_event_still_works(self):
-        """asyncio.Event must still be available."""
-        ns = self._make_namespace()
-        self.assertTrue(hasattr(ns["asyncio"], "Event"))
-
-    # -- Try importing os/subprocess directly --
-
-    def test_import_os_blocked(self):
-        """Direct 'import os' must fail (no __import__)."""
-        with self.assertRaises(ImportError):
-            self._exec_hook("import os")
-
-    def test_import_subprocess_blocked(self):
-        with self.assertRaises(ImportError):
-            self._exec_hook("import subprocess")
-
-    def test_import_sys_blocked(self):
-        with self.assertRaises(ImportError):
-            self._exec_hook("import sys")
-
-    # -- Try __import__ smuggling --
-
-    def test_dunder_import_not_available(self):
-        """__import__ must not be in builtins."""
-        ns = self._make_namespace()
-        self.assertNotIn('__import__', ns['__builtins__'])
-
-    def test_builtins_import_via_type(self):
-        """type().__bases__ subclass scanning can list classes but can't get __import__."""
-        ns = self._exec_hook("""
-result = [c.__name__ for c in type.__bases__[0].__subclasses__()[:5]]
-""")
-        # The subclass list is accessible, but without __import__ in builtins
-        # there's no path to import os/subprocess for RCE
-        self.assertNotIn('__import__', ns['__builtins__'])
-
-    # -- Try reaching os via module attributes --
-
-    def test_json_os_not_reachable(self):
-        """json module should not expose os."""
-        ns = self._make_namespace()
-        self.assertFalse(hasattr(ns.get("json"), "os"))
-
-    def test_re_os_not_reachable(self):
-        """re module should not expose os."""
-        ns = self._make_namespace()
-        self.assertFalse(hasattr(ns.get("re"), "os"))
-
-    def test_asyncio_os_not_reachable(self):
-        """asyncio should not expose os."""
-        ns = self._make_namespace()
-        self.assertFalse(hasattr(ns.get("asyncio"), "os"))
-
-    # -- Try module __loader__ / __spec__ traversal --
-
-    def test_module_loader_traversal(self):
-        """Try to reach importlib via asyncio.__loader__ -- should not give RCE."""
-        ns = self._make_namespace()
-        # Even if __loader__ exists, it shouldn't provide __import__
-        asyncio_mod = ns.get("asyncio")
-        if hasattr(asyncio_mod, "__loader__"):
-            loader = asyncio_mod.__loader__
-            # loader.load_module is deprecated but check it doesn't exist
-            # The key is: without __import__ in builtins, the hook code
-            # can't call loader methods that would import modules
-            self.assertNotIn('__import__', ns['__builtins__'])
-
-    # -- Try getattr/setattr (should be removed) --
-
-    def test_getattr_not_available(self):
-        """getattr must not be in builtins (sandbox escape vector)."""
-        ns = self._make_namespace()
-        self.assertNotIn('getattr', ns['__builtins__'])
-
-    def test_setattr_not_available(self):
-        """setattr must not be in builtins."""
-        ns = self._make_namespace()
-        self.assertNotIn('setattr', ns['__builtins__'])
-
-    # -- Try frame walking from within hook --
-
-    def test_frame_walk_from_hook(self):
-        """Frame walking inside exec'd code to escape sandbox."""
-        code = '''
-import sys
-'''
-        with self.assertRaises(ImportError):
-            self._exec_hook(code)
-
-    # -- Try generator gi_frame trick (the original vuln) from hook --
-
-    def test_gi_frame_from_hook(self):
-        """The original gi_frame.f_back exploit should not give __import__."""
-        # Even if frame walking works, builtins in this frame should not have __import__
-        ns = self._make_namespace()
-        self.assertNotIn('__import__', ns['__builtins__'])
-
-
-# ============================================================================
-# PART 7: End-to-end exploit payload test
+# PART 6: End-to-end exploit payload test
 # ============================================================================
 
 class TestEndToEndExploit(unittest.TestCase):

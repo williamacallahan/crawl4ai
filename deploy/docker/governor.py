@@ -24,13 +24,17 @@ import math
 DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 DEFAULT_MAX_PAGES = 100
 DEFAULT_MAX_DEPTH = 5
+DEFAULT_PER_PRINCIPAL_JOBS = 100
 
 
 class BodySizeLimitMiddleware:
-    """Reject HTTP requests whose declared Content-Length exceeds the limit.
+    """Reject HTTP requests whose received body exceeds the configured limit.
 
-    (Chunked/unknown-length bodies are additionally bounded at the transport by
-    gunicorn --limit-request-* in the hardened deployment.)
+    ``Content-Length`` is only an early rejection hint: clients can omit it or
+    stream with chunked transfer encoding.  Count the actual ASGI
+    ``http.request`` bytes and replay the bounded body downstream so every
+    transport gets the same limit.  A configured value of ``0`` is the
+    documented unbounded mode and leaves ``receive`` untouched.
     """
 
     def __init__(self, app, max_bytes: int = DEFAULT_MAX_BODY_BYTES):
@@ -38,17 +42,49 @@ class BodySizeLimitMiddleware:
         self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            for name, value in scope.get("headers", []):
-                if name == b"content-length":
-                    try:
-                        if int(value) > self.max_bytes:
-                            await self._reject(send)
-                            return
-                    except ValueError:
-                        pass
+        if scope["type"] != "http" or self.max_bytes <= 0:
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers", []):
+            if name != b"content-length":
+                continue
+            try:
+                if int(value) > self.max_bytes:
+                    await self._reject(send)
+                    return
+            except ValueError:
+                # An invalid declaration is not trusted; the actual received
+                # bytes below remain authoritative.
+                pass
+            break
+
+        messages = []
+        received = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    await self._reject(send)
+                    return
+                if not message.get("more_body", False):
                     break
-        await self.app(scope, receive, send)
+            elif message["type"] == "http.disconnect":
+                break
+
+        replay_index = 0
+
+        async def replay_receive():
+            nonlocal replay_index
+            if replay_index < len(messages):
+                message = messages[replay_index]
+                replay_index += 1
+                return message
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, replay_receive, send)
 
     async def _reject(self, send):
         body = json.dumps({"detail": "Request body too large"}).encode()
@@ -76,16 +112,10 @@ def clamp_deep_crawl(crawler_config, *, max_pages: int = DEFAULT_MAX_PAGES,
         return
     mp = getattr(dc, "max_pages", None)
     if mp is None or (isinstance(mp, float) and math.isinf(mp)) or mp > max_pages:
-        try:
-            dc.max_pages = max_pages
-        except Exception:
-            pass
+        dc.max_pages = max_pages
     md = getattr(dc, "max_depth", None)
     if md is None or md > max_depth:
-        try:
-            dc.max_depth = max_depth
-        except Exception:
-            pass
+        dc.max_depth = max_depth
 
 
 def max_body_bytes_from_config(config: dict) -> int:
@@ -104,8 +134,9 @@ def wall_clock_seconds(config: dict) -> float:
 def job_queue_caps(config: dict) -> dict:
     """Bounded-job-queue settings; 0 => unbounded/unlimited (current behavior)."""
     q = _limits(config).get("queue", {}) or {}
+    per_principal = q.get("per_principal", DEFAULT_PER_PRINCIPAL_JOBS)
     return {
         "maxsize": int(q.get("maxsize", 1000) or 0),
         "workers": int(q.get("workers", 4) or 1),
-        "per_principal": int(q.get("per_principal", 0) or 0),
+        "per_principal": int(per_principal) if per_principal is not None else 0,
     }

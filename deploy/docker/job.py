@@ -1,39 +1,43 @@
 """
-Job endpoints (enqueue + poll) for long-running LL​M extraction and raw crawl.
+Job endpoints (enqueue + poll) for long-running LL\u200bM extraction and raw crawl.
 Relies on the existing Redis task helpers in api.py
 """
 
-from typing import Dict, Optional, Callable, Literal
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from pydantic import BaseModel, HttpUrl
+import asyncio
+from typing import Annotated, Any, Literal
 
 from api import (
-    handle_llm_request,
     handle_crawl_job,
+    handle_llm_request,
     handle_task_status,
 )
 from auth import get_principal
-from schemas import WebhookConfig
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+from schemas import CrawlRequest, WebhookConfig
 
 # ------------- dependency placeholders -------------
-_redis = None        # will be injected from server.py
-_config = None
-_token_dep: Callable = lambda: None  # dummy until injected
+_redis: Any = None        # injected from server.py before the router serves requests
+_config: Any = None
+
+
+def _token_dep():
+    return None
 
 # public router
 router = APIRouter()
 
 
-def _principal_dep(request: Request) -> Optional[Dict]:
+def _principal_dep(request: Request) -> dict | None:
     """The principal the AuthGateMiddleware already validated for this request."""
     return get_principal(request)
 
 
-def _owner_of(principal: Optional[Dict]) -> Optional[str]:
+def _owner_of(principal: dict | None) -> str | None:
     return principal.get("sub") if principal else None
 
 
-def _is_admin(principal: Optional[Dict]) -> bool:
+def _is_admin(principal: dict | None) -> bool:
     return bool(principal) and principal.get("scope") == "admin"
 
 
@@ -49,29 +53,26 @@ def init_job_router(redis, config, token_dep) -> APIRouter:
 class LlmJobPayload(BaseModel):
     url:    HttpUrl
     q:      str
-    schema: Optional[str] = None
+    schema_: str | None = Field(default=None, alias="schema")
     cache:  bool = False
-    provider: Optional[str] = None
-    webhook_config: Optional[WebhookConfig] = None
-    temperature: Optional[float] = None
+    provider: str | None = None
+    webhook_config: WebhookConfig | None = None
+    temperature: float | None = None
     # base_url removed: server-derived LLM endpoint only (key-exfil vector).
 
 
 class CrawlJobPayload(BaseModel):
-    urls:           list[HttpUrl]
-    browser_config: Dict = {}
-    crawler_config: Dict = {}
-    result_fields: Optional[list[Literal[
-        "url",
-        "redirected_url",
-        "success",
-        "error_message",
-        "status_code",
-        "markdown",
-        "links",
-        "metadata",
-    ]]] = None
-    webhook_config: Optional[WebhookConfig] = None
+    urls: list[HttpUrl]
+    browser_config: dict = Field(default_factory=dict)
+    crawler_config: dict = Field(default_factory=dict)
+    result_fields: list[Literal["url", "redirected_url", "success", "error_message", "status_code", "markdown", "links", "metadata"]] | None = None
+    webhook_config: WebhookConfig | None = None
+
+    @field_validator("urls", mode="before")
+    @classmethod
+    def enforce_canonical_url_list_bounds(cls, urls):
+        """Delegate list cardinality to the canonical synchronous crawl model."""
+        return CrawlRequest.model_validate({"urls": urls}).urls
 
 
 # ---------- LL​M job ---------------------------------------------------------
@@ -80,13 +81,16 @@ async def llm_job_enqueue(
         payload: LlmJobPayload,
         background_tasks: BackgroundTasks,
         request: Request,
-        _td: Optional[Dict] = Depends(_principal_dep),
+        _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     webhook_config = None
     if payload.webhook_config:
         from utils import validate_webhook_url
         try:
-            validate_webhook_url(str(payload.webhook_config.webhook_url))
+            await asyncio.to_thread(
+                validate_webhook_url,
+                str(payload.webhook_config.webhook_url),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         webhook_config = payload.webhook_config.model_dump(mode='json')
@@ -97,8 +101,8 @@ async def llm_job_enqueue(
         request,
         str(payload.url),
         query=payload.q,
-        schema=payload.schema,
-        cache=payload.cache,
+        schema=payload.schema_,
+        cache="1" if payload.cache else "0",
         config=_config,
         provider=payload.provider,
         webhook_config=webhook_config,
@@ -112,7 +116,7 @@ async def llm_job_enqueue(
 async def llm_job_status(
     request: Request,
     task_id: str,
-    _td: Optional[Dict] = Depends(_principal_dep),
+    _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     return await handle_task_status(
         _redis, task_id, base_url=str(request.base_url),
@@ -125,13 +129,16 @@ async def llm_job_status(
 async def crawl_job_enqueue(
         payload: CrawlJobPayload,
         background_tasks: BackgroundTasks,
-        _td: Optional[Dict] = Depends(_principal_dep),
+        _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     webhook_config = None
     if payload.webhook_config:
         from utils import validate_webhook_url
         try:
-            validate_webhook_url(str(payload.webhook_config.webhook_url))
+            await asyncio.to_thread(
+                validate_webhook_url,
+                str(payload.webhook_config.webhook_url),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         webhook_config = payload.webhook_config.model_dump(mode='json')
@@ -142,7 +149,11 @@ async def crawl_job_enqueue(
         payload.browser_config,
         payload.crawler_config,
         config=_config,
-        result_fields=payload.result_fields,
+        result_fields=(
+            [str(field) for field in payload.result_fields]
+            if payload.result_fields is not None
+            else None
+        ),
         webhook_config=webhook_config,
         owner=_owner_of(_td),
     )
@@ -152,7 +163,7 @@ async def crawl_job_enqueue(
 async def crawl_job_status(
     request: Request,
     task_id: str,
-    _td: Optional[Dict] = Depends(_principal_dep),
+    _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     return await handle_task_status(
         _redis, task_id, base_url=str(request.base_url),

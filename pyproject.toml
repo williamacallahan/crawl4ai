@@ -98,6 +98,11 @@ crawl4ai = { workspace = true }
 dev = [
     "crawl4ai",
 ]
+test = [
+    "httpx2>=2,<3",
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.24,<2",
+]
 server = [
     "fastapi>=0.115.12,<0.137",
     "uvicorn>=0.34.2",
@@ -112,7 +117,7 @@ server = [
     "rank-bm25==0.2.2",
     "anyio==4.9.0",
     "pyjwt==2.10.1",
-    "mcp>=1.18.0",
+    "mcp>=1.18.0,<2",
     "websockets>=15.0.1",
     "httpx[http2]>=0.27.2",
 ]

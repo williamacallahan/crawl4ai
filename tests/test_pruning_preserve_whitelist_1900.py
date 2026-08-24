@@ -4,9 +4,7 @@ Tests for #1900: PruningContentFilter preserve_classes and preserve_tags.
 Verifies that whitelisted classes/tags are always kept regardless of
 pruning score, while non-whitelisted content is still pruned normally.
 """
-import pytest
 from crawl4ai.content_filter_strategy import PruningContentFilter
-
 
 # ── HTML fixtures ────────────────────────────────────────────────────────
 
@@ -209,6 +207,31 @@ class TestCombined:
         # nav is in excluded_tags and removed before pruning runs
         # preserve_tags only affects the pruning phase
         # This is expected — excluded_tags are structural boilerplate
+        assert "Home" not in combined
+        assert "About" not in combined
+
+    def test_preserved_class_survives_low_scoring_ancestors(self):
+        """Every wrapper on the path to a preserved descendant must survive."""
+        html = """
+        <body><main><div class="low-score-wrapper">
+            <span><em class="keep-me">retained attribution</em></span>
+            <span class="discard-me">discarded sibling</span>
+        </div></main></body>
+        """
+        f = PruningContentFilter(threshold=2.0, preserve_classes=["keep-me"])
+        combined = " ".join(f.filter_content(html))
+
+        assert "retained attribution" in combined
+        assert "discarded sibling" not in combined
+
+    def test_preserved_tag_survives_low_scoring_ancestors(self):
+        """Tag preservation also protects its ancestor path from decomposition."""
+        html = """
+        <body><section><div><span><cite>retained source</cite></span></div></section></body>
+        """
+        f = PruningContentFilter(threshold=2.0, preserve_tags=["cite"])
+
+        assert "retained source" in " ".join(f.filter_content(html))
 
 
 # ── _is_preserved method ─────────────────────────────────────────────────

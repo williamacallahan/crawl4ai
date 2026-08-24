@@ -12,8 +12,9 @@ Prereqs: Docker + docker compose, a checkout of this branch.
 ## 0. Offline suite (no Docker) — should already pass
 
 ```bash
-python -m pip install -e . && pip install -r deploy/docker/requirements.txt pytest pytest-asyncio
-pytest deploy/docker/tests/test_security_*.py -q
+uv lock --check
+uv sync --locked --no-dev --group server --group test
+.venv/bin/python -m pytest deploy/docker/tests/test_security_*.py -q
 ```
 Expected: all pass, `1 xfailed` (the `--no-sandbox` posture test, see §3).
 
@@ -47,7 +48,8 @@ inside the container). This is the fail-closed default.
 ### 2b. With a credential -> may expose 0.0.0.0
 
 ```bash
-TOKEN=$(openssl rand -hex 32)
+# Use the existing operator-managed API token for this deployment.
+TOKEN="$CRAWL4AI_API_TOKEN"
 docker run --rm -e CRAWL4AI_API_TOKEN=$TOKEN -p 11235:11235 unclecode/crawl4ai:local-sec &
 sleep 8
 curl -fsS http://localhost:11235/health                            # expect 200

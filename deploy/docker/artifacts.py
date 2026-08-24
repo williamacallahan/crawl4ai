@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import os
 import re
+import stat
+import threading
 import time
 import uuid
-from typing import Dict, Tuple
 
 ARTIFACT_DIR = os.environ.get("CRAWL4AI_ARTIFACT_DIR", "/var/lib/crawl4ai/outputs")
 MAX_ARTIFACT_BYTES = int(os.environ.get("CRAWL4AI_MAX_ARTIFACT_BYTES", str(50 * 1024 * 1024)))
@@ -31,6 +32,7 @@ _KIND = {
     "png": (".png", "image/png"),
     "pdf": (".pdf", "application/pdf"),
 }
+_STORE_LOCK = threading.Lock()
 
 
 class ArtifactError(Exception):
@@ -65,7 +67,7 @@ def _dir_size() -> int:
             for entry in it:
                 try:
                     st = entry.stat(follow_symlinks=False)
-                    if os.path.stat.S_ISREG(st.st_mode):
+                    if stat.S_ISREG(st.st_mode):
                         total += st.st_size
                 except OSError:
                     continue
@@ -74,8 +76,13 @@ def _dir_size() -> int:
     return total
 
 
-def write_artifact(kind: str, data: bytes) -> Dict:
+def write_artifact(kind: str, data: bytes) -> dict:
     """Write bytes under a server-generated opaque id. Returns metadata."""
+    with _STORE_LOCK:
+        return _write_artifact(kind, data)
+
+
+def _write_artifact(kind: str, data: bytes) -> dict:
     ext, mime = _KIND.get(kind, (".bin", "application/octet-stream"))
     if len(data) > MAX_ARTIFACT_BYTES:
         raise ArtifactTooLarge(f"artifact exceeds {MAX_ARTIFACT_BYTES} bytes")
@@ -94,7 +101,7 @@ def write_artifact(kind: str, data: bytes) -> Dict:
     return {"artifact_id": artifact_id, "mime": mime, "size": len(data)}
 
 
-def resolve_artifact(artifact_id: str) -> Tuple[str, str]:
+def resolve_artifact(artifact_id: str) -> tuple[str, str]:
     """Map an opaque id to (path, mime), enforcing hex-id, no-symlink, TTL.
 
     Raises ArtifactNotFound for an invalid id, a non-regular/symlink file, a
@@ -108,7 +115,7 @@ def resolve_artifact(artifact_id: str) -> Tuple[str, str]:
             st = os.lstat(path)  # do NOT follow symlinks
         except FileNotFoundError:
             continue
-        if not os.path.stat.S_ISREG(st.st_mode):
+        if not stat.S_ISREG(st.st_mode):
             raise ArtifactNotFound()  # symlink / special file
         if time.time() - st.st_mtime > ARTIFACT_TTL_SECONDS:
             try:
@@ -121,6 +128,12 @@ def resolve_artifact(artifact_id: str) -> Tuple[str, str]:
 
 
 def janitor() -> int:
+    """Serialize cleanup with quota checks and artifact writes."""
+    with _STORE_LOCK:
+        return _janitor()
+
+
+def _janitor() -> int:
     """Reap expired artifacts; if still over quota, reap oldest first."""
     init_store()
     now = time.time()
@@ -133,7 +146,7 @@ def janitor() -> int:
                     st = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
-                if not os.path.stat.S_ISREG(st.st_mode):
+                if not stat.S_ISREG(st.st_mode):
                     # remove anything that is not a regular file (e.g. a symlink)
                     try:
                         os.unlink(entry.path)

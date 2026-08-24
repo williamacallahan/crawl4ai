@@ -18,6 +18,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setenv("CRAWL4AI_ARTIFACT_QUOTA_BYTES", "4096")
     monkeypatch.setenv("CRAWL4AI_ARTIFACT_TTL_SECONDS", "3600")
     import importlib
+
     import artifacts
     importlib.reload(artifacts)
     artifacts.init_store()
@@ -88,8 +89,41 @@ class TestResolve:
 class TestWriteIsExclusiveAndNoFollow:
     def test_write_uses_oexcl_nofollow(self, store):
         import inspect
-        src = inspect.getsource(store.write_artifact)
+        src = inspect.getsource(store._write_artifact)
         assert "O_EXCL" in src and "O_NOFOLLOW" in src
+
+    def test_quota_check_and_write_are_serialized(self, store, monkeypatch):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+        real_dir_size = store._dir_size
+
+        def observed_dir_size():
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            try:
+                return real_dir_size()
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        monkeypatch.setattr(store, "_dir_size", observed_dir_size)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(store.write_artifact, "png", b"data")
+                for _ in range(2)
+            ]
+            for future in futures:
+                future.result()
+
+        assert max_active == 1
 
 
 class TestJanitor:

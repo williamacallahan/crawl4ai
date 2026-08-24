@@ -19,11 +19,8 @@ gate (and the /token endpoint) call:
 """
 
 import hmac
-import logging
 import os
-import secrets as _secrets
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
 
 import jwt
 from fastapi import HTTPException, Request
@@ -36,49 +33,39 @@ _ALGORITHMS = [ALGORITHM]  # a LIST on purpose: no substring matching, no alg:no
 _WEAK_SECRETS = {"mysecret", "secret", "password", "changeme", "test", "12345678"}
 _MIN_SECRET_LEN = 32
 
-_log = logging.getLogger("crawl4ai.security")
-
-
 def resolve_secret_key(*, required: bool) -> str:
     """Resolve and validate SECRET_KEY.
 
     required=True  -> fail fast (RuntimeError) if unset/weak/short. Used when a
                       real auth deployment is in effect; an ephemeral key would
                       silently invalidate every issued token on restart.
-    required=False -> auto-generate an ephemeral key (and warn) when unset, so
-                      loopback/dev still works. A set-but-weak key still fails.
+    required=False -> return an empty value when unset. Credential creation and
+                      lifecycle remain exclusively operator-owned.
     """
     key = os.environ.get("SECRET_KEY", "")
     if key:
         if key.lower() in _WEAK_SECRETS:
             raise RuntimeError(
-                "FATAL: SECRET_KEY is a known weak value. Generate a strong one: "
-                'python3 -c "import secrets; print(secrets.token_hex(32))"'
+                "FATAL: SECRET_KEY is a known weak value; provide an existing "
+                "operator-managed signing key"
             )
         if len(key) < _MIN_SECRET_LEN:
             raise RuntimeError(
                 f"FATAL: SECRET_KEY must be at least {_MIN_SECRET_LEN} characters. "
-                'Generate one: python3 -c "import secrets; print(secrets.token_hex(32))"'
+                "Provide an existing operator-managed signing key."
             )
         return key
 
     if required:
         raise RuntimeError(
-            "FATAL: authentication is enabled but SECRET_KEY is not set. "
-            'Set it: SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")'
+            "FATAL: JWT authentication requires an existing operator-managed "
+            "SECRET_KEY"
         )
-
-    generated = _secrets.token_hex(32)
-    _log.warning(
-        "No SECRET_KEY set. Auto-generated an ephemeral key (changes on restart, "
-        "invalidating issued tokens). Set SECRET_KEY for any real deployment."
-    )
-    return generated
+    return ""
 
 
-# Module-level key, resolved leniently at import. The server's startup
-# _resolve_auth() performs the fail-fast check when a real deployment is
-# detected (credential set and/or non-loopback bind).
+# Compatibility snapshot for callers that inspect the module. Signing and
+# verification resolve the live operator-owned value at the operation boundary.
 SECRET_KEY = resolve_secret_key(required=False)
 
 
@@ -86,7 +73,7 @@ def create_access_token(
     data: dict,
     *,
     scope: str = "data",
-    expires_delta: Optional[timedelta] = None,
+    expires_delta: timedelta | None = None,
 ) -> str:
     """Mint an HS256 JWT. `scope` is "data" (normal) or "admin"."""
     to_encode = dict(data)
@@ -95,17 +82,25 @@ def create_access_token(
         expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     to_encode["exp"] = expire
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(
+        to_encode,
+        resolve_secret_key(required=True),
+        algorithm=ALGORITHM,
+    )
 
 
-def decode_token(token: str) -> Dict:
+def decode_token(token: str) -> dict:
     """Verify an HS256 JWT and return its claims.
 
     Raises jwt.InvalidTokenError (incl. ExpiredSignatureError) on any failure.
     `algorithms` is a list, so alg:none and every non-HS256 algorithm are
     rejected outright.
     """
-    return jwt.decode(token, SECRET_KEY, algorithms=_ALGORITHMS)
+    return jwt.decode(
+        token,
+        resolve_secret_key(required=True),
+        algorithms=_ALGORITHMS,
+    )
 
 
 def constant_time_eq(a: str, b: str) -> bool:
@@ -113,12 +108,12 @@ def constant_time_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
-def get_principal(request: Request) -> Optional[Dict]:
+def get_principal(request: Request) -> dict | None:
     """The principal the AuthGateMiddleware already validated (or None)."""
     return getattr(request.state, "principal", None)
 
 
-def get_token_dependency(config: Dict):
+def get_token_dependency(config: dict):
     """Backward-compatible dependency factory.
 
     Auth enforcement now lives in the AuthGateMiddleware (the outermost ASGI
@@ -127,13 +122,13 @@ def get_token_dependency(config: Dict):
     surfaces the validated principal to handlers that declared `_td`.
     """
 
-    def _principal(request: Request) -> Optional[Dict]:
+    def _principal(request: Request) -> dict | None:
         return get_principal(request)
 
     return _principal
 
 
-def require_admin(request: Request) -> Dict:
+def require_admin(request: Request) -> dict:
     """Dependency: require an admin-scope principal (destructive actions)."""
     principal = get_principal(request)
     if not principal or principal.get("scope") != "admin":
@@ -143,4 +138,4 @@ def require_admin(request: Request) -> Dict:
 
 class TokenRequest(BaseModel):
     email: EmailStr
-    api_token: Optional[str] = None
+    api_token: str | None = None

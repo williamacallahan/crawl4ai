@@ -7,75 +7,80 @@ Crawl4AI FastAPI entry‑point
 """
 
 # ── stdlib & 3rd‑party imports ───────────────────────────────
-from crawler_pool import get_crawler, release_crawler, close_all, janitor
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from crawl4ai.async_configs import Provenance, UntrustedConfigError
-from crawl4ai.__version__ import __version__
-from auth import (
-    create_access_token, get_token_dependency, TokenRequest,
-    constant_time_eq, resolve_secret_key,
-)
-from auth_gate import AuthGateMiddleware
-from pydantic import BaseModel
-from typing import Optional, List, Dict
-from fastapi import Request, Depends
-from fastapi.responses import FileResponse
+import ast
+import asyncio
 import base64
-import re
 import logging
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from api import (
-    handle_markdown_request, handle_llm_qa,
-    handle_stream_crawl_request, handle_crawl_request,
-    stream_results
-)
-from schemas import (
-    CrawlRequestWithHooks,
-    MarkdownRequest,
-    RawCode,
-    HTMLRequest,
-    ScreenshotRequest,
-    PDFRequest,
-    JSEndpointRequest,
-)
-
-from utils import (
-    FilterType, load_config, setup_logging, verify_email_domain,
-    validate_webhook_url, validate_url_destination,
-)
 import os
+import pathlib
+import re
 import sys
 import time
-import asyncio
-from typing import List
+import uuid
 from contextlib import asynccontextmanager
-import pathlib
+from typing import Dict, List, Optional
 
-from fastapi import (
-    FastAPI, HTTPException, Request, Path, Query, Depends
+from api import (
+    handle_crawl_request,
+    handle_llm_qa,
+    handle_markdown_request,
+    handle_stream_crawl_request,
+    stream_results,
 )
-from rank_bm25 import BM25Okapi
-from fastapi.responses import (
-    StreamingResponse, RedirectResponse, PlainTextResponse, JSONResponse
+from auth import (
+    TokenRequest,
+    constant_time_eq,
+    create_access_token,
+    get_token_dependency,
+    resolve_secret_key,
 )
+from auth_gate import AuthGateMiddleware
+from crawler_pool import close_all, get_crawler, janitor, release_crawler
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
+from governor import BodySizeLimitMiddleware, max_body_bytes_from_config
 from job import init_job_router
-
-from mcp_bridge import attach_mcp, mcp_resource, mcp_template, mcp_tool
-
-import ast
-import crawl4ai as _c4
-from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from mcp_bridge import attach_mcp, mcp_tool
+from monitor_routes import router as monitor_router
 from prometheus_fastapi_instrumentator import Instrumentator
+from rank_bm25 import BM25Okapi
 from redis import asyncio as aioredis
 from redis_config import (
     build_rate_limit_storage_uri as _build_rate_limit_storage_uri,
+)
+from redis_config import (
     build_redis_url as _build_redis_url,
 )
+from schemas import (
+    CrawlRequestWithHooks,
+    HTMLRequest,
+    JSEndpointRequest,
+    MarkdownRequest,
+    PDFRequest,
+    ScreenshotRequest,
+)
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from starlette.exceptions import HTTPException as _StarletteHTTPException
+from utils import (
+    load_config,
+    setup_logging,
+    validate_url_destination,
+    validate_webhook_url,
+    verify_email_domain,
+)
+
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from crawl4ai.__version__ import __version__
+from crawl4ai.async_configs import Provenance, UntrustedConfigError
 
 # ── internal imports (after sys.path append) ─────────────────
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
@@ -104,13 +109,62 @@ EXECUTE_JS_ENABLED = os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lowe
 # renderer sandboxed. Verify Chromium still starts after flipping it.
 CHROMIUM_SANDBOX = os.environ.get("CRAWL4AI_CHROMIUM_SANDBOX", "false").lower() == "true"
 
-# Warn loudly if API token is not set (all endpoints unauthenticated)
-_api_token = config.get("security", {}).get("api_token", "") or os.environ.get("CRAWL4AI_API_TOKEN", "")
-if not _api_token:
-    import logging as _logging
-    _logging.getLogger("crawl4ai.security").warning(
-        "CRAWL4AI_API_TOKEN is not set. All API endpoints are unauthenticated. "
-        "Set CRAWL4AI_API_TOKEN environment variable to enable authentication."
+def _current_api_token() -> str:
+    """The effective static operator token (config or environment)."""
+    configured = config.get("security", {}).get("api_token", "")
+    if configured and not isinstance(configured, str):
+        raise RuntimeError("security.api_token must be a string")
+    return os.environ.get("CRAWL4AI_API_TOKEN", "") or configured
+
+
+def _current_jwt_enabled() -> bool:
+    """Resolve one JWT posture for socket binding and issuance.
+
+    ``CRAWL4AI_JWT_ENABLED`` is an explicit runtime override for container
+    deployments; otherwise the canonical config value applies.
+    """
+    raw = os.environ.get("CRAWL4AI_JWT_ENABLED")
+    if raw is None or not raw.strip():
+        configured = config.get("security", {}).get("jwt_enabled", False)
+        if not isinstance(configured, bool):
+            raise RuntimeError("security.jwt_enabled must be a YAML boolean")
+        return configured
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(
+        "CRAWL4AI_JWT_ENABLED must be one of true/false, 1/0, yes/no, on/off"
+    )
+
+
+def _internal_service_auth_headers() -> dict:
+    """Use the effective operator token, or a JWT in JWT-only deployments."""
+    token = _current_api_token()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {
+        "Authorization": (
+            "Bearer " + create_access_token({"sub": "mcp-service"}, scope="data")
+        )
+    }
+
+
+def _effective_bind_host() -> str:
+    """Return the host actually bound by Gunicorn or the direct server."""
+    bind = os.environ.get("GUNICORN_BIND", "")
+    if not bind or bind.startswith("unix:"):
+        return config["app"]["host"]
+    if bind.startswith("["):
+        return bind[1:].split("]", 1)[0]
+    return bind.rsplit(":", 1)[0]
+
+
+if not _current_api_token() and not _current_jwt_enabled():
+    logging.getLogger("crawl4ai.security").warning(
+        "No API token or JWT posture is configured; startup will restrict the "
+        "service to loopback."
     )
 
 # ── default browser config helper ─────────────────────────────
@@ -164,70 +218,83 @@ AsyncWebCrawler.arun = capped_arun
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    from crawler_pool import init_permanent
-    from monitor import MonitorStats
     import monitor as monitor_module
+    from crawler_pool import init_permanent
+    from egress_proxy import start_pinning_proxy, stop_pinning_proxy
+    from monitor import MonitorStats
 
     # Enforce auth posture before serving any traffic.
     _resolve_auth()
 
-    # Initialize the sandboxed artifact store + reaper.
-    from artifacts import init_store
-    init_store()
-    app.state.artifact_janitor = asyncio.create_task(_artifact_janitor())
-
-    # Start the localhost pinning forward-proxy and route the browser through it.
-    from egress_proxy import PinningProxy
-    from egress_broker import set_egress_proxy
-    app.state.egress_proxy = PinningProxy()
-    set_egress_proxy(await app.state.egress_proxy.start())
-
-    # Bounded background-job queue (per-principal quotas optional).
-    from work_queue import WorkQueue, set_job_queue
-    from governor import job_queue_caps
-    _caps = job_queue_caps(config)
-    app.state.job_queue = WorkQueue(**_caps)
-    await app.state.job_queue.start()
-    set_job_queue(app.state.job_queue)
-
-    # Initialize monitor
-    monitor_module.monitor_stats = MonitorStats(redis)
-    await monitor_module.monitor_stats.load_from_redis()
-    monitor_module.monitor_stats.start_persistence_worker()
-
-    # Initialize browser pool
-    await init_permanent(BrowserConfig(
-        extra_args=_browser_extra_args(),
-        **config["crawler"]["browser"].get("kwargs", {}),
-    ))
-
-    # Start background tasks
-    app.state.janitor = asyncio.create_task(janitor())
-    app.state.timeline_updater = asyncio.create_task(_timeline_updater())
-
-    yield
-
-    # Cleanup
-    app.state.janitor.cancel()
-    app.state.timeline_updater.cancel()
-    app.state.artifact_janitor.cancel()
+    app.state.egress_proxy = None
+    app.state.readiness_checks_active = False
     try:
-        await app.state.egress_proxy.stop()
-    except Exception:
-        pass
-    try:
-        await app.state.job_queue.stop()
-    except Exception:
-        pass
+        # Initialize the sandboxed artifact store + reaper.
+        from artifacts import init_store
 
-    # Monitor cleanup (persist stats and stop workers)
-    from monitor import get_monitor
-    try:
-        await get_monitor().cleanup()
-    except Exception as e:
-        logger.error(f"Monitor cleanup failed: {e}")
+        init_store()
+        app.state.artifact_janitor = asyncio.create_task(_artifact_janitor())
 
-    await close_all()
+        # The API and every durable worker use the same lifecycle owner.  It
+        # registers the localhost pinning proxy before any browser config is
+        # constructed.
+        app.state.egress_proxy = await start_pinning_proxy()
+
+        # Bounded background-job queue (per-principal quotas optional).
+        from governor import job_queue_caps
+        from work_queue import WorkQueue, set_job_queue
+
+        caps = job_queue_caps(config)
+        app.state.job_queue = WorkQueue(redis=redis, **caps)
+        await app.state.job_queue.start()
+        set_job_queue(app.state.job_queue)
+
+        # Initialize monitor and prove the effective (possibly external,
+        # authenticated) Redis is reachable before readiness becomes active.
+        await asyncio.wait_for(redis.ping(), timeout=5.0)
+        monitor_module.monitor_stats = MonitorStats(redis)
+        await monitor_module.monitor_stats.load_from_redis()
+        monitor_module.monitor_stats.start_persistence_worker()
+
+        # Permanent browser must be initialized from the same post-proxy
+        # effective config used by per-request crawlers.
+        await init_permanent(get_default_browser_config())
+
+        app.state.janitor = asyncio.create_task(janitor())
+        app.state.timeline_updater = asyncio.create_task(_timeline_updater())
+        app.state.readiness_checks_active = True
+
+        yield
+    finally:
+        app.state.readiness_checks_active = False
+        background_tasks = []
+        for task_name in ("janitor", "timeline_updater", "artifact_janitor"):
+            task = getattr(app.state, task_name, None)
+            if task is not None:
+                task.cancel()
+                background_tasks.append(task)
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        job_queue = getattr(app.state, "job_queue", None)
+        if job_queue is not None:
+            try:
+                await job_queue.stop()
+            except Exception:
+                pass
+
+        from monitor import get_monitor
+
+        try:
+            await get_monitor().cleanup()
+        except Exception as e:
+            logger.error(f"Monitor cleanup failed: {e}")
+
+        await close_all()
+        try:
+            await stop_pinning_proxy(app.state.egress_proxy)
+        except Exception:
+            pass
 
 async def _artifact_janitor():
     """Periodically reap expired / over-quota artifacts."""
@@ -235,7 +302,7 @@ async def _artifact_janitor():
     while True:
         await asyncio.sleep(300)
         try:
-            _reap()
+            await asyncio.to_thread(_reap)
         except Exception as e:
             logger.warning(f"Artifact janitor error: {e}")
 
@@ -292,6 +359,13 @@ if ASSETS_DIR.exists():
 async def root():
     return RedirectResponse("/playground")
 
+
+# Pre-0.9 clients used /monitor for the dashboard shell, which now lives at
+# /dashboard.  Only this exact path is public; /monitor/* remains protected.
+@app.get("/monitor", include_in_schema=False)
+async def monitor_ui_redirect():
+    return RedirectResponse("/dashboard")
+
 # ─────────────────── infra / middleware  ─────────────────────
 redis = aioredis.from_url(_build_redis_url(config))
 
@@ -311,11 +385,11 @@ def _setup_security(app_: FastAPI):
     trusted = sec.get("trusted_hosts", ["*"])
     if trusted and trusted != ["*"]:
         app_.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted)
-    elif config["app"]["host"] not in ("127.0.0.1", "localhost", "::1"):
+    elif _effective_bind_host() not in ("127.0.0.1", "localhost", "::1"):
         logging.getLogger("crawl4ai.security").warning(
             "trusted_hosts is ['*'] on a non-loopback bind (%s): the Host guard "
             "is disabled. Set security.trusted_hosts to your real hostname(s).",
-            config["app"]["host"],
+            _effective_bind_host(),
         )
 
     # Deny-by-default CORS: only explicitly allowlisted origins; never '*' with
@@ -359,7 +433,6 @@ STRICT_CSP = (
 _UI_PREFIXES = ("/dashboard", "/playground", "/static")
 
 
-@app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     resp = await call_next(request)
     for k, v in SECURITY_BASELINE_HEADERS.items():
@@ -377,28 +450,26 @@ async def add_security_headers(request: Request, call_next):
 # ── authentication gate (outermost ASGI layer, fails closed) ──────────
 # The single place auth is decided: covers every route, static mount, the MCP
 # transports and the metrics endpoint, for HTTP and WebSocket alike. Only the
-# health check and the token-issuing endpoint are public.
+# health/token endpoints and the exact UI redirects are public.
 HEALTH_PATH = config["observability"]["health_check"]["endpoint"]
 
 
-def _current_api_token() -> str:
-    """The effective static operator token (config or environment)."""
-    return (
-        config.get("security", {}).get("api_token", "")
-        or os.environ.get("CRAWL4AI_API_TOKEN", "")
-    )
+# ── request body-size limit (DoS) ─────────────────────────────────────
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body_bytes_from_config(config))
 
-
+# Add auth after the body limiter so Starlette makes it the outermost layer:
+# unauthorized callers are rejected before their body is read or buffered.
 app.add_middleware(
     AuthGateMiddleware,
     token_provider=_current_api_token,
-    public_paths={HEALTH_PATH, "/token"},
+    public_paths={HEALTH_PATH, "/token", "/", "/monitor"},
     public_prefixes=_UI_PREFIXES,
 )
 
-# ── request body-size limit (DoS) ─────────────────────────────────────
-from governor import BodySizeLimitMiddleware, max_body_bytes_from_config
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body_bytes_from_config(config))
+# Response decoration sits outside the auth boundary so even an early 401/413
+# carries the baseline headers. It does not read request bodies; AuthGate is
+# still the first authorization decision and remains outermost for WebSockets.
+app.middleware("http")(add_security_headers)
 
 
 def _resolve_auth():
@@ -407,12 +478,17 @@ def _resolve_auth():
 
     - credential configured  -> enforce (fail fast on jwt_enabled w/o SECRET_KEY)
     - none + non-loopback bind -> refuse to start (would be open to the network)
-    - none + loopback bind    -> generate a one-off token and print it
+    - none + loopback bind    -> start with protected routes unavailable
     """
-    host = config["app"]["host"]
-    loopback = host in ("127.0.0.1", "localhost", "::1")
+    bind = os.environ.get("GUNICORN_BIND", "")
+    bind_host = _effective_bind_host()
+    loopback = bind.startswith("unix:") or bind_host in (
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    )
     api_token = _current_api_token()
-    jwt_enabled = config.get("security", {}).get("jwt_enabled", False)
+    jwt_enabled = _current_jwt_enabled()
 
     if api_token or jwt_enabled:
         if jwt_enabled:
@@ -423,19 +499,16 @@ def _resolve_auth():
     if not loopback:
         logger.critical(
             "Refusing to start: binding %s with no CRAWL4AI_API_TOKEN and "
-            "jwt_enabled=false would expose an unauthenticated API. Set "
-            "CRAWL4AI_API_TOKEN=$(openssl rand -hex 32), enable jwt, or bind loopback.",
-            host,
+            "jwt_enabled=false would expose an unauthenticated API. Provide an "
+            "existing operator-managed credential, enable JWT with an existing "
+            "SECRET_KEY, or bind loopback.",
+            bind_host,
         )
         sys.exit(1)
 
-    import secrets as _secrets
-    gen = _secrets.token_hex(32)
-    os.environ["CRAWL4AI_API_TOKEN"] = gen
     logger.warning(
-        "No CRAWL4AI_API_TOKEN set; generated an ephemeral token for this "
-        "loopback session:\n    CRAWL4AI_API_TOKEN=%s",
-        gen,
+        "No API credential is configured; protected loopback routes will return "
+        "401 until the operator supplies an existing credential."
     )
 
 # ───────────────── URL validation helper ─────────────────
@@ -443,13 +516,19 @@ ALLOWED_URL_SCHEMES = ("http://", "https://")
 ALLOWED_URL_SCHEMES_WITH_RAW = ("http://", "https://", "raw:", "raw://")
 
 
-def validate_url_scheme(url: str, allow_raw: bool = False) -> None:
+async def validate_url_scheme(
+    url: str,
+    allow_raw: bool = False,
+    check_destination: bool = True,
+) -> None:
     """Validate URL scheme (LFI) and destination (SSRF)."""
     allowed = ALLOWED_URL_SCHEMES_WITH_RAW if allow_raw else ALLOWED_URL_SCHEMES
     if not url.startswith(allowed):
         schemes = ", ".join(allowed)
         raise HTTPException(400, f"URL must start with {schemes}")
-    validate_url_destination(url)
+    if url.startswith(("raw:", "raw://")) or not check_destination:
+        return
+    await asyncio.to_thread(validate_url_destination, url)
 
 
 # ───────────────── safe config‑dump helper ─────────────────
@@ -486,7 +565,6 @@ app.include_router(init_job_router(redis, config, token_dep))
 # the WebSocket upgrade on /monitor/ws (TypeError: _principal() missing 'request').
 # AuthGateMiddleware already authenticates HTTP + WS; destructive monitor
 # actions keep their own Depends(require_admin).
-from monitor_routes import router as monitor_router
 app.include_router(monitor_router)
 
 logger = logging.getLogger(__name__)
@@ -497,17 +575,13 @@ logger = logging.getLogger(__name__)
 # versions, resolved internal IPs and sometimes secrets. Centralize: 5xx
 # responses are generic + carry a correlation id; the full detail is logged
 # server-side. 4xx developer messages are preserved.
-import uuid as _uuid
-from starlette.exceptions import HTTPException as _StarletteHTTPException
-
-
 @app.exception_handler(_StarletteHTTPException)
 async def _http_exception_handler(request: Request, exc: _StarletteHTTPException):
     # 500 is the raw-str(e) leak vector -> genericize with a correlation id.
     # Deliberate operational statuses (502/503/504, with their own short
     # messages + headers like Retry-After) pass through, as do 4xx.
     if exc.status_code == 500:
-        cid = _uuid.uuid4().hex[:12]
+        cid = uuid.uuid4().hex[:12]
         logger.error("server error 500 [cid=%s]: %s", cid, exc.detail)
         return JSONResponse(
             {"error": "Internal server error", "correlation_id": cid},
@@ -522,7 +596,7 @@ async def _http_exception_handler(request: Request, exc: _StarletteHTTPException
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
-    cid = _uuid.uuid4().hex[:12]
+    cid = uuid.uuid4().hex[:12]
     logger.exception("unhandled exception [cid=%s]", cid)
     return JSONResponse(
         {"error": "Internal server error", "correlation_id": cid},
@@ -533,19 +607,27 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 # ──────────────────────── Endpoints ──────────────────────────
 @app.post("/token")
 async def get_token(req: TokenRequest):
-    expected_token = config.get("security", {}).get("api_token", "")
+    if not _current_jwt_enabled():
+        raise HTTPException(403, "JWT issuance is disabled on the server.")
+    expected_token = _current_api_token()
     if not expected_token:
         # Fail closed: without a configured api_token the old behavior minted a
         # JWT to anyone whose email merely had an MX record. Refuse instead.
         raise HTTPException(
             403,
-            "Token issuance is disabled: no api_token is configured on the server.",
+            "Token issuance is disabled: no operator API token is configured.",
         )
     if not req.api_token or not constant_time_eq(req.api_token, expected_token):
         raise HTTPException(401, "Invalid or missing api_token")
-    if not verify_email_domain(req.email):
+    if not await asyncio.to_thread(verify_email_domain, req.email):
         raise HTTPException(400, "Invalid email domain")
-    token = create_access_token({"sub": req.email})
+    try:
+        token = create_access_token({"sub": req.email})
+    except RuntimeError:
+        raise HTTPException(
+            503,
+            "JWT issuance is unavailable until an existing SECRET_KEY is configured.",
+        )
     return {"email": req.email, "access_token": token, "token_type": "bearer"}
 
 
@@ -610,7 +692,7 @@ async def generate_html(
     Crawls the URL, preprocesses the raw HTML for schema extraction, and returns the processed HTML.
     Use when you need sanitized HTML structures for building schemas or further processing.
     """
-    validate_url_scheme(body.url, allow_raw=True)
+    await validate_url_scheme(body.url, allow_raw=True)
     cfg = CrawlerRunConfig()
     crawler = None
     try:
@@ -632,7 +714,7 @@ async def generate_html(
 # ── artifact store helpers ───────────────────────────────────
 def _store_artifact(kind: str, data: bytes) -> dict:
     """Write to the sandboxed store; map quota/size errors to HTTP codes."""
-    from artifacts import write_artifact, ArtifactTooLarge, QuotaExceeded
+    from artifacts import ArtifactTooLarge, QuotaExceeded, write_artifact
     try:
         meta = write_artifact(kind, data)
     except ArtifactTooLarge:
@@ -650,9 +732,9 @@ def _store_artifact(kind: str, data: bytes) -> dict:
 @app.get("/artifacts/{artifact_id}")
 async def get_artifact(artifact_id: str, _td: Dict = Depends(token_dep)):
     """Fetch a previously generated artifact by its opaque id (authed)."""
-    from artifacts import resolve_artifact, ArtifactNotFound
+    from artifacts import ArtifactNotFound, resolve_artifact
     try:
-        path, mime = resolve_artifact(artifact_id)
+        path, mime = await asyncio.to_thread(resolve_artifact, artifact_id)
     except ArtifactNotFound:
         raise HTTPException(404, "Artifact not found")
     return FileResponse(path, media_type=mime, headers={"X-Content-Type-Options": "nosniff"})
@@ -674,7 +756,7 @@ async def generate_screenshot(
     Use when you need an image snapshot of the rendered page. The image is also written to the
     sandboxed artifact store; the response includes an `artifact_id` and a `url` to fetch it.
     """
-    validate_url_scheme(body.url)
+    await validate_url_scheme(body.url)
     crawler = None
     try:
         cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for, wait_for_images=body.wait_for_images)
@@ -683,7 +765,11 @@ async def generate_screenshot(
         if not results[0].success:
             raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
         screenshot_data = results[0].screenshot
-        art = _store_artifact("png", base64.b64decode(screenshot_data))
+        art = await asyncio.to_thread(
+            _store_artifact,
+            "png",
+            base64.b64decode(screenshot_data),
+        )
         return {"success": True, "screenshot": screenshot_data, **art}
     except HTTPException:
         raise
@@ -709,7 +795,7 @@ async def generate_pdf(
     Use when you need a printable or archivable snapshot of the page. The PDF is also written to the
     sandboxed artifact store; the response includes an `artifact_id` and a `url` to fetch it.
     """
-    validate_url_scheme(body.url)
+    await validate_url_scheme(body.url)
     crawler = None
     try:
         cfg = CrawlerRunConfig(pdf=True)
@@ -718,7 +804,7 @@ async def generate_pdf(
         if not results[0].success:
             raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
         pdf_data = results[0].pdf
-        art = _store_artifact("pdf", pdf_data)
+        art = await asyncio.to_thread(_store_artifact, "pdf", pdf_data)
         return {"success": True, "pdf": base64.b64encode(pdf_data).decode(), **art}
     except HTTPException:
         raise
@@ -784,12 +870,11 @@ async def execute_js(
     """
     if not EXECUTE_JS_ENABLED:
         raise HTTPException(403, "execute_js endpoint is disabled. Set CRAWL4AI_EXECUTE_JS_ENABLED=true to enable.")
-    validate_url_scheme(body.url)
-    # Block SSRF: reject internal/private IPs
+    await validate_url_scheme(body.url, check_destination=False)
     try:
-        validate_webhook_url(body.url)  # reuse SSRF blocklist
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+        await asyncio.to_thread(validate_webhook_url, body.url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     crawler = None
     try:
         cfg = CrawlerRunConfig(js_code=body.scripts)
@@ -849,13 +934,30 @@ async def get_hooks_info():
             "shape": [{"action": "<action>", "params": {"...": "..."}}],
             "max_hooks": 10,
         },
-        "timeout_limits": {"min": 1, "max": 120, "default": 30},
     })
 
 
 @app.get(config["observability"]["health_check"]["endpoint"])
 async def health():
-    return {"status": "ok", "timestamp": time.time(), "version": __version__}
+    payload = {
+        "status": "ok",
+        "timestamp": time.time(),
+        "version": __version__,
+        "components": {"api": "ready"},
+    }
+    # TestClient can intentionally skip lifespan for route-only tests.  A real
+    # server activates readiness checks during lifespan and probes the same
+    # effective Redis client used by jobs/monitoring (including external host,
+    # ACL credentials and TLS), rather than an unauthenticated localhost CLI.
+    if getattr(app.state, "readiness_checks_active", False):
+        try:
+            await asyncio.wait_for(redis.ping(), timeout=2.0)
+            payload["components"]["redis"] = "ready"
+        except Exception:
+            payload["status"] = "unhealthy"
+            payload["components"]["redis"] = "unavailable"
+            return JSONResponse(payload, status_code=503)
+    return payload
 
 
 @app.get(config["observability"]["prometheus"]["endpoint"])
@@ -878,7 +980,7 @@ async def crawl(
     """
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
-    if crawl_request.hooks and not HOOKS_ENABLED:
+    if crawl_request.hooks and crawl_request.hooks.hooks and not HOOKS_ENABLED:
         raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
     # Check whether it is a redirection for a streaming request
     try:
@@ -892,11 +994,8 @@ async def crawl(
     
     # Prepare hooks config if provided
     hooks_config = None
-    if crawl_request.hooks:
-        hooks_config = {
-            'hooks': crawl_request.hooks.hooks,
-            'timeout': crawl_request.hooks.timeout
-        }
+    if crawl_request.hooks and crawl_request.hooks.hooks:
+        hooks_config = {'hooks': crawl_request.hooks.hooks}
     
     results = await handle_crawl_request(
         urls=crawl_request.urls,
@@ -921,7 +1020,7 @@ async def crawl_stream(
 ):
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
-    if crawl_request.hooks and not HOOKS_ENABLED:
+    if crawl_request.hooks and crawl_request.hooks.hooks and not HOOKS_ENABLED:
         raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
 
     return await stream_process(crawl_request=crawl_request)
@@ -930,11 +1029,8 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
     
     # Prepare hooks config if provided# Prepare hooks config if provided
     hooks_config = None
-    if crawl_request.hooks:
-        hooks_config = {
-            'hooks': crawl_request.hooks.hooks,
-            'timeout': crawl_request.hooks.timeout
-        }
+    if crawl_request.hooks and crawl_request.hooks.hooks:
+        hooks_config = {'hooks': crawl_request.hooks.hooks}
     
     crawler, gen, hooks_info = await handle_stream_crawl_request(
         urls=crawl_request.urls,
@@ -1007,7 +1103,7 @@ def chunk_doc_sections(doc: str) -> List[str]:
 async def get_context(
     request: Request,
     _td: Dict = Depends(token_dep),
-    context_type: str = Query("all", regex="^(code|doc|all)$"),
+    context_type: str = Query("all", pattern="^(code|doc|all)$"),
     query: Optional[str] = Query(
         None, description="search query to filter chunks"),
     score_ratio: float = Query(
@@ -1094,7 +1190,8 @@ attach_mcp(
     # Internal MCP tool calls go over loopback to our own gated endpoints,
     # carrying a service token. Pin to 127.0.0.1 (config host may be 0.0.0.0,
     # which is a bind address, not a valid connect target).
-    base_url=f"http://127.0.0.1:{config['app']['port']}"
+    base_url=f"http://127.0.0.1:{config['app']['port']}",
+    auth_headers_provider=_internal_service_auth_headers,
 )
 
 # ────────────────────────── cli ──────────────────────────────

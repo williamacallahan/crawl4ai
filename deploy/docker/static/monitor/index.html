@@ -4,29 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Crawl4AI Monitor</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        primary: '#4EFFFF',
-                        primarydim: '#09b5a5',
-                        accent: '#F380F5',
-                        dark: '#070708',
-                        light: '#E8E9ED',
-                        secondary: '#D5CEBF',
-                        codebg: '#1E1E1E',
-                        surface: '#202020',
-                        border: '#3F3F44',
-                    },
-                    fontFamily: {
-                        mono: ['Fira Code', 'monospace'],
-                    },
-                }
-            }
-        }
-    </script>
+    <link rel="stylesheet" href="/static/assets/tailwind-3.4.17.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <style>
         @keyframes pulse-slow {
@@ -96,6 +74,7 @@
             <!-- Token bar -->
             <div class="flex items-center space-x-2">
                 <input id="token-input" type="password" placeholder="API token"
+                       autocomplete="off" autocapitalize="off" spellcheck="false"
                        class="bg-dark border border-border rounded px-2 py-1 text-xs w-48">
                 <button id="token-save" class="px-2 py-1 bg-primary text-dark rounded text-xs hover:bg-primarydim">Set</button>
                 <button id="token-clear" class="px-2 py-1 border border-border rounded text-xs hover:bg-surface">Clear</button>
@@ -327,7 +306,8 @@
 
     <script>
         // ========== Auth ==========
-        function getToken() { return sessionStorage.getItem('crawl4ai_token') || ''; }
+        let sessionToken = '';
+        function getToken() { return sessionToken; }
 
         function authFetch(url, opts = {}) {
             const token = getToken();
@@ -340,14 +320,13 @@
         (function initTokenBar() {
             const input = document.getElementById('token-input');
             const status = document.getElementById('token-status');
-            const saved = sessionStorage.getItem('crawl4ai_token');
-            if (saved) input.value = saved;
 
             function applyToken() {
                 const val = input.value.trim();
                 if (!val) return;
-                sessionStorage.setItem('crawl4ai_token', val);
-                status.textContent = 'Token saved';
+                sessionToken = val;
+                input.value = '';
+                status.textContent = 'Token active for this page';
                 status.className = 'text-xs text-green-400';
                 setTimeout(() => { status.textContent = ''; }, 2000);
                 // Reconnect WebSocket with new token
@@ -359,11 +338,12 @@
             document.getElementById('token-save').addEventListener('click', applyToken);
             input.addEventListener('keydown', e => { if (e.key === 'Enter') applyToken(); });
             document.getElementById('token-clear').addEventListener('click', () => {
-                sessionStorage.removeItem('crawl4ai_token');
+                sessionToken = '';
                 input.value = '';
                 status.textContent = 'Token cleared';
                 status.className = 'text-xs text-yellow-400';
                 setTimeout(() => { status.textContent = ''; }, 2000);
+                if (websocket) { websocket.close(); }
             });
         })();
 
@@ -379,6 +359,17 @@
         // No more tabs - all sections visible at once!
 
         // ========== WebSocket Connection ==========
+        function websocketBearerProtocol(token) {
+            const bytes = new TextEncoder().encode(token);
+            let binary = '';
+            bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+            const encoded = btoa(binary)
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=+$/, '');
+            return `crawl4ai.bearer.${encoded}`;
+        }
+
         function updateConnectionStatus(status, message) {
             const indicator = document.getElementById('ws-indicator');
             const text = document.getElementById('ws-text');
@@ -417,11 +408,11 @@
             wsReconnectAttempts++;
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            let wsUrl = `${protocol}//${window.location.host}/monitor/ws`;
+            const wsUrl = `${protocol}//${window.location.host}/monitor/ws`;
             const wsToken = getToken();
-            if (wsToken) wsUrl += `?token=${encodeURIComponent(wsToken)}`;
-
-            websocket = new WebSocket(wsUrl);
+            websocket = wsToken
+                ? new WebSocket(wsUrl, [websocketBearerProtocol(wsToken)])
+                : new WebSocket(wsUrl);
 
             websocket.onopen = () => {
                 console.log('WebSocket connected');

@@ -9,13 +9,12 @@ Vuln 3: Stored XSS in Monitor Dashboard (server-side + client-side)
 Vuln 4: SSRF via Webhook URL
 """
 
+import ipaddress
 import os
+import socket
 import sys
 import unittest
-import ipaddress
-import socket
 from urllib.parse import urlparse
-
 
 # ============================================================================
 # Local copies of security utilities (to avoid dns.resolver import in utils.py)
@@ -119,14 +118,14 @@ class TestPydanticPathValidator(unittest.TestCase):
 
     def test_no_output_path_field_on_request_models(self):
         sys.path.insert(0, DEPLOY_DIR)
-        from schemas import ScreenshotRequest, PDFRequest
+        from schemas import PDFRequest, ScreenshotRequest
         self.assertNotIn("output_path", ScreenshotRequest.model_fields)
         self.assertNotIn("output_path", PDFRequest.model_fields)
 
     def test_traversal_validator_removed(self):
         # No reject_traversal validator should remain registered on the models.
         sys.path.insert(0, DEPLOY_DIR)
-        from schemas import ScreenshotRequest, PDFRequest
+        from schemas import PDFRequest, ScreenshotRequest
         for model in (ScreenshotRequest, PDFRequest):
             names = set(getattr(model, "__pydantic_decorators__").field_validators)
             self.assertNotIn("reject_traversal", names)
@@ -159,16 +158,39 @@ class TestMonitorAuthStructural(unittest.TestCase):
         and into the outermost ASGI gate, which closes an unauthenticated
         WebSocket before it is accepted.
         """
+        import asyncio
         import sys
         sys.path.insert(0, DEPLOY_DIR)
-        import server
-        from starlette.testclient import TestClient
+        from auth_gate import AuthGateMiddleware
 
-        client = TestClient(server.app)
-        # Unauthenticated connect must be rejected by the gate.
-        with self.assertRaises(Exception):
-            with client.websocket_connect("/monitor/ws") as ws:
-                ws.receive_text()
+        reached = False
+        sent = []
+
+        async def inner(_scope, _receive, _send):
+            nonlocal reached
+            reached = True
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        async def send(message):
+            sent.append(message)
+
+        gate = AuthGateMiddleware(inner, token_provider=lambda: "operator-token")
+        asyncio.run(
+            gate(
+                {
+                    "type": "websocket",
+                    "path": "/monitor/ws",
+                    "headers": [],
+                    "query_string": b"",
+                },
+                receive,
+                send,
+            )
+        )
+        self.assertFalse(reached)
+        self.assertEqual(sent, [{"type": "websocket.close", "code": 4401}])
 
         # The old in-route check must be gone (it read a different secret than
         # the REST path and compared with a timing-unsafe `!=`).
@@ -292,7 +314,7 @@ class TestWebhookSourceChecks(unittest.TestCase):
         with open(os.path.join(DEPLOY_DIR, "webhook.py")) as f:
             source = f.read()
         self.assertIn("allow_redirects=False", source)
-        self.assertIn("check_redirect", source)  # each hop re-validated
+        self.assertIn("resolve_and_pin_async", source)  # every hop is pinned before fetch
 
     def test_webhook_validates_at_send_time(self):
         # Validation happens at send time via the egress broker (resolve_and_pin

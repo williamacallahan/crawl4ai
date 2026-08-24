@@ -9,9 +9,8 @@ redirects are refused.
 
 import asyncio
 
-import pytest
-
 import egress_broker
+import pytest
 from egress_broker import EgressBlocked, PinnedTarget
 from webhook import WebhookDeliveryService
 
@@ -58,17 +57,15 @@ class TestWebhookPinning:
         server, port = await _raw_server(
             b"HTTP/1.1 302 Found\r\nLocation: http://evil.internal/\r\nContent-Length: 0\r\n\r\n"
         )
-        monkeypatch.setattr(
-            egress_broker, "resolve_and_pin",
-            lambda url: PinnedTarget("http", "good.example", port, "127.0.0.1"),
-        )
+        def pin(url):
+            if url == "http://evil.internal/":
+                raise EgressBlocked()
+            return PinnedTarget("http", "good.example", port, "127.0.0.1")
 
-        def check(loc):
-            raise EgressBlocked()  # the redirect target is internal
-        monkeypatch.setattr(egress_broker, "check_redirect", check)
+        monkeypatch.setattr(egress_broker, "resolve_and_pin", pin)
         try:
             ok = await _svc().send_webhook(f"http://good.example:{port}/cb", {"x": 1})
-            assert ok is False  # redirect re-validation refused it
+            assert ok is False  # the next pinned dial refused the redirect
         finally:
             server.close()
 

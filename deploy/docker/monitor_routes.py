@@ -1,12 +1,11 @@
 # monitor_routes.py - Monitor API endpoints
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from pydantic import BaseModel
-from typing import Optional
-from monitor import get_monitor
-from auth import require_admin
-import logging
 import asyncio
-import json
+import logging
+
+from auth import require_admin
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from monitor import get_monitor
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/monitor", tags=["monitor"])
@@ -158,13 +157,11 @@ class KillBrowserRequest(BaseModel):
 async def force_cleanup():
     """Force immediate janitor cleanup (kills idle cold pool browsers)."""
     try:
-        from crawler_pool import COLD_POOL, LAST_USED, USAGE_COUNT, LOCK
-        import time
         from contextlib import suppress
 
-        killed_count = 0
-        now = time.time()
+        from crawler_pool import COLD_POOL, LAST_USED, LOCK, USAGE_COUNT
 
+        killed_count = 0
         async with LOCK:
             for sig in list(COLD_POOL.keys()):
                 # Kill all cold pool browsers immediately
@@ -193,8 +190,16 @@ async def kill_browser(req: KillBrowserRequest):
         sig: Browser config signature (first 8 chars)
     """
     try:
-        from crawler_pool import HOT_POOL, COLD_POOL, LAST_USED, USAGE_COUNT, LOCK, DEFAULT_CONFIG_SIG
         from contextlib import suppress
+
+        from crawler_pool import (
+            COLD_POOL,
+            DEFAULT_CONFIG_SIG,
+            HOT_POOL,
+            LAST_USED,
+            LOCK,
+            USAGE_COUNT,
+        )
 
         # Find full signature matching prefix
         target_sig = None
@@ -262,11 +267,20 @@ async def restart_browser(req: KillBrowserRequest):
         sig: Browser config signature (first 8 chars), or "permanent"
     """
     try:
-        from crawler_pool import (PERMANENT, HOT_POOL, COLD_POOL, LAST_USED,
-                                  USAGE_COUNT, LOCK, DEFAULT_CONFIG_SIG, init_permanent)
-        from crawl4ai import AsyncWebCrawler, BrowserConfig
         from contextlib import suppress
-        import time
+
+        from crawler_pool import (
+            COLD_POOL,
+            DEFAULT_CONFIG_SIG,
+            HOT_POOL,
+            LAST_USED,
+            LOCK,
+            PERMANENT,
+            USAGE_COUNT,
+            init_permanent,
+        )
+
+        from crawl4ai import BrowserConfig
 
         # Handle permanent browser restart
         if req.sig == "permanent" or (DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig)):
@@ -289,8 +303,6 @@ async def restart_browser(req: KillBrowserRequest):
         # Handle hot/cold browser restart
         target_sig = None
         pool_type = None
-        browser_config = None
-
         async with LOCK:
             # Find browser
             for sig in HOT_POOL.keys():
@@ -362,8 +374,8 @@ async def websocket_endpoint(websocket: WebSocket):
     - Timeline data
     """
     # Auth is enforced by the AuthGateMiddleware (outermost ASGI layer), which
-    # validates the ?token= query param / Authorization header for this
-    # WebSocket and closes 4401 before we are reached. No bespoke check here.
+    # validates Authorization or the browser WebSocket bearer subprotocol and
+    # closes 4401 before we are reached. No bespoke check here.
     await websocket.accept()
     logger.info("WebSocket client connected")
 

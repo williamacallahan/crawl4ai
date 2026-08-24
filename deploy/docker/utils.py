@@ -1,12 +1,14 @@
-import dns.resolver
 import logging
-import yaml
 import os
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from fastapi import Request
 from typing import Dict, Optional
+
+import dns.resolver
+import yaml
+from fastapi import Request
+
 
 class TaskStatus(str, Enum):
     PROCESSING = "processing"
@@ -41,6 +43,7 @@ DEFAULT_CONFIG = {
         "ssl": False,
     },
     "crawl_jobs": {
+        "protocol_version": 2,
         "stream": "crawl-jobs",
         "group": "crawl-workers",
         "lease_seconds": 20,
@@ -49,6 +52,7 @@ DEFAULT_CONFIG = {
         "max_attempts": 3,
         "max_pending_jobs": 1000,
         "max_attempt_seconds": 600,
+        "max_payload_bytes": 262144,
     },
     "rate_limiting": {
         "enabled": True,
@@ -335,7 +339,6 @@ def get_llm_base_url(config: Dict, provider: Optional[str] = None) -> Optional[s
 
 
 import ipaddress
-import socket
 from urllib.parse import urlparse
 
 _BLOCKED_NETWORKS = [
@@ -400,7 +403,7 @@ def validate_webhook_url(url: str) -> None:
     forms). The raised message is intentionally opaque - it never echoes the
     resolved IP or hostname, so this is not a DNS/oracle leak.
     """
-    from egress_broker import resolve_and_pin, EgressBlocked
+    from egress_broker import EgressBlocked, resolve_and_pin
     parsed = urlparse(str(url))
     if not parsed.hostname:
         raise ValueError("URL must have a valid hostname")
@@ -416,7 +419,7 @@ def verify_email_domain(email: str) -> bool:
         # Try to resolve MX records for the domain.
         records = dns.resolver.resolve(domain, 'MX')
         return True if records else False
-    except Exception as e:
+    except Exception:
         return False
 
 def get_container_memory_percent() -> float:

@@ -15,15 +15,21 @@ Requirements:
 """
 
 import asyncio
-import requests
-import time
 import sys
+import time
 
-from crawl4ai import (AsyncWebCrawler, CrawlerRunConfig, BrowserConfig,
-                      CacheMode, FilterChain, URLPatternFilter, BFSDeepCrawlStrategy,
-                      hooks_to_string)
+import requests
+
+from crawl4ai import (
+    AsyncWebCrawler,
+    BFSDeepCrawlStrategy,
+    CrawlerRunConfig,
+    FilterChain,
+    URLPatternFilter,
+    hooks_to_string,
+)
 from crawl4ai.docker_client import Crawl4aiDockerClient
-    
+
 
 def print_section(title: str, description: str = ""):
     """Print a section header"""
@@ -168,7 +174,7 @@ async def hook(page, context, **kwargs):
         )
 
         if results and results.success:
-            print(f"✅ Function-based hooks executed successfully!")
+            print("✅ Function-based hooks executed successfully!")
             print(f"   📄 HTML length: {len(results.html)} characters")
             print(f"   🎯 URL: {results.url}")
         else:
@@ -217,7 +223,7 @@ async def demo_2_enhanced_llm_integration():
             print(f"✓ Request successful with provider: {provider}")
             print(f"  - Response keys: {list(result.keys())}")
             print(f"  - Content length: {len(result.get('markdown', ''))} characters")
-            print(f"  - Note: Actual LLM call may fail without valid API key")
+            print("  - Note: Actual LLM call may fail without valid API key")
         else:
             print(f"❌ Request failed: {response.status_code}")
             print(f"  - Response: {response.text[:500]}")
@@ -239,7 +245,7 @@ async def demo_3_https_preservation():
     print("\nTest 1: HTTPS Preservation ENABLED")
 
     url_filter = URLPatternFilter(
-        patterns=["^(https:\/\/)?quotes\.toscrape\.com(\/.*)?$"]
+        patterns=[r"^(https:\/\/)?quotes\.toscrape\.com(\/.*)?$"]
     )
     config = CrawlerRunConfig(
         exclude_external_links=True, 
@@ -275,10 +281,10 @@ async def main():
     print(f"  - Python version: {sys.version.split()[0]} {'✓' if sys.version_info >= (3, 10) else '❌ (3.10+ required)'}")
 
     try:
-        import requests
-        print(f"  - Requests library: ✓")
+        __import__("requests")
+        print("  - Requests library: ✓")
     except ImportError:
-        print(f"  - Requests library: ❌")
+        print("  - Requests library: ❌")
 
     print()
 
@@ -298,7 +304,7 @@ async def main():
                 input()
 
         except KeyboardInterrupt:
-            print(f"\n⏹️  Demo interrupted by user")
+            print("\n⏹️  Demo interrupted by user")
             break
         except Exception as e:
             print(f"❌ Demo {i} error: {str(e)}")

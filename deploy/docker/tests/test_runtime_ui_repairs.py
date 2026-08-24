@@ -1,0 +1,585 @@
+"""Focused behavioral checks for the PR #6 runtime/UI repair slice."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import re
+import time
+from pathlib import Path
+
+import egress_broker
+import egress_proxy
+import httpx
+import pytest
+from auth_gate import AuthGateMiddleware
+from egress_broker import PinnedTarget
+from fastapi import BackgroundTasks, Request
+from governor import BodySizeLimitMiddleware
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from webhook import WebhookDeliveryService
+
+pytestmark = pytest.mark.posture
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DOCKER_DIR = Path(__file__).resolve().parents[1]
+
+
+async def _run_asgi(app, messages, *, headers=None):
+    sent = []
+
+    async def receive():
+        return messages.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "method": "POST",
+            "path": "/upload",
+            "raw_path": b"/upload",
+            "query_string": b"",
+            "headers": headers or [],
+            "client": ("127.0.0.1", 1),
+            "server": ("test", 80),
+            "scheme": "http",
+        },
+        receive,
+        send,
+    )
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_body_limit_counts_chunked_receive_bytes():
+    received = []
+
+    async def endpoint(scope, receive, send):
+        while True:
+            message = await receive()
+            received.append(message)
+            if not message.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    app = BodySizeLimitMiddleware(endpoint, max_bytes=5)
+    sent = await _run_asgi(
+        app,
+        [
+            {"type": "http.request", "body": b"abc", "more_body": True},
+            {"type": "http.request", "body": b"def", "more_body": False},
+        ],
+    )
+
+    assert sent[0]["status"] == 413
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_zero_body_limit_is_unbounded_and_preserves_receive():
+    body = bytearray()
+
+    async def endpoint(scope, receive, send):
+        while True:
+            message = await receive()
+            body.extend(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    app = BodySizeLimitMiddleware(endpoint, max_bytes=0)
+    sent = await _run_asgi(
+        app,
+        [{"type": "http.request", "body": b"unbounded", "more_body": False}],
+    )
+
+    assert sent[0]["status"] == 204
+    assert body == b"unbounded"
+
+
+@pytest.mark.asyncio
+async def test_cors_preflight_reaches_cors_middleware_without_opening_data_route():
+    async def data(_request):
+        return JSONResponse({"secret": True})
+
+    inner = Starlette(routes=[Route("/data", data, methods=["POST"])])
+    cors = CORSMiddleware(
+        inner,
+        allow_origins=["https://allowed.example"],
+        allow_methods=["POST"],
+        allow_headers=["authorization", "content-type"],
+    )
+    app = AuthGateMiddleware(
+        cors,
+        token_provider=lambda: "operator-token",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        preflight = await client.options(
+            "/data",
+            headers={
+                "Origin": "https://allowed.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        assert preflight.status_code == 200
+        assert preflight.headers["access-control-allow-origin"] == (
+            "https://allowed.example"
+        )
+        assert (await client.options("/data")).status_code == 401
+        assert (await client.post("/data")).status_code == 401
+
+
+def test_websocket_subprotocol_carries_token_but_query_string_does_not():
+    token = "operator.token-with_symbols"
+    encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
+    protocol_scope = {
+        "type": "websocket",
+        "headers": [
+            (b"sec-websocket-protocol", f"other, crawl4ai.bearer.{encoded}".encode())
+        ],
+        "query_string": b"",
+    }
+    query_scope = {
+        "type": "websocket",
+        "headers": [],
+        "query_string": b"token=must-not-be-read",
+    }
+
+    assert AuthGateMiddleware._extract_token(protocol_scope) == token
+    assert AuthGateMiddleware._extract_token(query_scope) is None
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_runs_off_the_event_loop(monkeypatch):
+    def slow_resolve(url):
+        time.sleep(0.05)
+        return PinnedTarget("https", "example.com", 443, "93.184.216.34")
+
+    monkeypatch.setattr(egress_broker, "resolve_and_pin", slow_resolve)
+    ticked = asyncio.Event()
+
+    async def tick():
+        await asyncio.sleep(0.005)
+        ticked.set()
+
+    result, _ = await asyncio.gather(
+        egress_broker.resolve_and_pin_async("https://example.com"), tick()
+    )
+    assert ticked.is_set()
+    assert result.ip == "93.184.216.34"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_kind", ["llm", "crawl"])
+async def test_job_webhook_validation_runs_off_the_event_loop(monkeypatch, job_kind):
+    import job
+    import utils
+
+    def slow_validate(_url):
+        time.sleep(0.05)
+
+    async def accepted(*_args, **_kwargs):
+        return {"accepted": True}
+
+    monkeypatch.setattr(utils, "validate_webhook_url", slow_validate)
+    if job_kind == "llm":
+        payload = job.LlmJobPayload(
+            url="https://example.com",
+            q="summary",
+            webhook_config={"webhook_url": "https://hooks.example/callback"},
+        )
+        monkeypatch.setattr(job, "handle_llm_request", accepted)
+        enqueue = job.llm_job_enqueue(
+            payload,
+            BackgroundTasks(),
+            Request({"type": "http", "scheme": "http", "server": ("test", 80)}),
+            None,
+        )
+    else:
+        payload = job.CrawlJobPayload(
+            urls=["https://example.com"],
+            webhook_config={"webhook_url": "https://hooks.example/callback"},
+        )
+        monkeypatch.setattr(job, "handle_crawl_job", accepted)
+        enqueue = job.crawl_job_enqueue(payload, BackgroundTasks(), None)
+
+    task = asyncio.create_task(enqueue)
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    assert await task == {"accepted": True}
+
+
+@pytest.mark.asyncio
+async def test_pinning_proxy_lifecycle_registers_and_clears_global_proxy(monkeypatch):
+    for name in (
+        "CRAWL4AI_UPSTREAM_PROXY",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    proxy = await egress_proxy.start_pinning_proxy()
+    try:
+        assert egress_broker.get_egress_proxy() == proxy.url
+    finally:
+        await egress_proxy.stop_pinning_proxy(proxy)
+    assert egress_broker.get_egress_proxy() is None
+
+
+def test_upstream_proxy_parsing_falls_through_and_honors_no_proxy(monkeypatch):
+    for name in (
+        "CRAWL4AI_UPSTREAM_PROXY",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://broken.example:not-a-port")
+    assert egress_proxy.upstream_proxy() == ("proxy.example", 3128, None)
+    monkeypatch.setenv("HTTPS_PROXY", "https://unsupported.example")
+    assert egress_proxy.upstream_proxy() == ("proxy.example", 3128, None)
+
+    pin = PinnedTarget("https", "site.example", 443, "93.184.216.34")
+    monkeypatch.setenv("NO_PROXY", "site.example:443")
+    assert egress_proxy._use_upstream(pin) is None
+    monkeypatch.setenv("NO_PROXY", "site.example:444")
+    assert egress_proxy._use_upstream(pin) == ("proxy.example", 3128, None)
+
+
+@pytest.mark.asyncio
+async def test_upstream_proxy_connect_receives_only_the_pinned_ip(monkeypatch):
+    seen = []
+
+    async def corporate_proxy(reader, writer):
+        seen.append(await reader.readline())
+        while await reader.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await writer.drain()
+        await reader.read(65536)
+        writer.write(b"TUNNEL-OK")
+        await writer.drain()
+        writer.close()
+
+    corporate = await asyncio.start_server(corporate_proxy, "127.0.0.1", 0)
+    corporate_port = corporate.sockets[0].getsockname()[1]
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{corporate_port}")
+    monkeypatch.delenv("CRAWL4AI_UPSTREAM_PROXY", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.setattr(
+        egress_proxy,
+        "resolve_and_pin",
+        lambda _url: PinnedTarget(
+            "https", "target.example", 443, "203.0.113.7"
+        ),
+    )
+
+    proxy = await egress_proxy.start_pinning_proxy()
+    try:
+        reader, writer = await asyncio.open_connection(
+            proxy.bound_host, proxy.bound_port
+        )
+        writer.write(b"CONNECT target.example:443 HTTP/1.1\r\n\r\n")
+        await writer.drain()
+        assert b"200" in await asyncio.wait_for(reader.readline(), timeout=2)
+        await reader.readline()
+        writer.write(b"hello")
+        await writer.drain()
+        assert await asyncio.wait_for(reader.read(100), timeout=2) == b"TUNNEL-OK"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await egress_proxy.stop_pinning_proxy(proxy)
+        corporate.close()
+        await corporate.wait_closed()
+
+    assert seen == [b"CONNECT 203.0.113.7:443 HTTP/1.1\r\n"]
+
+
+@pytest.mark.asyncio
+async def test_relative_webhook_redirect_is_joined_before_next_pinned_dial(monkeypatch):
+    validated = []
+
+    async def handle(reader, writer):
+        request = await reader.readuntil(b"\r\n\r\n")
+        if request.startswith(b"POST /start "):
+            response = (
+                b"HTTP/1.1 302 Found\r\nLocation: /next\r\n"
+                b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        else:
+            response = b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+        writer.write(response)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    def pin(url):
+        validated.append(("pin", url))
+        return PinnedTarget("http", "hooks.example", port, "127.0.0.1")
+
+    monkeypatch.setattr(egress_broker, "resolve_and_pin", pin)
+    service = WebhookDeliveryService(
+        {"webhooks": {"retry": {"max_attempts": 1, "timeout_ms": 5000}}}
+    )
+    try:
+        status = await service._deliver(
+            f"http://hooks.example:{port}/start",
+            {"ok": True},
+            {"Content-Type": "application/json"},
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    absolute = f"http://hooks.example:{port}/next"
+    assert status == 204
+    assert validated.count(("pin", absolute)) == 1
+
+
+@pytest.mark.asyncio
+async def test_server_auth_posture_token_issuance_and_public_redirect(
+    server_module, monkeypatch
+):
+    monkeypatch.delenv("CRAWL4AI_API_TOKEN", raising=False)
+    monkeypatch.setattr(server_module, "verify_email_domain", lambda _email: True)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app),
+        base_url="http://test",
+    ) as client:
+        root = await client.get("/", follow_redirects=False)
+        assert root.status_code in {302, 307}
+        assert root.headers["location"] == "/playground"
+        tailwind = await client.get("/static/assets/tailwind-3.4.17.min.css")
+        assert tailwind.status_code == 200
+        assert ".bg-dark" in tailwind.text
+        bad_bearer = await client.get(
+            "/schema", headers={"Authorization": "Bearer not-a-jwt"}
+        )
+        assert bad_bearer.status_code == 401
+        assert bad_bearer.headers["x-content-type-options"] == "nosniff"
+        assert "frame-ancestors 'none'" in bad_bearer.headers[
+            "content-security-policy"
+        ]
+
+        monkeypatch.setenv("CRAWL4AI_API_TOKEN", "effective-operator-token")
+        monkeypatch.setenv("CRAWL4AI_JWT_ENABLED", "true")
+        monkeypatch.setenv("SECRET_KEY", "test-only-secret-key-value-000000")
+        issued = await client.post(
+            "/token",
+            json={
+                "email": "operator@example.com",
+                "api_token": "effective-operator-token",
+            },
+        )
+        monkeypatch.setenv("CRAWL4AI_JWT_ENABLED", "false")
+        disabled = await client.post(
+            "/token",
+            json={
+                "email": "operator@example.com",
+                "api_token": "effective-operator-token",
+            },
+        )
+    assert issued.status_code == 200
+    assert issued.json()["token_type"] == "bearer"
+    assert disabled.status_code == 403
+
+
+def test_exposed_jwt_only_posture_does_not_create_or_log_static_admin_token(
+    server_module, monkeypatch, caplog
+):
+    monkeypatch.delenv("CRAWL4AI_API_TOKEN", raising=False)
+    monkeypatch.setenv("CRAWL4AI_JWT_ENABLED", "true")
+    monkeypatch.setenv("GUNICORN_BIND", "0.0.0.0:11235")
+    monkeypatch.setenv("SECRET_KEY", "test-only-secret-key-value-000000")
+
+    server_module._resolve_auth()
+
+    assert "CRAWL4AI_API_TOKEN" not in server_module.os.environ
+    assert "CRAWL4AI_API_TOKEN=" not in caplog.text
+
+
+def test_loopback_without_credentials_never_creates_a_token(
+    server_module, monkeypatch, caplog
+):
+    monkeypatch.delenv("CRAWL4AI_API_TOKEN", raising=False)
+    monkeypatch.setenv("CRAWL4AI_JWT_ENABLED", "false")
+    monkeypatch.setenv("GUNICORN_BIND", "127.0.0.1:11235")
+
+    server_module._resolve_auth()
+
+    assert "CRAWL4AI_API_TOKEN" not in server_module.os.environ
+    assert "generated" not in caplog.text.lower()
+
+
+def test_runtime_api_token_override_has_one_owner(server_module, monkeypatch):
+    monkeypatch.setitem(server_module.config["security"], "api_token", "config-token")
+    monkeypatch.setenv("CRAWL4AI_API_TOKEN", "runtime-token")
+    assert server_module._current_api_token() == "runtime-token"
+
+
+def test_internal_mcp_auth_prefers_existing_static_operator_token(
+    server_module, monkeypatch
+):
+    monkeypatch.setenv("CRAWL4AI_API_TOKEN", "existing-operator-token")
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+
+    assert server_module._internal_service_auth_headers() == {
+        "Authorization": "Bearer existing-operator-token"
+    }
+
+
+@pytest.mark.asyncio
+async def test_health_uses_effective_redis_client_when_lifespan_is_active(
+    server_module, monkeypatch
+):
+    class ReadyRedis:
+        async def ping(self):
+            return True
+
+    monkeypatch.setattr(server_module, "redis", ReadyRedis())
+    server_module.app.state.readiness_checks_active = True
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server_module.app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/health")
+    finally:
+        server_module.app.state.readiness_checks_active = False
+    assert response.status_code == 200
+    assert response.json()["components"]["redis"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_health_reports_unavailable_effective_redis_without_details(
+    server_module, monkeypatch
+):
+    class UnavailableRedis:
+        async def ping(self):
+            raise ConnectionError("internal redis topology detail")
+
+    monkeypatch.setattr(server_module, "redis", UnavailableRedis())
+    server_module.app.state.readiness_checks_active = True
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server_module.app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/health")
+    finally:
+        server_module.app.state.readiness_checks_active = False
+    assert response.status_code == 503
+    assert response.json()["components"]["redis"] == "unavailable"
+    assert "topology detail" not in response.text
+
+
+def test_ui_tokens_are_ephemeral_and_cdn_assets_are_version_pinned():
+    playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
+    monitor = (DOCKER_DIR / "static" / "monitor" / "index.html").read_text()
+
+    for html in (playground, monitor):
+        assert "sessionStorage" not in html
+        assert 'autocomplete="off"' in html
+        assert "cdn.tailwindcss.com" not in html
+        assert "tailwind-3.4.17.min.css" in html
+        for tag in re.findall(r"<script\b[^>]*\bsrc=\"https://[^>]+>", html):
+            assert "integrity=\"sha384-" in tag
+            assert "crossorigin=\"anonymous\"" in tag
+
+        tailwind = re.search(r'href="([^"]*tailwind-3\.4\.17\.min\.css)"', html)
+        assert tailwind
+        assert tailwind.group(1) == "/static/assets/tailwind-3.4.17.min.css"
+
+    tailwind_asset = DOCKER_DIR / "static" / "assets" / "tailwind-3.4.17.min.css"
+    assert tailwind_asset.is_file()
+    compiled_css = tailwind_asset.read_text()
+    assert all(
+        selector in compiled_css
+        for selector in (".bg-dark", ".bg-accent", ".text-primary", ".hidden")
+    )
+
+    assert "${CRAWL4AI_API_TOKEN}" in playground
+    assert "os.environ['CRAWL4AI_API_TOKEN']" in playground
+    assert "?token=" not in monitor
+    assert "crawl4ai.bearer." in monitor
+
+
+def test_container_contracts_use_app_readiness_and_compose_v5_shape():
+    import yaml
+
+    compose_text = (REPO_ROOT / "docker-compose.yml").read_text()
+    compose = yaml.safe_load(compose_text)
+    base = compose["x-base-config"]
+    assert base["env_file"] == [{"path": ".llm.env", "required": False}]
+    assert (
+        "CRAWL4AI_API_TOKEN_FROM_HOST=${CRAWL4AI_API_TOKEN:-}"
+        in base["environment"]
+    )
+    assert "REDIS_PASSWORD_FROM_HOST=${REDIS_PASSWORD:-}" in base["environment"]
+    assert not any(
+        value.startswith("CRAWL4AI_API_TOKEN=") for value in base["environment"]
+    )
+    assert "pids_limit" not in base
+    assert base["deploy"]["resources"]["limits"]["pids"] == 512
+
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text()
+    assert "redis-cli ping" not in dockerfile
+    assert "http://127.0.0.1:11235/health" in dockerfile
+
+    ignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
+    assert ".env" in ignore
+    assert ".llm.env" in ignore
+
+    entrypoint = (DOCKER_DIR / "entrypoint.sh").read_text()
+    assert "EMBEDDED_REDIS" in entrypoint
+    assert 'export REDIS_PASSWORD="${REDIS_PASSWORD:-}"' in entrypoint
+    assert "embedded Redis requires an existing operator-managed" in entrypoint
+    assert "CRAWL4AI_JWT_ENABLED" in entrypoint
+    assert "token_hex" not in entrypoint
+    assert "requires an existing operator-managed REDIS_PASSWORD" in entrypoint
+
+    supervisord = (DOCKER_DIR / "supervisord.conf").read_text()
+    assert "--bind 127.0.0.1 -::1" in supervisord
+
+    server = (DOCKER_DIR / "server.py").read_text()
+    assert "await init_permanent(get_default_browser_config())" in server
+    assert 'await asyncio.to_thread(_store_artifact, "pdf", pdf_data)' in server
+    assert "await asyncio.to_thread(resolve_artifact, artifact_id)" in server
+
+
+def test_coolify_keeps_external_durable_redis_without_client_only_password():
+    import yaml
+
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.coolify.yml").read_text())
+    app = compose["services"]["crawl4ai"]
+    redis = compose["services"]["redis"]
+    assert "REDIS_HOST=redis" in app["environment"]
+    assert (
+        "CRAWL4AI_API_TOKEN_FROM_HOST=${CRAWL4AI_API_TOKEN:-}"
+        in app["environment"]
+    )
+    assert "--requirepass" not in redis["command"]
+    assert "crawl4ai-redis:/data" in redis["volumes"]

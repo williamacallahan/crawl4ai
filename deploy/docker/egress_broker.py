@@ -24,11 +24,11 @@ leaks a resolved internal IP, hostname, or traceback (the old DNS oracle).
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import os
 import socket
 from dataclasses import dataclass
-from typing import List, Optional
 from urllib.parse import urlparse
 
 # Operator escape hatch for trusted internal deployments (off by default).
@@ -62,13 +62,15 @@ class PinnedTarget:
     ip: str            # the exact IP to dial - do NOT re-resolve `host`
 
 
-def _embedded_v4_forms(ip: ipaddress._BaseAddress) -> List[ipaddress._BaseAddress]:
+def _embedded_v4_forms(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     """The address plus any IPv4 embedded in a transition IPv6 form.
 
     Only the well-defined transition ranges are unwrapped, so a normal global
     IPv6 is never mis-derived into a bogus (and possibly non-global) IPv4.
     """
-    forms: List[ipaddress._BaseAddress] = [ip]
+    forms: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [ip]
     if isinstance(ip, ipaddress.IPv6Address):
         mapped = ip.ipv4_mapped
         if mapped is not None:
@@ -147,6 +149,16 @@ def resolve_and_pin(url: str) -> PinnedTarget:
     return PinnedTarget(scheme, host, port, pinned)
 
 
+async def resolve_and_pin_async(url: str) -> PinnedTarget:
+    """Non-blocking event-loop wrapper around the canonical pinning rule.
+
+    ``socket.getaddrinfo`` is a blocking libc call.  Keep the synchronous
+    primitive for schema validation and non-async callers, but move DNS off the
+    API/proxy event loop for every outbound connection path.
+    """
+    return await asyncio.to_thread(resolve_and_pin, url)
+
+
 def check_redirect(location: str) -> PinnedTarget:
     """Re-validate (and pin) a redirect Location. Same rule as the initial hop."""
     return resolve_and_pin(location)
@@ -157,15 +169,15 @@ ALLOW_INSECURE_TLS = os.environ.get("CRAWL4AI_ALLOW_INSECURE_TLS", "false").lowe
 # URL of the localhost pinning forward-proxy (egress_proxy.py), set at boot.
 # When present, enforce_egress routes the browser through it so Chromium never
 # resolves the target itself (closes DNS rebinding on the browser path).
-_EGRESS_PROXY_URL: Optional[str] = None
+_EGRESS_PROXY_URL: str | None = None
 
 
-def set_egress_proxy(url: Optional[str]) -> None:
+def set_egress_proxy(url: str | None) -> None:
     global _EGRESS_PROXY_URL
     _EGRESS_PROXY_URL = url
 
 
-def get_egress_proxy() -> Optional[str]:
+def get_egress_proxy() -> str | None:
     return _EGRESS_PROXY_URL
 
 # Chromium flags that would re-route or weaken egress; scrubbed server-side.
@@ -196,11 +208,9 @@ def enforce_egress(browser_config) -> None:
         if getattr(browser_config, attr, None) is not None:
             setattr(browser_config, attr, None)
     if _EGRESS_PROXY_URL and hasattr(browser_config, "proxy_config"):
-        try:
-            from crawl4ai import ProxyConfig
-            browser_config.proxy_config = ProxyConfig(server=_EGRESS_PROXY_URL)
-        except Exception:
-            pass
+        from crawl4ai import ProxyConfig
+
+        browser_config.proxy_config = ProxyConfig(server=_EGRESS_PROXY_URL)
     args = getattr(browser_config, "extra_args", None)
     if args:
         browser_config.extra_args = [

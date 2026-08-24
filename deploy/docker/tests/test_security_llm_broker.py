@@ -5,8 +5,7 @@ be redirected to an attacker endpoint (the reported credential-exfil gadget).
 """
 
 import pytest
-
-from llm_broker import resolve_llm, allowed_provider_families, LLMProviderNotAllowed
+from llm_broker import LLMProviderNotAllowed, resolve_llm
 
 pytestmark = pytest.mark.posture
 

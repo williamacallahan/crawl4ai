@@ -7,8 +7,9 @@ import asyncio
 import logging
 import re
 import socket
-from typing import Dict, List, Optional
 from datetime import datetime, timezone
+from typing import Dict, Optional
+from urllib.parse import urljoin
 
 import aiohttp
 from aiohttp.abc import AbstractResolver
@@ -149,12 +150,16 @@ class WebhookDeliveryService:
     async def _deliver(self, url: str, payload: Dict, headers: Dict[str, str]) -> int:
         """POST with the connection pinned to the validated IP, following (and
         re-validating) redirects manually. Returns the final status code."""
-        from egress_broker import resolve_and_pin, check_redirect, EgressBlocked, ALLOW_INSECURE_TLS
+        from egress_broker import (
+            ALLOW_INSECURE_TLS,
+            EgressBlocked,
+            resolve_and_pin_async,
+        )
 
         current = url
         for _hop in range(_MAX_WEBHOOK_REDIRECTS + 1):
             try:
-                pin = resolve_and_pin(current)
+                pin = await resolve_and_pin_async(current)
             except EgressBlocked as e:
                 raise _WebhookBlocked(str(e))
 
@@ -170,20 +175,13 @@ class WebhookDeliveryService:
                         loc = resp.headers.get("Location")
                         if not loc:
                             return resp.status
-                        # Re-validate every redirect hop before following it.
-                        try:
-                            check_redirect(loc)
-                        except EgressBlocked as e:
-                            raise _WebhookBlocked(f"redirect to blocked target: {e}")
-                        current = loc
+                        # Resolve relative Location values now. The next loop
+                        # validates and pins that absolute URL exactly once,
+                        # immediately before opening its connection.
+                        current = urljoin(current, loc)
                         continue
                     return resp.status
         raise _WebhookBlocked("too many webhook redirects")
-
-        logger.error(
-            f"Webhook delivery failed after {self.max_attempts} attempts to {webhook_url}"
-        )
-        return False
 
     async def notify_job_completion(
         self,

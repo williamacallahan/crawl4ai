@@ -9,12 +9,10 @@ B2-V3: eval() in /config/dump replaced with JSON
 B2-V4: Hook sandbox __builtins__ escape fixed
 """
 
+import ast
 import os
 import sys
-import ast
 import unittest
-import builtins
-import types
 from unittest import mock
 
 DEPLOY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -65,12 +63,21 @@ class TestJWTSecretHardened(unittest.TestCase):
         self.assertIn("mysecret", source,
             "'mysecret' must be listed in _WEAK_SECRETS blocklist")
 
-    def test_auto_generation_exists(self):
-        """auth.py must auto-generate key when none is set."""
+    def test_missing_secret_is_never_generated(self):
+        """Credential lifecycle remains exclusively operator-owned."""
+        import importlib
+        import sys
+        sys.path.insert(0, DEPLOY_DIR)
+        auth = importlib.import_module("auth")
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(auth.resolve_secret_key(required=False), "")
+            with self.assertRaises(RuntimeError):
+                auth.resolve_secret_key(required=True)
+
         with open(os.path.join(DEPLOY_DIR, "auth.py")) as f:
             source = f.read()
-        self.assertIn("token_hex", source,
-            "auth.py must use secrets.token_hex for auto-generation")
+        self.assertNotIn("token_hex", source)
 
 
 # ============================================================================
@@ -219,13 +226,13 @@ class TestHookExecPathRemoved(unittest.TestCase):
 
     def test_registry_rejects_unknown_action(self):
         sys.path.insert(0, DEPLOY_DIR)
-        from hook_registry import build_declarative_hooks, HookValidationError
+        from hook_registry import HookValidationError, build_declarative_hooks
         with self.assertRaises(HookValidationError):
             build_declarative_hooks([{"action": "run_python", "params": {"code": "x"}}])
 
     def test_registry_rejects_bad_params(self):
         sys.path.insert(0, DEPLOY_DIR)
-        from hook_registry import build_declarative_hooks, HookValidationError
+        from hook_registry import HookValidationError, build_declarative_hooks
         with self.assertRaises(HookValidationError):
             build_declarative_hooks([{"action": "block_resources", "params": {"resource_types": ["script"]}}])
 
