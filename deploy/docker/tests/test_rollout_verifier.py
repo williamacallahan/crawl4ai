@@ -6,7 +6,7 @@ from threading import Thread
 
 import pytest
 
-from verify_rollout import MAX_RESPONSE_BYTES, _curl_json, verify_rollout
+from verify_rollout import MAX_RESPONSE_BYTES, _curl_json, _has_task_error, verify_rollout
 
 
 def _health(instance: str, revision: str = "target") -> dict:
@@ -27,6 +27,19 @@ def _fake_read(handlers):
         return handler(url) if callable(handler) else handler
 
     return read_json
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("", False),
+        ("Error:", False),
+        ("Error: task failed", True),
+        ("task failed", True),
+    ],
+)
+def test_task_error_ignores_only_empty_dokploy_error_boilerplate(error, expected):
+    assert _has_task_error({"error": error}) is expected
 
 
 def test_curl_json_rejects_streamed_responses_over_64_kib():
