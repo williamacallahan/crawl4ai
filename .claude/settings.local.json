@@ -22,7 +22,8 @@
       "Bash(docker compose:*)",
       "Bash(./test-final-integration.sh:*)",
       "Bash(mv:*)",
-      "Bash(ssh *)"
+      "Bash(ssh *)",
+      "Bash(command -v docker)"
     ]
   },
   "enableAllProjectMcpServers": false
