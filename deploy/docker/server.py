@@ -943,6 +943,8 @@ async def health():
         "status": "ok",
         "timestamp": time.time(),
         "version": __version__,
+        "revision": os.environ.get("C4AI_GIT_SHA", ""),
+        "instance": os.environ.get("HOSTNAME", ""),
         "components": {"api": "ready"},
     }
     # TestClient can intentionally skip lifespan for route-only tests.  A real

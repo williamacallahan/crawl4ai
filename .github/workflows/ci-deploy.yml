@@ -48,6 +48,8 @@ jobs:
             deploy/docker/tests/test_auth.py \
             deploy/docker/tests/test_crawl_job_queue.py \
             deploy/docker/tests/test_crawl_job_contract.py \
+            deploy/docker/tests/test_rollout_verifier.py \
+            deploy/docker/tests/test_runtime_ui_repairs.py \
             deploy/docker/tests/test_resource_policy.py \
             tests/test_memory_cgroup.py
 
@@ -168,40 +170,34 @@ jobs:
     needs: merge
     runs-on: [self-hosted, Linux, X64, williamacallahan]
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
       - name: Point Dokploy at the new image and deploy
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
-          GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          curl -fsS -X POST "$DOKPLOY_URL/api/application.update" \
+          curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 \
+            -X POST "$DOKPLOY_URL/api/application.update" \
             -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s"}' "$APPLICATION_ID" "$IMAGE" "$GIT_SHA")" >/dev/null
-          curl -fsS -X POST "$DOKPLOY_URL/api/application.deploy" \
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s"}' "$APPLICATION_ID" "$IMAGE" "$GITHUB_SHA")" >/dev/null
+          curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 \
+            -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
             --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
-          echo "deploy queued for ${IMAGE}:${GIT_SHA}"
+          echo "deploy queued for ${IMAGE}:${GITHUB_SHA}"
 
-      # Health alone is not a rollout gate: the previous replicas keep answering
-      # /health throughout, so a failed deploy would look green. Wait on Dokploy's
-      # own deployment status first, then confirm the endpoint still serves.
-      - name: Wait for the rollout to finish
+      # Dokploy marks a deployment done after it updates the service, before
+      # Docker Swarm necessarily converges. A failed update can then roll back
+      # while old replicas keep /health green. Require every configured replica
+      # to identify itself and serve this exact Git SHA.
+      - name: Prove the exact rollout on every replica
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
         run: |
           set -euo pipefail
-          for i in $(seq 1 40); do
-            STATUS=$(curl -fsS "$DOKPLOY_URL/api/deployment.all?applicationId=${APPLICATION_ID}" \
-              -H "x-api-key: $DOKPLOY_API_KEY" \
-              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["status"] if d else "none")')
-            case "$STATUS" in
-              done)    echo "rollout done after $((i*15))s"; break ;;
-              error)   echo "Dokploy reported a failed deployment"; exit 1 ;;
-              *)       sleep 15 ;;
-            esac
-            if [ "$i" -eq 40 ]; then echo "rollout did not finish within 10 minutes"; exit 1; fi
-          done
-          curl -fsS --max-time 15 https://crawl4ai.haiku.host/health >/dev/null
-          echo "endpoint healthy"
+          python3 deploy/docker/verify_rollout.py
