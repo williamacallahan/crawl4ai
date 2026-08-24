@@ -6,15 +6,22 @@ import asyncio
 import logging
 import os
 import socket
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
+from crawl_job_queue import (
+    CrawlJobAttempt,
+    CrawlJobEntry,
+    CrawlJobLeaseLost,
+    CrawlJobQueue,
+)
+from crawler_pool import close_all
+from egress_proxy import start_pinning_proxy, stop_pinning_proxy
 from fastapi import HTTPException, status
 from redis import asyncio as aioredis
-
-from crawl_job_queue import CrawlJobEntry, CrawlJobLeaseLost, CrawlJobQueue
-from crawler_pool import close_all
-from utils import build_redis_url, load_config, setup_logging
+from redis_config import build_redis_url
+from utils import load_config, setup_logging
 from webhook import WebhookDeliveryService
 
 logger = logging.getLogger(__name__)
@@ -30,8 +37,8 @@ class CrawlJobWorker:
         queue: CrawlJobQueue,
         config: dict,
         consumer: str,
-        crawl: Optional[CrawlCallable] = None,
-        webhook_service: Optional[Any] = None,
+        crawl: CrawlCallable | None = None,
+        webhook_service: Any | None = None,
     ):
         self.queue = queue
         self.config = config
@@ -58,14 +65,25 @@ class CrawlJobWorker:
         payload = await self.queue.load_payload(entry.task_id)
         if payload is None:
             logger.error("Discarding crawl job %s because its durable payload is absent", entry.task_id)
-            await self.queue.discard_missing_payload(entry)
+            try:
+                await self.queue.discard_missing_payload(entry, self.consumer)
+            except CrawlJobLeaseLost:
+                logger.warning(
+                    "Crawl worker no longer owns %s during missing-payload cleanup",
+                    entry.task_id,
+                )
             return
 
-        attempt = await self.queue.start_attempt(entry, payload, self.consumer)
-        if attempt > self.queue.settings.max_attempts:
+        try:
+            attempt = await self.queue.start_attempt(entry, payload, self.consumer)
+        except CrawlJobLeaseLost:
+            logger.warning("Crawl worker no longer owns %s before attempt start", entry.task_id)
+            return
+        if attempt.number > self.queue.settings.max_attempts:
             await self.queue.complete(
                 entry,
                 payload,
+                attempt,
                 error="Crawl job exhausted its retry budget before execution",
             )
             await self._notify(
@@ -96,8 +114,8 @@ class CrawlJobWorker:
         self,
         entry: CrawlJobEntry,
         payload: dict,
-        attempt: int,
-    ) -> Optional[tuple[str, Optional[dict], Optional[str]]]:
+        attempt: CrawlJobAttempt,
+    ) -> tuple[str, dict | None, str | None] | None:
         operation_task = asyncio.create_task(self._process_attempt(entry, payload, attempt))
         heartbeat_task = asyncio.create_task(self._heartbeat(entry, payload, attempt))
         try:
@@ -127,8 +145,8 @@ class CrawlJobWorker:
         self,
         entry: CrawlJobEntry,
         payload: dict,
-        attempt: int,
-    ) -> Optional[tuple[str, Optional[dict], Optional[str]]]:
+        attempt: CrawlJobAttempt,
+    ) -> tuple[str, dict | None, str | None] | None:
         """Give up on an attempt that outlived its budget so its consumer is freed.
 
         The heartbeat renews the lease for as long as an attempt runs, which means a crawl
@@ -146,11 +164,11 @@ class CrawlJobWorker:
         logger.error(
             "Crawl job %s exceeded its attempt budget on attempt %s/%s; releasing its lease",
             entry.task_id,
-            attempt,
+            attempt.number,
             self.queue.settings.max_attempts,
         )
-        if attempt >= self.queue.settings.max_attempts:
-            await self.queue.complete(entry, payload, error=error_message)
+        if attempt.number >= self.queue.settings.max_attempts:
+            await self.queue.complete(entry, payload, attempt, error=error_message)
             return "failed", None, error_message
         # Leave the entry pending: cancelling the heartbeat lets its idle time pass
         # lease_seconds so another worker reclaims it through claim_stale.
@@ -161,33 +179,33 @@ class CrawlJobWorker:
         self,
         entry: CrawlJobEntry,
         payload: dict,
-        attempt: int,
-    ) -> Optional[tuple[str, Optional[dict], Optional[str]]]:
+        attempt: CrawlJobAttempt,
+    ) -> tuple[str, dict | None, str | None] | None:
         try:
             result = await self.crawl(payload)
         except asyncio.CancelledError:
             raise
-        except Exception as error:
+        except (HTTPException, OSError, RuntimeError, TypeError, ValueError) as error:
             error_message = str(error.detail if isinstance(error, HTTPException) else error)
             terminal_input = isinstance(error, HTTPException) and error.status_code in {
                 status.HTTP_400_BAD_REQUEST,
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
             }
-            if terminal_input or attempt >= self.queue.settings.max_attempts:
-                await self.queue.complete(entry, payload, error=error_message)
+            if terminal_input or attempt.number >= self.queue.settings.max_attempts:
+                await self.queue.complete(entry, payload, attempt, error=error_message)
                 return "failed", None, error_message
             else:
                 logger.warning(
                     "Crawl job %s attempt %s/%s failed; retaining it for lease-based retry: %s",
                     entry.task_id,
-                    attempt,
+                    attempt.number,
                     self.queue.settings.max_attempts,
                     error_message,
                 )
                 await self.queue.mark_retry(entry, payload, self.consumer, attempt, error_message)
             return
 
-        await self.queue.complete(entry, payload, result=result)
+        await self.queue.complete(entry, payload, attempt, result=result)
         return "completed", result, None
 
     async def _crawl(self, payload: dict) -> dict:
@@ -202,7 +220,12 @@ class CrawlJobWorker:
             result_fields=payload.get("result_fields"),
         )
 
-    async def _heartbeat(self, entry: CrawlJobEntry, payload: dict, attempt: int) -> None:
+    async def _heartbeat(
+        self,
+        entry: CrawlJobEntry,
+        payload: dict,
+        attempt: CrawlJobAttempt,
+    ) -> None:
         while True:
             await asyncio.sleep(self.queue.settings.heartbeat_seconds)
             await self.queue.heartbeat(entry, payload, self.consumer, attempt)
@@ -213,8 +236,8 @@ class CrawlJobWorker:
         payload: dict,
         status: str,
         *,
-        result: Optional[dict] = None,
-        error: Optional[str] = None,
+        result: dict | None = None,
+        error: str | None = None,
     ) -> None:
         try:
             await self.webhook_service.notify_job_completion(
@@ -238,12 +261,19 @@ async def run_worker() -> None:
     redis = aioredis.from_url(build_redis_url(config), decode_responses=True)
     queue = CrawlJobQueue(redis, config)
     consumer = f"{socket.gethostname()}-{os.getpid()}"
-    worker = CrawlJobWorker(queue, config, consumer)
+    proxy = None
     try:
+        proxy = await start_pinning_proxy()
+        worker = CrawlJobWorker(queue, config, consumer)
         await worker.run()
     finally:
-        await close_all()
-        await redis.aclose()
+        try:
+            await close_all()
+        finally:
+            try:
+                await stop_pinning_proxy(proxy)
+            finally:
+                await redis.aclose()
 
 
 def main() -> None:

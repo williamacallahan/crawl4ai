@@ -3,9 +3,18 @@ x-base-config: &base-config
   ports:
     - "11235:11235"  # Gunicorn port
   env_file:
-    - .llm.env       # API keys (create from .llm.env.example)
+    # Optional LLM provider keys; a fresh checkout does not need this file.
+    - path: .llm.env
+      required: false
+  environment:
+    # Forward host-shell overrides through staging names. entrypoint.sh applies
+    # non-empty values without replacing credentials already supplied by the
+    # optional env_file or mounted secrets with an empty Compose default.
+    - CRAWL4AI_API_TOKEN_FROM_HOST=${CRAWL4AI_API_TOKEN:-}
+    - CRAWL4AI_JWT_ENABLED_FROM_HOST=${CRAWL4AI_JWT_ENABLED:-}
+    - REDIS_PASSWORD_FROM_HOST=${REDIS_PASSWORD:-}
   # Uncomment to set default environment variables (will overwrite .llm.env)
-  # environment:
+  # environment additions:
   #   - OPENAI_API_KEY=${OPENAI_API_KEY:-}
   #   - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
   #   - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -14,13 +23,34 @@ x-base-config: &base-config
   #   - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
   #   - GEMINI_API_KEY=${GEMINI_API_KEY:-}
   #   - LLM_PROVIDER=${LLM_PROVIDER:-}  # Optional: Override default provider (e.g., "anthropic/claude-3-opus")
+  # Chromium needs shared memory but the host /dev/shm bind was a shared,
+  # writable mount; use a private sized tmpfs instead.
+  shm_size: "1gb"
+  # Least privilege: drop all capabilities, forbid privilege escalation, cap PIDs.
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  # Read-only root filesystem; only these paths are writable.
+  read_only: true
+  # Redis state is a NAMED VOLUME, not tmpfs: /crawl/job durability depends on the
+  # stream surviving a restart, and upstream's tmpfs entry for this path would
+  # discard every queued and leased job on each container recreate.
   volumes:
-    - /dev/shm:/dev/shm  # Chromium performance
     - crawl4ai-redis:/var/lib/redis
+  tmpfs:
+    - /tmp
+    - /var/lib/crawl4ai/outputs:uid=999,gid=999,mode=0700
+    - /home/appuser/.crawl4ai:uid=999,gid=999,mode=0700
+    # Keep the baked Playwright browser under ~/.cache/ms-playwright visible.
+    - /home/appuser/.cache/url_seeder:uid=999,gid=999,mode=0700
+    - /home/appuser/.gunicorn:uid=999,gid=999,mode=0700
   deploy:
     resources:
       limits:
         memory: 4G
+        # Compose v5 rejects service-level pids_limit beside this limits block.
+        pids: 512
       reservations:
         memory: 1G
   restart: unless-stopped
@@ -36,14 +66,14 @@ services:
   crawl4ai:
     # 1. Default: Build the checked-out fork under a version-pinned local tag
     # 2. Override with a published immutable image via: IMAGE=registry/image@sha256:digest
-    image: ${IMAGE:-crawl4ai-local:${TAG:-0.8.9}}
+    image: ${IMAGE:-crawl4ai-local:${TAG:-0.9.2}}
     
     # Local build config (used with --build)
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        C4AI_VER: ${C4AI_VER:-0.8.9}
+        C4AI_VER: ${C4AI_VER:-0.9.2}
         C4AI_GIT_SHA: ${C4AI_GIT_SHA:?set C4AI_GIT_SHA to the exact checkout commit}
         INSTALL_TYPE: ${INSTALL_TYPE:-default}
         ENABLE_GPU: ${ENABLE_GPU:-false}

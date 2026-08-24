@@ -1,0 +1,81 @@
+name: Security
+
+# Runs the offline Docker-server security suite: behavioral tests for the
+# secure-by-default posture (R1-R7). No network, browser, Redis or Docker needed
+# - it boots the app via TestClient and monkeypatches DNS, so it is fast
+# (~seconds) and deterministic.
+
+on:
+  push:
+    branches: [main, develop, "security/**"]
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "deploy/docker/**"
+      - "crawl4ai/async_configs.py"
+      - "crawl4ai/async_crawler_strategy.py"
+      - "crawl4ai/browser_manager.py"
+      - "crawl4ai/extraction_strategy.py"
+      - ".github/workflows/security.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "deploy/docker/**"
+      - "crawl4ai/async_configs.py"
+      - "crawl4ai/async_crawler_strategy.py"
+      - "crawl4ai/browser_manager.py"
+      - "crawl4ai/extraction_strategy.py"
+      - ".github/workflows/security.yml"
+
+jobs:
+  security-offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Build the locked server test environment
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv lock --check
+          uv sync --locked --no-dev --group server --group test
+
+      - name: Run security suite
+        run: |
+          .venv/bin/python -m pytest deploy/docker/tests/test_security_*.py -q
+
+  posture-gate:
+    # The headline secure-by-default acceptance gate, isolated so it can be a
+    # required status check. xfail-marked items (e.g. the build-gated
+    # --no-sandbox removal) do not fail this job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Build the locked server test environment
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv lock --check
+          uv sync --locked --no-dev --group server --group test
+
+      - name: Default-posture gate
+        run: |
+          .venv/bin/python -m pytest deploy/docker/tests/test_security_default_posture.py -q

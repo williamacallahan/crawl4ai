@@ -5,44 +5,28 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Crawl4AI Playground</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        primary: '#4EFFFF',
-                        primarydim: '#09b5a5',
-                        accent: '#F380F5',
-                        dark: '#070708',
-                        light: '#E8E9ED',
-                        secondary: '#D5CEBF',
-                        codebg: '#1E1E1E',
-                        surface: '#202020',
-                        border: '#3F3F44',
-                    },
-                    fontFamily: {
-                        mono: ['Fira Code', 'monospace'],
-                    },
-                }
-            }
-        }
-    </script>
+    <link rel="stylesheet" href="/static/assets/tailwind-3.4.17.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <!-- Highlight.js -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/clipboard.js/2.0.11/clipboard.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
+          integrity="sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH" crossorigin="anonymous">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"
+            integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/clipboard.js/2.0.11/clipboard.min.js"
+            integrity="sha384-J08i8An/QeARD9ExYpvphB8BsyOj3Gh2TSh1aLINKO3L0cMSH2dN3E22zFoXEi0Q" crossorigin="anonymous"></script>
     <!-- CodeMirror (python mode) -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/darcula.min.css">
-    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script> -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css"
+          integrity="sha384-zaeBlB/vwYsDRSlFajnDd7OydJ0cWk+c2OWybl3eSUf6hW2EbhlCsQPqKr3gkznT" crossorigin="anonymous">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"
+            integrity="sha384-ZYmwuq4n2gOcNxMSiJ6jyTj+BbIrilr7p6dlq6q5nmSWKmsH9UU4K1qqjycMkfmR" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"
+            integrity="sha384-Xy+2exU6lBoT4OpUOtnQb+cUpn+nlJQEHvRobWVtwz6wIsw4oNoO7xyd/l8rYgMy" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"
+            integrity="sha384-LjCI3E8qhhxXZvu7+FCvqx9eZYSowFvuJ7z54KsgI/BDPGKEuysqCg/vYiKHvC4Y" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js"
+            integrity="sha384-hcxaXyAtJ30s2NeDu1OHWsQRiHiWuYLTbI596+YFb+f2pFhzO0mDuahZziRPPDxg" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/darcula.min.css"
+          integrity="sha384-O7baQ60DV8PF9lmTWsCobbRqqwybdAMd27xf3MCGJPyaiJOUgqR5MD/l2KvMVqan" crossorigin="anonymous">
     <style>
         /* Custom CodeMirror styling to match theme */
         .CodeMirror {
@@ -172,6 +156,15 @@
         </h1>
 
         <div class="ml-auto flex items-center space-x-4">
+            <!-- Token bar -->
+            <div id="token-bar" class="flex items-center space-x-2">
+                <input id="token-input" type="password" placeholder="API token"
+                       autocomplete="off" autocapitalize="off" spellcheck="false"
+                       class="bg-dark border border-border rounded px-2 py-1 text-xs w-48">
+                <button id="token-save" class="px-2 py-1 bg-primary text-dark rounded text-xs hover:bg-primarydim">Set</button>
+                <button onclick="clearToken()" class="px-2 py-1 border border-border rounded text-xs hover:bg-surface">Clear</button>
+                <span id="token-status" class="text-xs"></span>
+            </div>
             <a href="/dashboard" class="text-xs text-secondary hover:text-primary underline">Monitor</a>
             <div class="flex space-x-2">
                 <button id="play-tab"
@@ -402,6 +395,44 @@
     </div>
 
     <script>
+        // ================ AUTH ================
+        const _tokenBar = document.getElementById('token-bar');
+        const _tokenInput = document.getElementById('token-input');
+        const _tokenSave = document.getElementById('token-save');
+        const _tokenStatus = document.getElementById('token-status');
+        let _sessionToken = '';
+
+        function getToken() { return _sessionToken; }
+
+        function authFetch(url, opts = {}) {
+            const token = getToken();
+            if (token) {
+                opts.headers = { ...opts.headers, 'Authorization': 'Bearer ' + token };
+            }
+            return fetch(url, opts);
+        }
+
+        function applyToken() {
+            const val = _tokenInput.value.trim();
+            if (!val) return;
+            _sessionToken = val;
+            _tokenInput.value = '';
+            _tokenStatus.textContent = 'Token active for this page';
+            _tokenStatus.className = 'text-xs text-green-400';
+            setTimeout(() => { _tokenStatus.textContent = ''; }, 2000);
+        }
+
+        function clearToken() {
+            _sessionToken = '';
+            _tokenInput.value = '';
+            _tokenStatus.textContent = 'Token cleared';
+            _tokenStatus.className = 'text-xs text-yellow-400';
+            setTimeout(() => { _tokenStatus.textContent = ''; }, 2000);
+        }
+
+        _tokenSave.addEventListener('click', applyToken);
+        _tokenInput.addEventListener('keydown', e => { if (e.key === 'Enter') applyToken(); });
+
         // Tab switching
         document.querySelectorAll('.tab-btn').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -522,10 +553,13 @@
             const code = cm.getValue().trim();
             if (!code) return {};
 
-            const res = await fetch('/config/dump', {
+            // Server requires `type` alongside `code` (CrawlerRunConfig | BrowserConfig).
+            // The UI already tracks this in #cfg-type; omitting it always 400s Advanced Config.
+            const cfgType = document.getElementById('cfg-type').value;
+            const res = await authFetch('/config/dump', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ code }),
+                body: JSON.stringify({ type: cfgType, code }),
             });
 
             const statusEl = document.getElementById('cfg-status');
@@ -581,10 +615,10 @@
             
             if (method === 'GET') {
                 // GET request (for /llm endpoint)
-                pySnippet = `import httpx\n\nasync def crawl():\n    async with httpx.AsyncClient() as client:\n        response = await client.get(\n            "${window.location.origin}${api}"\n        )\n        return response.json()`;
+                pySnippet = `import os\nimport httpx\n\nasync def crawl():\n    headers = {"Authorization": f"Bearer {os.environ['CRAWL4AI_API_TOKEN']}"}\n    async with httpx.AsyncClient() as client:\n        response = await client.get(\n            "${window.location.origin}${api}",\n            headers=headers\n        )\n        return response.json()`;
             } else {
                 // POST request (for /crawl and /md endpoints)
-                pySnippet = `import httpx\n\nasync def crawl():\n    async with httpx.AsyncClient() as client:\n        response = await client.post(\n            "${window.location.origin}${api}",\n            json=${JSON.stringify(payload, null, 4).replace(/\n/g, '\n            ')}\n        )\n        return response.json()`;
+                pySnippet = `import os\nimport httpx\n\nasync def crawl():\n    headers = {"Authorization": f"Bearer {os.environ['CRAWL4AI_API_TOKEN']}"}\n    async with httpx.AsyncClient() as client:\n        response = await client.post(\n            "${window.location.origin}${api}",\n            headers=headers,\n            json=${JSON.stringify(payload, null, 4).replace(/\n/g, '\n            ')}\n        )\n        return response.json()`;
             }
 
             pyCodeEl.textContent = pySnippet;
@@ -603,6 +637,10 @@
                 curlSnippet = `curl -X POST ${window.location.origin}${api} \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(payload)}'`;
             }
 
+            curlSnippet = curlSnippet.replace(
+                'curl -X',
+                'curl -H "Authorization: Bearer ${CRAWL4AI_API_TOKEN}" -X'
+            );
             curlCodeEl.textContent = curlSnippet;
             curlCodeEl.className = 'bash hljs'; // Reset classes
             forceHighlightElement(curlCodeEl);
@@ -611,9 +649,12 @@
         // Detect if stream is requested inside payload
         function shouldUseStream(payload) {
             const toBool = (v) => v === true || (typeof v === 'string' && v.toLowerCase() === 'true');
-            const fromCrawler = payload && payload.crawler_config && payload.crawler_config.params && payload.crawler_config.params.stream;
+            // Successful /config/dump returns { type, params: { stream, ... } }
+            const fromCrawlerParams = payload && payload.crawler_config && payload.crawler_config.params && payload.crawler_config.params.stream;
+            // Fallback / minimal shapes may set stream at the crawler_config top level
+            const fromCrawlerTop = payload && payload.crawler_config && payload.crawler_config.stream;
             const direct = payload && payload.stream;
-            return toBool(fromCrawler) || toBool(direct);
+            return toBool(fromCrawlerParams) || toBool(fromCrawlerTop) || toBool(direct);
         }
 
         // Main run function
@@ -635,8 +676,8 @@
                 const streamFlag = /stream\s*=\s*True/i.test(codeText);
                 const isCrawlEndpoint = document.getElementById('endpoint').value === 'crawl';
                 if (isCrawlEndpoint && streamFlag) {
-                    // Fallback: proceed with minimal config only for stream
-                    advConfig = { crawler_config: { stream: true } };
+                    // Fallback: minimal dump-shaped config so shouldUseStream + server load agree
+                    advConfig = { crawler_config: { type: 'CrawlerRunConfig', params: { stream: true } } };
                 } else {
                     updateStatus('error');
                     document.querySelector('#response-content code').textContent =
@@ -696,7 +737,7 @@
                     // Get the question from the LLM-specific input
                     const question = document.getElementById('llm-question').value.trim() || "What is this page about?";
                     
-                    response = await fetch(`${api}/${encodedUrl}?q=${encodeURIComponent(question)}`, {
+                    response = await authFetch(`${api}/${encodedUrl}?q=${encodeURIComponent(question)}`, {
                         method: 'GET',
                         headers: { 'Accept': 'application/json' }
                     });
@@ -712,7 +753,7 @@
                     forceHighlightElement(document.querySelector('#response-content code'));
                 } else if (endpoint === 'crawl_stream' || useStreamOverride) {
                     // Stream processing - now handled directly by /crawl endpoint
-                    response = await fetch(api, {
+                    response = await authFetch(api, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
@@ -751,7 +792,7 @@
                     forceHighlightElement(document.querySelector('#response-content code'));
                 } else {
                     // Regular request (handles /crawl and /md)
-                    response = await fetch(api, {
+                    response = await authFetch(api, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
@@ -840,7 +881,7 @@
 
                 try {
                     if (useStream) {
-                        const response = await fetch(api, {
+                        const response = await authFetch(api, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(payload)
@@ -864,7 +905,7 @@
 
                         memory = maxMem;
                     } else {
-                        const response = await fetch(api, {
+                        const response = await authFetch(api, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(payload)

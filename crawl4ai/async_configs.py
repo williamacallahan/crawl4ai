@@ -1,37 +1,38 @@
 import copy
 import functools
 import importlib
+import inspect
+import math
 import os
 import warnings
+from enum import Enum
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+
 import requests
+
+from .cache_context import CacheMode
+from .chunking_strategy import ChunkingStrategy, RegexChunking
 from .config import (
     DEFAULT_PROVIDER,
     DEFAULT_PROVIDER_API_KEY,
-    MIN_WORD_THRESHOLD,
     IMAGE_DESCRIPTION_MIN_WORD_THRESHOLD,
-    PROVIDER_MODELS,
+    IMAGE_SCORE_THRESHOLD,
+    MIN_WORD_THRESHOLD,
+    PAGE_TIMEOUT,
     PROVIDER_MODELS_PREFIXES,
     SCREENSHOT_HEIGHT_TRESHOLD,
-    PAGE_TIMEOUT,
-    IMAGE_SCORE_THRESHOLD,
     SOCIAL_MEDIA_DOMAINS,
 )
-
-from .user_agent_generator import UAGen, ValidUAGenerator  # , OnlineUAGenerator
-from .extraction_strategy import ExtractionStrategy, LLMExtractionStrategy
-from .chunking_strategy import ChunkingStrategy, RegexChunking
-
-from .markdown_generation_strategy import MarkdownGenerationStrategy, DefaultMarkdownGenerator
 from .content_scraping_strategy import ContentScrapingStrategy, LXMLWebScrapingStrategy
 from .deep_crawling import DeepCrawlStrategy
-from .table_extraction import TableExtractionStrategy, DefaultTableExtraction
-
-from .cache_context import CacheMode
+from .extraction_strategy import ExtractionStrategy
+from .markdown_generation_strategy import (
+    DefaultMarkdownGenerator,
+    MarkdownGenerationStrategy,
+)
 from .proxy_strategy import ProxyRotationStrategy
-
-import inspect
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
-from enum import Enum
+from .table_extraction import DefaultTableExtraction, TableExtractionStrategy
+from .user_agent_generator import UAGen, ValidUAGenerator  # , OnlineUAGenerator
 
 # Type alias for URL matching
 UrlMatcher = Union[str, Callable[[str], bool], List[Union[str, Callable[[str], bool]]]]
@@ -156,6 +157,442 @@ ALLOWED_DESERIALIZE_TYPES = {
 }
 
 
+# ───────────────────────── untrusted-input trust boundary ─────────────────────────
+# When a config is deserialized from an untrusted source (a network request body
+# on the Docker server), it may only construct a strict subset of types and may
+# only set scalar, non-power fields, which are then clamped. SDK / in-process use
+# is TRUSTED by default, so this changes nothing for library callers.
+
+
+class Provenance(Enum):
+    """Where deserialized config data came from.
+
+    TRUSTED   - SDK / in-process construction (unchanged behavior).
+    UNTRUSTED - a network request body; gated by the allowlists below.
+    """
+    TRUSTED = "trusted"
+    UNTRUSTED = "untrusted"
+
+
+class UntrustedConfigError(ValueError):
+    """An untrusted request tried to construct a forbidden type or set a
+    forbidden power-field. The Docker layer maps this to HTTP 400."""
+
+
+# Types an untrusted body may construct - a strict subset of
+# ALLOWED_DESERIALIZE_TYPES. Deliberately EXCLUDES everything that can run code,
+# read secrets, route traffic, or recurse the crawl: LLMConfig,
+# LLMExtractionStrategy, LLMContentFilter, LLMTableExtraction, ProxyConfig,
+# RoundRobinProxyStrategy, all DeepCrawl*/Filter/Scorer/Dispatcher classes,
+# SeedingConfig, DomainMapperConfig, and constructors with independent
+# egress/model-loading paths.
+UNTRUSTED_ALLOWED_TYPES = {
+    "CrawlerRunConfig", "BrowserConfig", "GeolocationConfig", "VirtualScrollConfig",
+    # side-effect-free extraction / markdown / scraping strategies
+    "JsonCssExtractionStrategy", "JsonXPathExtractionStrategy",
+    "JsonLxmlExtractionStrategy",
+    "DefaultMarkdownGenerator", "PruningContentFilter", "BM25ContentFilter",
+    "LXMLWebScrapingStrategy",
+    "DefaultTableExtraction", "NoTableExtraction",
+    # safe scalar enums
+    "CacheMode", "MatchMode", "DisplayMode",
+}
+
+# Fields that must NEVER come from an untrusted body. Presence => 400 (loud), so
+# a client smuggling these gets an explicit error rather than a silent drop.
+UNTRUSTED_FORBIDDEN_FIELDS = {
+    "BrowserConfig": {
+        "proxy", "proxy_config", "extra_args", "user_data_dir", "channel",
+        "chrome_channel", "cdp_url", "debugging_port", "host", "storage_state",
+        "cookies", "headers", "init_scripts", "browser_context_id", "target_id",
+        "accept_downloads", "downloads_path", "ignore_https_errors",
+        "use_managed_browser", "use_persistent_context", "create_isolated_context",
+        "cache_cdp_connection",
+    },
+    "CrawlerRunConfig": {
+        "js_code", "js_code_before_wait", "c4a_script", "deep_crawl_strategy",
+        "proxy_config", "proxy_rotation_strategy", "proxy_session_id",
+        "proxy_session_ttl", "proxy_session_auto_release",
+        "fallback_fetch_function", "experimental", "base_url", "simulate_user",
+        "override_navigator", "magic", "process_in_browser", "shared_data",
+        "session_id", "fetch_ssl_certificate", "check_cache_freshness",
+        "cache_validation_timeout", "check_robots_txt", "link_preview_config",
+        "method", "capture_network_requests", "capture_console_messages",
+    },
+}
+
+# Scalar knobs an untrusted body MAY set, per class. A field not listed here is
+# dropped (forward-compatible: new SDK fields don't open a hole). Strategy-object
+# fields are kept so the nested object is itself type-gated by the recursion.
+UNTRUSTED_FIELD_ALLOWLIST = {
+    "BrowserConfig": {
+        "headless", "viewport_width", "viewport_height", "viewport",
+        "device_scale_factor",
+        "java_script_enabled", "text_mode", "light_mode", "enable_stealth",
+        "avoid_ads", "avoid_css", "user_agent", "user_agent_mode",
+        "user_agent_generator_config", "verbose", "memory_saving_mode",
+    },
+    "CrawlerRunConfig": {
+        # content selection / cleaning
+        "word_count_threshold", "only_text", "css_selector", "target_elements",
+        "excluded_tags", "excluded_selector", "keep_data_attributes", "keep_attrs",
+        "remove_forms", "prettiify", "parser_type",
+        # strategy objects (nested type is gated by the recursion)
+        "extraction_strategy", "markdown_generator",
+        "scraping_strategy", "table_extraction",
+        # locale / geo
+        "locale", "timezone_id", "geolocation",
+        # cache
+        "cache_mode", "bypass_cache", "disable_cache", "no_cache_read",
+        "no_cache_write",
+        # timing / waiting
+        "wait_until", "page_timeout", "wait_for", "wait_for_timeout",
+        "wait_for_images", "delay_before_return_html", "mean_delay", "max_range",
+        # scrolling / rendering
+        "ignore_body_visibility", "scan_full_page", "scroll_delay",
+        "max_scroll_steps", "process_iframes", "flatten_shadow_dom",
+        "remove_overlay_elements", "remove_consent_popups", "virtual_scroll_config",
+        # media / capture
+        "screenshot", "screenshot_wait_for", "screenshot_height_threshold",
+        "force_viewport_screenshot", "pdf", "capture_mhtml",
+        "image_description_min_word_threshold", "image_score_threshold",
+        "table_score_threshold",
+        # links / images filtering
+        "exclude_external_images", "exclude_all_images",
+        "exclude_social_media_domains", "exclude_external_links",
+        "exclude_social_media_links", "exclude_domains", "exclude_internal_links",
+        "score_links", "preserve_https_for_internal_links",
+        # misc safe knobs
+        "verbose", "stream", "prefetch", "user_agent", "user_agent_mode",
+        "user_agent_generator_config", "url_matcher", "match_mode", "max_retries",
+    },
+    "GeolocationConfig": {"latitude", "longitude", "accuracy"},
+    "VirtualScrollConfig": {
+        "container_selector", "scroll_count", "scroll_by", "wait_after_scroll",
+    },
+    "JsonCssExtractionStrategy": {"schema", "verbose"},
+    "JsonXPathExtractionStrategy": {"schema", "verbose"},
+    "JsonLxmlExtractionStrategy": {
+        "schema", "verbose", "use_caching", "optimize_common_patterns",
+    },
+    "DefaultMarkdownGenerator": {"content_filter", "content_source"},
+    "PruningContentFilter": {
+        "min_word_threshold", "threshold_type", "threshold",
+        "preserve_classes", "preserve_tags",
+    },
+    "BM25ContentFilter": {
+        "user_query", "bm25_threshold", "language", "use_stemming",
+    },
+    "LXMLWebScrapingStrategy": set(),
+    "DefaultTableExtraction": {
+        "table_score_threshold", "min_rows", "min_cols", "verbose",
+    },
+    "NoTableExtraction": set(),
+}
+
+# Upper bounds applied to attacker-influenced quantities after filtering.
+_MAX_TIMEOUT_MS = 60_000
+_MAX_SCROLL_STEPS = 1000
+_MAX_VIEWPORT_DIMENSION = 4000
+_MAX_VIEWPORT_PIXELS = 3840 * 2160
+_MAX_RENDER_PIXELS = 16_000_000
+_MAX_DEVICE_SCALE_FACTOR = 2.0
+_MAX_DELAY_SECONDS = 5.0
+_MAX_SCROLL_DELAY_SECONDS = 2.0
+_MAX_RETRIES = 3
+_MAX_VIRTUAL_SCROLLS = 100
+_MAX_SELECTOR_LENGTH = 2048
+_MAX_UNTRUSTED_LIST_ITEMS = 64
+_MAX_NAME_LENGTH = 64
+_MAX_DOMAIN_LENGTH = 253
+
+
+def _filter_untrusted_fields(type_name: str, params: dict) -> dict:
+    """Drop non-allowlisted fields and raise on forbidden (power) fields."""
+    forbidden = UNTRUSTED_FORBIDDEN_FIELDS.get(type_name, set())
+    allowlist = UNTRUSTED_FIELD_ALLOWLIST.get(type_name)
+    if allowlist is None:
+        raise UntrustedConfigError(
+            f"type '{type_name}' has no untrusted field policy"
+        )
+    out = {}
+    for key, value in params.items():
+        if key in forbidden:
+            raise UntrustedConfigError(
+                f"field '{key}' is not permitted on {type_name} from an untrusted request"
+            )
+        if allowlist is not None and key not in allowlist:
+            continue  # silently drop unknown/unsafe fields (forward-compatible)
+        out[key] = value
+    return out
+
+
+def _bounded_number(
+    type_name: str,
+    field: str,
+    value: Any,
+    *,
+    minimum: float,
+    maximum: float,
+    integer: bool = False,
+    zero_as_maximum: bool = False,
+):
+    expected = int if integer else (int, float)
+    if isinstance(value, bool) or not isinstance(value, expected):
+        expected_name = "an integer" if integer else "a number"
+        raise UntrustedConfigError(
+            f"field '{field}' on {type_name} must be {expected_name}"
+        )
+    if (isinstance(value, float) and not math.isfinite(value)) or value < minimum:
+        raise UntrustedConfigError(
+            f"field '{field}' on {type_name} must be at least {minimum}"
+        )
+    if zero_as_maximum and value == 0:
+        return int(maximum) if integer else maximum
+    bounded = min(value, maximum)
+    return int(bounded) if integer else float(bounded)
+
+
+def _bounded_string_list(
+    type_name: str,
+    field: str,
+    value: Any,
+    *,
+    maximum_length: int,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise UntrustedConfigError(
+            f"field '{field}' on {type_name} must be a list"
+        )
+    if len(value) > _MAX_UNTRUSTED_LIST_ITEMS:
+        raise UntrustedConfigError(
+            f"field '{field}' may contain at most {_MAX_UNTRUSTED_LIST_ITEMS} items"
+        )
+
+    bounded = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise UntrustedConfigError(
+                f"every item in field '{field}' on {type_name} must be a string"
+            )
+        item = item.strip()
+        if not item or len(item) > maximum_length:
+            raise UntrustedConfigError(
+                f"every item in field '{field}' on {type_name} must be non-empty "
+                f"and at most {maximum_length} characters"
+            )
+        if item not in seen:
+            seen.add(item)
+            bounded.append(item)
+    return bounded
+
+
+def _bounded_viewport(params: dict) -> None:
+    viewport = params.get("viewport")
+    if viewport is not None:
+        if not isinstance(viewport, dict):
+            raise UntrustedConfigError("field 'viewport' on BrowserConfig must be an object")
+        viewport = {key: value for key, value in viewport.items() if key in {"width", "height"}}
+        width = viewport.get("width", params.get("viewport_width", 1080))
+        height = viewport.get("height", params.get("viewport_height", 600))
+    else:
+        width = params.get("viewport_width", 1080)
+        height = params.get("viewport_height", 600)
+
+    width = _bounded_number(
+        "BrowserConfig", "viewport_width", width,
+        minimum=1, maximum=_MAX_VIEWPORT_DIMENSION, integer=True,
+    )
+    height = _bounded_number(
+        "BrowserConfig", "viewport_height", height,
+        minimum=1, maximum=_MAX_VIEWPORT_DIMENSION, integer=True,
+    )
+    pixels = width * height
+    if pixels > _MAX_VIEWPORT_PIXELS:
+        scale = math.sqrt(_MAX_VIEWPORT_PIXELS / pixels)
+        width = max(1, int(width * scale))
+        height = max(1, int(height * scale))
+
+    if viewport is not None:
+        params["viewport"] = {"width": width, "height": height}
+    else:
+        if "viewport_width" in params:
+            params["viewport_width"] = width
+        if "viewport_height" in params:
+            params["viewport_height"] = height
+
+    device_scale = params.get("device_scale_factor", 1.0)
+    device_scale = _bounded_number(
+        "BrowserConfig", "device_scale_factor", device_scale,
+        minimum=0.1, maximum=_MAX_DEVICE_SCALE_FACTOR,
+    )
+    render_scale_cap = math.sqrt(_MAX_RENDER_PIXELS / (width * height))
+    if "device_scale_factor" in params:
+        params["device_scale_factor"] = min(device_scale, render_scale_cap)
+
+
+def _clamp_untrusted(type_name: str, params: dict) -> dict:
+    """Validate and cap attacker-influenced quantities."""
+    if type_name == "CrawlerRunConfig":
+        for field, maximum_length in (
+            ("target_elements", _MAX_SELECTOR_LENGTH),
+            ("excluded_tags", _MAX_NAME_LENGTH),
+            ("keep_attrs", _MAX_NAME_LENGTH),
+            ("exclude_social_media_domains", _MAX_DOMAIN_LENGTH),
+            ("exclude_domains", _MAX_DOMAIN_LENGTH),
+        ):
+            if field in params:
+                params[field] = _bounded_string_list(
+                    type_name, field, params[field], maximum_length=maximum_length
+                )
+        if "url_matcher" in params:
+            url_matcher = params["url_matcher"]
+            if isinstance(url_matcher, str):
+                params["url_matcher"] = _bounded_string_list(
+                    type_name,
+                    "url_matcher",
+                    [url_matcher],
+                    maximum_length=_MAX_SELECTOR_LENGTH,
+                )[0]
+            else:
+                params["url_matcher"] = _bounded_string_list(
+                    type_name,
+                    "url_matcher",
+                    url_matcher,
+                    maximum_length=_MAX_SELECTOR_LENGTH,
+                )
+        for field in ("page_timeout", "wait_for_timeout"):
+            if field in params and params[field] is not None:
+                params[field] = _bounded_number(
+                    type_name, field, params[field], minimum=0,
+                    maximum=_MAX_TIMEOUT_MS, integer=True, zero_as_maximum=True,
+                )
+        for field in ("delay_before_return_html", "mean_delay", "max_range", "screenshot_wait_for"):
+            if field in params and params[field] is not None:
+                params[field] = _bounded_number(
+                    type_name, field, params[field], minimum=0,
+                    maximum=_MAX_DELAY_SECONDS,
+                )
+        if "scroll_delay" in params:
+            params["scroll_delay"] = _bounded_number(
+                type_name, "scroll_delay", params["scroll_delay"], minimum=0,
+                maximum=_MAX_SCROLL_DELAY_SECONDS,
+            )
+        for field, minimum, maximum in (
+            ("max_scroll_steps", 0, _MAX_SCROLL_STEPS),
+            ("max_retries", 0, _MAX_RETRIES),
+            ("screenshot_height_threshold", 1, SCREENSHOT_HEIGHT_TRESHOLD),
+            ("word_count_threshold", 0, 100_000),
+            ("image_description_min_word_threshold", 0, 100_000),
+            ("image_score_threshold", 0, 100),
+            ("table_score_threshold", 0, 100),
+        ):
+            if field in params and params[field] is not None:
+                params[field] = _bounded_number(
+                    type_name, field, params[field], minimum=minimum,
+                    maximum=maximum, integer=True,
+                )
+        if "wait_for" in params and params["wait_for"] is not None:
+            wait_for = params["wait_for"]
+            if not isinstance(wait_for, str):
+                raise UntrustedConfigError("field 'wait_for' on CrawlerRunConfig must be a string")
+            wait_for = wait_for.strip()
+            if wait_for.startswith("css:"):
+                wait_for = wait_for[4:].strip()
+            if not wait_for or len(wait_for) > _MAX_SELECTOR_LENGTH:
+                raise UntrustedConfigError("field 'wait_for' must contain a bounded CSS selector")
+            if wait_for.startswith(("js:", "()", "function")):
+                raise UntrustedConfigError("field 'wait_for' may only contain a CSS selector")
+            params["wait_for"] = f"css:{wait_for}"
+        virtual_scroll = params.get("virtual_scroll_config")
+        if isinstance(virtual_scroll, dict):
+            params["virtual_scroll_config"] = _enforce_untrusted(
+                "VirtualScrollConfig", virtual_scroll
+            )
+    elif type_name == "BrowserConfig":
+        _bounded_viewport(params)
+    elif type_name == "GeolocationConfig":
+        for field, minimum, maximum in (
+            ("latitude", -90, 90),
+            ("longitude", -180, 180),
+            ("accuracy", 0, 100_000),
+        ):
+            if field in params and params[field] is not None:
+                value = _bounded_number(
+                    type_name, field, params[field], minimum=minimum, maximum=maximum,
+                )
+                if value != params[field]:
+                    raise UntrustedConfigError(
+                        f"field '{field}' on {type_name} must be between {minimum} and {maximum}"
+                    )
+                params[field] = value
+    elif type_name == "VirtualScrollConfig":
+        selector = params.get("container_selector")
+        if not isinstance(selector, str) or not selector.strip() or len(selector) > _MAX_SELECTOR_LENGTH:
+            raise UntrustedConfigError(
+                "field 'container_selector' on VirtualScrollConfig must be a bounded CSS selector"
+            )
+        if "scroll_count" in params:
+            params["scroll_count"] = _bounded_number(
+                type_name, "scroll_count", params["scroll_count"], minimum=0,
+                maximum=_MAX_VIRTUAL_SCROLLS, integer=True,
+            )
+        if "wait_after_scroll" in params:
+            params["wait_after_scroll"] = _bounded_number(
+                type_name, "wait_after_scroll", params["wait_after_scroll"],
+                minimum=0, maximum=_MAX_SCROLL_DELAY_SECONDS,
+            )
+        if "scroll_by" in params:
+            scroll_by = params["scroll_by"]
+            if isinstance(scroll_by, str):
+                if scroll_by not in {"container_height", "page_height"}:
+                    raise UntrustedConfigError(
+                        "field 'scroll_by' on VirtualScrollConfig has an unsupported value"
+                    )
+            else:
+                params["scroll_by"] = _bounded_number(
+                    type_name, "scroll_by", scroll_by, minimum=0,
+                    maximum=100_000, integer=True,
+                )
+    elif type_name == "PruningContentFilter":
+        for field in ("preserve_classes", "preserve_tags"):
+            if field in params:
+                params[field] = _bounded_string_list(
+                    type_name,
+                    field,
+                    params[field],
+                    maximum_length=_MAX_NAME_LENGTH,
+                )
+        if "min_word_threshold" in params and params["min_word_threshold"] is not None:
+            params["min_word_threshold"] = _bounded_number(
+                type_name, "min_word_threshold", params["min_word_threshold"],
+                minimum=0, maximum=100_000, integer=True,
+            )
+        if "threshold" in params:
+            params["threshold"] = _bounded_number(
+                type_name, "threshold", params["threshold"], minimum=0, maximum=1,
+            )
+    elif type_name == "BM25ContentFilter" and "bm25_threshold" in params:
+        params["bm25_threshold"] = _bounded_number(
+            type_name, "bm25_threshold", params["bm25_threshold"],
+            minimum=0, maximum=100,
+        )
+    elif type_name == "DefaultTableExtraction":
+        for field in ("table_score_threshold", "min_rows", "min_cols"):
+            if field in params:
+                params[field] = _bounded_number(
+                    type_name, field, params[field], minimum=0,
+                    maximum=100_000, integer=True,
+                )
+    return params
+
+
+def _enforce_untrusted(type_name: str, params: dict) -> dict:
+    """Filter then clamp a parameter dict for an untrusted construction."""
+    return _clamp_untrusted(type_name, _filter_untrusted_fields(type_name, params))
+
+
 def to_serializable_dict(obj: Any, ignore_default_value : bool = False):
     """
     Recursively convert an object to a serializable dictionary using {type, params} structure
@@ -237,10 +674,17 @@ def to_serializable_dict(obj: Any, ignore_default_value : bool = False):
     return str(obj)
 
 
-def from_serializable_dict(data: Any) -> Any:
+def from_serializable_dict(data: Any, provenance: "Provenance" = None) -> Any:
     """
     Recursively convert a serializable dictionary back to an object instance.
+
+    provenance defaults to TRUSTED (SDK/in-process). When UNTRUSTED, every typed
+    object must be in UNTRUSTED_ALLOWED_TYPES and its params are filtered (drop
+    unknown, raise on forbidden) and clamped before construction.
     """
+    if provenance is None:
+        provenance = Provenance.TRUSTED
+
     if data is None:
         return None
 
@@ -262,7 +706,7 @@ def from_serializable_dict(data: Any) -> Any:
     ):
         # Handle plain dictionaries
         if data["type"] == "dict" and "value" in data:
-            return {k: from_serializable_dict(v) for k, v in data["value"].items()}
+            return {k: from_serializable_dict(v, provenance) for k, v in data["value"].items()}
 
         # Security: only allow known-safe types to be deserialized.
         # Unknown types (e.g. logging.Logger serialized by older clients) are
@@ -270,6 +714,13 @@ def from_serializable_dict(data: Any) -> Any:
         type_name = data["type"]
         if type_name not in ALLOWED_DESERIALIZE_TYPES:
             return None
+
+        # Untrusted bodies may only construct the strict subset of types and
+        # may not set forbidden power-fields.
+        if provenance == Provenance.UNTRUSTED and type_name not in UNTRUSTED_ALLOWED_TYPES:
+            raise UntrustedConfigError(
+                f"type '{type_name}' may not be constructed from an untrusted request"
+            )
 
         cls = None
         module_paths = ["crawl4ai"]
@@ -288,19 +739,28 @@ def from_serializable_dict(data: Any) -> Any:
                 return cls(data["params"])
 
             if "params" in data:
-                # Handle class instances
+                params = data["params"]
+                if provenance == Provenance.UNTRUSTED:
+                    if not isinstance(params, dict):
+                        raise UntrustedConfigError(
+                            f"params for type '{type_name}' must be an object"
+                        )
+                    params = _filter_untrusted_fields(type_name, params)
                 constructor_args = {
-                    k: from_serializable_dict(v) for k, v in data["params"].items()
+                    key: from_serializable_dict(value, provenance)
+                    for key, value in params.items()
                 }
+                if provenance == Provenance.UNTRUSTED:
+                    constructor_args = _clamp_untrusted(type_name, constructor_args)
                 return cls(**constructor_args)
 
     # Handle lists
     if isinstance(data, list):
-        return [from_serializable_dict(item) for item in data]
+        return [from_serializable_dict(item, provenance) for item in data]
 
     # Handle raw dictionaries (legacy support)
     if isinstance(data, dict):
-        return {k: from_serializable_dict(v) for k, v in data.items()}
+        return {k: from_serializable_dict(v, provenance) for k, v in data.items()}
 
     return data
 
@@ -838,11 +1298,17 @@ class BrowserConfig:
         return to_serializable_dict(self)
 
     @staticmethod
-    def load(data: dict) -> "BrowserConfig":
+    def load(data: dict, provenance: "Provenance" = None) -> "BrowserConfig":
         # Deserialize the object from a dictionary
-        config = from_serializable_dict(data)
+        if provenance is None:
+            provenance = Provenance.TRUSTED
+        config = from_serializable_dict(data, provenance)
         if isinstance(config, BrowserConfig):
             return config
+        # Plain-dict path: enforce the untrusted gate on top-level fields too,
+        # so a body that sends bare kwargs (no {type,params}) cannot bypass it.
+        if provenance == Provenance.UNTRUSTED and isinstance(config, dict):
+            config = _enforce_untrusted("BrowserConfig", config)
         return BrowserConfig.from_kwargs(config)
 
     def set_nstproxy(
@@ -1133,10 +1599,14 @@ class HTTPCrawlerConfig:
         return to_serializable_dict(self)
 
     @staticmethod
-    def load(data: dict) -> "HTTPCrawlerConfig":
-        config = from_serializable_dict(data)
+    def load(data: dict, provenance: "Provenance" = None) -> "HTTPCrawlerConfig":
+        if provenance is None:
+            provenance = Provenance.TRUSTED
+        config = from_serializable_dict(data, provenance)
         if isinstance(config, HTTPCrawlerConfig):
             return config
+        if provenance == Provenance.UNTRUSTED and isinstance(config, dict):
+            config = _enforce_untrusted("HTTPCrawlerConfig", config)
         return HTTPCrawlerConfig.from_kwargs(config)
 
 @_with_defaults
@@ -1889,11 +2359,15 @@ class CrawlerRunConfig():
         return to_serializable_dict(self)
 
     @staticmethod
-    def load(data: dict) -> "CrawlerRunConfig":
+    def load(data: dict, provenance: "Provenance" = None) -> "CrawlerRunConfig":
         # Deserialize the object from a dictionary
-        config = from_serializable_dict(data)
+        if provenance is None:
+            provenance = Provenance.TRUSTED
+        config = from_serializable_dict(data, provenance)
         if isinstance(config, CrawlerRunConfig):
             return config
+        if provenance == Provenance.UNTRUSTED and isinstance(config, dict):
+            config = _enforce_untrusted("CrawlerRunConfig", config)
         return CrawlerRunConfig.from_kwargs(config)
 
     def to_dict(self):
@@ -2022,30 +2496,6 @@ class CrawlerRunConfig():
         config_dict.update(kwargs)
         return CrawlerRunConfig.from_kwargs(config_dict)
 
-
-# Environment variable names that `LLMConfig(api_token="env:NAME")` may NOT
-# resolve. This blocks the credential-exfil gadget where an untrusted config
-# body sets api_token="env:SECRET_KEY" and pairs it with a base_url to leak a
-# server secret. Normal provider keys (OPENAI_API_KEY, ANTHROPIC_API_KEY,
-# HF_TOKEN, ...) are unaffected.
-_FORBIDDEN_ENV_SUBSTRINGS = ("SECRET", "PASSWORD", "PRIVATE", "PASSWD")
-_FORBIDDEN_ENV_PREFIXES = ("CRAWL4AI", "AWS_SECRET")
-_FORBIDDEN_ENV_EXACT = {"SECRET_KEY", "REDIS_PASSWORD", "TOKEN"}
-
-
-def _is_forbidden_env_name(name: str) -> bool:
-    if not name:
-        return True
-    u = name.upper()
-    if u in _FORBIDDEN_ENV_EXACT:
-        return True
-    if any(s in u for s in _FORBIDDEN_ENV_SUBSTRINGS):
-        return True
-    if any(u.startswith(p) for p in _FORBIDDEN_ENV_PREFIXES):
-        return True
-    return False
-
-
 class LLMConfig:
     def __init__(
         self,
@@ -2062,23 +2512,40 @@ class LLMConfig:
         backoff_base_delay: Optional[int] = None,
         backoff_max_attempts: Optional[int] = None,
         backoff_exponential_factor: Optional[int] = None,
+        provenance: "Provenance" = None,
     ):
         """Configuaration class for LLM provider and API token."""
+        if provenance is None:
+            provenance = Provenance.TRUSTED
+        # Defense in depth: untrusted callers can already not reach here (the
+        # type gate forbids constructing LLMConfig from a request body), but if
+        # they ever do, never resolve env vars or read provider keys from the
+        # environment - that is the credential-exfil gadget.
+        if provenance == Provenance.UNTRUSTED:
+            if api_token and api_token.startswith("env:"):
+                raise UntrustedConfigError(
+                    "LLMConfig.api_token may not reference an environment variable "
+                    "from an untrusted request"
+                )
+            self.provider = provider
+            self.api_token = api_token  # never os.getenv
+            self.base_url = base_url
+            self.temperature = temperature
+            self.max_tokens = max_tokens
+            self.top_p = top_p
+            self.frequency_penalty = frequency_penalty
+            self.presence_penalty = presence_penalty
+            self.stop = stop
+            self.n = n
+            self.backoff_base_delay = backoff_base_delay if backoff_base_delay is not None else 2
+            self.backoff_max_attempts = backoff_max_attempts if backoff_max_attempts is not None else 3
+            self.backoff_exponential_factor = backoff_exponential_factor if backoff_exponential_factor is not None else 2
+            return
         self.provider = provider
         if api_token and not api_token.startswith("env:"):
             self.api_token = api_token
         elif api_token and api_token.startswith("env:"):
-            # `env:NAME` resolves an environment variable. Refuse to read names
-            # that are clearly server secrets, so an untrusted config body cannot
-            # exfiltrate them via `env:SECRET_KEY` and a paired base_url. Normal
-            # provider keys (…_API_KEY / …_TOKEN) are unaffected.
-            _env_name = api_token[4:]
-            if _is_forbidden_env_name(_env_name):
-                raise ValueError(
-                    f"LLMConfig.api_token may not reference the protected "
-                    f"environment variable {_env_name!r}"
-                )
-            self.api_token = os.getenv(_env_name)
+            self.api_token = os.getenv(api_token[4:])
         else:
             # Check if given provider starts with any of key in PROVIDER_MODELS_PREFIXES
             # If not, check if it is in PROVIDER_MODELS

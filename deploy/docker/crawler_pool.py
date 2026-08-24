@@ -1,10 +1,16 @@
 # crawler_pool.py - Smart browser pool with tiered management
-import asyncio, json, hashlib, time
+import asyncio
+import hashlib
+import json
+import logging
+import time
+import uuid
 from contextlib import suppress
 from typing import Dict, Optional
+
+from utils import get_container_memory_percent, load_config
+
 from crawl4ai import AsyncWebCrawler, BrowserConfig
-from utils import load_config, get_container_memory_percent
-import logging
 
 logger = logging.getLogger(__name__)
 CONFIG = load_config()
@@ -58,6 +64,26 @@ def _is_default_config(sig: str) -> bool:
     return sig == DEFAULT_CONFIG_SIG
 
 
+def _active_requests(crawler: AsyncWebCrawler) -> int:
+    active = getattr(crawler, "active_requests", 0)
+    return active if isinstance(active, int) else 0
+
+
+def _set_active_requests(crawler: AsyncWebCrawler, active: int) -> None:
+    setattr(crawler, "active_requests", active)
+
+
+async def _close_even_if_cancelled(crawler: AsyncWebCrawler) -> None:
+    """Finish browser close before propagating caller cancellation."""
+    close_task = asyncio.create_task(crawler.close())
+    try:
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await close_task
+        raise
+
+
 async def _make_browser_capacity() -> None:
     """Evict one idle browser before admitting a new configuration."""
     browser_count = (1 if PERMANENT else 0) + len(HOT_POOL) + len(COLD_POOL)
@@ -75,10 +101,13 @@ async def _make_browser_capacity() -> None:
 
     _, idle_sig, idle_pool = min(idle_browser, key=lambda candidate: candidate[0])
     crawler = idle_pool.pop(idle_sig)
-    with suppress(Exception):
-        await crawler.close()
-    LAST_USED.pop(idle_sig, None)
-    USAGE_COUNT.pop(idle_sig, None)
+    try:
+        await _close_even_if_cancelled(crawler)
+    except Exception:
+        logger.warning("Idle browser cleanup failed during replacement", exc_info=True)
+    finally:
+        LAST_USED.pop(idle_sig, None)
+        USAGE_COUNT.pop(idle_sig, None)
     logger.info(f"🧹 Replaced idle browser at pool capacity (sig={idle_sig[:8]})")
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
@@ -91,6 +120,100 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         raise
 
 
+async def get_dedicated_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
+    """Create one request-owned crawler under the canonical pool admission.
+
+    Dedicated hook crawlers are never returned by ``get_crawler``. They are
+    temporarily registered in the existing cold-pool capacity registry under
+    an unreachable signature so every browser instance is counted while its
+    admission lease remains held from creation through disposal.
+    """
+    await ADMISSION_SEM.acquire()
+    crawler: Optional[AsyncWebCrawler] = None
+    try:
+        async with LOCK:
+            mem_pct = get_container_memory_percent()
+            if mem_pct >= MEM_LIMIT:
+                raise MemoryError(
+                    f"Memory at {mem_pct:.1f}%, refusing dedicated browser"
+                )
+            await _make_browser_capacity()
+            crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
+            try:
+                await crawler.start()
+            except BaseException:
+                try:
+                    await _close_even_if_cancelled(crawler)
+                except Exception:
+                    logger.warning(
+                        "Dedicated browser cleanup failed after start error",
+                        exc_info=True,
+                    )
+                raise
+
+            sig = f"dedicated:{uuid.uuid4().hex}"
+            setattr(crawler, "_docker_request_owned", True)
+            setattr(crawler, "_docker_pool_sig", sig)
+            _set_active_requests(crawler, 1)
+            COLD_POOL[sig] = crawler
+            LAST_USED[sig] = time.time()
+            USAGE_COUNT[sig] = 1
+            return crawler
+    except BaseException:
+        ADMISSION_SEM.release()
+        raise
+
+
+async def release_dedicated_crawler(crawler: AsyncWebCrawler) -> None:
+    """Close a request-owned crawler, then release its admission lease.
+
+    Cleanup runs in a shielded task so caller cancellation cannot leave a live
+    browser registered or leak the shared semaphore permit.
+    """
+    if getattr(crawler, "_docker_admission_released", False):
+        return
+
+    existing_cleanup = getattr(crawler, "_docker_release_task", None)
+    if isinstance(existing_cleanup, asyncio.Task):
+        try:
+            await asyncio.shield(existing_cleanup)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await existing_cleanup
+            raise
+        return
+
+    sig = getattr(crawler, "_docker_pool_sig", None)
+    if not isinstance(sig, str) or not sig.startswith("dedicated:"):
+        raise RuntimeError("Crawler does not own a dedicated admission lease")
+
+    async def close_and_unregister() -> None:
+        async with LOCK:
+            try:
+                await crawler.close()
+            finally:
+                if sig and COLD_POOL.get(sig) is crawler:
+                    COLD_POOL.pop(sig, None)
+                    LAST_USED.pop(sig, None)
+                    USAGE_COUNT.pop(sig, None)
+                _set_active_requests(crawler, 0)
+
+    cleanup_task = asyncio.create_task(close_and_unregister())
+    setattr(crawler, "_docker_release_task", cleanup_task)
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await cleanup_task
+        raise
+    finally:
+        setattr(crawler, "_docker_request_owned", False)
+        setattr(crawler, "_docker_pool_sig", None)
+        setattr(crawler, "_docker_release_task", None)
+        setattr(crawler, "_docker_admission_released", True)
+        ADMISSION_SEM.release()
+
+
 async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Resolve a crawler after request admission has bounded pool growth."""
     sig = _sig(cfg)
@@ -99,9 +222,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         if PERMANENT and _is_default_config(sig):
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
-            if not hasattr(PERMANENT, 'active_requests'):
-                PERMANENT.active_requests = 0
-            PERMANENT.active_requests += 1
+            _set_active_requests(PERMANENT, _active_requests(PERMANENT) + 1)
             logger.info("🔥 Using permanent browser")
             return PERMANENT
 
@@ -110,10 +231,9 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             crawler = HOT_POOL[sig]
-            if not hasattr(crawler, 'active_requests'):
-                crawler.active_requests = 0
-            crawler.active_requests += 1
-            logger.info(f"♨️  Using hot pool browser (sig={sig[:8]}, active={crawler.active_requests})")
+            active_requests = _active_requests(crawler) + 1
+            _set_active_requests(crawler, active_requests)
+            logger.info(f"♨️  Using hot pool browser (sig={sig[:8]}, active={active_requests})")
             return crawler
 
         # Check cold pool (promote to hot if used 3+ times)
@@ -121,9 +241,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             crawler = COLD_POOL[sig]
-            if not hasattr(crawler, 'active_requests'):
-                crawler.active_requests = 0
-            crawler.active_requests += 1
+            _set_active_requests(crawler, _active_requests(crawler) + 1)
 
             if USAGE_COUNT[sig] >= 3:
                 logger.info(f"⬆️  Promoting to hot pool (sig={sig[:8]}, count={USAGE_COUNT[sig]})")
@@ -133,7 +251,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                 try:
                     from monitor import get_monitor
                     await get_monitor().track_janitor_event("promote", sig, {"count": USAGE_COUNT[sig]})
-                except:
+                except Exception:
                     pass
 
                 return HOT_POOL[sig]
@@ -152,7 +270,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]}, mem={mem_pct:.1f}%)")
         crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
         await crawler.start()
-        crawler.active_requests = 1
+        _set_active_requests(crawler, 1)
         COLD_POOL[sig] = crawler
         LAST_USED[sig] = time.time()
         USAGE_COUNT[sig] = 1
@@ -167,8 +285,7 @@ async def release_crawler(crawler: AsyncWebCrawler):
     """
     try:
         async with LOCK:
-            if hasattr(crawler, 'active_requests'):
-                crawler.active_requests = max(0, crawler.active_requests - 1)
+            _set_active_requests(crawler, max(0, _active_requests(crawler) - 1))
     finally:
         ADMISSION_SEM.release()
 
@@ -234,7 +351,7 @@ async def janitor():
                     try:
                         from monitor import get_monitor
                         await get_monitor().track_janitor_event("close_cold", sig, {"idle_seconds": int(idle_time), "ttl": cold_ttl})
-                    except:
+                    except Exception:
                         pass
 
             # Clean hot pool (more conservative)
@@ -255,7 +372,7 @@ async def janitor():
                     try:
                         from monitor import get_monitor
                         await get_monitor().track_janitor_event("close_hot", sig, {"idle_seconds": int(idle_time), "ttl": hot_ttl})
-                    except:
+                    except Exception:
                         pass
 
             # Log pool stats

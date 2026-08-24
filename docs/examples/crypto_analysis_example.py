@@ -17,19 +17,21 @@ Key Features:
 """
 
 import asyncio
-import pandas as pd
-import numpy as np
 import re
+from typing import List
+
+import numpy as np
+import pandas as pd
 import plotly.express as px
+
 from crawl4ai import (
     AsyncWebCrawler,
     BrowserConfig,
-    CrawlerRunConfig,
     CacheMode,
+    CrawlerRunConfig,
+    CrawlResult,
     LXMLWebScrapingStrategy,
 )
-from crawl4ai import CrawlResult
-from typing import List
 
 __current_dir__ = __file__.rsplit("/", 1)[0]
 
@@ -56,7 +58,7 @@ class CryptoAlphaGenerator:
         df = df.copy()
         
         # Clean Price column (handle currency symbols)
-        df["Price"] = df["Price"].astype(str).str.replace("[^\d.]", "", regex=True).astype(float)
+        df["Price"] = df["Price"].astype(str).str.replace(r"[^\d.]", "", regex=True).astype(float)
         
         # Handle Market Cap and Volume, considering both Billions and Trillions
         def convert_large_numbers(value):

@@ -1,20 +1,27 @@
 # deploy/docker/mcp_bridge.py
 
 from __future__ import annotations
-import inspect, json, re, anyio
+
+import inspect
+import json
+import re
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any
+from urllib.parse import unquote, urlsplit
+
+import anyio
 import httpx
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from starlette.routing import Route, Mount
-from mcp.server.sse import SseServerTransport
-
 import mcp.types as t
-from mcp.server.lowlevel.server import Server, NotificationOptions
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from mcp.server.lowlevel.helper_types import ReadResourceContents
+from mcp.server.lowlevel.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
+from mcp.server.sse import SseServerTransport
+from pydantic import AnyUrl, BaseModel
+from starlette.routing import Mount, Route
+
 
 # ── opt‑in decorators ───────────────────────────────────────────
 def mcp_resource(name: str | None = None):
@@ -36,9 +43,37 @@ def mcp_tool(name: str | None = None):
     return deco
 
 # ── HTTP‑proxy helper for FastAPI endpoints ─────────────────────
-def _make_http_proxy(base_url: str, route, *, timeout: float | None = None):
-    method = list(route.methods - {"HEAD", "OPTIONS"})[0]
-    async def proxy(**kwargs):
+def _service_auth_headers() -> dict:
+    """Authenticate the internal loopback call to our own gated endpoints.
+
+    The MCP transport is now behind the AuthGateMiddleware, so by the time a
+    tool is invoked the MCP client is already authenticated. The loopback HTTP
+    call this proxy makes must therefore carry a credential too, or the gate
+    would 401 it. We mint a short-lived, data-scope service token: MCP exposes
+    only data-plane tools (no admin/monitor actions), so this grants no
+    privilege escalation. (Requires a shared SECRET_KEY across workers, which
+    the auth startup check already mandates for any real deployment.)
+    """
+    from auth import create_access_token
+    token = create_access_token({"sub": "mcp-service"}, scope="data")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _make_http_proxy(
+    base_url: str,
+    route: Route,
+    *,
+    timeout: float | None = None,
+    auth_headers_provider: Callable[[], dict] = _service_auth_headers,
+) -> Callable[..., Awaitable[Any]]:
+    methods = route.methods
+    if methods is None:
+        raise ValueError("MCP tools require an HTTP route with an explicit method")
+    method = next((candidate for candidate in methods if candidate not in {"HEAD", "OPTIONS"}), None)
+    if method is None:
+        raise ValueError("MCP tools require a method other than HEAD or OPTIONS")
+
+    async def proxy(**kwargs: Any) -> Any:
         # replace `/items/{id}` style params first
         path = route.path
         for k, v in list(kwargs.items()):
@@ -48,12 +83,13 @@ def _make_http_proxy(base_url: str, route, *, timeout: float | None = None):
                 kwargs.pop(k)
         url = base_url.rstrip("/") + path
 
+        headers = auth_headers_provider()
         async with httpx.AsyncClient(timeout=timeout) as client:
             try:
                 r = (
-                    await client.get(url, params=kwargs)
+                    await client.get(url, params=kwargs, headers=headers)
                     if method == "GET"
-                    else await client.request(method, url, json=kwargs)
+                    else await client.request(method, url, json=kwargs, headers=headers)
                 )
                 r.raise_for_status()
                 return r.text if method == "GET" else r.json()
@@ -72,38 +108,48 @@ def attach_mcp(
     name: str | None = None,
     base_url: str,              # eg. "http://127.0.0.1:8020"
     timeout: float | None = None,  # httpx timeout in seconds; None = no limit
+    auth_headers_provider: Callable[[], dict] = _service_auth_headers,
 ) -> None:
     """Call once after all routes are declared to expose WS+SSE MCP endpoints."""
     server_name = name or app.title or "FastAPI-MCP"
     mcp = Server(server_name)
 
     # tools: Dict[str, Callable] = {}
-    tools: Dict[str, Tuple[Callable, Callable]] = {}
-    resources: Dict[str, Callable] = {}
-    templates: Dict[str, Callable] = {}
+    tools: dict[str, tuple[Callable[..., Awaitable[Any]], Callable[..., Any]]] = {}
+    resources: dict[str, tuple[str, Callable[..., Any]]] = {}
+    templates: dict[str, tuple[Route, Callable[..., Any]]] = {}
 
     # register decorated FastAPI routes
     for route in app.routes:
-        fn = getattr(route, "endpoint", None)
+        if not isinstance(route, Route):
+            continue
+
+        fn = route.endpoint
         kind = getattr(fn, "__mcp_kind__", None)
         if not kind:
             continue
 
-        key = fn.__mcp_name__ or re.sub(r"[/{}}]", "_", route.path).strip("_")
+        configured_name = getattr(fn, "__mcp_name__", None)
+        key = configured_name if isinstance(configured_name, str) and configured_name else _route_name(route.path)
 
         # if kind == "tool":
         #     tools[key] = _make_http_proxy(base_url, route)
         if kind == "tool":
-            proxy = _make_http_proxy(base_url, route, timeout=timeout)
+            proxy = _make_http_proxy(
+                base_url,
+                route,
+                timeout=timeout,
+                auth_headers_provider=auth_headers_provider,
+            )
             tools[key] = (proxy, fn)
             continue
         if kind == "resource":
-            resources[key] = fn
+            resources[_mcp_uri(route.path)] = (key, fn)
         if kind == "template":
-            templates[key] = fn
+            templates[key] = (route, fn)
 
     # helpers for JSON‑Schema
-    def _schema(model: type[BaseModel] | None) -> dict:
+    def _schema(model: type[BaseModel] | None) -> dict[str, Any]:
         return {"type": "object"} if model is None else model.model_json_schema()
 
     def _body_model(fn: Callable) -> type[BaseModel] | None:
@@ -115,7 +161,7 @@ def attach_mcp(
 
     # MCP handlers
     @mcp.list_tools()
-    async def _list_tools() -> List[t.Tool]:
+    async def _list_tools() -> list[t.Tool]:
         out = []
         for k, (proxy, orig_fn) in tools.items():
             desc   = getattr(orig_fn, "__mcp_description__", None) or inspect.getdoc(orig_fn) or ""
@@ -127,7 +173,7 @@ def attach_mcp(
              
 
     @mcp.call_tool()
-    async def _call_tool(name: str, arguments: Dict | None) -> List[t.TextContent]:
+    async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[t.TextContent]:
         if name not in tools:
             raise HTTPException(404, "tool not found")
         
@@ -141,30 +187,42 @@ def attach_mcp(
         return [t.TextContent(type = "text", text=json.dumps(res, default=str, ensure_ascii=False))]
 
     @mcp.list_resources()
-    async def _list_resources() -> List[t.Resource]:
+    async def _list_resources() -> list[t.Resource]:
         return [
-            t.Resource(name=k, description=inspect.getdoc(f) or "", mime_type="application/json")
-            for k, f in resources.items()
+            t.Resource(
+                uri=uri,
+                name=name,
+                description=inspect.getdoc(fn) or "",
+                mimeType="application/json",
+            )
+            for uri, (name, fn) in resources.items()
         ]
 
     @mcp.read_resource()
-    async def _read_resource(name: str) -> List[t.TextContent]:
-        if name not in resources:
-            raise HTTPException(404, "resource not found")
-        res = resources[name]()
-        return [t.TextContent(type = "text", text=json.dumps(res, default=str, ensure_ascii=False))]
+    async def _read_resource(uri: AnyUrl) -> list[ReadResourceContents]:
+        resource = resources.get(str(uri))
+        if resource is not None:
+            _, handler = resource
+            result = await _invoke(handler)
+        else:
+            result = await _read_template(uri, templates)
+        return [
+            ReadResourceContents(
+                content=json.dumps(result, default=str, ensure_ascii=False),
+                mime_type="application/json",
+            )
+        ]
 
     @mcp.list_resource_templates()
-    async def _list_templates() -> List[t.ResourceTemplate]:
+    async def _list_templates() -> list[t.ResourceTemplate]:
         return [
             t.ResourceTemplate(
                 name=k,
+                uriTemplate=_mcp_uri(route.path),
                 description=inspect.getdoc(f) or "",
-                parameters={
-                    p: {"type": "string"} for p in _path_params(app, f)
-                },
+                mimeType="application/json",
             )
-            for k, f in templates.items()
+            for k, (route, f) in templates.items()
         ]
 
     init_opts = InitializationOptions(
@@ -183,8 +241,8 @@ def attach_mcp(
         c2s_send, c2s_recv = anyio.create_memory_object_stream(100)
         s2c_send, s2c_recv = anyio.create_memory_object_stream(100)
 
-        from pydantic import TypeAdapter
         from mcp.types import JSONRPCMessage
+        from pydantic import TypeAdapter
         adapter = TypeAdapter(JSONRPCMessage)
 
         init_done = anyio.Event()
@@ -239,9 +297,9 @@ def attach_mcp(
     @app.get(f"{base}/schema")
     async def _schema_endpoint():
         return JSONResponse({
-            "tools": [x.model_dump() for x in await _list_tools()],
-            "resources": [x.model_dump() for x in await _list_resources()],
-            "resource_templates": [x.model_dump() for x in await _list_templates()],
+            "tools": [x.model_dump(mode="json") for x in await _list_tools()],
+            "resources": [x.model_dump(mode="json") for x in await _list_resources()],
+            "resource_templates": [x.model_dump(mode="json") for x in await _list_templates()],
         })
 
 
@@ -249,8 +307,39 @@ def attach_mcp(
 def _route_name(path: str) -> str:
     return re.sub(r"[/{}}]", "_", path).strip("_")
 
-def _path_params(app: FastAPI, fn: Callable) -> List[str]:
-    for r in app.routes:
-        if r.endpoint is fn:
-            return list(r.param_convertors.keys())
-    return []
+
+def _mcp_uri(path: str) -> str:
+    """Map a FastAPI route path to the URI namespace used by this bridge."""
+    uri_path = re.sub(r"{([^}:]+):[^}]+}", r"{\1}", path)
+    return f"crawl4ai://resources{uri_path}"
+
+
+async def _invoke(handler: Callable[..., Any], **arguments: Any) -> Any:
+    result = handler(**arguments)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _read_template(
+    uri: AnyUrl,
+    templates: dict[str, tuple[Route, Callable[..., Any]]],
+) -> Any:
+    parsed = urlsplit(str(uri))
+    if parsed.scheme != "crawl4ai" or parsed.netloc != "resources":
+        raise HTTPException(404, "resource not found")
+
+    for route, handler in templates.values():
+        match = route.path_regex.fullmatch(unquote(parsed.path))
+        if match is None:
+            continue
+
+        arguments: dict[str, Any] = {}
+        for name, value in match.groupdict().items():
+            if value is None:
+                break
+            arguments[name] = route.param_convertors[name].convert(value)
+        else:
+            return await _invoke(handler, **arguments)
+
+    raise HTTPException(404, "resource not found")

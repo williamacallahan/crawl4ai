@@ -10,12 +10,14 @@ services:
       dockerfile: Dockerfile
     environment:
       - REDIS_HOST=redis
+      - CRAWL4AI_API_TOKEN_FROM_HOST=${CRAWL4AI_API_TOKEN:-}
+      - CRAWL4AI_JWT_ENABLED_FROM_HOST=${CRAWL4AI_JWT_ENABLED:-}
     shm_size: 1gb
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11235/health"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:11235/health"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -2,36 +2,42 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import time
-from abc import ABC, abstractmethod
-from typing import Callable, Dict, Any, List, Union
-from typing import Optional, AsyncGenerator, Final
-import os
-from playwright.async_api import Page, Error
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
+import contextlib
 import hashlib
+import os
 import random
+import time
 import uuid
-from .js_snippet import load_js_script
-from .models import AsyncCrawlResponse
-from .config import SCREENSHOT_HEIGHT_TRESHOLD
-from .async_configs import BrowserConfig, CrawlerRunConfig, HTTPCrawlerConfig
-from .async_logger import AsyncLogger
-from .ssl_certificate import SSLCertificate
-from .user_agent_generator import ValidUAGenerator, UAGen
-from .browser_manager import BrowserManager
-from .browser_adapter import BrowserAdapter, PlaywrightAdapter, UndetectedAdapter
+from abc import ABC, abstractmethod
+from functools import partial
+from io import BytesIO
+from types import MappingProxyType
+from typing import Any, AsyncGenerator, Callable, Dict, Final, List, Optional, Union
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
 import chardet
 from aiohttp.client import ClientTimeout
-from urllib.parse import urlparse
-from types import MappingProxyType
-import contextlib
-from functools import partial
+from PIL import Image, ImageDraw, ImageFont
+from playwright.async_api import Error, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from .async_configs import (
+    BrowserConfig,
+    CrawlerRunConfig,
+    HTTPCrawlerConfig,
+    VirtualScrollConfig,
+)
+from .async_logger import AsyncLogger
+from .browser_adapter import BrowserAdapter, PlaywrightAdapter, UndetectedAdapter
+from .browser_manager import BrowserManager
+from .config import SCREENSHOT_HEIGHT_TRESHOLD
+from .js_snippet import load_js_script
+from .models import AsyncCrawlResponse
+from .ssl_certificate import SSLCertificate
+from .user_agent_generator import UAGen, ValidUAGenerator
+
 
 class AsyncCrawlerStrategy(ABC):
     """
@@ -454,7 +460,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         config = config or CrawlerRunConfig.from_kwargs(kwargs)
         response_headers = {}
         status_code = 200  # Default for local/raw HTML
-        screenshot_data = None
 
         if url.startswith(("http://", "https://", "view-source:")):
             return await self._crawl_web(url, config)
@@ -652,8 +657,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             # body = await response.body()
                             # json_body = await response.json()
                             text_body = await response.text()
-                        except Exception as e:
-                            body = None
+                        except Exception:
+                            text_body = None
                             # json_body = None
                             # text_body = None
                         captured_requests.append({
@@ -1078,7 +1083,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         except Error as e:
                             print(f"Warning: Could not get content for selector '{selector}': {str(e)}")
 
-                    html = f"<div class='crawl4ai-result'>\n" + "\n".join(html_parts) + "\n</div>"
+                    html = "<div class='crawl4ai-result'>\n" + "\n".join(html_parts) + "\n</div>"
                 except Error as e:
                     raise RuntimeError(f"Failed to extract HTML content: {str(e)}")
             else:
@@ -1303,9 +1308,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             config: Virtual scroll configuration
         """
         try:
-            # Import VirtualScrollConfig to avoid circular import
-            from .async_configs import VirtualScrollConfig
-            
             # Ensure config is a VirtualScrollConfig instance
             if isinstance(config, dict):
                 config = VirtualScrollConfig.from_dict(config)
@@ -1474,7 +1476,11 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         """
         try:
             suggested_filename = download.suggested_filename
-            download_path = os.path.join(self.browser_config.downloads_path, suggested_filename)
+            download_path = _safe_download_filepath(self.browser_config.downloads_path, suggested_filename)
+            # Playwright's save_as performs the write itself (no O_NOFOLLOW
+            # hook), so reject a symlink planted at the target before writing.
+            if os.path.islink(download_path):
+                raise ValueError(f"Refusing to write download through symlink: {download_path}")
 
             self.logger.info(
                 message="Downloading {filename} to {path}",
@@ -2119,7 +2125,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             result = {"success": False, "error": str(e)}
 
                     # If we made it this far with no repeated error, do post-load waits
-                    t1 = time.time()
                     try:
                         await page.wait_for_load_state("domcontentloaded", timeout=5000)
                     except Error as e:
@@ -2226,11 +2231,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     )
 
                     # Wait for network idle after script execution
-                    t1 = time.time()
                     await page.wait_for_load_state("domcontentloaded", timeout=5000)
 
-
-                    t1 = time.time()
                     await page.wait_for_load_state("networkidle", timeout=5000)
 
                     results.append(result if result else {"success": True})
@@ -2412,6 +2414,42 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 ####################################################################################################
 # HTTP Crawler Strategy
 ####################################################################################################
+
+def _safe_download_filepath(downloads_path: str, filename: str) -> str:
+    """Resolve a download destination confined to ``downloads_path``.
+
+    The filename is derived from attacker-influenced input (a remote
+    Content-Disposition header, or the browser's suggested filename), so it is
+    reduced to a bare basename (dropping absolute paths and ``..`` traversal)
+    and the resolved path is re-checked to live inside the downloads root,
+    rejecting any pre-existing symlink that points outside. Raises ValueError
+    on any escape. The final write must still use ``_nofollow_opener`` (or an
+    equivalent ``O_NOFOLLOW`` / pre-write symlink check) to close the TOCTOU
+    window between this check and the open.
+    """
+    safe_name = os.path.basename(filename or "")
+    if not safe_name or safe_name in (".", ".."):
+        safe_name = f"download_{hashlib.md5((filename or '').encode()).hexdigest()[:10]}"
+    real_root = os.path.realpath(downloads_path)
+    real_path = os.path.realpath(os.path.join(real_root, safe_name))
+    if os.path.commonpath([real_root, real_path]) != real_root:
+        raise ValueError(f"Unsafe download filename rejected: {filename!r}")
+    return real_path
+
+
+def _nofollow_opener(path, flags):
+    """Opener for ``open``/``aiofiles.open`` that refuses to follow a symlink at
+    the final path component, closing the TOCTOU symlink-swap race after a path
+    has been confined by ``_safe_download_filepath``."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        # Windows does not expose O_NOFOLLOW. Keep the portable path usable,
+        # while rejecting an already-present link immediately before open.
+        if os.path.islink(path):
+            raise OSError(f"Refusing to open download through symlink: {path}")
+        return os.open(path, flags)
+    return os.open(path, flags | nofollow)
+
 
 class HTTPCrawlerError(Exception):
     """Base error class for HTTP crawler specific exceptions"""
@@ -2649,8 +2687,10 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
         config: CrawlerRunConfig
     ) -> AsyncCrawlResponse:
         async with self._session_context() as session:
+            # page_timeout is in ms (Playwright convention), but aiohttp expects seconds
+            timeout_sec = (config.page_timeout / 1000) if config.page_timeout else self.DEFAULT_TIMEOUT
             timeout = ClientTimeout(
-                total=config.page_timeout or self.DEFAULT_TIMEOUT,
+                total=timeout_sec,
                 connect=10,
                 sock_read=30
             )
@@ -2707,9 +2747,9 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
                         os.makedirs(downloads_path, exist_ok=True)
 
                         filename = self._extract_filename(content_disposition, url, content_type)
-                        filepath = os.path.join(downloads_path, filename)
+                        filepath = _safe_download_filepath(downloads_path, filename)
 
-                        async with aiofiles.open(filepath, 'wb') as f:
+                        async with aiofiles.open(filepath, 'wb', opener=_nofollow_opener) as f:
                             await f.write(raw_bytes)
 
                         downloaded_files = [filepath]
