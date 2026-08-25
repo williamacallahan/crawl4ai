@@ -27,6 +27,7 @@ from work_queue import (
 from crawl4ai import BrowserConfig, CrawlerRunConfig
 from crawl4ai.async_configs import (
     Provenance,
+    UNTRUSTED_FIELD_ALLOWLIST,
     UntrustedConfigError,
     to_serializable_dict,
 )
@@ -445,10 +446,21 @@ class CrawlJobQueue:
         owner: str,
     ) -> str:
         try:
-            canonical_browser = BrowserConfig.load(
+            loaded_browser = BrowserConfig.load(
                 browser_config,
                 provenance=Provenance.UNTRUSTED,
-            ).dump()
+            )
+            canonical_browser = {"type": "BrowserConfig", "params": {}}
+            request_browser_params = (
+                browser_config.get("params", {})
+                if browser_config.get("type") == "BrowserConfig"
+                else browser_config
+            )
+            for field in request_browser_params:
+                if field in UNTRUSTED_FIELD_ALLOWLIST["BrowserConfig"]:
+                    canonical_browser["params"][field] = to_serializable_dict(
+                        getattr(loaded_browser, field)
+                    )
             loaded_crawler = CrawlerRunConfig.load(
                 crawler_config,
                 provenance=Provenance.UNTRUSTED,
@@ -459,12 +471,11 @@ class CrawlJobQueue:
                 if crawler_config.get("type") == "CrawlerRunConfig"
                 else crawler_config
             )
-            if isinstance(request_params, dict):
-                for field in request_params:
-                    if hasattr(loaded_crawler, field):
-                        canonical_crawler["params"][field] = to_serializable_dict(
-                            getattr(loaded_crawler, field)
-                        )
+            for field in request_params:
+                if field in UNTRUSTED_FIELD_ALLOWLIST["CrawlerRunConfig"]:
+                    canonical_crawler["params"][field] = to_serializable_dict(
+                        getattr(loaded_crawler, field)
+                    )
         except (TypeError, UntrustedConfigError, ValueError) as error:
             raise CrawlJobPayloadRejected(f"Rejected crawl job configuration: {error}") from error
 

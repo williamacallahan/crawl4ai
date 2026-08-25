@@ -620,13 +620,23 @@ def test_untrusted_configs_are_rejected_before_any_redis_write(
     assert dict(redis.streams) == {}
 
 
-def test_enqueue_persists_canonical_untrusted_config_dumps():
+@pytest.mark.parametrize(
+    "browser_config",
+    [
+        {"headless": False, "__dict__": "ignored"},
+        {
+            "type": "BrowserConfig",
+            "params": {"headless": False, "__dict__": "ignored"},
+        },
+    ],
+)
+def test_enqueue_persists_canonical_untrusted_config_dumps(browser_config):
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
     task_id = asyncio.run(
         queue.enqueue(
             urls=["https://example.com"],
-            browser_config={"headless": False},
+            browser_config=browser_config,
             crawler_config={"css_selector": "main"},
             result_fields=None,
             webhook_config=None,
@@ -637,6 +647,7 @@ def test_enqueue_persists_canonical_untrusted_config_dumps():
     assert payload["protocol_version"] == 2
     assert payload["browser_config"]["type"] == "BrowserConfig"
     assert payload["browser_config"]["params"]["headless"] is False
+    assert set(payload["browser_config"]["params"]) == {"headless"}
     assert "extra_args" not in payload["browser_config"]["params"]
     assert payload["crawler_config"]["type"] == "CrawlerRunConfig"
     assert payload["crawler_config"]["params"]["css_selector"] == "main"
@@ -667,6 +678,7 @@ def test_enqueue_preserves_explicit_default_valued_crawler_fields(crawler_config
     )
 
     payload = json.loads(redis.hashes[queue.payload_key(task_id)]["payload"])
+    assert payload["browser_config"]["params"] == {}
     assert payload["crawler_config"]["params"]["delay_before_return_html"] == 0.1
 
 
