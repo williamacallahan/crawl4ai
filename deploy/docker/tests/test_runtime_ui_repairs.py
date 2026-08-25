@@ -709,6 +709,26 @@ def test_container_contracts_use_app_readiness_and_compose_v5_shape():
     assert "await asyncio.to_thread(resolve_artifact, artifact_id)" in server
 
 
+def test_ci_build_reclaims_repo_disk_before_and_after_native_build():
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "ci-deploy.yml").read_text()
+    )
+    build_script = next(
+        step["run"]
+        for step in workflow["jobs"]["build"]["steps"]
+        if step.get("name") == "Build and push ${{ matrix.arch }}"
+    )
+
+    assert "reclaim_build_disk()" in build_script
+    assert "trap reclaim_build_disk EXIT" in build_script
+    assert build_script.index("reclaim_build_disk\n") < build_script.index(
+        "docker build --provenance"
+    )
+    assert "docker system prune" not in build_script
+
+
 def test_coolify_keeps_external_durable_redis_without_client_only_password():
     import yaml
 

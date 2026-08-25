@@ -88,6 +88,18 @@ jobs:
           GIT_SHA: ${{ github.sha }}
           ARCH: ${{ matrix.arch }}
         run: |
+          reclaim_build_disk() {
+            docker images --filter=reference="${IMAGE}:*" --format '{{.Repository}}:{{.Tag}}' \
+              | xargs -r docker rmi || true
+            docker builder prune -f --filter until=72h || true
+            df -h /
+          }
+          trap reclaim_build_disk EXIT
+          # Long-lived runners can start a build with the prior run's image and
+          # cache still present. Reclaim this repo's old bytes before Chromium
+          # export needs the space; the EXIT trap performs the same cleanup after.
+          reclaim_build_disk
+
           # Read the version from the package instead of hardcoding it. A literal
           # here goes stale on every release bump and silently mislabels the image.
           C4AI_VER=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' crawl4ai/__version__.py)
@@ -114,25 +126,6 @@ jobs:
       - name: Drop registry credentials
         if: always()
         run: docker logout docker.iocloudhost.net || true
-
-      # Every run left a multi-GB Chromium image and its cache on the runner and
-      # nothing ever removed them, so haiku-18 eventually died mid-apt with
-      # "No space left on device". This is a separate step on purpose: the push
-      # loop above ends in `exit 0`, so anything appended to that script would
-      # never run on success.
-      - name: Reclaim build disk
-        if: always()
-        run: |
-          # Scoped to this repo's own tags. These runners share their Docker
-          # daemon with Coolify, so `docker system prune -a` would delete
-          # co-tenant images. Docker refuses to remove an image backing a
-          # running container, so an in-use tag fails harmlessly here.
-          docker images --filter=reference="${IMAGE}:*" --format '{{.Repository}}:{{.Tag}}' \
-            | xargs -r docker rmi || true
-          # Cache older than the window only. Pruning all of it would make every
-          # build reinstall Chromium cold.
-          docker builder prune -f --filter until=72h || true
-          df -h /
 
   merge:
     needs: build
