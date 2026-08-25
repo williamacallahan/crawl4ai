@@ -15,6 +15,7 @@ if DOCKER_DIR not in sys.path:
     sys.path.insert(0, DOCKER_DIR)
 
 import crawl_job_queue as crawl_job_queue_module  # noqa: E402
+import api  # noqa: E402
 from api import handle_crawl_job  # noqa: E402
 from crawl_job_queue import (  # noqa: E402
     CrawlJobLeaseLost,
@@ -925,6 +926,85 @@ def test_worker_completes_and_removes_stream_entry_atomically():
     assert redis.deleted == [(queue.settings.stream, entry.stream_id)]
     assert redis.expires == [(queue.task_key(task_id), 60)]
     assert webhook.called is True
+
+
+def test_default_worker_persists_projected_render_fields(monkeypatch):
+    redis = FakeRedis()
+    config = queue_config()
+    config.update(
+        {
+            "crawler": {
+                "base_config": {},
+                "pool": {"max_pages": 2},
+                "memory_threshold_percent": 95,
+                "recovery_threshold_percent": 80,
+                "rate_limiter": {"enabled": False, "base_delay": [0, 0]},
+                "browser": {"kwargs": {}},
+            },
+            "limits": {"wall_clock_s": 0},
+        }
+    )
+    queue = CrawlJobQueue(redis, config)
+    task_id = asyncio.run(
+        queue.enqueue(
+            urls=["https://example.com"],
+            browser_config={"type": "BrowserConfig", "params": {}},
+            crawler_config={"type": "CrawlerRunConfig", "params": {}},
+            result_fields=["success", "error_message", "html", "media"],
+            webhook_config=None,
+        )
+    )
+    entry = asyncio.run(queue.read_new("worker-a"))[0]
+
+    class FakeBrowserConfig:
+        @classmethod
+        def load(cls, _value, **_kwargs):
+            return cls()
+
+    class FakeCrawlerRunConfig:
+        deep_crawl_strategy = None
+        scraping_strategy = None
+
+        @classmethod
+        def load(cls, _value, **_kwargs):
+            return cls()
+
+    class FakeResult:
+        def model_dump(self):
+            return {
+                "success": True,
+                "error_message": "",
+                "html": "<main>Rendered body</main>",
+                "media": {"images": [{"src": "https://example.com/hero.png"}]},
+            }
+
+    class FakeCrawler:
+        async def arun(self, *_args, **_kwargs):
+            return FakeResult()
+
+    async def get_crawler(_config):
+        return FakeCrawler()
+
+    async def release_crawler(_crawler):
+        return None
+
+    import crawler_pool
+    import egress_broker
+
+    monkeypatch.setattr(api, "BrowserConfig", FakeBrowserConfig)
+    monkeypatch.setattr(api, "CrawlerRunConfig", FakeCrawlerRunConfig)
+    monkeypatch.setattr(
+        api, "_apply_server_browser_policy", lambda value, _config: value
+    )
+    monkeypatch.setattr(egress_broker, "enforce_egress", lambda _config: None)
+    monkeypatch.setattr(crawler_pool, "get_crawler", get_crawler)
+    monkeypatch.setattr(crawler_pool, "release_crawler", release_crawler)
+    worker = CrawlJobWorker(queue, config, "worker-a", webhook_service=NoopWebhook())
+    asyncio.run(worker.process(entry))
+
+    persisted = json.loads(redis.hashes[queue.task_key(task_id)]["result"])
+    assert persisted["results"][0]["html"] == "<main>Rendered body</main>"
+    assert persisted["results"][0]["media"]["images"][0]["src"].endswith("hero.png")
 
 
 def test_worker_retains_pending_entry_until_retry_budget_is_exhausted():
