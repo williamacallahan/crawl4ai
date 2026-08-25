@@ -14,7 +14,13 @@ from api import (
 from auth import get_principal
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, HttpUrl, field_validator
-from schemas import CRAWL_RESULT_FIELDS, CrawlRequest, CrawlResultField, WebhookConfig
+from schemas import (
+    CRAWL_RESULT_FIELDS,
+    CrawlRequest,
+    CrawlResultField,
+    WebhookConfig,
+    validate_crawl_result_fields,
+)
 
 # ------------- dependency placeholders -------------
 _redis: Any = None  # injected from server.py before the router serves requests
@@ -76,6 +82,11 @@ class CrawlJobPayload(BaseModel):
     def enforce_canonical_url_list_bounds(cls, urls):
         """Delegate list cardinality to the canonical synchronous crawl model."""
         return CrawlRequest.model_validate({"urls": urls}).urls
+
+    @field_validator("result_fields")
+    @classmethod
+    def require_status_result_fields(cls, result_fields):
+        return validate_crawl_result_fields(result_fields)
 
 
 # ---------- LL​M job ---------------------------------------------------------

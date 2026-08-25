@@ -90,6 +90,12 @@ def test_crawl_job_reuses_canonical_url_count_bounds():
             urls=[f"https://example.com/{index}" for index in range(101)]
         )
 
+    with pytest.raises(ValueError, match="must include 'success' and 'error_message'"):
+        job.CrawlJobPayload(
+            urls=["https://example.com"],
+            result_fields=["html"],
+        )
+
 
 def test_worker_terminalizes_deterministic_input_failure_without_retry():
     queue = SimpleNamespace(
