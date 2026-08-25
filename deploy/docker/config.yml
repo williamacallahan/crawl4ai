@@ -93,7 +93,8 @@ security:
 # Crawler Configuration
 crawler:
   base_config:
-    simulate_user: true
+    # Give JavaScript application shells time to hydrate before validation.
+    delay_before_return_html: 1.0
   memory_threshold_percent: 80.0
   recovery_threshold_percent: 65.0
   rate_limiter:

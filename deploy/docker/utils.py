@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
         },
     },
     "crawler": {
-        "base_config": {"simulate_user": True},
+        "base_config": {"delay_before_return_html": 1.0},
         "memory_threshold_percent": 95.0,
         "rate_limiter": {"enabled": True, "base_delay": [1.0, 2.0]},
         "timeouts": {"stream_init": 30.0, "batch_process": 300.0},

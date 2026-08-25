@@ -25,6 +25,7 @@ from api import (
     handle_llm_qa,
     handle_markdown_request,
     handle_stream_crawl_request,
+    server_crawler_config,
     stream_results,
 )
 from auth import (
@@ -677,7 +678,7 @@ async def generate_html(
     Use when you need sanitized HTML structures for building schemas or further processing.
     """
     await validate_url_scheme(body.url, allow_raw=True)
-    cfg = CrawlerRunConfig()
+    cfg = server_crawler_config(config)
     crawler = None
     try:
         crawler = await get_crawler(get_default_browser_config())
@@ -743,7 +744,12 @@ async def generate_screenshot(
     await validate_url_scheme(body.url)
     crawler = None
     try:
-        cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for, wait_for_images=body.wait_for_images)
+        cfg = server_crawler_config(
+            config,
+            screenshot=True,
+            screenshot_wait_for=body.screenshot_wait_for,
+            wait_for_images=body.wait_for_images,
+        )
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
@@ -782,7 +788,7 @@ async def generate_pdf(
     await validate_url_scheme(body.url)
     crawler = None
     try:
-        cfg = CrawlerRunConfig(pdf=True)
+        cfg = server_crawler_config(config, pdf=True)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
@@ -861,7 +867,7 @@ async def execute_js(
         raise HTTPException(400, str(exc)) from exc
     crawler = None
     try:
-        cfg = CrawlerRunConfig(js_code=body.scripts)
+        cfg = server_crawler_config(config, js_code=body.scripts)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:

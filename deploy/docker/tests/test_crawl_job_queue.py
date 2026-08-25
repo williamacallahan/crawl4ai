@@ -642,6 +642,34 @@ def test_enqueue_persists_canonical_untrusted_config_dumps():
     assert payload["crawler_config"]["params"]["css_selector"] == "main"
 
 
+@pytest.mark.parametrize(
+    "crawler_config",
+    [
+        {"delay_before_return_html": 0.1},
+        {
+            "type": "CrawlerRunConfig",
+            "params": {"delay_before_return_html": 0.1},
+        },
+    ],
+)
+def test_enqueue_preserves_explicit_default_valued_crawler_fields(crawler_config):
+    redis = FakeRedis()
+    queue = CrawlJobQueue(redis, queue_config())
+
+    task_id = asyncio.run(
+        queue.enqueue(
+            urls=["https://example.com"],
+            browser_config={},
+            crawler_config=crawler_config,
+            result_fields=None,
+            webhook_config=None,
+        )
+    )
+
+    payload = json.loads(redis.hashes[queue.payload_key(task_id)]["payload"])
+    assert payload["crawler_config"]["params"]["delay_before_return_html"] == 0.1
+
+
 def test_oversized_canonical_payload_is_rejected_before_any_redis_write():
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config(max_payload_bytes=512))

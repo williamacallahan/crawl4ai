@@ -25,7 +25,11 @@ from work_queue import (
 )
 
 from crawl4ai import BrowserConfig, CrawlerRunConfig
-from crawl4ai.async_configs import Provenance, UntrustedConfigError
+from crawl4ai.async_configs import (
+    Provenance,
+    UntrustedConfigError,
+    to_serializable_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -445,10 +449,22 @@ class CrawlJobQueue:
                 browser_config,
                 provenance=Provenance.UNTRUSTED,
             ).dump()
-            canonical_crawler = CrawlerRunConfig.load(
+            loaded_crawler = CrawlerRunConfig.load(
                 crawler_config,
                 provenance=Provenance.UNTRUSTED,
-            ).dump()
+            )
+            canonical_crawler = loaded_crawler.dump()
+            request_params = (
+                crawler_config.get("params", {})
+                if crawler_config.get("type") == "CrawlerRunConfig"
+                else crawler_config
+            )
+            if isinstance(request_params, dict):
+                for field in request_params:
+                    if hasattr(loaded_crawler, field):
+                        canonical_crawler["params"][field] = to_serializable_dict(
+                            getattr(loaded_crawler, field)
+                        )
         except (TypeError, UntrustedConfigError, ValueError) as error:
             raise CrawlJobPayloadRejected(f"Rejected crawl job configuration: {error}") from error
 

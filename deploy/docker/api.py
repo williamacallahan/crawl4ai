@@ -124,6 +124,27 @@ def _apply_server_browser_policy(browser_config, config):
     return browser_config
 
 
+def apply_server_crawler_defaults(loaded_config, request_config, config):
+    """Apply server defaults only when the wire request omitted the field."""
+    request_config = request_config or {}
+    request_params = (
+        request_config.get("params", {})
+        if request_config.get("type") == "CrawlerRunConfig"
+        else request_config
+    )
+    if not isinstance(request_params, dict):
+        request_params = {}
+    for key, value in config["crawler"]["base_config"].items():
+        if key not in request_params and hasattr(loaded_config, key):
+            setattr(loaded_config, key, value)
+    return loaded_config
+
+
+def server_crawler_config(config, **kwargs):
+    """Construct a server-owned crawler config with canonical defaults."""
+    return apply_server_crawler_defaults(CrawlerRunConfig(**kwargs), {}, config)
+
+
 def _project_crawl_result(result, result_fields):
     """Narrow a crawl result to the caller's requested fields.
 
@@ -189,7 +210,12 @@ async def handle_llm_qa(
         from egress_broker import enforce_egress
         enforce_egress(browser_cfg)
         crawler = await get_crawler(browser_cfg)
-        result = await _crawler_arun(crawler, url=url)
+        crawler_config = server_crawler_config(cfg)
+        result = await _crawler_arun(
+            crawler,
+            url=url,
+            config=crawler_config,
+        )
         if not result.success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -299,13 +325,15 @@ async def process_llm_extraction(
         from egress_broker import enforce_egress
         enforce_egress(worker_browser_cfg)
         async with AsyncWebCrawler(config=worker_browser_cfg) as crawler:
+            crawler_config = server_crawler_config(
+                _wcfg,
+                extraction_strategy=llm_strategy,
+                scraping_strategy=LXMLWebScrapingStrategy(),
+                cache_mode=cache_mode,
+            )
             result = await crawler.arun(
                 url=url,
-                config=CrawlerRunConfig(
-                    extraction_strategy=llm_strategy,
-                    scraping_strategy=LXMLWebScrapingStrategy(),
-                    cache_mode=cache_mode
-                )
+                config=crawler_config,
             )
 
         if not result.success:
@@ -424,14 +452,16 @@ async def handle_markdown_request(
         from egress_broker import enforce_egress
         enforce_egress(browser_cfg)
         crawler = await get_crawler(browser_cfg)
+        crawler_config = server_crawler_config(
+            _cfg,
+            markdown_generator=md_generator,
+            scraping_strategy=LXMLWebScrapingStrategy(),
+            cache_mode=cache_mode,
+        )
         result = await _crawler_arun(
             crawler,
             url=decoded_url,
-            config=CrawlerRunConfig(
-                markdown_generator=md_generator,
-                scraping_strategy=LXMLWebScrapingStrategy(),
-                cache_mode=cache_mode
-            )
+            config=crawler_config,
         )
 
         if not result.success:
@@ -813,27 +843,20 @@ async def handle_crawl_request(
         else:
             crawler = await get_crawler(loaded_browser_config)
         
-        base_config = config["crawler"]["base_config"]
-
         # Build the config(s) to pass to arun/arun_many
         if crawler_configs and len(urls) > 1:
             # Per-URL config list: deserialize each and apply base_config
             config_list = [CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED) for cc in crawler_configs]
-            for cfg in config_list:
-                for key, value in base_config.items():
-                    if hasattr(cfg, key):
-                        current_value = getattr(cfg, key)
-                        if current_value is None or current_value == "":
-                            setattr(cfg, key, value)
+            for cfg, request_config in zip(config_list, crawler_configs):
+                apply_server_crawler_defaults(cfg, request_config, config)
             effective_config = config_list
         else:
             # Single config (original behavior)
-            for key, value in base_config.items():
-                if hasattr(loaded_crawler_config, key):
-                    current_value = getattr(loaded_crawler_config, key)
-                    if current_value is None or current_value == "":
-                        setattr(loaded_crawler_config, key, value)
-            effective_config = loaded_crawler_config
+            effective_config = apply_server_crawler_defaults(
+                loaded_crawler_config,
+                crawler_config,
+                config,
+            )
 
         results = []
         func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
@@ -1008,6 +1031,11 @@ async def handle_stream_crawl_request(
         loaded_crawler_config = CrawlerRunConfig.load(
             crawler_config,
             provenance=Provenance.UNTRUSTED,
+        )
+        apply_server_crawler_defaults(
+            loaded_crawler_config,
+            crawler_config,
+            config,
         )
         from governor import clamp_deep_crawl
         clamp_deep_crawl(loaded_crawler_config)

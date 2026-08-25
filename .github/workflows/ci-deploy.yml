@@ -50,6 +50,7 @@ jobs:
             deploy/docker/tests/test_crawl_job_contract.py \
             deploy/docker/tests/test_rollout_verifier.py \
             deploy/docker/tests/test_runtime_ui_repairs.py \
+            deploy/docker/tests/test_server_crawler_defaults.py \
             deploy/docker/tests/test_resource_policy.py \
             tests/test_memory_cgroup.py
 
