@@ -112,14 +112,8 @@ jobs:
             --build-arg INSTALL_TYPE=default \
             --build-arg ENABLE_GPU=false \
             -t "${IMAGE}:${GIT_SHA}-${ARCH}" .
-          # Nexus 504s on the ~1GB Chromium layer often enough to matter, mostly
-          # from the arm64 node. Already-uploaded layers are skipped on retry.
-          for attempt in 1 2 3; do
-            if docker push "${IMAGE}:${GIT_SHA}-${ARCH}"; then exit 0; fi
-            echo "push attempt ${attempt} failed; retrying"
-            sleep 20
-          done
-          echo "push failed after 3 attempts"; exit 1
+          # Docker owns layer-transfer retries; surface its terminal failure.
+          docker push "${IMAGE}:${GIT_SHA}-${ARCH}"
 
       # The runners are long-lived and shared; without this the Nexus credential
       # stays in ~/.docker/config.json for whatever job lands here next.

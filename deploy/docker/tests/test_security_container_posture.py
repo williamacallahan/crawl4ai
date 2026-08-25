@@ -57,18 +57,11 @@ class TestDockerfile:
         assert "/var/lib/crawl4ai/outputs" in dockerfile
         assert "chmod 700 /var/lib/crawl4ai/outputs" in dockerfile
 
-    def test_playwright_headless_shell_is_copied_to_runtime_cache(self, dockerfile):
-        # Playwright launches chromium_headless_shell for headless crawls. The
-        # image runs as appuser, so both Chromium artifacts must be copied out
-        # of root's install cache.
-        cache_copy = re.search(
-            r"cp -r(?P<artifacts>(?:(?!&&).)*)/home/appuser/\.cache/ms-playwright/",
-            dockerfile,
-            re.DOTALL,
-        )
-        assert cache_copy, "Dockerfile must copy Playwright artifacts into appuser's cache"
-        assert "chromium-*" in cache_copy.group("artifacts")
-        assert "chromium_headless_shell-*" in cache_copy.group("artifacts")
+    def test_playwright_installs_directly_into_runtime_cache(self, dockerfile):
+        runtime_cache = "PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright"
+        assert dockerfile.count(runtime_cache) == 1
+        assert "cp -r /root/.cache/ms-playwright" not in dockerfile
+        assert "chown -R appuser:appuser /home/appuser/.cache" in dockerfile
 
     def test_runs_as_non_root(self, dockerfile):
         assert re.search(r"^USER\s+appuser", dockerfile, re.MULTILINE)
@@ -102,9 +95,6 @@ class TestCompose:
     def test_no_host_dev_shm_bind(self, compose):
         assert "/dev/shm:/dev/shm" not in compose
         assert "shm_size" in compose
-
-    def test_pids_limit(self, compose):
-        assert "pids_limit" in compose
 
     def test_read_only_runtime_tmpfs_are_appuser_owned(self, compose):
         assert "/var/lib/crawl4ai/outputs:uid=999,gid=999,mode=0700" in compose

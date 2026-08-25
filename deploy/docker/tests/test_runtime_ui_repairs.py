@@ -728,6 +728,8 @@ def test_ci_build_reclaims_repo_disk_before_and_after_native_build():
     )
     assert "docker builder prune -af --filter until=10m" in build_script
     assert "docker system prune" not in build_script
+    assert build_script.count('docker push "${IMAGE}:${GIT_SHA}-${ARCH}"') == 1
+    assert "for attempt in" not in build_script
 
 
 def test_coolify_keeps_external_durable_redis_without_client_only_password():

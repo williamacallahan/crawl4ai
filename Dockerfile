@@ -26,6 +26,7 @@ ENV PYTHONFAULTHANDLER=1 \
     DEBIAN_FRONTEND=noninteractive \
     REDIS_HOST=localhost \
     REDIS_PORT=6379 \
+    PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright \
     UV_PROJECT_ENVIRONMENT=/usr/local \
     UV_LINK_MODE=copy
 
@@ -151,27 +152,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN python -c "import crawl4ai, fastapi, gunicorn, mcp, redis, websockets"
 
-RUN crawl4ai-setup
-
-RUN python -c "from patchright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=['--no-sandbox']); b.close(); p.stop()"
+RUN mkdir -p /home/appuser/.cache/ms-playwright \
+    && crawl4ai-setup \
+    && python -c "from patchright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=['--no-sandbox']); b.close(); p.stop()" \
+    && crawl4ai-doctor \
+    && chown -R appuser:appuser /home/appuser/.cache
 
 WORKDIR ${APP_HOME}
 
 # Copy supervisor config first (might need root later, but okay for now)
 COPY deploy/docker/supervisord.conf .
-
-RUN mkdir -p /home/appuser/.cache/ms-playwright \
-    && cp -r /root/.cache/ms-playwright/chromium-* \
-        /root/.cache/ms-playwright/chromium_headless_shell-* \
-        /home/appuser/.cache/ms-playwright/ \
-    && chown -R appuser:appuser /home/appuser/.cache/ms-playwright
-
-RUN crawl4ai-doctor
-
-# Ensure all cache directories belong to appuser
-# This fixes permission issues with .cache/url_seeder and other runtime cache dirs
-RUN mkdir -p /home/appuser/.cache \
-    && chown -R appuser:appuser /home/appuser/.cache
 
 # Copy application code
 COPY deploy/docker/* ${APP_HOME}/
