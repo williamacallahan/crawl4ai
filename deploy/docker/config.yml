@@ -112,6 +112,10 @@ crawler:
       text_mode: true
       memory_saving_mode: true
       max_pages_before_recycle: 500
+      # Current macOS Chrome in UA-reduced form: real Chrome freezes the minor
+      # version (major.0.0.0) and the macOS platform token. The SDK default is
+      # Chrome/116 (2023), which age-based WAF rules flag.
+      user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
     extra_args:
       # - "--single-process"
       # SECURITY: --no-sandbox disables the Chromium renderer sandbox (a renderer
