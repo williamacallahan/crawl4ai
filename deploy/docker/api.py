@@ -74,7 +74,9 @@ async def _enqueue_job(background_tasks, factory, principal=None):
     try:
         await queue.submit(factory, principal)
     except QuotaExceeded:
-        raise HTTPException(status_code=429, detail="Too many concurrent jobs for this caller")
+        raise HTTPException(
+            status_code=429, detail="Too many concurrent jobs for this caller"
+        )
     except QueueFull:
         raise HTTPException(
             status_code=503,
@@ -135,6 +137,7 @@ def _project_crawl_result(result, result_fields):
         return result
     return {field: result[field] for field in result_fields if field in result}
 
+
 # --- Helper to get memory ---
 def _get_memory_mb():
     try:
@@ -169,31 +172,36 @@ async def handle_llm_qa(
 ) -> str:
     """Process QA using LLM with crawled content as context."""
     from crawler_pool import get_crawler, release_crawler
+
     crawler: Optional[AsyncWebCrawler] = None
     try:
-        if not url.startswith(('http://', 'https://')) and not url.startswith(("raw:", "raw://")):
-            url = 'https://' + url
+        if not url.startswith(("http://", "https://")) and not url.startswith(
+            ("raw:", "raw://")
+        ):
+            url = "https://" + url
         await asyncio.to_thread(validate_url_destination, url)
         # Extract base URL by finding last '?q=' occurrence
-        last_q_index = url.rfind('?q=')
+        last_q_index = url.rfind("?q=")
         if last_q_index != -1:
             url = url[:last_q_index]
 
         # Get markdown content (use default config)
         from utils import load_config
+
         cfg = load_config()
         browser_cfg = BrowserConfig(
             extra_args=get_browser_extra_args(cfg),
             **cfg["crawler"]["browser"].get("kwargs", {}),
         )
         from egress_broker import enforce_egress
+
         enforce_egress(browser_cfg)
         crawler = await get_crawler(browser_cfg)
         result = await _crawler_arun(crawler, url=url)
         if not result.success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.error_message
+                detail=result.error_message,
             )
         content = result.markdown.fit_markdown or result.markdown.raw_markdown
 
@@ -209,6 +217,7 @@ async def handle_llm_qa(
         # Provider by name only; base_url/api_token are server-derived. A
         # request-supplied base_url is ignored (it was the key-exfil vector).
         from llm_broker import resolve_llm
+
         llm = resolve_llm(config, provider)
         response = perform_completion_with_backoff(
             provider=llm["provider"],
@@ -218,7 +227,7 @@ async def handle_llm_qa(
             base_url=llm["base_url"],
             base_delay=config["llm"].get("backoff_base_delay", 2),
             max_attempts=config["llm"].get("backoff_max_attempts", 3),
-            exponential_factor=config["llm"].get("backoff_exponential_factor", 2)
+            exponential_factor=config["llm"].get("backoff_exponential_factor", 2),
         )
 
         return response.choices[0].message.content
@@ -227,12 +236,12 @@ async def handle_llm_qa(
     except Exception as e:
         logger.error(f"QA processing error: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
     finally:
         if crawler:
             await release_crawler(crawler)
+
 
 async def process_llm_extraction(
     redis: aioredis.Redis,
@@ -245,7 +254,7 @@ async def process_llm_extraction(
     provider: Optional[str] = None,
     webhook_config: Optional[Dict] = None,
     temperature: Optional[float] = None,
-    base_url: Optional[str] = None
+    base_url: Optional[str] = None,
 ) -> None:
     """Process LLM extraction in background."""
     # Initialize webhook service
@@ -255,10 +264,12 @@ async def process_llm_extraction(
         # Validate provider
         is_valid, error_msg = validate_llm_provider(config, provider)
         if not is_valid:
-            await hset_with_ttl(redis, f"task:{task_id}", {
-                "status": TaskStatus.FAILED,
-                "error": error_msg
-            }, config)
+            await hset_with_ttl(
+                redis,
+                f"task:{task_id}",
+                {"status": TaskStatus.FAILED, "error": error_msg},
+                config,
+            )
 
             # Send webhook notification on failure
             await webhook_service.notify_job_completion(
@@ -267,11 +278,12 @@ async def process_llm_extraction(
                 status="failed",
                 urls=[url],
                 webhook_config=webhook_config,
-                error=error_msg
+                error=error_msg,
             )
             return
         # Provider by name only; base_url/api_token server-derived (no exfil).
         from llm_broker import resolve_llm
+
         _llm = resolve_llm(config, provider)
         llm_strategy = LLMExtractionStrategy(
             llm_config=LLMConfig(
@@ -291,12 +303,14 @@ async def process_llm_extraction(
         # be rebound/redirected to an internal target.
         await asyncio.to_thread(validate_url_destination, url)
         from utils import load_config as _load_config
+
         _wcfg = await asyncio.to_thread(_load_config)
         worker_browser_cfg = BrowserConfig(
             extra_args=get_browser_extra_args(_wcfg),
             **_wcfg["crawler"]["browser"].get("kwargs", {}),
         )
         from egress_broker import enforce_egress
+
         enforce_egress(worker_browser_cfg)
         async with AsyncWebCrawler(config=worker_browser_cfg) as crawler:
             result = await crawler.arun(
@@ -304,15 +318,17 @@ async def process_llm_extraction(
                 config=CrawlerRunConfig(
                     extraction_strategy=llm_strategy,
                     scraping_strategy=LXMLWebScrapingStrategy(),
-                    cache_mode=cache_mode
-                )
+                    cache_mode=cache_mode,
+                ),
             )
 
         if not result.success:
-            await hset_with_ttl(redis, f"task:{task_id}", {
-                "status": TaskStatus.FAILED,
-                "error": result.error_message
-            }, config)
+            await hset_with_ttl(
+                redis,
+                f"task:{task_id}",
+                {"status": TaskStatus.FAILED, "error": result.error_message},
+                config,
+            )
 
             # Send webhook notification on failure
             await webhook_service.notify_job_completion(
@@ -321,7 +337,7 @@ async def process_llm_extraction(
                 status="failed",
                 urls=[url],
                 webhook_config=webhook_config,
-                error=result.error_message
+                error=result.error_message,
             )
             return
 
@@ -332,10 +348,12 @@ async def process_llm_extraction(
 
         result_data = {"extracted_content": content}
 
-        await hset_with_ttl(redis, f"task:{task_id}", {
-            "status": TaskStatus.COMPLETED,
-            "result": json.dumps(content)
-        }, config)
+        await hset_with_ttl(
+            redis,
+            f"task:{task_id}",
+            {"status": TaskStatus.COMPLETED, "result": json.dumps(content)},
+            config,
+        )
 
         # Send webhook notification on successful completion
         await webhook_service.notify_job_completion(
@@ -344,15 +362,17 @@ async def process_llm_extraction(
             status="completed",
             urls=[url],
             webhook_config=webhook_config,
-            result=result_data
+            result=result_data,
         )
 
     except Exception as e:
         logger.error(f"LLM extraction error: {str(e)}", exc_info=True)
-        await hset_with_ttl(redis, f"task:{task_id}", {
-            "status": TaskStatus.FAILED,
-            "error": str(e)
-        }, config)
+        await hset_with_ttl(
+            redis,
+            f"task:{task_id}",
+            {"status": TaskStatus.FAILED, "error": str(e)},
+            config,
+        )
 
         # Send webhook notification on failure
         await webhook_service.notify_job_completion(
@@ -361,8 +381,9 @@ async def process_llm_extraction(
             status="failed",
             urls=[url],
             webhook_config=webhook_config,
-            error=str(e)
+            error=str(e),
         )
+
 
 async def handle_markdown_request(
     url: str,
@@ -372,7 +393,7 @@ async def handle_markdown_request(
     config: Optional[dict] = None,
     provider: Optional[str] = None,
     temperature: Optional[float] = None,
-    base_url: Optional[str] = None
+    base_url: Optional[str] = None,
 ) -> str:
     """Handle markdown generation requests."""
     config = config or {}
@@ -383,12 +404,13 @@ async def handle_markdown_request(
             is_valid, error_msg = validate_llm_provider(config, provider)
             if not is_valid:
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=error_msg
+                    status_code=status.HTTP_400_BAD_REQUEST, detail=error_msg
                 )
         decoded_url = unquote(url)
-        if not decoded_url.startswith(('http://', 'https://')) and not decoded_url.startswith(("raw:", "raw://")):
-            decoded_url = 'https://' + decoded_url
+        if not decoded_url.startswith(
+            ("http://", "https://")
+        ) and not decoded_url.startswith(("raw:", "raw://")):
+            decoded_url = "https://" + decoded_url
         await asyncio.to_thread(validate_url_destination, decoded_url)
 
         if filter_type == FilterType.RAW:
@@ -396,6 +418,7 @@ async def handle_markdown_request(
         else:
             # Provider by name only; base_url/api_token are server-derived.
             from llm_broker import resolve_llm
+
             _llm = resolve_llm(config, provider)
             content_filter = {
                 FilterType.FIT: PruningContentFilter(),
@@ -407,8 +430,8 @@ async def handle_markdown_request(
                         temperature=temperature or _llm["temperature"],
                         base_url=_llm["base_url"],
                     ),
-                    instruction=query or "Extract main content"
-                )
+                    instruction=query or "Extract main content",
+                ),
             }[filter_type]
             md_generator = DefaultMarkdownGenerator(content_filter=content_filter)
 
@@ -416,12 +439,14 @@ async def handle_markdown_request(
 
         from crawler_pool import get_crawler, release_crawler
         from utils import load_config as _load_config
+
         _cfg = _load_config()
         browser_cfg = BrowserConfig(
             extra_args=get_browser_extra_args(_cfg),
             **_cfg["crawler"]["browser"].get("kwargs", {}),
         )
         from egress_broker import enforce_egress
+
         enforce_egress(browser_cfg)
         crawler = await get_crawler(browser_cfg)
         result = await _crawler_arun(
@@ -430,19 +455,21 @@ async def handle_markdown_request(
             config=CrawlerRunConfig(
                 markdown_generator=md_generator,
                 scraping_strategy=LXMLWebScrapingStrategy(),
-                cache_mode=cache_mode
-            )
+                cache_mode=cache_mode,
+            ),
         )
 
         if not result.success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.error_message
+                detail=result.error_message,
             )
 
-        return (result.markdown.raw_markdown
-               if filter_type == FilterType.RAW
-               else result.markdown.fit_markdown)
+        return (
+            result.markdown.raw_markdown
+            if filter_type == FilterType.RAW
+            else result.markdown.fit_markdown
+        )
 
     except HTTPException:
         raise
@@ -451,12 +478,12 @@ async def handle_markdown_request(
     except Exception as e:
         logger.error(f"Markdown error: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
     finally:
         if crawler:
             await release_crawler(crawler)
+
 
 async def handle_llm_request(
     redis: aioredis.Redis,
@@ -481,20 +508,25 @@ async def handle_llm_request(
     try:
         if is_task_id(input_path):
             return await handle_task_status(
-                redis, input_path, base_url,
-                requester=requester, is_admin=is_admin,
+                redis,
+                input_path,
+                base_url,
+                requester=requester,
+                is_admin=is_admin,
             )
 
         if not query:
-            return JSONResponse({
-                "message": "Please provide an instruction",
-                "_links": {
-                    "example": {
-                        "href": f"{base_url}/llm/{input_path}?q=Extract+main+content",
-                        "title": "Try this example"
-                    }
+            return JSONResponse(
+                {
+                    "message": "Please provide an instruction",
+                    "_links": {
+                        "example": {
+                            "href": f"{base_url}/llm/{input_path}?q=Extract+main+content",
+                            "title": "Try this example",
+                        }
+                    },
                 }
-            })
+            )
 
         return await create_new_task(
             redis,
@@ -518,6 +550,7 @@ async def handle_llm_request(
         logger.exception("LLM endpoint failed")
         raise
 
+
 async def handle_task_status(
     redis: aioredis.Redis,
     task_id: str,
@@ -536,8 +569,7 @@ async def handle_task_status(
     task = await redis.hgetall(f"task:{task_id}")
     if not task:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
         )
 
     task = decode_redis_hash(cast(Dict[bytes, bytes], task))
@@ -546,8 +578,7 @@ async def handle_task_status(
     if owner and not is_admin and owner != requester:
         # Do not leak existence of someone else's task.
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
         )
 
     response = create_task_response(task, task_id, base_url)
@@ -557,6 +588,7 @@ async def handle_task_status(
             await redis.delete(f"task:{task_id}")
 
     return JSONResponse(response)
+
 
 async def create_new_task(
     redis: aioredis.Redis,
@@ -575,17 +607,20 @@ async def create_new_task(
 ) -> JSONResponse:
     """Create and initialize a new task."""
     decoded_url = unquote(input_path)
-    if not decoded_url.startswith(('http://', 'https://')) and not decoded_url.startswith(("raw:", "raw://")):
-        decoded_url = 'https://' + decoded_url
+    if not decoded_url.startswith(
+        ("http://", "https://")
+    ) and not decoded_url.startswith(("raw:", "raw://")):
+        decoded_url = "https://" + decoded_url
     await asyncio.to_thread(validate_url_destination, decoded_url)
 
     from datetime import datetime
+
     task_id = f"llm_{int(datetime.now().timestamp())}_{id(background_tasks)}"
 
     task_data = {
         "status": TaskStatus.PROCESSING,
         "created_at": datetime.now().isoformat(),
-        "url": decoded_url
+        "url": decoded_url,
     }
     if owner:
         task_data["owner"] = owner
@@ -600,8 +635,17 @@ async def create_new_task(
         await _enqueue_job(
             background_tasks,
             lambda: process_llm_extraction(
-                redis, config, task_id, decoded_url, query, schema, cache,
-                provider, webhook_config, temperature, api_base_url,
+                redis,
+                config,
+                task_id,
+                decoded_url,
+                query,
+                schema,
+                cache,
+                provider,
+                webhook_config,
+                temperature,
+                api_base_url,
             ),
             principal=owner,
         )
@@ -610,15 +654,18 @@ async def create_new_task(
         await redis.delete(f"task:{task_id}")
         raise
 
-    return JSONResponse({
-        "task_id": task_id,
-        "status": TaskStatus.PROCESSING,
-        "url": decoded_url,
-        "_links": {
-            "self": {"href": f"{base_url}/llm/{task_id}"},
-            "status": {"href": f"{base_url}/llm/{task_id}"}
+    return JSONResponse(
+        {
+            "task_id": task_id,
+            "status": TaskStatus.PROCESSING,
+            "url": decoded_url,
+            "_links": {
+                "self": {"href": f"{base_url}/llm/{task_id}"},
+                "status": {"href": f"{base_url}/llm/{task_id}"},
+            },
         }
-    })
+    )
+
 
 def create_task_response(task: dict, task_id: str, base_url: str) -> dict:
     """Create response for task status check."""
@@ -629,8 +676,8 @@ def create_task_response(task: dict, task_id: str, base_url: str) -> dict:
         "url": task["url"],
         "_links": {
             "self": {"href": f"{base_url}/llm/{task_id}"},
-            "refresh": {"href": f"{base_url}/llm/{task_id}"}
-        }
+            "refresh": {"href": f"{base_url}/llm/{task_id}"},
+        },
     }
 
     if task["status"] == TaskStatus.COMPLETED:
@@ -703,39 +750,57 @@ async def _await_before_deadline(awaitable, deadline_at: Optional[float]):
     return await asyncio.wait_for(awaitable, timeout=remaining)
 
 
-async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) -> AsyncGenerator[bytes, None]:
+async def stream_results(
+    crawler: AsyncWebCrawler,
+    results_gen: AsyncGenerator,
+    result_fields: Optional[List[str]] = None,
+) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers."""
     import json
 
     from utils import datetime_handler
+
     try:
         async for result in results_gen:
             try:
                 server_memory_mb = _get_memory_mb()
                 result_dict = result.model_dump()
-                result_dict['server_memory_mb'] = server_memory_mb
+                if result_fields:
+                    result_dict = _project_crawl_result(result_dict, result_fields)
+                result_dict["server_memory_mb"] = server_memory_mb
                 # Ensure fit_html is JSON-serializable
-                if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
+                if "fit_html" in result_dict and not (
+                    result_dict["fit_html"] is None
+                    or isinstance(result_dict["fit_html"], str)
+                ):
                     result_dict["fit_html"] = None
                 # If PDF exists, encode it to base64
-                if result_dict.get('pdf') is not None:
-                    result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
+                if result_dict.get("pdf") is not None:
+                    result_dict["pdf"] = b64encode(result_dict["pdf"]).decode("utf-8")
                 logger.info(f"Streaming result for {result_dict.get('url', 'unknown')}")
                 data = json.dumps(result_dict, default=datetime_handler) + "\n"
-                yield data.encode('utf-8')
+                yield data.encode("utf-8")
             except Exception as e:
                 logger.error(f"Serialization error: {e}")
-                error_response = {"error": str(e), "url": getattr(result, 'url', 'unknown')}
-                yield (json.dumps(error_response) + "\n").encode('utf-8')
+                error_response = {
+                    "error": str(e),
+                    "url": getattr(result, "url", "unknown"),
+                }
+                yield (json.dumps(error_response) + "\n").encode("utf-8")
 
-        yield json.dumps({"status": "completed"}).encode('utf-8')
-        
+        yield json.dumps({"status": "completed"}).encode("utf-8")
+
     except asyncio.TimeoutError:
         logger.warning("Streaming crawl exceeded its wall-clock deadline")
-        yield (json.dumps({
-            "status": "failed",
-            "error": "Crawl exceeded the time limit",
-        }) + "\n").encode("utf-8")
+        yield (
+            json.dumps(
+                {
+                    "status": "failed",
+                    "error": "Crawl exceeded the time limit",
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
     except asyncio.CancelledError:
         logger.warning("Client disconnected during streaming")
     finally:
@@ -746,7 +811,13 @@ async def _normalize_and_validate_seeds(urls: List[str]) -> List[str]:
     """Prefix bare hosts with https:// and SSRF-validate every seed URL's
     destination. Shared by the streaming and non-streaming crawl handlers so a
     new entry point cannot silently skip the destination check."""
-    urls = [('https://' + url) if not url.startswith(('http://', 'https://')) and not url.startswith(("raw:", "raw://")) else url for url in urls]
+    urls = [
+        ("https://" + url)
+        if not url.startswith(("http://", "https://"))
+        and not url.startswith(("raw:", "raw://"))
+        else url
+        for url in urls
+    ]
     for url in urls:
         await asyncio.to_thread(validate_url_destination, url)
     return urls
@@ -767,13 +838,14 @@ async def handle_crawl_request(
     crawler: Optional[AsyncWebCrawler] = None
     try:
         from monitor import get_monitor
+
         await get_monitor().track_request_start(
             request_id, "/crawl", urls[0] if urls else "batch", browser_config
         )
     except Exception:
         pass  # Monitor not critical
 
-    start_mem_mb = _get_memory_mb() # <--- Get memory before
+    start_mem_mb = _get_memory_mb()  # <--- Get memory before
     start_time = time.time()
     mem_delta_mb = None
     peak_mem_mb = start_mem_mb
@@ -790,8 +862,10 @@ async def handle_crawl_request(
             provenance=Provenance.UNTRUSTED,
         )
         from egress_broker import enforce_egress
+
         enforce_egress(loaded_browser_config)
         from governor import clamp_deep_crawl
+
         clamp_deep_crawl(loaded_crawler_config)
 
         dispatcher = MemoryAdaptiveDispatcher(
@@ -800,9 +874,11 @@ async def handle_crawl_request(
             recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
             rate_limiter=RateLimiter(
                 base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-            ) if config["crawler"]["rate_limiter"]["enabled"] else None
+            )
+            if config["crawler"]["rate_limiter"]["enabled"]
+            else None,
         )
-        
+
         from crawler_pool import get_crawler
 
         hooks_status = {}
@@ -812,13 +888,16 @@ async def handle_crawl_request(
             logger.info(f"Hooks attachment status: {hooks_status['status']}")
         else:
             crawler = await get_crawler(loaded_browser_config)
-        
+
         base_config = config["crawler"]["base_config"]
 
         # Build the config(s) to pass to arun/arun_many
         if crawler_configs and len(urls) > 1:
             # Per-URL config list: deserialize each and apply base_config
-            config_list = [CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED) for cc in crawler_configs]
+            config_list = [
+                CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED)
+                for cc in crawler_configs
+            ]
             for cfg in config_list:
                 for key, value in base_config.items():
                     if hasattr(cfg, key):
@@ -837,29 +916,36 @@ async def handle_crawl_request(
 
         results = []
         func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
-        partial_func = partial(func,
-                                urls[0] if len(urls) == 1 else urls,
-                                config=effective_config,
-                                dispatcher=dispatcher)
+        partial_func = partial(
+            func,
+            urls[0] if len(urls) == 1 else urls,
+            config=effective_config,
+            dispatcher=dispatcher,
+        )
         # Optional per-crawl wall-clock deadline (config limits.wall_clock_s; 0 = none).
         from governor import wall_clock_seconds
+
         _deadline = wall_clock_seconds(config)
         if _deadline and _deadline > 0:
             results = await asyncio.wait_for(partial_func(), timeout=_deadline)
         else:
             results = await partial_func()
-        
+
         # Ensure results is always a list
         if not isinstance(results, list):
             results = [results]
 
-        end_mem_mb = _get_memory_mb() # <--- Get memory after
+        end_mem_mb = _get_memory_mb()  # <--- Get memory after
         end_time = time.time()
-        
+
         if start_mem_mb is not None and end_mem_mb is not None:
-            mem_delta_mb = end_mem_mb - start_mem_mb # <--- Calculate delta
-            peak_mem_mb = max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb) # <--- Get peak memory
-        logger.info(f"Memory usage: Start: {start_mem_mb} MB, End: {end_mem_mb} MB, Delta: {mem_delta_mb} MB, Peak: {peak_mem_mb} MB")
+            mem_delta_mb = end_mem_mb - start_mem_mb  # <--- Calculate delta
+            peak_mem_mb = max(
+                peak_mem_mb if peak_mem_mb else 0, end_mem_mb
+            )  # <--- Get peak memory
+        logger.info(
+            f"Memory usage: Start: {start_mem_mb} MB, End: {end_mem_mb} MB, Delta: {mem_delta_mb} MB, Peak: {peak_mem_mb} MB"
+        )
 
         # Process results to handle PDF bytes
         processed_results = []
@@ -867,7 +953,7 @@ async def handle_crawl_request(
             try:
                 result_dict: Dict[str, Any]
                 # Check if result has model_dump method (is a proper CrawlResult)
-                if hasattr(result, 'model_dump'):
+                if hasattr(result, "model_dump"):
                     result_dict = result.model_dump()
                 elif isinstance(result, dict):
                     result_dict = dict(result)
@@ -875,43 +961,45 @@ async def handle_crawl_request(
                     # Handle unexpected result type
                     logger.warning(f"Unexpected result type: {type(result)}")
                     result_dict = {
-                        "url": str(result) if hasattr(result, '__str__') else "unknown",
+                        "url": str(result) if hasattr(result, "__str__") else "unknown",
                         "success": False,
-                        "error_message": f"Unexpected result type: {type(result).__name__}"
+                        "error_message": f"Unexpected result type: {type(result).__name__}",
                     }
-                
+
                 # if fit_html is not a string, set it to None to avoid serialization errors
-                if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
+                if "fit_html" in result_dict and not (
+                    result_dict["fit_html"] is None
+                    or isinstance(result_dict["fit_html"], str)
+                ):
                     result_dict["fit_html"] = None
-                    
+
                 # If PDF exists, encode it to base64
-                pdf = result_dict.get('pdf')
+                pdf = result_dict.get("pdf")
                 if isinstance(pdf, bytes):
-                    result_dict['pdf'] = b64encode(pdf).decode('utf-8')
+                    result_dict["pdf"] = b64encode(pdf).decode("utf-8")
 
                 if result_fields:
                     result_dict = _project_crawl_result(result_dict, result_fields)
-                    
+
                 processed_results.append(result_dict)
             except Exception as e:
                 logger.error(f"Error processing result: {e}")
-                processed_results.append({
-                    "url": "unknown",
-                    "success": False,
-                    "error_message": str(e)
-                })
-            
+                processed_results.append(
+                    {"url": "unknown", "success": False, "error_message": str(e)}
+                )
+
         response = {
             "success": True,
             "results": processed_results,
             "server_processing_time_s": end_time - start_time,
             "server_memory_delta_mb": mem_delta_mb,
-            "server_peak_memory_mb": peak_mem_mb
+            "server_peak_memory_mb": peak_mem_mb,
         }
 
         # Track request completion
         try:
             from monitor import get_monitor
+
             await get_monitor().track_request_end(
                 request_id, success=True, pool_hit=True, status_code=200
             )
@@ -929,6 +1017,7 @@ async def handle_crawl_request(
         # construct a disallowed type, or specify an invalid hook. Client error.
         try:
             from monitor import get_monitor
+
             await get_monitor().track_request_end(
                 request_id, success=False, error=str(e), status_code=400
             )
@@ -951,6 +1040,7 @@ async def handle_crawl_request(
         # Track request error
         try:
             from monitor import get_monitor
+
             await get_monitor().track_request_end(
                 request_id, success=False, error=str(e), status_code=500
             )
@@ -964,21 +1054,26 @@ async def handle_crawl_request(
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=json.dumps({ # Send structured error
-                "error": str(e),
-                "server_memory_delta_mb": mem_delta_mb,
-                "server_peak_memory_mb": max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb_error or 0)
-            })
+            detail=json.dumps(
+                {  # Send structured error
+                    "error": str(e),
+                    "server_memory_delta_mb": mem_delta_mb,
+                    "server_peak_memory_mb": max(
+                        peak_mem_mb if peak_mem_mb else 0, end_mem_mb_error or 0
+                    ),
+                }
+            ),
         )
     finally:
         await _dispose_crawler(crawler)
+
 
 async def handle_stream_crawl_request(
     urls: List[str],
     browser_config: dict,
     crawler_config: dict,
     config: dict,
-    hooks_config: Optional[dict] = None
+    hooks_config: Optional[dict] = None,
 ) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict]]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
@@ -1004,12 +1099,14 @@ async def handle_stream_crawl_request(
         # browser_config.verbose = True # Set to False or remove for production stress testing
         loaded_browser_config.verbose = False
         from egress_broker import enforce_egress
+
         enforce_egress(loaded_browser_config)
         loaded_crawler_config = CrawlerRunConfig.load(
             crawler_config,
             provenance=Provenance.UNTRUSTED,
         )
         from governor import clamp_deep_crawl
+
         clamp_deep_crawl(loaded_crawler_config)
         loaded_crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
         loaded_crawler_config.stream = True
@@ -1032,8 +1129,10 @@ async def handle_stream_crawl_request(
                 deadline_at,
             )
             hooks_status = _attach_declarative_hooks(crawler, hooks_config)
-            logger.info(f"Hooks attachment status for streaming: {hooks_status['status']}")
-            hooks_info = {'status': hooks_status}
+            logger.info(
+                f"Hooks attachment status for streaming: {hooks_status['status']}"
+            )
+            hooks_info = {"status": hooks_status}
         else:
             crawler = await _await_before_deadline(
                 get_crawler(loaded_browser_config),
@@ -1055,10 +1154,12 @@ async def handle_stream_crawl_request(
             dispatcher = MemoryAdaptiveDispatcher(
                 max_session_permit=config["crawler"]["pool"]["max_pages"],
                 memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
-                recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
+                recovery_threshold_percent=config["crawler"][
+                    "recovery_threshold_percent"
+                ],
                 rate_limiter=RateLimiter(
                     base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-                )
+                ),
             )
             results_gen = await _await_before_deadline(
                 crawler.arun_many(
@@ -1094,10 +1195,10 @@ async def handle_stream_crawl_request(
         logger.error(f"Stream crawl error: {str(e)}", exc_info=True)
         # Raising HTTPException here will prevent streaming response
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
-        
+
+
 async def handle_crawl_job(
     redis,
     urls: List[str],
@@ -1124,9 +1225,15 @@ async def handle_crawl_job(
             owner=owner,
         )
     except CrawlJobPayloadRejected as error:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
+        ) from error
     except CrawlJobPrincipalQuotaExceeded as error:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(error)) from error
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(error)
+        ) from error
     except CrawlJobQueueFull as error:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)
+        ) from error
     return {"task_id": task_id}
