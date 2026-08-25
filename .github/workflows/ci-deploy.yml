@@ -91,7 +91,7 @@ jobs:
           reclaim_build_disk() {
             docker images --filter=reference="${IMAGE}:*" --format '{{.Repository}}:{{.Tag}}' \
               | xargs -r docker rmi || true
-            docker builder prune -f --filter until=10m || true
+            docker builder prune -af --filter until=10m || true
             df -h /
           }
           trap reclaim_build_disk EXIT
