@@ -652,7 +652,7 @@ async def get_markdown(
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
     markdown = await handle_markdown_request(
-        body.url, body.f, body.q, body.c, config, body.provider,
+        redis, body.url, body.f, body.q, body.c, config, body.provider,
         body.temperature
     )
     return JSONResponse({
@@ -896,7 +896,14 @@ async def llm_endpoint(
         raise HTTPException(400, "Query parameter 'q' is required")
     if not url.startswith(("http://", "https://")) and not url.startswith(("raw:", "raw://")):
         url = "https://" + url
-    answer = await handle_llm_qa(url, q, config, provider=provider, temperature=temperature)
+    answer = await handle_llm_qa(
+        url,
+        q,
+        config,
+        provider=provider,
+        temperature=temperature,
+        redis=redis,
+    )
     return JSONResponse({"answer": answer})
 
 

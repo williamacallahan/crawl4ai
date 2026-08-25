@@ -63,6 +63,6 @@ def resolve_llm(config: Dict, requested_provider: Optional[str] = None) -> Dict:
         "temperature": get_llm_temperature(config, provider),
         "extra_args": {
             "timeout": config["llm"].get("request_timeout_seconds", 25),
-            "num_retries": config["llm"].get("request_retries", 1),
+            "num_retries": config["llm"].get("request_retries", 0),
         },
     }

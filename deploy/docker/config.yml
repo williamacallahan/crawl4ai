@@ -16,8 +16,11 @@ llm:
   # Bound one slow provider attempt below the public ingress deadline; LiteLLM
   # retries once through the gateway, which can select another provider.
   request_timeout_seconds: 25
-  request_retries: 1
+  request_retries: 0
+  job_request_timeout_seconds: 120
+  job_request_retries: 0
   backoff_max_attempts: 1
+  permit_ttl_seconds: 300
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
 # Redis Configuration

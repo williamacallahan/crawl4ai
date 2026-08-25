@@ -3,7 +3,7 @@ import json
 import logging
 import time
 from base64 import b64encode
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from functools import partial
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, cast
 from urllib.parse import unquote
@@ -49,14 +49,89 @@ from crawl4ai import (
 from crawl4ai.async_configs import Provenance, UntrustedConfigError
 from crawl4ai.content_filter_strategy import (
     BM25ContentFilter,
-    LLMContentFilter,
     PruningContentFilter,
 )
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
-from crawl4ai.utils import aperform_completion_with_backoff
+from crawl4ai.prompts import PROMPT_FILTER_CONTENT
+from crawl4ai.utils import (
+    aperform_completion_with_backoff,
+    escape_json_string,
+    extract_xml_data,
+    sanitize_html,
+)
 
 logger = logging.getLogger(__name__)
+LLM_PERMIT_KEY = "crawl4ai:llm:permit:v1"
+_RELEASE_LLM_PERMIT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+_RENEW_LLM_PERMIT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+
+@asynccontextmanager
+async def llm_permit(redis, config):
+    token = uuid4().hex
+    ttl = config["llm"].get("permit_ttl_seconds", 300)
+    acquired = await redis.set(
+        LLM_PERMIT_KEY,
+        token,
+        nx=True,
+        ex=ttl,
+    )
+    if not acquired:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Crawl4AI LLM capacity is busy",
+            headers={"Retry-After": "30"},
+        )
+    owner = asyncio.current_task()
+    lease_lost = asyncio.Event()
+
+    async def renew_permit():
+        try:
+            while True:
+                await asyncio.sleep(ttl / 3)
+                renewed = await redis.eval(
+                    _RENEW_LLM_PERMIT,
+                    1,
+                    LLM_PERMIT_KEY,
+                    token,
+                    ttl,
+                )
+                if not renewed:
+                    lease_lost.set()
+                    if owner is not None:
+                        owner.cancel()
+                    return
+        except Exception:
+            lease_lost.set()
+            if owner is not None:
+                owner.cancel()
+
+    heartbeat = asyncio.create_task(renew_permit())
+    try:
+        yield
+    except asyncio.CancelledError:
+        if lease_lost.is_set():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Crawl4AI LLM capacity lease was lost",
+            )
+        raise
+    finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
+        await redis.eval(_RELEASE_LLM_PERMIT, 1, LLM_PERMIT_KEY, token)
 
 
 async def _enqueue_job(background_tasks, factory, principal=None):
@@ -187,6 +262,8 @@ async def handle_llm_qa(
     provider: Optional[str] = None,
     temperature: Optional[float] = None,
     base_url: Optional[str] = None,
+    *,
+    redis=None,
 ) -> str:
     """Process QA using LLM with crawled content as context."""
     from crawler_pool import get_crawler, release_crawler
@@ -236,21 +313,29 @@ async def handle_llm_qa(
         # request-supplied base_url is ignored (it was the key-exfil vector).
         from llm_broker import resolve_llm
         llm = resolve_llm(config, provider)
-        response = await aperform_completion_with_backoff(
-            provider=llm["provider"],
-            prompt_with_variables=prompt,
-            api_token=llm["api_token"],
-            temperature=temperature or llm["temperature"],
-            base_url=llm["base_url"],
-            extra_args=llm["extra_args"],
-            base_delay=config["llm"].get("backoff_base_delay", 2),
-            max_attempts=config["llm"].get("backoff_max_attempts", 1),
-            exponential_factor=config["llm"].get("backoff_exponential_factor", 2)
-        )
+        if redis is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Crawl4AI LLM admission is unavailable",
+            )
+        async with llm_permit(redis, config):
+            response = await aperform_completion_with_backoff(
+                provider=llm["provider"],
+                prompt_with_variables=prompt,
+                api_token=llm["api_token"],
+                temperature=temperature or llm["temperature"],
+                base_url=llm["base_url"],
+                extra_args=llm["extra_args"],
+                base_delay=config["llm"].get("backoff_base_delay", 2),
+                max_attempts=config["llm"].get("backoff_max_attempts", 1),
+                exponential_factor=config["llm"].get("backoff_exponential_factor", 2)
+            )
 
         return response.choices[0].message.content
     except LLMProviderNotAllowed as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"QA processing error: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -300,6 +385,11 @@ async def process_llm_extraction(
         # Provider by name only; base_url/api_token server-derived (no exfil).
         from llm_broker import resolve_llm
         _llm = resolve_llm(config, provider)
+        job_extra_args = {
+            **_llm["extra_args"],
+            "timeout": config["llm"].get("job_request_timeout_seconds", 120),
+            "num_retries": config["llm"].get("job_request_retries", 0),
+        }
         llm_strategy = LLMExtractionStrategy(
             llm_config=LLMConfig(
                 provider=_llm["provider"],
@@ -310,7 +400,8 @@ async def process_llm_extraction(
             ),
             instruction=instruction,
             schema=cast(Dict, json.loads(schema) if schema else None),
-            extra_args=_llm["extra_args"],
+            apply_chunking=False,
+            extra_args=job_extra_args,
         )
 
         cache_mode = CacheMode.ENABLED if cache == "1" else CacheMode.WRITE_ONLY
@@ -327,17 +418,18 @@ async def process_llm_extraction(
         )
         from egress_broker import enforce_egress
         enforce_egress(worker_browser_cfg)
-        async with AsyncWebCrawler(config=worker_browser_cfg) as crawler:
-            crawler_config = server_crawler_config(
-                _wcfg,
-                extraction_strategy=llm_strategy,
-                scraping_strategy=LXMLWebScrapingStrategy(),
-                cache_mode=cache_mode,
-            )
-            result = await crawler.arun(
-                url=url,
-                config=crawler_config,
-            )
+        async with llm_permit(redis, config):
+            async with AsyncWebCrawler(config=worker_browser_cfg) as crawler:
+                crawler_config = server_crawler_config(
+                    _wcfg,
+                    extraction_strategy=llm_strategy,
+                    scraping_strategy=LXMLWebScrapingStrategy(),
+                    cache_mode=cache_mode,
+                )
+                result = await crawler.arun(
+                    url=url,
+                    config=crawler_config,
+                )
 
         if not result.success:
             await hset_with_ttl(redis, f"task:{task_id}", {
@@ -360,6 +452,14 @@ async def process_llm_extraction(
             content = json.loads(result.extracted_content)
         except json.JSONDecodeError:
             content = result.extracted_content
+        if isinstance(content, list):
+            extraction_errors = [
+                str(block.get("content") or "LLM extraction failed")
+                for block in content
+                if isinstance(block, dict) and block.get("error")
+            ]
+            if extraction_errors:
+                raise RuntimeError("; ".join(extraction_errors))
 
         result_data = {"extracted_content": content}
 
@@ -396,6 +496,7 @@ async def process_llm_extraction(
         )
 
 async def handle_markdown_request(
+    redis,
     url: str,
     filter_type: FilterType,
     query: Optional[str] = None,
@@ -408,6 +509,7 @@ async def handle_markdown_request(
     """Handle markdown generation requests."""
     config = config or {}
     crawler: Optional[AsyncWebCrawler] = None
+    llm = None
     try:
         # Validate provider if using LLM filter
         if filter_type == FilterType.LLM:
@@ -417,31 +519,20 @@ async def handle_markdown_request(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=error_msg
                 )
+            from llm_broker import resolve_llm
+
+            llm = resolve_llm(config, provider)
         decoded_url = unquote(url)
         if not decoded_url.startswith(('http://', 'https://')) and not decoded_url.startswith(("raw:", "raw://")):
             decoded_url = 'https://' + decoded_url
         await asyncio.to_thread(validate_url_destination, decoded_url)
 
-        if filter_type == FilterType.RAW:
+        if filter_type in {FilterType.RAW, FilterType.LLM}:
             md_generator = DefaultMarkdownGenerator()
         else:
-            # Provider by name only; base_url/api_token are server-derived.
-            from llm_broker import resolve_llm
-            _llm = resolve_llm(config, provider)
             content_filter = {
                 FilterType.FIT: PruningContentFilter(),
                 FilterType.BM25: BM25ContentFilter(user_query=query or ""),
-                FilterType.LLM: LLMContentFilter(
-                    llm_config=LLMConfig(
-                        provider=_llm["provider"],
-                        api_token=_llm["api_token"],
-                        temperature=temperature or _llm["temperature"],
-                        base_url=_llm["base_url"],
-                        backoff_max_attempts=config["llm"].get("backoff_max_attempts", 1),
-                    ),
-                    instruction=query or "Extract main content",
-                    extra_args=_llm["extra_args"],
-                )
             }[filter_type]
             md_generator = DefaultMarkdownGenerator(content_filter=content_filter)
 
@@ -474,6 +565,34 @@ async def handle_markdown_request(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=result.error_message
             )
+
+        if filter_type == FilterType.LLM:
+            prompt = PROMPT_FILTER_CONTENT.replace(
+                "{HTML}",
+                escape_json_string(sanitize_html(result.cleaned_html)),
+            ).replace(
+                "{REQUEST}",
+                query or "Extract main content",
+            )
+            async with llm_permit(redis, config):
+                response = await aperform_completion_with_backoff(
+                    provider=llm["provider"],
+                    prompt_with_variables=prompt,
+                    api_token=llm["api_token"],
+                    base_url=llm["base_url"],
+                    extra_args=llm["extra_args"],
+                    max_attempts=1,
+                )
+            markdown = extract_xml_data(
+                ["content"],
+                response.choices[0].message.content or "",
+            )["content"]
+            if not markdown:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="LLM markdown filter returned no content",
+                )
+            return markdown
 
         return (result.markdown.raw_markdown
                if filter_type == FilterType.RAW
