@@ -726,6 +726,7 @@ def test_ci_build_reclaims_repo_disk_before_and_after_native_build():
     assert build_script.index("reclaim_build_disk\n") < build_script.index(
         "docker build --provenance"
     )
+    assert "docker builder prune -f --filter until=10m" in build_script
     assert "docker system prune" not in build_script
 
 
