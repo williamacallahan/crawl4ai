@@ -1,9 +1,9 @@
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 from utils import FilterType
 
-CRAWL_RESULT_FIELDS = (
+CrawlResultField = Literal[
     "url",
     "redirected_url",
     "success",
@@ -15,8 +15,15 @@ CRAWL_RESULT_FIELDS = (
     "links",
     "metadata",
     "response_headers",
-)
-CrawlResultField = Literal[*CRAWL_RESULT_FIELDS]
+]
+CRAWL_RESULT_FIELDS = get_args(CrawlResultField)
+
+
+def validate_crawl_result_fields(result_fields):
+    required = {"success", "error_message"}
+    if result_fields is not None and not required.issubset(result_fields):
+        raise ValueError("result_fields must include 'success' and 'error_message'")
+    return result_fields
 
 
 class CrawlRequest(BaseModel):
@@ -36,10 +43,7 @@ class CrawlRequest(BaseModel):
     @field_validator("result_fields")
     @classmethod
     def require_status_result_fields(cls, result_fields):
-        required = {"success", "error_message"}
-        if result_fields is not None and not required.issubset(result_fields):
-            raise ValueError("result_fields must include 'success' and 'error_message'")
-        return result_fields
+        return validate_crawl_result_fields(result_fields)
 
 
 class HookSpec(BaseModel):
