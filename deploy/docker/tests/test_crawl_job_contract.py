@@ -1,11 +1,12 @@
 import asyncio
+import json
 import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 DOCKER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -162,6 +163,54 @@ def test_llm_unexpected_failure_propagates_to_central_exception_owner(monkeypatc
                 config={},
             )
         )
+
+
+def test_llm_job_enqueue_returns_accepted_with_canonical_links(monkeypatch):
+    monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
+    monkeypatch.setattr(api, "_enqueue_job", AsyncMock())
+
+    response = asyncio.run(
+        api.create_new_task(
+            SimpleNamespace(hset=AsyncMock(), expire=AsyncMock()),
+            BackgroundTasks(),
+            "https://example.com",
+            "extract",
+            None,
+            "0",
+            "https://crawl.example/",
+            {"redis": {"task_ttl_seconds": 3600}},
+        )
+    )
+    body = json.loads(response.body)
+
+    assert response.status_code == 202
+    assert body["_links"]["self"]["href"].startswith(
+        "https://crawl.example/llm/job/llm_"
+    )
+    assert body["_links"]["status"] == body["_links"]["self"]
+
+
+@pytest.mark.parametrize(
+    ("collection", "expected"),
+    [
+        ("llm/job", "https://crawl.example/llm/job/llm_123"),
+        ("crawl/job", "https://crawl.example/crawl/job/crawl_123"),
+    ],
+)
+def test_task_status_links_preserve_their_job_collection(collection, expected):
+    response = api.create_task_response(
+        {
+            "status": api.TaskStatus.PROCESSING,
+            "created_at": "2026-08-25T12:00:00",
+            "url": "https://example.com",
+        },
+        expected.rsplit("/", 1)[-1],
+        "https://crawl.example/",
+        collection,
+    )
+
+    assert response["_links"]["self"]["href"] == expected
+    assert response["_links"]["refresh"]["href"] == expected
 
 
 @pytest.mark.parametrize("worker_error", [False, True])

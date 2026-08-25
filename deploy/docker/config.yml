@@ -13,6 +13,11 @@ app:
 # Default LLM Configuration
 llm:
   provider: "openai/gpt-4o-mini"
+  # Bound one slow provider attempt below the public ingress deadline; LiteLLM
+  # retries once through the gateway, which can select another provider.
+  request_timeout_seconds: 25
+  request_retries: 1
+  backoff_max_attempts: 1
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
 # Redis Configuration

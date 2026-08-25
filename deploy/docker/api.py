@@ -54,7 +54,7 @@ from crawl4ai.content_filter_strategy import (
 )
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
-from crawl4ai.utils import perform_completion_with_backoff
+from crawl4ai.utils import aperform_completion_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -236,14 +236,15 @@ async def handle_llm_qa(
         # request-supplied base_url is ignored (it was the key-exfil vector).
         from llm_broker import resolve_llm
         llm = resolve_llm(config, provider)
-        response = perform_completion_with_backoff(
+        response = await aperform_completion_with_backoff(
             provider=llm["provider"],
             prompt_with_variables=prompt,
             api_token=llm["api_token"],
             temperature=temperature or llm["temperature"],
             base_url=llm["base_url"],
+            extra_args=llm["extra_args"],
             base_delay=config["llm"].get("backoff_base_delay", 2),
-            max_attempts=config["llm"].get("backoff_max_attempts", 3),
+            max_attempts=config["llm"].get("backoff_max_attempts", 1),
             exponential_factor=config["llm"].get("backoff_exponential_factor", 2)
         )
 
@@ -305,9 +306,11 @@ async def process_llm_extraction(
                 api_token=_llm["api_token"],
                 temperature=temperature or _llm["temperature"],
                 base_url=_llm["base_url"],
+                backoff_max_attempts=config["llm"].get("backoff_max_attempts", 1),
             ),
             instruction=instruction,
             schema=cast(Dict, json.loads(schema) if schema else None),
+            extra_args=_llm["extra_args"],
         )
 
         cache_mode = CacheMode.ENABLED if cache == "1" else CacheMode.WRITE_ONLY
@@ -434,8 +437,10 @@ async def handle_markdown_request(
                         api_token=_llm["api_token"],
                         temperature=temperature or _llm["temperature"],
                         base_url=_llm["base_url"],
+                        backoff_max_attempts=config["llm"].get("backoff_max_attempts", 1),
                     ),
-                    instruction=query or "Extract main content"
+                    instruction=query or "Extract main content",
+                    extra_args=_llm["extra_args"],
                 )
             }[filter_type]
             md_generator = DefaultMarkdownGenerator(content_filter=content_filter)
@@ -512,6 +517,7 @@ async def handle_llm_request(
         if is_task_id(input_path):
             return await handle_task_status(
                 redis, input_path, base_url,
+                collection="llm/job",
                 requester=requester, is_admin=is_admin,
             )
 
@@ -553,6 +559,7 @@ async def handle_task_status(
     task_id: str,
     base_url: str,
     *,
+    collection: str,
     keep: bool = False,
     requester: Optional[str] = None,
     is_admin: bool = False,
@@ -580,7 +587,7 @@ async def handle_task_status(
             detail="Task not found"
         )
 
-    response = create_task_response(task, task_id, base_url)
+    response = create_task_response(task, task_id, base_url, collection)
 
     if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
         if not keep and should_cleanup_task(task["created_at"]):
@@ -640,26 +647,28 @@ async def create_new_task(
         await redis.delete(f"task:{task_id}")
         raise
 
+    task_url = f"{base_url.rstrip('/')}/llm/job/{task_id}"
     return JSONResponse({
         "task_id": task_id,
         "status": TaskStatus.PROCESSING,
         "url": decoded_url,
         "_links": {
-            "self": {"href": f"{base_url}/llm/{task_id}"},
-            "status": {"href": f"{base_url}/llm/{task_id}"}
+            "self": {"href": task_url},
+            "status": {"href": task_url}
         }
-    })
+    }, status_code=status.HTTP_202_ACCEPTED)
 
-def create_task_response(task: dict, task_id: str, base_url: str) -> dict:
+def create_task_response(task: dict, task_id: str, base_url: str, collection: str) -> dict:
     """Create response for task status check."""
+    task_url = f"{base_url.rstrip('/')}/{collection}/{task_id}"
     response = {
         "task_id": task_id,
         "status": task["status"],
         "created_at": task["created_at"],
         "url": task["url"],
         "_links": {
-            "self": {"href": f"{base_url}/llm/{task_id}"},
-            "refresh": {"href": f"{base_url}/llm/{task_id}"}
+            "self": {"href": task_url},
+            "refresh": {"href": task_url}
         }
     }
 

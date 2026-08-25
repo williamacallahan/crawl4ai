@@ -155,6 +155,7 @@ class AsyncWebCrawler:
 
         # Thread safety setup
         self._lock = asyncio.Lock() if thread_safe else None
+        self._markdown_generation_sem = asyncio.Semaphore(1)
 
         # Initialize directories
         self.crawl4ai_folder = os.path.join(base_directory, ".crawl4ai")
@@ -868,13 +869,41 @@ class AsyncWebCrawler:
         if base_tag_match:
             base_url = base_tag_match.group(1)
 
-        markdown_result: MarkdownGenerationResult = (
-            markdown_generator.generate_markdown(
-                input_html=markdown_input_html,
-                base_url=base_url
-                # html2text_options=kwargs.get('html2text', {})
+        await self._markdown_generation_sem.acquire()
+        cancelled_by_caller = False
+        try:
+            markdown_task = asyncio.create_task(
+                asyncio.to_thread(
+                    markdown_generator.generate_markdown,
+                    input_html=markdown_input_html,
+                    base_url=base_url,
+                    # html2text_options=kwargs.get('html2text', {})
+                )
             )
-        )
+        except BaseException:
+            self._markdown_generation_sem.release()
+            raise
+
+        def complete_markdown(task: asyncio.Task) -> None:
+            try:
+                error = None if task.cancelled() else task.exception()
+                if cancelled_by_caller and error is not None:
+                    self.logger.error(
+                        "Markdown generation failed after request cancellation: {error}",
+                        tag="ERROR",
+                        params={"error": str(error)},
+                    )
+            finally:
+                self._markdown_generation_sem.release()
+
+        markdown_task.add_done_callback(complete_markdown)
+        try:
+            markdown_result: MarkdownGenerationResult = await asyncio.shield(
+                markdown_task
+            )
+        except asyncio.CancelledError:
+            cancelled_by_caller = True
+            raise
 
         # Log processing completion — reflect actual content outcome
         self.logger.url_status(

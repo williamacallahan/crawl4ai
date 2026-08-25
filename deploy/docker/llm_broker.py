@@ -61,4 +61,8 @@ def resolve_llm(config: Dict, requested_provider: Optional[str] = None) -> Dict:
         "base_url": get_llm_base_url(config, provider),   # canonical, never from request
         "api_token": get_llm_api_key(config, provider),   # server credential
         "temperature": get_llm_temperature(config, provider),
+        "extra_args": {
+            "timeout": config["llm"].get("request_timeout_seconds", 25),
+            "num_retries": config["llm"].get("request_retries", 1),
+        },
     }

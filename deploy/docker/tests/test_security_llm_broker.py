@@ -21,6 +21,10 @@ class TestProviderAllowlist:
         out = resolve_llm(CONF, "openai/gpt-4o")
         assert out["provider"] == "openai/gpt-4o"
 
+    def test_server_bounds_slow_provider_attempts(self):
+        out = resolve_llm(CONF)
+        assert out["extra_args"] == {"timeout": 25, "num_retries": 1}
+
     def test_other_family_rejected(self):
         with pytest.raises(LLMProviderNotAllowed):
             resolve_llm(CONF, "anthropic/claude-3-opus")

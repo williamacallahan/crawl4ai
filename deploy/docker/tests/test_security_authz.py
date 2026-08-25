@@ -92,7 +92,12 @@ class TestJobOwnership:
         import api
         redis = _FakeRedis(task)
         return await api.handle_task_status(
-            redis, "crawl_abc", base_url="http://t/", keep=True, **kw
+            redis,
+            "crawl_abc",
+            base_url="http://t/",
+            collection="crawl/job",
+            keep=True,
+            **kw,
         )
 
     async def test_owner_can_read_own_task(self):
