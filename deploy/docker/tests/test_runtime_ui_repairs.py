@@ -17,8 +17,9 @@ from egress_broker import PinnedTarget
 from fastapi import BackgroundTasks, Request
 from governor import BodySizeLimitMiddleware
 from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 from webhook import WebhookDeliveryService
 
@@ -106,6 +107,39 @@ async def test_zero_body_limit_is_unbounded_and_preserves_receive():
 
 
 @pytest.mark.asyncio
+async def test_body_limit_preserves_streaming_response_after_body_replay():
+    async def endpoint(request):
+        assert await request.body() == b"bounded"
+
+        async def content():
+            yield b"first\n"
+            await asyncio.sleep(0)
+            yield b"second\n"
+
+        return StreamingResponse(content(), media_type="text/plain")
+
+    app = BodySizeLimitMiddleware(
+        Starlette(routes=[Route("/stream", endpoint, methods=["POST"])]),
+        max_bytes=1024,
+    )
+
+    async def decorate(_request, call_next):
+        response = await call_next(_request)
+        response.headers["x-decorated"] = "true"
+        return response
+
+    app = BaseHTTPMiddleware(app, dispatch=decorate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/stream", content=b"bounded")
+
+    assert response.status_code == 200
+    assert response.text == "first\nsecond\n"
+    assert response.headers["x-decorated"] == "true"
+
+
+@pytest.mark.asyncio
 async def test_cors_preflight_reaches_cors_middleware_without_opening_data_route():
     async def data(_request):
         return JSONResponse({"secret": True})
@@ -146,9 +180,8 @@ def test_websocket_subprotocol_carries_token_but_query_string_does_not():
     encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
     protocol_scope = {
         "type": "websocket",
-        "headers": [
-            (b"sec-websocket-protocol", f"other, crawl4ai.bearer.{encoded}".encode())
-        ],
+        "headers": [],
+        "subprotocols": ["other", f"crawl4ai.bearer.{encoded}"],
         "query_string": b"",
     }
     query_scope = {
@@ -159,6 +192,70 @@ def test_websocket_subprotocol_carries_token_but_query_string_does_not():
 
     assert AuthGateMiddleware._extract_token(protocol_scope) == token
     assert AuthGateMiddleware._extract_token(query_scope) is None
+
+
+@pytest.mark.asyncio
+async def test_websocket_gate_selects_authenticated_bearer_protocol():
+    token = "operator.token-with_symbols"
+    encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
+    protocol = f"crawl4ai.bearer.{encoded}"
+    sent = []
+
+    async def websocket_app(_scope, _receive, send):
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.close", "code": 1000})
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(message):
+        sent.append(message)
+
+    app = AuthGateMiddleware(websocket_app, token_provider=lambda: token)
+    await app(
+        {
+            "type": "websocket",
+            "path": "/monitor/ws",
+            "headers": [],
+            "subprotocols": [protocol],
+            "query_string": b"",
+        },
+        receive,
+        send,
+    )
+
+    assert sent[0] == {"type": "websocket.accept", "subprotocol": protocol}
+
+
+@pytest.mark.asyncio
+async def test_websocket_gate_does_not_select_protocol_authenticated_by_header():
+    token = "operator-token"
+    sent = []
+
+    async def websocket_app(_scope, _receive, send):
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.close", "code": 1000})
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(message):
+        sent.append(message)
+
+    app = AuthGateMiddleware(websocket_app, token_provider=lambda: token)
+    await app(
+        {
+            "type": "websocket",
+            "path": "/monitor/ws",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+            "subprotocols": ["crawl4ai.bearer.not-the-authenticated-token"],
+            "query_string": b"",
+        },
+        receive,
+        send,
+    )
+
+    assert sent[0] == {"type": "websocket.accept"}
 
 
 @pytest.mark.asyncio
@@ -530,6 +627,43 @@ def test_ui_tokens_are_ephemeral_and_cdn_assets_are_version_pinned():
     assert "os.environ['CRAWL4AI_API_TOKEN']" in playground
     assert "?token=" not in monitor
     assert "crawl4ai.bearer." in monitor
+
+
+def test_playground_controls_are_named_and_header_can_wrap():
+    from bs4 import BeautifulSoup
+
+    playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
+    document = BeautifulSoup(playground, "html.parser")
+
+    assert document.select_one("#endpoint")["aria-label"] == "API endpoint"
+    for control_id in ("urls", "st-total", "st-chunk", "st-conc"):
+        assert document.select_one(f'label[for="{control_id}"]') is not None
+
+    dialog = document.select_one("#stress-modal")
+    assert dialog["role"] == "dialog"
+    assert dialog["aria-modal"] == "true"
+    assert dialog["aria-labelledby"] == "stress-title"
+    assert document.select_one("#stress-title") is not None
+
+    header = document.find("header")
+    assert {"flex-wrap", "gap-4"} <= set(header["class"])
+    assert {"flex-wrap", "gap-4"} <= set(header.find("h1")["class"])
+    token_bar = document.select_one("#token-bar")
+    assert {"flex-wrap", "gap-2"} <= set(token_bar["class"])
+    assert {"flex-wrap", "gap-4"} <= set(token_bar.parent["class"])
+
+
+def test_ui_error_and_websocket_fallback_paths_are_explicit():
+    playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
+    monitor = (DOCKER_DIR / "static" / "monitor" / "index.html").read_text()
+
+    assert "const errorData = await response.json().catch(() => ({}));" in playground
+    assert "errorData.detail || errorData.error || 'Request failed'" in playground
+    assert "Number.isFinite(memory) && Number.isFinite(peakMemory)" in playground
+
+    assert "if (!token)" in monitor
+    assert "websocket.onclose = null;" in monitor
+    assert "updateConnectionStatus('disconnected', 'Token required');" in monitor
 
 
 def test_container_contracts_use_app_readiness_and_compose_v5_shape():

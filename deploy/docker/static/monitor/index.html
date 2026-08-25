@@ -329,9 +329,9 @@
                 status.textContent = 'Token active for this page';
                 status.className = 'text-xs text-green-400';
                 setTimeout(() => { status.textContent = ''; }, 2000);
-                // Reconnect WebSocket with new token
-                if (websocket) { websocket.close(); }
+                stopWebSocket();
                 wsReconnectAttempts = 0;
+                stopAutoRefresh();
                 connectWebSocket();
             }
 
@@ -343,7 +343,9 @@
                 status.textContent = 'Token cleared';
                 status.className = 'text-xs text-yellow-400';
                 setTimeout(() => { status.textContent = ''; }, 2000);
-                if (websocket) { websocket.close(); }
+                stopWebSocket();
+                stopAutoRefresh();
+                updateConnectionStatus('disconnected', 'Token required');
             });
         })();
 
@@ -352,9 +354,9 @@
         let refreshInterval;
         const REFRESH_RATE = 1000; // 1 second
         let websocket = null;
+        let reconnectTimeout = null;
         let wsReconnectAttempts = 0;
         const MAX_WS_RECONNECT = 5;
-        let useWebSocket = true; // Try WebSocket first, fallback to polling
 
         // No more tabs - all sections visible at once!
 
@@ -396,9 +398,13 @@
         }
 
         function connectWebSocket() {
+            const token = getToken();
+            if (!token) {
+                updateConnectionStatus('disconnected', 'Token required');
+                return;
+            }
             if (wsReconnectAttempts >= MAX_WS_RECONNECT) {
                 console.log('Max WebSocket reconnect attempts reached, falling back to polling');
-                useWebSocket = false;
                 updateConnectionStatus('polling');
                 startAutoRefresh();
                 return;
@@ -409,37 +415,51 @@
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/monitor/ws`;
-            const wsToken = getToken();
-            websocket = wsToken
-                ? new WebSocket(wsUrl, [websocketBearerProtocol(wsToken)])
-                : new WebSocket(wsUrl);
+            const socket = new WebSocket(wsUrl, [websocketBearerProtocol(token)]);
+            websocket = socket;
 
-            websocket.onopen = () => {
+            socket.onopen = () => {
+                if (websocket !== socket) return;
                 console.log('WebSocket connected');
                 wsReconnectAttempts = 0;
                 updateConnectionStatus('connected');
                 stopAutoRefresh(); // Stop polling if running
             };
 
-            websocket.onmessage = (event) => {
+            socket.onmessage = (event) => {
+                if (websocket !== socket) return;
                 const data = JSON.parse(event.data);
                 updateDashboard(data);
             };
 
-            websocket.onerror = (error) => {
+            socket.onerror = (error) => {
+                if (websocket !== socket) return;
                 console.error('WebSocket error:', error);
             };
 
-            websocket.onclose = () => {
+            socket.onclose = () => {
+                if (websocket !== socket) return;
+                websocket = null;
                 console.log('WebSocket closed');
                 updateConnectionStatus('disconnected', 'Reconnecting...');
 
-                if (useWebSocket) {
-                    setTimeout(connectWebSocket, 2000 * wsReconnectAttempts);
-                } else {
-                    startAutoRefresh();
-                }
+                reconnectTimeout = setTimeout(() => {
+                    reconnectTimeout = null;
+                    connectWebSocket();
+                }, 2000 * wsReconnectAttempts);
             };
+        }
+
+        function stopWebSocket() {
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+            if (websocket) {
+                websocket.onclose = null;
+                websocket.close();
+                websocket = null;
+            }
         }
 
         function updateDashboard(data) {
@@ -1113,8 +1133,7 @@
         document.getElementById('filter-requests')?.addEventListener('change', fetchRequests);
 
         // ========== Initialize ==========
-        // Try WebSocket first, fallback to polling on failure
-        connectWebSocket();
+        updateConnectionStatus('disconnected', 'Token required');
     </script>
 </body>
 </html>

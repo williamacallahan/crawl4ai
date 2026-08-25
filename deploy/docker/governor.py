@@ -82,7 +82,7 @@ class BodySizeLimitMiddleware:
                 message = messages[replay_index]
                 replay_index += 1
                 return message
-            return {"type": "http.disconnect"}
+            return await receive()
 
         await self.app(scope, replay_receive, send)
 

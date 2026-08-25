@@ -80,7 +80,28 @@ class AuthGateMiddleware:
         # Expose the principal to downstream handlers/dependencies.
         state = scope.setdefault("state", {})
         state["principal"] = principal
-        await self.app(scope, receive, send)
+        if scope["type"] != "websocket":
+            await self.app(scope, receive, send)
+            return
+
+        has_authorization_header = any(
+            name.lower() == b"authorization" for name, _ in scope.get("headers", [])
+        )
+        bearer_protocol = (
+            None
+            if has_authorization_header
+            else self._websocket_bearer_protocol(scope)
+        )
+        if bearer_protocol is None:
+            await self.app(scope, receive, send)
+            return
+
+        async def select_bearer_protocol(message):
+            if message["type"] == "websocket.accept" and not message.get("subprotocol"):
+                message = {**message, "subprotocol": bearer_protocol}
+            await send(message)
+
+        await self.app(scope, receive, select_bearer_protocol)
 
     # ──────────────────────────── helpers ─────────────────────────────
     def _authenticate(self, scope) -> dict | None:
@@ -119,20 +140,24 @@ class AuthGateMiddleware:
         # history, or referrer telemetry.  Non-browser clients should keep
         # using the Authorization header above.
         if scope["type"] == "websocket":
-            prefix = "crawl4ai.bearer."
-            for name, value in scope.get("headers", []):
-                if name.lower() != b"sec-websocket-protocol":
-                    continue
-                for protocol in value.decode("latin-1").split(","):
-                    protocol = protocol.strip()
-                    if not protocol.startswith(prefix):
-                        continue
-                    encoded = protocol[len(prefix):]
-                    try:
-                        padding = "=" * (-len(encoded) % 4)
-                        return base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
-                    except (ValueError, UnicodeDecodeError):
-                        return None
+            protocol = AuthGateMiddleware._websocket_bearer_protocol(scope)
+            if protocol is not None:
+                encoded = protocol.removeprefix("crawl4ai.bearer.")
+                try:
+                    padding = "=" * (-len(encoded) % 4)
+                    return base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+                except (ValueError, UnicodeDecodeError):
+                    return None
+        return None
+
+    @staticmethod
+    def _websocket_bearer_protocol(scope) -> str | None:
+        if scope["type"] != "websocket":
+            return None
+        prefix = "crawl4ai.bearer."
+        for protocol in scope.get("subprotocols", []):
+            if protocol.startswith(prefix):
+                return protocol
         return None
 
     async def _reject(self, scope, receive, send):

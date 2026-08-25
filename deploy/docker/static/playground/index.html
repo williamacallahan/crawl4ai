@@ -126,8 +126,8 @@
 
 <body class="bg-dark text-light font-mono min-h-screen flex flex-col" style="font-feature-settings: 'calt' 0;">
     <!-- Header -->
-    <header class="border-b border-border px-4 py-2 flex items-center">
-        <h1 class="text-lg font-medium flex items-center space-x-4">
+    <header class="border-b border-border px-4 py-2 flex flex-wrap items-center gap-4">
+        <h1 class="text-lg font-medium flex flex-wrap items-center gap-4">
             <span>🚀🤖 <span class="text-primary">Crawl4AI</span> Playground</span>
 
             <!-- GitHub badges -->
@@ -155,9 +155,9 @@
             </a>
         </h1>
 
-        <div class="ml-auto flex items-center space-x-4">
+        <div class="ml-auto flex flex-wrap items-center gap-4">
             <!-- Token bar -->
-            <div id="token-bar" class="flex items-center space-x-2">
+            <div id="token-bar" class="flex flex-wrap items-center gap-2">
                 <input id="token-input" type="password" placeholder="API token"
                        autocomplete="off" autocapitalize="off" spellcheck="false"
                        class="bg-dark border border-border rounded px-2 py-1 text-xs w-48">
@@ -181,7 +181,8 @@
         <section class="bg-surface rounded-lg border border-border overflow-hidden">
             <div class="px-4 py-2 border-b border-border flex items-center">
                 <h2 class="font-medium">Request Builder</h2>
-                <select id="endpoint" class="ml-auto bg-dark border border-border rounded px-2 py-1 text-sm">
+                <select id="endpoint" aria-label="API endpoint"
+                    class="ml-auto bg-dark border border-border rounded px-2 py-1 text-sm">
                     <option value="crawl">/crawl (batch)</option>
                     <option value="crawl_stream">/crawl/stream</option>
                     <option value="md">/md</option>
@@ -189,7 +190,7 @@
                 </select>
             </div>
             <div class="p-4">
-                <label class="block mb-2 text-sm">URL(s) - one per line</label>
+                <label for="urls" class="block mb-2 text-sm">URL(s) - one per line</label>
                 <textarea id="urls" class="w-full bg-dark border border-border rounded p-2 h-32 text-sm mb-4"
                     spellcheck="false">https://example.com</textarea>
 
@@ -342,28 +343,29 @@
     </main>
 
     <!-- Stress Test Modal -->
-    <div id="stress-modal"
+    <div id="stress-modal" role="dialog" aria-modal="true" aria-labelledby="stress-title"
         class="hidden fixed inset-0 bg-black bg-opacity-70 z-50 flex items-center justify-center p-4">
         <div class="bg-surface rounded-lg border border-accent w-full max-w-3xl max-h-[90vh] flex flex-col">
             <div class="px-4 py-2 border-b border-border flex items-center">
-                <h2 class="font-medium text-accent">🔥 Stress Test</h2>
-                <button id="close-stress" class="ml-auto text-secondary hover:text-light">&times;</button>
+                <h2 id="stress-title" class="font-medium text-accent">🔥 Stress Test</h2>
+                <button id="close-stress" aria-label="Close Stress Test"
+                    class="ml-auto text-secondary hover:text-light">&times;</button>
             </div>
 
             <div class="p-4 space-y-4 flex-1 overflow-auto">
                 <div class="grid grid-cols-3 gap-4">
                     <div>
-                        <label class="block text-sm mb-1">Total URLs</label>
+                        <label for="st-total" class="block text-sm mb-1">Total URLs</label>
                         <input id="st-total" type="number" value="20"
                             class="w-full bg-dark border border-border rounded px-3 py-1">
                     </div>
                     <div>
-                        <label class="block text-sm mb-1">Chunk Size</label>
+                        <label for="st-chunk" class="block text-sm mb-1">Chunk Size</label>
                         <input id="st-chunk" type="number" value="5"
                             class="w-full bg-dark border border-border rounded px-3 py-1">
                     </div>
                     <div>
-                        <label class="block text-sm mb-1">Concurrency</label>
+                        <label for="st-conc" class="block text-sm mb-1">Concurrency</label>
                         <input id="st-conc" type="number" value="2"
                             class="w-full bg-dark border border-border rounded px-3 py-1">
                     </div>
@@ -598,12 +600,12 @@
                 textEl.textContent = 'Processing...';
             }
 
-            if (time) {
-                document.getElementById('exec-time').textContent = `${time}ms`;
-            }
+            document.getElementById('exec-time').textContent = Number.isFinite(time) ? `${time}ms` : '-';
 
-            if (memory !== undefined && peakMemory !== undefined) {
+            if (Number.isFinite(memory) && Number.isFinite(peakMemory)) {
                 document.getElementById('exec-mem').textContent = `Δ${memory >= 0 ? '+' : ''}${memory}MB (Peak: ${peakMemory}MB)`;
+            } else {
+                document.getElementById('exec-mem').textContent = '-';
             }
         }
 
@@ -724,9 +726,9 @@
             }
 
             updateStatus('processing');
+            const startTime = performance.now();
 
             try {
-                const startTime = performance.now();
                 let response, responseData;
                 const useStreamOverride = (endpoint === 'crawl') && shouldUseStream(payload);
 
@@ -744,7 +746,6 @@
                     responseData = await response.json();
                     const time = Math.round(performance.now() - startTime);
                     if (!response.ok) {
-                        updateStatus('error', time);
                         throw new Error(responseData.error || 'Request failed');
                     }
                     updateStatus('success', time);
@@ -759,9 +760,13 @@
                         body: JSON.stringify(payload)
                     });
 
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({}));
+                        throw new Error(errorData.detail || errorData.error || 'Request failed');
+                    }
+
                     const reader = response.body.getReader();
                     let text = '';
-                    let maxMemory = 0;
 
                     while (true) {
                         const { value, done } = await reader.read();
@@ -769,24 +774,10 @@
 
                         const chunk = new TextDecoder().decode(value);
                         text += chunk;
-
-                        // Process each line for memory updates
-                        chunk.trim().split('\n').forEach(line => {
-                            if (!line) return;
-                            try {
-                                const obj = JSON.parse(line);
-                                if (obj.server_memory_mb) {
-                                    maxMemory = Math.max(maxMemory, obj.server_memory_mb);
-                                }
-                            } catch (e) {
-                                console.error('Error parsing stream line:', e);
-                            }
-                        });
                     }
 
-                    responseData = { stream: text };
                     const time = Math.round(performance.now() - startTime);
-                    updateStatus('success', time, null, maxMemory);
+                    updateStatus('success', time);
                     document.querySelector('#response-content code').textContent = text;
                     document.querySelector('#response-content code').className = 'json hljs'; // Reset classes
                     forceHighlightElement(document.querySelector('#response-content code'));
@@ -802,7 +793,6 @@
                     const time = Math.round(performance.now() - startTime);
 
                     if (!response.ok) {
-                        updateStatus('error', time);
                         throw new Error(responseData.error || 'Request failed');
                     }
 
@@ -832,7 +822,7 @@
                 }
             } catch (error) {
                 console.error('Error:', error);
-                updateStatus('error');
+                updateStatus('error', Math.round(performance.now() - startTime));
                 document.querySelector('#response-content code').textContent = JSON.stringify(
                     { error: error.message },
                     null,
