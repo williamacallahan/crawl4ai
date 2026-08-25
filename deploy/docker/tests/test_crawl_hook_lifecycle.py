@@ -122,7 +122,7 @@ def install_fakes(monkeypatch, pooled, dedicated=None):
     monkeypatch.setattr(api, "BrowserConfig", FakeBrowserConfig)
     monkeypatch.setattr(api, "CrawlerRunConfig", FakeCrawlerRunConfig)
     monkeypatch.setattr(api, "AsyncWebCrawler", lambda **_kwargs: dedicated)
-    monkeypatch.setattr(api, "_apply_browser_resource_policy", lambda value, _config: value)
+    monkeypatch.setattr(api, "_apply_server_browser_policy", lambda value, _config: value)
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
     monkeypatch.setattr(
         api,

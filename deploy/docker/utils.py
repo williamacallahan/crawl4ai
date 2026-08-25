@@ -163,6 +163,15 @@ def load_config() -> Dict:
 
     return config
 
+
+def get_browser_extra_args(config: Dict) -> list[str]:
+    """Resolve operator Chromium flags against the sandbox opt-in."""
+    configured_args = config["crawler"]["browser"].get("extra_args", [])
+    if os.environ.get("CRAWL4AI_CHROMIUM_SANDBOX", "false").lower() == "true":
+        return [arg for arg in configured_args if arg != "--no-sandbox"]
+    return list(configured_args)
+
+
 class CRLFSafeFilter(logging.Filter):
     """Strip CR/LF/control chars from log records (log-injection / forging).
 

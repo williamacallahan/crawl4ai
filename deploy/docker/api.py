@@ -27,6 +27,7 @@ from utils import (
     TaskStatus,
     decode_redis_hash,
     get_base_url,
+    get_browser_extra_args,
     get_redis_task_ttl,
     is_task_id,
     should_cleanup_task,
@@ -96,8 +97,8 @@ async def _crawler_arun(crawler: AsyncWebCrawler, *args, **kwargs):
     return await getattr(crawler, "arun")(*args, **kwargs)
 
 
-def _apply_browser_resource_policy(browser_config, config):
-    """Apply server-owned browser limits to every caller-supplied configuration.
+def _apply_server_browser_policy(browser_config, config):
+    """Apply server-owned launch flags and limits to caller browser config.
 
     Kept from the fork alongside upstream's egress_broker/governor guards, which
     cover SSRF and deep-crawl budgets but NOT Chromium's own memory growth. The
@@ -105,6 +106,7 @@ def _apply_browser_resource_policy(browser_config, config):
     supersedes it. Guarded by tests/test_resource_policy.py.
     """
     browser_defaults = config["crawler"]["browser"].get("kwargs", {})
+    browser_config.extra_args = get_browser_extra_args(config)
 
     if browser_defaults.get("memory_saving_mode", False):
         browser_config.memory_saving_mode = True
@@ -181,7 +183,7 @@ async def handle_llm_qa(
         from utils import load_config
         cfg = load_config()
         browser_cfg = BrowserConfig(
-            extra_args=cfg["crawler"]["browser"].get("extra_args", []),
+            extra_args=get_browser_extra_args(cfg),
             **cfg["crawler"]["browser"].get("kwargs", {}),
         )
         from egress_broker import enforce_egress
@@ -291,7 +293,7 @@ async def process_llm_extraction(
         from utils import load_config as _load_config
         _wcfg = await asyncio.to_thread(_load_config)
         worker_browser_cfg = BrowserConfig(
-            extra_args=_wcfg["crawler"]["browser"].get("extra_args", []),
+            extra_args=get_browser_extra_args(_wcfg),
             **_wcfg["crawler"]["browser"].get("kwargs", {}),
         )
         from egress_broker import enforce_egress
@@ -416,7 +418,7 @@ async def handle_markdown_request(
         from utils import load_config as _load_config
         _cfg = _load_config()
         browser_cfg = BrowserConfig(
-            extra_args=_cfg["crawler"]["browser"].get("extra_args", []),
+            extra_args=get_browser_extra_args(_cfg),
             **_cfg["crawler"]["browser"].get("kwargs", {}),
         )
         from egress_broker import enforce_egress
@@ -782,7 +784,7 @@ async def handle_crawl_request(
             browser_config,
             provenance=Provenance.UNTRUSTED,
         )
-        _apply_browser_resource_policy(loaded_browser_config, config)
+        _apply_server_browser_policy(loaded_browser_config, config)
         loaded_crawler_config = CrawlerRunConfig.load(
             crawler_config,
             provenance=Provenance.UNTRUSTED,
@@ -998,7 +1000,7 @@ async def handle_stream_crawl_request(
             browser_config,
             provenance=Provenance.UNTRUSTED,
         )
-        _apply_browser_resource_policy(loaded_browser_config, config)
+        _apply_server_browser_policy(loaded_browser_config, config)
         # browser_config.verbose = True # Set to False or remove for production stress testing
         loaded_browser_config.verbose = False
         from egress_broker import enforce_egress

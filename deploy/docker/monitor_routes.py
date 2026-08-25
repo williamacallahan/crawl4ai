@@ -6,6 +6,7 @@ from auth import require_admin
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from monitor import get_monitor
 from pydantic import BaseModel
+from utils import get_browser_extra_args
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/monitor", tags=["monitor"])
@@ -293,7 +294,7 @@ async def restart_browser(req: KillBrowserRequest):
                 from utils import load_config
                 config = load_config()
                 await init_permanent(BrowserConfig(
-                    extra_args=config["crawler"]["browser"].get("extra_args", []),
+                    extra_args=get_browser_extra_args(config),
                     **config["crawler"]["browser"].get("kwargs", {}),
                 ))
 

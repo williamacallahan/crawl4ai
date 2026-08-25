@@ -139,12 +139,13 @@ class TestEntrypoint:
 
 class TestSandboxOptOut:
     def test_default_keeps_no_sandbox(self, server_module, monkeypatch):
-        monkeypatch.setattr(server_module, "CHROMIUM_SANDBOX", False)
-        assert "--no-sandbox" in server_module._browser_extra_args()
+        monkeypatch.delenv("CRAWL4AI_CHROMIUM_SANDBOX", raising=False)
+        assert "--no-sandbox" in server_module.get_default_browser_config().extra_args
 
     def test_opt_in_drops_no_sandbox(self, server_module, monkeypatch):
         # CRAWL4AI_CHROMIUM_SANDBOX=true -> run the renderer sandboxed.
-        monkeypatch.setattr(server_module, "CHROMIUM_SANDBOX", True)
-        assert "--no-sandbox" not in server_module._browser_extra_args()
+        monkeypatch.setenv("CRAWL4AI_CHROMIUM_SANDBOX", "true")
+        extra_args = server_module.get_default_browser_config().extra_args
+        assert "--no-sandbox" not in extra_args
         # other flags are preserved
-        assert "--disable-dev-shm-usage" in server_module._browser_extra_args()
+        assert "--disable-dev-shm-usage" in extra_args

@@ -71,6 +71,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.exceptions import HTTPException as _StarletteHTTPException
 from utils import (
+    get_browser_extra_args,
     load_config,
     setup_logging,
     validate_url_destination,
@@ -101,13 +102,6 @@ HOOKS_ENABLED = os.environ.get("CRAWL4AI_HOOKS_ENABLED", "false").lower() == "tr
 
 # /execute_js disabled by default (arbitrary JS + SSRF risk). Set to "true" to enable.
 EXECUTE_JS_ENABLED = os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lower() == "true"
-
-# Chromium renderer sandbox. --no-sandbox is kept by default because the
-# container runs as non-root without a usable sandbox. On a host that provides
-# an unprivileged user namespace (unprivileged_userns_clone=1) or a seccomp
-# profile, set CRAWL4AI_CHROMIUM_SANDBOX=true to drop --no-sandbox and run the
-# renderer sandboxed. Verify Chromium still starts after flipping it.
-CHROMIUM_SANDBOX = os.environ.get("CRAWL4AI_CHROMIUM_SANDBOX", "false").lower() == "true"
 
 def _current_api_token() -> str:
     """The effective static operator token (config or environment)."""
@@ -167,16 +161,6 @@ if not _current_api_token() and not _current_jwt_enabled():
         "service to loopback."
     )
 
-# ── default browser config helper ─────────────────────────────
-def _browser_extra_args() -> list:
-    """Effective Chromium launch flags. Drops --no-sandbox when the operator
-    opts into the renderer sandbox (CRAWL4AI_CHROMIUM_SANDBOX=true)."""
-    args = list(config["crawler"]["browser"].get("extra_args", []))
-    if CHROMIUM_SANDBOX:
-        args = [a for a in args if a != "--no-sandbox"]
-    return args
-
-
 def get_default_browser_config() -> BrowserConfig:
     """Get default BrowserConfig from config.yml.
 
@@ -186,7 +170,7 @@ def get_default_browser_config() -> BrowserConfig:
     DNS-rebinding / redirect-to-internal protection as /crawl, rather than
     relying on each handler to remember it."""
     bc = BrowserConfig(
-        extra_args=_browser_extra_args(),
+        extra_args=get_browser_extra_args(config),
         **config["crawler"]["browser"].get("kwargs", {}),
     )
     from egress_broker import enforce_egress

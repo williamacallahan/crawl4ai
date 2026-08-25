@@ -20,23 +20,34 @@ def _config():
                 "kwargs": {
                     "memory_saving_mode": True,
                     "max_pages_before_recycle": 500,
-                }
+                },
+                "extra_args": ["--no-sandbox", "--disable-dev-shm-usage"],
             }
         }
     }
 
 
-def test_resource_policy_enforces_server_browser_limits():
+def test_resource_policy_enforces_server_browser_limits(monkeypatch):
+    monkeypatch.delenv("CRAWL4AI_CHROMIUM_SANDBOX", raising=False)
     browser_config = BrowserConfig(
         memory_saving_mode=False,
         max_pages_before_recycle=0,
     )
 
-    result = api._apply_browser_resource_policy(browser_config, _config())
+    result = api._apply_server_browser_policy(browser_config, _config())
 
     assert result is browser_config
     assert result.memory_saving_mode is True
     assert result.max_pages_before_recycle == 500
+    assert result.extra_args == ["--no-sandbox", "--disable-dev-shm-usage"]
+
+
+def test_resource_policy_honors_chromium_sandbox_opt_in(monkeypatch):
+    monkeypatch.setenv("CRAWL4AI_CHROMIUM_SANDBOX", "true")
+
+    result = api._apply_server_browser_policy(BrowserConfig(), _config())
+
+    assert result.extra_args == ["--disable-dev-shm-usage"]
 
 
 def test_resource_policy_preserves_stricter_recycle_limit():
@@ -45,7 +56,7 @@ def test_resource_policy_preserves_stricter_recycle_limit():
         max_pages_before_recycle=100,
     )
 
-    result = api._apply_browser_resource_policy(browser_config, _config())
+    result = api._apply_server_browser_policy(browser_config, _config())
 
     assert result.max_pages_before_recycle == 100
 
@@ -54,7 +65,7 @@ def test_resource_policy_replaces_malformed_recycle_limit():
     browser_config = BrowserConfig()
     browser_config.max_pages_before_recycle = None
 
-    result = api._apply_browser_resource_policy(browser_config, _config())
+    result = api._apply_server_browser_policy(browser_config, _config())
 
     assert result.max_pages_before_recycle == 500
 
