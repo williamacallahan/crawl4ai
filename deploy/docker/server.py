@@ -101,7 +101,10 @@ GLOBAL_SEM = asyncio.Semaphore(MAX_PAGES)
 HOOKS_ENABLED = os.environ.get("CRAWL4AI_HOOKS_ENABLED", "false").lower() == "true"
 
 # /execute_js disabled by default (arbitrary JS + SSRF risk). Set to "true" to enable.
-EXECUTE_JS_ENABLED = os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lower() == "true"
+EXECUTE_JS_ENABLED = (
+    os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lower() == "true"
+)
+
 
 def _current_api_token() -> str:
     """The effective static operator token (config or environment)."""
@@ -161,6 +164,7 @@ if not _current_api_token() and not _current_jwt_enabled():
         "service to loopback."
     )
 
+
 def get_default_browser_config() -> BrowserConfig:
     """Get default BrowserConfig from config.yml.
 
@@ -174,8 +178,10 @@ def get_default_browser_config() -> BrowserConfig:
         **config["crawler"]["browser"].get("kwargs", {}),
     )
     from egress_broker import enforce_egress
+
     enforce_egress(bc)
     return bc
+
 
 # import logging
 # page_log = logging.getLogger("page_cap")
@@ -195,6 +201,8 @@ orig_arun = AsyncWebCrawler.arun
 async def capped_arun(self, *a, **kw):
     async with GLOBAL_SEM:
         return await orig_arun(self, *a, **kw)
+
+
 AsyncWebCrawler.arun = capped_arun
 
 # ───────────────────── FastAPI lifespan ──────────────────────
@@ -280,9 +288,11 @@ async def lifespan(_: FastAPI):
         except Exception:
             pass
 
+
 async def _artifact_janitor():
     """Periodically reap expired / over-quota artifacts."""
     from artifacts import janitor as _reap
+
     while True:
         await asyncio.sleep(300)
         try:
@@ -290,9 +300,11 @@ async def _artifact_janitor():
         except Exception as e:
             logger.warning(f"Artifact janitor error: {e}")
 
+
 async def _timeline_updater():
     """Update timeline data every 5 seconds."""
     from monitor import get_monitor
+
     while True:
         await asyncio.sleep(5)
         try:
@@ -301,6 +313,7 @@ async def _timeline_updater():
             logger.warning("Timeline update timeout after 4s")
         except Exception as e:
             logger.warning(f"Timeline update error: {e}")
+
 
 # ───────────────────── FastAPI instance ──────────────────────
 app = FastAPI(
@@ -350,6 +363,7 @@ async def root():
 async def monitor_ui_redirect():
     return RedirectResponse("/dashboard")
 
+
 # ─────────────────── infra / middleware  ─────────────────────
 redis = aioredis.from_url(_build_redis_url(config))
 
@@ -381,6 +395,7 @@ def _setup_security(app_: FastAPI):
     origins = [o for o in (sec.get("cors_allow_origins") or []) if o and o != "*"]
     if origins:
         from fastapi.middleware.cors import CORSMiddleware
+
         app_.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
@@ -439,7 +454,9 @@ HEALTH_PATH = config["observability"]["health_check"]["endpoint"]
 
 
 # ── request body-size limit (DoS) ─────────────────────────────────────
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body_bytes_from_config(config))
+app.add_middleware(
+    BodySizeLimitMiddleware, max_bytes=max_body_bytes_from_config(config)
+)
 
 # Add auth after the body limiter so Starlette makes it the outermost layer:
 # unauthorized callers are rejected before their body is read or buffered.
@@ -494,6 +511,7 @@ def _resolve_auth():
         "No API credential is configured; protected loopback routes will return "
         "401 until the operator supplies an existing credential."
     )
+
 
 # ───────────────── URL validation helper ─────────────────
 ALLOWED_URL_SCHEMES = ("http://", "https://")
@@ -645,23 +663,28 @@ async def get_markdown(
 
     Use this tool when you need clean, readable text from web pages.
     """
-    if not body.url.startswith(("http://", "https://")) and not body.url.startswith(("raw:", "raw://")):
+    if not body.url.startswith(("http://", "https://")) and not body.url.startswith(
+        ("raw:", "raw://")
+    ):
         raise HTTPException(
-            400, "Invalid URL format. Must start with http://, https://, or for raw HTML (raw:, raw://)")
+            400,
+            "Invalid URL format. Must start with http://, https://, or for raw HTML (raw:, raw://)",
+        )
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
     markdown = await handle_markdown_request(
-        body.url, body.f, body.q, body.c, config, body.provider,
-        body.temperature
+        body.url, body.f, body.q, body.c, config, body.provider, body.temperature
     )
-    return JSONResponse({
-        "url": body.url,
-        "filter": body.f,
-        "query": body.q,
-        "cache": body.c,
-        "markdown": markdown,
-        "success": True
-    })
+    return JSONResponse(
+        {
+            "url": body.url,
+            "filter": body.f,
+            "query": body.q,
+            "cache": body.c,
+            "markdown": markdown,
+            "success": True,
+        }
+    )
 
 
 @app.post("/html")
@@ -687,6 +710,7 @@ async def generate_html(
 
         raw_html = results[0].html
         from crawl4ai.utils import preprocess_html_for_schema
+
         processed_html = preprocess_html_for_schema(raw_html)
         return JSONResponse({"html": processed_html, "url": body.url, "success": True})
     except Exception as e:
@@ -695,10 +719,12 @@ async def generate_html(
         if crawler:
             await release_crawler(crawler)
 
+
 # ── artifact store helpers ───────────────────────────────────
 def _store_artifact(kind: str, data: bytes) -> dict:
     """Write to the sandboxed store; map quota/size errors to HTTP codes."""
     from artifacts import ArtifactTooLarge, QuotaExceeded, write_artifact
+
     try:
         meta = write_artifact(kind, data)
     except ArtifactTooLarge:
@@ -717,11 +743,14 @@ def _store_artifact(kind: str, data: bytes) -> dict:
 async def get_artifact(artifact_id: str, _td: Dict = Depends(token_dep)):
     """Fetch a previously generated artifact by its opaque id (authed)."""
     from artifacts import ArtifactNotFound, resolve_artifact
+
     try:
         path, mime = await asyncio.to_thread(resolve_artifact, artifact_id)
     except ArtifactNotFound:
         raise HTTPException(404, "Artifact not found")
-    return FileResponse(path, media_type=mime, headers={"X-Content-Type-Options": "nosniff"})
+    return FileResponse(
+        path, media_type=mime, headers={"X-Content-Type-Options": "nosniff"}
+    )
 
 
 # Screenshot endpoint
@@ -743,7 +772,11 @@ async def generate_screenshot(
     await validate_url_scheme(body.url)
     crawler = None
     try:
-        cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for, wait_for_images=body.wait_for_images)
+        cfg = CrawlerRunConfig(
+            screenshot=True,
+            screenshot_wait_for=body.screenshot_wait_for,
+            wait_for_images=body.wait_for_images,
+        )
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
@@ -762,6 +795,7 @@ async def generate_screenshot(
     finally:
         if crawler:
             await release_crawler(crawler)
+
 
 # PDF endpoint
 
@@ -853,7 +887,10 @@ async def execute_js(
 
     """
     if not EXECUTE_JS_ENABLED:
-        raise HTTPException(403, "execute_js endpoint is disabled. Set CRAWL4AI_EXECUTE_JS_ENABLED=true to enable.")
+        raise HTTPException(
+            403,
+            "execute_js endpoint is disabled. Set CRAWL4AI_EXECUTE_JS_ENABLED=true to enable.",
+        )
     await validate_url_scheme(body.url, check_destination=False)
     try:
         await asyncio.to_thread(validate_webhook_url, body.url)
@@ -880,7 +917,9 @@ async def llm_endpoint(
     request: Request,
     url: str = Path(...),
     q: str = Query(...),
-    provider: Optional[str] = Query(None, description="LLM provider override, e.g. 'openai/gpt-4o-mini'"),
+    provider: Optional[str] = Query(
+        None, description="LLM provider override, e.g. 'openai/gpt-4o-mini'"
+    ),
     temperature: Optional[float] = Query(None, description="LLM temperature override"),
     _td: Dict = Depends(token_dep),
 ):
@@ -888,17 +927,21 @@ async def llm_endpoint(
     # derived server-side from the provider name only.
     if not q:
         raise HTTPException(400, "Query parameter 'q' is required")
-    if not url.startswith(("http://", "https://")) and not url.startswith(("raw:", "raw://")):
+    if not url.startswith(("http://", "https://")) and not url.startswith(
+        ("raw:", "raw://")
+    ):
         url = "https://" + url
-    answer = await handle_llm_qa(url, q, config, provider=provider, temperature=temperature)
+    answer = await handle_llm_qa(
+        url, q, config, provider=provider, temperature=temperature
+    )
     return JSONResponse({"answer": answer})
 
 
 @app.get("/schema")
 async def get_schema():
     from crawl4ai import BrowserConfig, CrawlerRunConfig
-    return {"browser": BrowserConfig().dump(),
-            "crawler": CrawlerRunConfig().dump()}
+
+    return {"browser": BrowserConfig().dump(), "crawler": CrawlerRunConfig().dump()}
 
 
 @app.get("/hooks/info")
@@ -911,14 +954,16 @@ async def get_hooks_info():
     """
     from hook_registry import describe_registry
 
-    return JSONResponse({
-        "available_actions": describe_registry(),
-        "usage": {
-            "field": "hooks",
-            "shape": [{"action": "<action>", "params": {"...": "..."}}],
-            "max_hooks": 10,
-        },
-    })
+    return JSONResponse(
+        {
+            "available_actions": describe_registry(),
+            "usage": {
+                "field": "hooks",
+                "shape": [{"action": "<action>", "params": {"...": "..."}}],
+                "max_hooks": 10,
+            },
+        }
+    )
 
 
 @app.get(config["observability"]["health_check"]["endpoint"])
@@ -967,7 +1012,9 @@ async def crawl(
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
     if crawl_request.hooks and crawl_request.hooks.hooks and not HOOKS_ENABLED:
-        raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
+        raise HTTPException(
+            403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable."
+        )
     # Check whether it is a redirection for a streaming request
     try:
         crawler_config = CrawlerRunConfig.load(
@@ -977,12 +1024,12 @@ async def crawl(
         raise HTTPException(400, f"Rejected config: {e}")
     if crawler_config.stream:
         return await stream_process(crawl_request=crawl_request)
-    
+
     # Prepare hooks config if provided
     hooks_config = None
     if crawl_request.hooks and crawl_request.hooks.hooks:
-        hooks_config = {'hooks': crawl_request.hooks.hooks}
-    
+        hooks_config = {"hooks": crawl_request.hooks.hooks}
+
     results = await handle_crawl_request(
         urls=crawl_request.urls,
         browser_config=crawl_request.browser_config,
@@ -990,10 +1037,12 @@ async def crawl(
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        result_fields=crawl_request.result_fields,
     )
     # check if all of the results are not successful
     if all(not result["success"] for result in results["results"]):
-        raise HTTPException(500, f"Crawl request failed: {results['results'][0]['error_message']}")
+        error_message = results["results"][0].get("error_message", "unknown error")
+        raise HTTPException(500, f"Crawl request failed: {error_message}")
     return JSONResponse(results)
 
 
@@ -1007,25 +1056,27 @@ async def crawl_stream(
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
     if crawl_request.hooks and crawl_request.hooks.hooks and not HOOKS_ENABLED:
-        raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
+        raise HTTPException(
+            403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable."
+        )
 
     return await stream_process(crawl_request=crawl_request)
 
+
 async def stream_process(crawl_request: CrawlRequestWithHooks):
-    
     # Prepare hooks config if provided# Prepare hooks config if provided
     hooks_config = None
     if crawl_request.hooks and crawl_request.hooks.hooks:
-        hooks_config = {'hooks': crawl_request.hooks.hooks}
-    
+        hooks_config = {"hooks": crawl_request.hooks.hooks}
+
     crawler, gen, hooks_info = await handle_stream_crawl_request(
         urls=crawl_request.urls,
         browser_config=crawl_request.browser_config,
         crawler_config=crawl_request.crawler_config,
         config=config,
-        hooks_config=hooks_config
+        hooks_config=hooks_config,
     )
-    
+
     # Add hooks info to response headers if available
     headers = {
         "Cache-Control": "no-cache",
@@ -1034,10 +1085,11 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
     }
     if hooks_info:
         import json
-        headers["X-Hooks-Status"] = json.dumps(hooks_info['status']['status'])
-    
+
+        headers["X-Hooks-Status"] = json.dumps(hooks_info["status"]["status"])
+
     return StreamingResponse(
-        stream_results(crawler, gen),
+        stream_results(crawler, gen, crawl_request.result_fields),
         media_type="application/x-ndjson",
         headers=headers,
     )
@@ -1047,10 +1099,10 @@ def chunk_code_functions(code_md: str) -> List[str]:
     """Extract each function/class from markdown code blocks per file."""
     pattern = re.compile(
         # match "## File: <path>" then a ```py fence, then capture until the closing ```
-        r'##\s*File:\s*(?P<path>.+?)\s*?\r?\n'      # file header
-        r'```py\s*?\r?\n'                         # opening fence
-        r'(?P<code>.*?)(?=\r?\n```)',             # code block
-        re.DOTALL
+        r"##\s*File:\s*(?P<path>.+?)\s*?\r?\n"  # file header
+        r"```py\s*?\r?\n"  # opening fence
+        r"(?P<code>.*?)(?=\r?\n```)",  # code block
+        re.DOTALL,
     )
     chunks: List[str] = []
     for m in pattern.finditer(code_md):
@@ -1090,15 +1142,14 @@ async def get_context(
     request: Request,
     _td: Dict = Depends(token_dep),
     context_type: str = Query("all", pattern="^(code|doc|all)$"),
-    query: Optional[str] = Query(
-        None, description="search query to filter chunks"),
+    query: Optional[str] = Query(None, description="search query to filter chunks"),
     score_ratio: float = Query(
-        0.5, ge=0.0, le=1.0, description="min score as fraction of max_score"),
-    max_results: int = Query(
-        20, ge=1, description="absolute cap on returned chunks"),
+        0.5, ge=0.0, le=1.0, description="min score as fraction of max_score"
+    ),
+    max_results: int = Query(20, ge=1, description="absolute cap on returned chunks"),
 ):
     """
-    This end point is design for any questions about Crawl4ai library. It returns a plain text markdown with extensive information about Crawl4ai. 
+    This end point is design for any questions about Crawl4ai library. It returns a plain text markdown with extensive information about Crawl4ai.
     You can use this as a context for any AI assistant. Use this endpoint for AI assistants to retrieve library context for decision making or code generation tasks.
     Alway is BEST practice you provide a query to filter the context. Otherwise the lenght of the response will be very long.
 
@@ -1132,10 +1183,12 @@ async def get_context(
             return JSONResponse({"code_context": code_content})
         if context_type == "doc":
             return JSONResponse({"doc_context": doc_content})
-        return JSONResponse({
-            "code_context": code_content,
-            "doc_context": doc_content,
-        })
+        return JSONResponse(
+            {
+                "code_context": code_content,
+                "doc_context": doc_content,
+            }
+        )
 
     tokens = query.split()
     results: Dict[str, List[Dict[str, float]]] = {}
@@ -1159,7 +1212,7 @@ async def get_context(
         max_sd = float(scores_d.max()) if scores_d.size > 0 else 0.0
         cutoff_d = max_sd * score_ratio
         idxs = [i for i, s in enumerate(scores_d) if s >= cutoff_d]
-        neighbors = set(i for idx in idxs for i in (idx-1, idx, idx+1))
+        neighbors = set(i for idx in idxs for i in (idx - 1, idx, idx + 1))
         valid = [i for i in sorted(neighbors) if 0 <= i < len(sections)]
         valid = valid[:max_results]
         results["doc_results"] = [
@@ -1183,6 +1236,7 @@ attach_mcp(
 # ────────────────────────── cli ──────────────────────────────
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "server:app",
         host=config["app"]["host"],

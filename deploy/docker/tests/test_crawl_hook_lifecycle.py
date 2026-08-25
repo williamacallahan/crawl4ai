@@ -122,7 +122,9 @@ def install_fakes(monkeypatch, pooled, dedicated=None):
     monkeypatch.setattr(api, "BrowserConfig", FakeBrowserConfig)
     monkeypatch.setattr(api, "CrawlerRunConfig", FakeCrawlerRunConfig)
     monkeypatch.setattr(api, "AsyncWebCrawler", lambda **_kwargs: dedicated)
-    monkeypatch.setattr(api, "_apply_server_browser_policy", lambda value, _config: value)
+    monkeypatch.setattr(
+        api, "_apply_server_browser_policy", lambda value, _config: value
+    )
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
     monkeypatch.setattr(
         api,
@@ -164,7 +166,10 @@ def test_non_streaming_hooks_use_dedicated_crawler(monkeypatch):
 
     response = run(
         api.handle_crawl_request(
-            ["https://example.com"], {}, {}, crawl_config(),
+            ["https://example.com"],
+            {},
+            {},
+            crawl_config(),
             hooks_config={"hooks": [{"action": "test"}]},
         )
     )
@@ -173,6 +178,24 @@ def test_non_streaming_hooks_use_dedicated_crawler(monkeypatch):
     assert pooled.crawler_strategy.hooks == original
     assert released == []
     assert dedicated.started and dedicated.closed
+
+
+def test_non_streaming_crawl_projects_requested_result_fields(monkeypatch):
+    pooled = FakeCrawler()
+    released, _dedicated = install_fakes(monkeypatch, pooled, dedicated=None)
+
+    response = run(
+        api.handle_crawl_request(
+            ["https://example.com"],
+            {},
+            {},
+            crawl_config(),
+            result_fields=["url", "success"],
+        )
+    )
+
+    assert response["results"] == [{"url": "https://example.com", "success": True}]
+    assert released == [pooled]
 
 
 def test_hook_attachment_failure_closes_dedicated_crawler(monkeypatch):
@@ -187,7 +210,10 @@ def test_hook_attachment_failure_closes_dedicated_crawler(monkeypatch):
     with pytest.raises(HTTPException) as error:
         run(
             api.handle_crawl_request(
-                ["https://example.com"], {}, {}, crawl_config(),
+                ["https://example.com"],
+                {},
+                {},
+                crawl_config(),
                 hooks_config={"hooks": [{"action": "test"}]},
             )
         )
@@ -229,7 +255,10 @@ def test_stream_close_closes_dedicated_hook_crawler(monkeypatch):
 
     async def exercise():
         crawler, results, _hooks = await api.handle_stream_crawl_request(
-            ["https://example.com"], {}, {}, crawl_config(),
+            ["https://example.com"],
+            {},
+            {},
+            crawl_config(),
             hooks_config={"hooks": [{"action": "test"}]},
         )
         output = api.stream_results(crawler, results)
@@ -245,7 +274,9 @@ def test_stream_close_closes_dedicated_hook_crawler(monkeypatch):
 def test_non_hook_request_keeps_pooled_lifecycle(monkeypatch):
     pooled = FakeCrawler()
     released, dedicated = install_fakes(monkeypatch, pooled)
-    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+    response = run(
+        api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config())
+    )
 
     assert response["success"] is True
     assert released == [pooled]
@@ -419,9 +450,7 @@ async def test_dedicated_admission_released_when_creation_is_cancelled(monkeypat
         return crawler
 
     configure_dedicated_pool(monkeypatch, factory, capacity=1)
-    task = asyncio.create_task(
-        crawler_pool.get_dedicated_crawler(BrowserConfig())
-    )
+    task = asyncio.create_task(crawler_pool.get_dedicated_crawler(BrowserConfig()))
     while not created:
         await asyncio.sleep(0)
     await created[0].run_started.wait()
@@ -458,9 +487,7 @@ async def test_dedicated_release_finishes_cleanup_when_cancelled(monkeypatch):
     crawler = await crawler_pool.get_dedicated_crawler(BrowserConfig())
     blocking_crawler = created[0]
     assert crawler is blocking_crawler
-    release_task = asyncio.create_task(
-        crawler_pool.release_dedicated_crawler(crawler)
-    )
+    release_task = asyncio.create_task(crawler_pool.release_dedicated_crawler(crawler))
     await blocking_crawler.close_started.wait()
     release_task.cancel()
     await asyncio.sleep(0)

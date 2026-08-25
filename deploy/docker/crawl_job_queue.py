@@ -25,11 +25,26 @@ from work_queue import (
 )
 
 from crawl4ai import BrowserConfig, CrawlerRunConfig
-from crawl4ai.async_configs import Provenance, UntrustedConfigError
+from crawl4ai.async_configs import (
+    Provenance,
+    UNTRUSTED_FIELD_ALLOWLIST,
+    UntrustedConfigError,
+)
 
 logger = logging.getLogger(__name__)
 
 CRAWL_JOB_PROTOCOL_VERSION = 2
+
+
+def _untrusted_dump(config: BrowserConfig | CrawlerRunConfig) -> dict:
+    """Serialize a validated config without constructor-injected power fields."""
+    payload = config.dump()
+    payload["params"] = {
+        key: value
+        for key, value in payload["params"].items()
+        if key in UNTRUSTED_FIELD_ALLOWLIST[payload["type"]]
+    }
+    return payload
 
 
 class CrawlJobLeaseLost(RuntimeError):
@@ -40,14 +55,18 @@ class CrawlJobQueueFull(RuntimeError):
     """Raised when the configured durable crawl-job backlog is full."""
 
     def __init__(self, max_pending_jobs: int):
-        super().__init__(f"Crawl job queue is full (max_pending_jobs={max_pending_jobs})")
+        super().__init__(
+            f"Crawl job queue is full (max_pending_jobs={max_pending_jobs})"
+        )
 
 
 class CrawlJobPrincipalQuotaExceeded(RuntimeError):
     """Raised when one principal has filled its durable pending-job allowance."""
 
     def __init__(self, per_principal: int):
-        super().__init__(f"Too many pending crawl jobs for this caller (limit={per_principal})")
+        super().__init__(
+            f"Too many pending crawl jobs for this caller (limit={per_principal})"
+        )
 
 
 class CrawlJobPayloadRejected(ValueError):
@@ -319,14 +338,20 @@ class CrawlJobQueueSettings:
 
         def positive_int(name: str) -> int:
             candidate = configured[name]
-            if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate <= 0:
+            if (
+                isinstance(candidate, bool)
+                or not isinstance(candidate, int)
+                or candidate <= 0
+            ):
                 raise ValueError(f"crawl_jobs.{name} must be a positive integer")
             return candidate
 
         lease_seconds = positive_int("lease_seconds")
         heartbeat_seconds = positive_int("heartbeat_seconds")
         if heartbeat_seconds >= lease_seconds:
-            raise ValueError("crawl_jobs.heartbeat_seconds must be less than lease_seconds")
+            raise ValueError(
+                "crawl_jobs.heartbeat_seconds must be less than lease_seconds"
+            )
 
         from governor import job_queue_caps
 
@@ -343,7 +368,9 @@ class CrawlJobQueueSettings:
         protocol_suffix = f":v{protocol_version}"
 
         def versioned_name(name: str) -> str:
-            return name if name.endswith(protocol_suffix) else f"{name}{protocol_suffix}"
+            return (
+                name if name.endswith(protocol_suffix) else f"{name}{protocol_suffix}"
+            )
 
         return cls(
             stream=versioned_name(str(configured["stream"])),
@@ -441,16 +468,22 @@ class CrawlJobQueue:
         owner: str,
     ) -> str:
         try:
-            canonical_browser = BrowserConfig.load(
-                browser_config,
-                provenance=Provenance.UNTRUSTED,
-            ).dump()
-            canonical_crawler = CrawlerRunConfig.load(
-                crawler_config,
-                provenance=Provenance.UNTRUSTED,
-            ).dump()
+            canonical_browser = _untrusted_dump(
+                BrowserConfig.load(
+                    browser_config,
+                    provenance=Provenance.UNTRUSTED,
+                )
+            )
+            canonical_crawler = _untrusted_dump(
+                CrawlerRunConfig.load(
+                    crawler_config,
+                    provenance=Provenance.UNTRUSTED,
+                )
+            )
         except (TypeError, UntrustedConfigError, ValueError) as error:
-            raise CrawlJobPayloadRejected(f"Rejected crawl job configuration: {error}") from error
+            raise CrawlJobPayloadRejected(
+                f"Rejected crawl job configuration: {error}"
+            ) from error
 
         payload = {
             "protocol_version": self.settings.protocol_version,
@@ -465,7 +498,9 @@ class CrawlJobQueue:
         try:
             serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError) as error:
-            raise CrawlJobPayloadRejected("Rejected non-serializable crawl job payload") from error
+            raise CrawlJobPayloadRejected(
+                "Rejected non-serializable crawl job payload"
+            ) from error
         payload_bytes = len(serialized.encode("utf-8"))
         if payload_bytes > self.settings.max_payload_bytes:
             raise CrawlJobPayloadRejected(
@@ -600,7 +635,9 @@ class CrawlJobQueue:
             self.settings.protocol_version,
         )
         if not result or int(result[0]) != 1:
-            raise CrawlJobLeaseLost(f"crawl job {entry.task_id} is no longer owned by {consumer}")
+            raise CrawlJobLeaseLost(
+                f"crawl job {entry.task_id} is no longer owned by {consumer}"
+            )
         return CrawlJobAttempt(
             number=int(result[1]),
             fence_token=fence_token,
@@ -633,7 +670,9 @@ class CrawlJobQueue:
             self._created_at(),
         )
         if int(renewed) != 1:
-            raise CrawlJobLeaseLost(f"crawl job {entry.task_id} lease was claimed by another worker")
+            raise CrawlJobLeaseLost(
+                f"crawl job {entry.task_id} lease was claimed by another worker"
+            )
 
     async def mark_retry(
         self,
@@ -660,7 +699,9 @@ class CrawlJobQueue:
             self._created_at(),
         )
         if int(updated) != 1:
-            raise CrawlJobLeaseLost(f"crawl job {entry.task_id} lease was claimed by another worker")
+            raise CrawlJobLeaseLost(
+                f"crawl job {entry.task_id} lease was claimed by another worker"
+            )
 
     async def complete(
         self,
@@ -672,7 +713,9 @@ class CrawlJobQueue:
         error: str | None = None,
     ) -> None:
         """Atomically publish a terminal task state and remove its Stream entry."""
-        status = TaskStatus.COMPLETED.value if error is None else TaskStatus.FAILED.value
+        status = (
+            TaskStatus.COMPLETED.value if error is None else TaskStatus.FAILED.value
+        )
         completed = await self.redis.eval(
             _COMPLETE_SCRIPT,
             5,
@@ -700,7 +743,9 @@ class CrawlJobQueue:
                 f"crawl job {entry.task_id} lease held by {attempt.consumer} was claimed by another worker"
             )
 
-    async def discard_missing_payload(self, entry: CrawlJobEntry, consumer: str) -> None:
+    async def discard_missing_payload(
+        self, entry: CrawlJobEntry, consumer: str
+    ) -> None:
         """Fenced cleanup for an entry whose durable payload is absent."""
         discarded = await self.redis.eval(
             _DISCARD_MISSING_PAYLOAD_SCRIPT,
@@ -741,5 +786,8 @@ class CrawlJobQueue:
             if task_id:
                 entries.append(CrawlJobEntry(_as_text(stream_id), task_id))
             else:
-                logger.error("Ignoring crawl Stream entry %s without task_id", _as_text(stream_id))
+                logger.error(
+                    "Ignoring crawl Stream entry %s without task_id",
+                    _as_text(stream_id),
+                )
         return entries

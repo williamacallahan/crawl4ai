@@ -4,7 +4,7 @@ Relies on the existing Redis task helpers in api.py
 """
 
 import asyncio
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from api import (
     handle_crawl_job,
@@ -14,15 +14,16 @@ from api import (
 from auth import get_principal
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, HttpUrl, field_validator
-from schemas import CrawlRequest, WebhookConfig
+from schemas import CRAWL_RESULT_FIELDS, CrawlRequest, CrawlResultField, WebhookConfig
 
 # ------------- dependency placeholders -------------
-_redis: Any = None        # injected from server.py before the router serves requests
+_redis: Any = None  # injected from server.py before the router serves requests
 _config: Any = None
 
 
 def _token_dep():
     return None
+
 
 # public router
 router = APIRouter()
@@ -51,10 +52,10 @@ def init_job_router(redis, config, token_dep) -> APIRouter:
 
 # ---------- payload models --------------------------------------------------
 class LlmJobPayload(BaseModel):
-    url:    HttpUrl
-    q:      str
+    url: HttpUrl
+    q: str
     schema_: str | None = Field(default=None, alias="schema")
-    cache:  bool = False
+    cache: bool = False
     provider: str | None = None
     webhook_config: WebhookConfig | None = None
     temperature: float | None = None
@@ -65,7 +66,9 @@ class CrawlJobPayload(BaseModel):
     urls: list[HttpUrl]
     browser_config: dict = Field(default_factory=dict)
     crawler_config: dict = Field(default_factory=dict)
-    result_fields: list[Literal["url", "redirected_url", "success", "error_message", "status_code", "markdown", "links", "metadata"]] | None = None
+    result_fields: list[CrawlResultField] = Field(
+        default_factory=lambda: list(CRAWL_RESULT_FIELDS)
+    )
     webhook_config: WebhookConfig | None = None
 
     @field_validator("urls", mode="before")
@@ -78,14 +81,15 @@ class CrawlJobPayload(BaseModel):
 # ---------- LL​M job ---------------------------------------------------------
 @router.post("/llm/job", status_code=202)
 async def llm_job_enqueue(
-        payload: LlmJobPayload,
-        background_tasks: BackgroundTasks,
-        request: Request,
-        _td: Annotated[dict | None, Depends(_principal_dep)],
+    payload: LlmJobPayload,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     webhook_config = None
     if payload.webhook_config:
         from utils import validate_webhook_url
+
         try:
             await asyncio.to_thread(
                 validate_webhook_url,
@@ -93,7 +97,7 @@ async def llm_job_enqueue(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        webhook_config = payload.webhook_config.model_dump(mode='json')
+        webhook_config = payload.webhook_config.model_dump(mode="json")
 
     return await handle_llm_request(
         _redis,
@@ -119,21 +123,25 @@ async def llm_job_status(
     _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     return await handle_task_status(
-        _redis, task_id, base_url=str(request.base_url),
-        requester=_owner_of(_td), is_admin=_is_admin(_td),
+        _redis,
+        task_id,
+        base_url=str(request.base_url),
+        requester=_owner_of(_td),
+        is_admin=_is_admin(_td),
     )
 
 
 # ---------- CRAWL job -------------------------------------------------------
 @router.post("/crawl/job", status_code=202)
 async def crawl_job_enqueue(
-        payload: CrawlJobPayload,
-        background_tasks: BackgroundTasks,
-        _td: Annotated[dict | None, Depends(_principal_dep)],
+    payload: CrawlJobPayload,
+    background_tasks: BackgroundTasks,
+    _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     webhook_config = None
     if payload.webhook_config:
         from utils import validate_webhook_url
+
         try:
             await asyncio.to_thread(
                 validate_webhook_url,
@@ -141,7 +149,7 @@ async def crawl_job_enqueue(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        webhook_config = payload.webhook_config.model_dump(mode='json')
+        webhook_config = payload.webhook_config.model_dump(mode="json")
 
     return await handle_crawl_job(
         _redis,
@@ -166,6 +174,9 @@ async def crawl_job_status(
     _td: Annotated[dict | None, Depends(_principal_dep)],
 ):
     return await handle_task_status(
-        _redis, task_id, base_url=str(request.base_url),
-        requester=_owner_of(_td), is_admin=_is_admin(_td),
+        _redis,
+        task_id,
+        base_url=str(request.base_url),
+        requester=_owner_of(_td),
+        is_admin=_is_admin(_td),
     )

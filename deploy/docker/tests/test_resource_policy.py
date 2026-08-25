@@ -1,16 +1,19 @@
 import os
 import sys
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from crawl4ai import BrowserConfig, MemoryAdaptiveDispatcher
 
 DOCKER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if DOCKER_DIR not in sys.path:
     sys.path.insert(0, DOCKER_DIR)
 
-import api
-import crawler_pool
+import api  # noqa: E402
+import crawler_pool  # noqa: E402
+from schemas import CrawlRequest  # noqa: E402
 
 
 def _config():
@@ -98,6 +101,62 @@ def test_crawl_result_projection_omits_unrequested_heavy_fields():
         "success": True,
         "markdown": {"fit_markdown": "# Example"},
     }
+
+
+def test_sync_crawl_contract_accepts_consumed_result_fields():
+    request = CrawlRequest.model_validate(
+        {
+            "urls": ["https://example.com"],
+            "result_fields": [
+                "success",
+                "error_message",
+                "html",
+                "markdown",
+                "media",
+                "response_headers",
+            ],
+        }
+    )
+
+    assert request.result_fields == [
+        "success",
+        "error_message",
+        "html",
+        "markdown",
+        "media",
+        "response_headers",
+    ]
+
+
+def test_sync_crawl_contract_requires_status_in_projection():
+    with pytest.raises(ValueError, match="must include 'success' and 'error_message'"):
+        CrawlRequest.model_validate(
+            {"urls": ["https://example.com"], "result_fields": ["success"]}
+        )
+
+
+def test_stream_projection_omits_unrequested_heavy_fields():
+    class Result:
+        def model_dump(self):
+            return {
+                "url": "https://example.com",
+                "success": True,
+                "html": "<main>large body</main>",
+            }
+
+    async def results():
+        yield Result()
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in api.stream_results(None, results(), ["url", "success"])
+        ]
+
+    payload = json.loads(asyncio.run(collect())[0])
+    assert payload["url"] == "https://example.com"
+    assert payload["success"] is True
+    assert "html" not in payload
 
 
 def test_browser_pool_evicts_least_recent_idle_browser(monkeypatch):

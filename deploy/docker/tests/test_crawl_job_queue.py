@@ -24,6 +24,8 @@ from crawl_job_queue import (  # noqa: E402
     CrawlJobQueueFull,
 )
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
+from crawl4ai import BrowserConfig, CrawlerRunConfig  # noqa: E402
+from crawl4ai.async_configs import Provenance  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -66,10 +68,12 @@ class FakeRedis:
 
     async def hset(self, key, key_name=None, value=None, mapping=None, **_kwargs):
         if mapping:
-            self.hashes[key].update({
-                str(name): str(field.value if hasattr(field, "value") else field)
-                for name, field in mapping.items()
-            })
+            self.hashes[key].update(
+                {
+                    str(name): str(field.value if hasattr(field, "value") else field)
+                    for name, field in mapping.items()
+                }
+            )
         elif key_name is not None:
             self.hashes[key][str(key_name)] = str(value)
         return 1
@@ -279,7 +283,10 @@ class FakeRedis:
             heartbeat_at,
         ) = args
         payload = self.hashes[payload_key]
-        if payload.get("fence_token") != fence_token or payload.get("lease_owner") != consumer:
+        if (
+            payload.get("fence_token") != fence_token
+            or payload.get("lease_owner") != consumer
+        ):
             return 0
         if stream_id not in self.pending:
             return 0
@@ -318,7 +325,10 @@ class FakeRedis:
             heartbeat_at,
         ) = args
         payload = self.hashes[payload_key]
-        if payload.get("fence_token") != fence_token or payload.get("lease_owner") != consumer:
+        if (
+            payload.get("fence_token") != fence_token
+            or payload.get("lease_owner") != consumer
+        ):
             return 0
         await self.hset(
             task_key,
@@ -366,7 +376,10 @@ class FakeRedis:
             task_id,
         ) = args
         payload = self.hashes[payload_key]
-        if payload.get("fence_token") != fence_token or payload.get("lease_owner") != consumer:
+        if (
+            payload.get("fence_token") != fence_token
+            or payload.get("lease_owner") != consumer
+        ):
             return 0
         await self.hset(
             task_key,
@@ -506,7 +519,9 @@ class FakeRedis:
         return 1
 
     async def xdel(self, stream, stream_id):
-        self.streams[stream] = [entry for entry in self.streams[stream] if entry[0] != stream_id]
+        self.streams[stream] = [
+            entry for entry in self.streams[stream] if entry[0] != stream_id
+        ]
         self.deleted.append((stream, stream_id))
         return 1
 
@@ -525,7 +540,10 @@ class TerminalWebhook:
 
     async def notify_job_completion(self, *, status, **_kwargs):
         assert self.entry.stream_id not in self.redis.pending
-        assert self.redis.hashes[self.queue.task_key(self.entry.task_id)]["status"] == status
+        assert (
+            self.redis.hashes[self.queue.task_key(self.entry.task_id)]["status"]
+            == status
+        )
         self.called = True
 
 
@@ -594,6 +612,7 @@ def test_protocol_names_are_not_double_suffixed_and_other_versions_are_rejected(
     ("browser_config", "crawler_config"),
     [
         ({"extra_args": ["--disable-web-security"]}, {}),
+        ({"headers": {}}, {}),
         ({}, {"deep_crawl_strategy": {"type": "BFSDeepCrawlStrategy", "params": {}}}),
     ],
 )
@@ -620,14 +639,14 @@ def test_untrusted_configs_are_rejected_before_any_redis_write(
     assert dict(redis.streams) == {}
 
 
-def test_enqueue_persists_canonical_untrusted_config_dumps():
+def test_enqueue_persists_untrusted_revalidatable_config_dumps():
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
     task_id = asyncio.run(
         queue.enqueue(
             urls=["https://example.com"],
-            browser_config={"headless": False},
-            crawler_config={"css_selector": "main"},
+            browser_config={"headless": False, "viewport_width": 99_999},
+            crawler_config={"css_selector": "main", "max_retries": 999},
             result_fields=None,
             webhook_config=None,
         )
@@ -638,8 +657,23 @@ def test_enqueue_persists_canonical_untrusted_config_dumps():
     assert payload["browser_config"]["type"] == "BrowserConfig"
     assert payload["browser_config"]["params"]["headless"] is False
     assert "extra_args" not in payload["browser_config"]["params"]
+    assert "headers" not in payload["browser_config"]["params"]
+    assert payload["browser_config"]["params"]["viewport_width"] == 4000
     assert payload["crawler_config"]["type"] == "CrawlerRunConfig"
     assert payload["crawler_config"]["params"]["css_selector"] == "main"
+    assert payload["crawler_config"]["params"]["max_retries"] == 3
+    assert (
+        BrowserConfig.load(
+            payload["browser_config"], provenance=Provenance.UNTRUSTED
+        ).viewport_width
+        == 4000
+    )
+    assert (
+        CrawlerRunConfig.load(
+            payload["crawler_config"], provenance=Provenance.UNTRUSTED
+        ).max_retries
+        == 3
+    )
 
 
 def test_oversized_canonical_payload_is_rejected_before_any_redis_write():
@@ -878,7 +912,9 @@ def test_worker_completes_and_removes_stream_entry_atomically():
         return {"success": True, "results": [{"url": "https://example.com"}]}
 
     webhook = TerminalWebhook(redis, queue, entry)
-    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=webhook)
+    worker = CrawlJobWorker(
+        queue, config, "worker-a", crawl=crawl, webhook_service=webhook
+    )
     asyncio.run(worker.process(entry))
 
     task = redis.hashes[queue.task_key(task_id)]
@@ -900,7 +936,9 @@ def test_worker_retains_pending_entry_until_retry_budget_is_exhausted():
     async def crawl(_payload):
         raise RuntimeError("upstream unavailable")
 
-    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook())
+    worker = CrawlJobWorker(
+        queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook()
+    )
     asyncio.run(worker.process(entry))
     assert entry.stream_id in redis.pending
     assert redis.hashes[queue.task_key(task_id)]["status"] == "processing"
@@ -920,7 +958,9 @@ def test_cancellation_leaves_the_pending_entry_unacknowledged():
     async def crawl(_payload):
         raise asyncio.CancelledError
 
-    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook())
+    worker = CrawlJobWorker(
+        queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook()
+    )
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(worker.process(entry))
 
@@ -965,9 +1005,7 @@ def test_stale_attempt_cannot_publish_terminal_state_after_takeover():
     assert queue.payload_key(task_id) in redis.hashes
     assert entry.stream_id in redis.pending
 
-    asyncio.run(
-        queue.complete(entry, payload, current_attempt, result={"worker": "b"})
-    )
+    asyncio.run(queue.complete(entry, payload, current_attempt, result={"worker": "b"}))
     task = redis.hashes[queue.task_key(task_id)]
     assert task["status"] == "completed"
     assert json.loads(task["result"]) == {"worker": "b"}
@@ -1059,9 +1097,7 @@ def test_stale_missing_payload_cleanup_cannot_overwrite_valid_completion_or_doub
     stale_attempt = asyncio.run(queue.start_attempt(entry, payload, "worker-a"))
     assert asyncio.run(queue.claim_stale("worker-b")) == [entry]
     current_attempt = asyncio.run(queue.start_attempt(entry, payload, "worker-b"))
-    asyncio.run(
-        queue.complete(entry, payload, current_attempt, result={"worker": "b"})
-    )
+    asyncio.run(queue.complete(entry, payload, current_attempt, result={"worker": "b"}))
 
     with pytest.raises(CrawlJobLeaseLost):
         asyncio.run(queue.discard_missing_payload(entry, stale_attempt.consumer))
@@ -1113,7 +1149,9 @@ def test_worker_heartbeats_during_a_long_crawl():
         await asyncio.sleep(1.1)
         return {"success": True, "results": []}
 
-    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook())
+    worker = CrawlJobWorker(
+        queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook()
+    )
     asyncio.run(worker.process(entry))
 
     assert redis.claims == [entry.stream_id]
@@ -1129,7 +1167,9 @@ def test_worker_releases_an_attempt_that_outlives_its_budget():
     async def crawl(_payload):
         await asyncio.sleep(3600)
 
-    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook())
+    worker = CrawlJobWorker(
+        queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook()
+    )
     asyncio.run(worker.process(entry))
 
     # Left pending and un-acked so another worker reclaims it once the lease goes stale.
@@ -1149,7 +1189,9 @@ def test_worker_fails_a_stalled_attempt_once_the_retry_budget_is_gone():
     async def crawl(_payload):
         await asyncio.sleep(3600)
 
-    worker = CrawlJobWorker(queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook())
+    worker = CrawlJobWorker(
+        queue, config, "worker-a", crawl=crawl, webhook_service=NoopWebhook()
+    )
     asyncio.run(worker.process(entry))
 
     task = redis.hashes[queue.task_key(task_id)]

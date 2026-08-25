@@ -17,6 +17,7 @@ import crawl_job_worker  # noqa: E402
 import job  # noqa: E402
 from crawl_job_queue import CrawlJobAttempt, CrawlJobEntry  # noqa: E402
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
+from schemas import CRAWL_RESULT_FIELDS  # noqa: E402
 
 
 def test_public_submit_accepts_every_supported_result_field(monkeypatch):
@@ -26,9 +27,12 @@ def test_public_submit_accepts_every_supported_result_field(monkeypatch):
         "success",
         "error_message",
         "status_code",
+        "html",
         "markdown",
+        "media",
         "links",
         "metadata",
+        "response_headers",
     ]
     submitted = {}
 
@@ -79,6 +83,7 @@ def test_crawl_job_reuses_canonical_url_count_bounds():
         urls=[f"https://example.com/{index}" for index in range(100)]
     )
     assert len(accepted.urls) == 100
+    assert accepted.result_fields == list(CRAWL_RESULT_FIELDS)
 
     with pytest.raises(ValueError, match="at most 100 items"):
         job.CrawlJobPayload(
@@ -96,7 +101,9 @@ def test_worker_terminalizes_deterministic_input_failure_without_retry():
     async def reject_input(_payload):
         raise HTTPException(status_code=400, detail="Cannot resolve URL host")
 
-    worker = CrawlJobWorker(queue, {}, "worker-a", crawl=reject_input, webhook_service=object())
+    worker = CrawlJobWorker(
+        queue, {}, "worker-a", crawl=reject_input, webhook_service=object()
+    )
     entry = CrawlJobEntry(stream_id="1-0", task_id="crawl_terminal")
     attempt = CrawlJobAttempt(number=1, fence_token="attempt-a", consumer="worker-a")
 
@@ -122,7 +129,9 @@ def test_worker_retries_request_timeout():
     async def time_out(_payload):
         raise HTTPException(status_code=408, detail="Target request timed out")
 
-    worker = CrawlJobWorker(queue, {}, "worker-a", crawl=time_out, webhook_service=object())
+    worker = CrawlJobWorker(
+        queue, {}, "worker-a", crawl=time_out, webhook_service=object()
+    )
     entry = CrawlJobEntry(stream_id="1-0", task_id="crawl_retry")
     attempt = CrawlJobAttempt(number=1, fence_token="attempt-a", consumer="worker-a")
 
@@ -195,7 +204,9 @@ def test_worker_proxy_lifecycle_wraps_execution_and_cleanup(monkeypatch, worker_
 
     monkeypatch.setattr(crawl_job_worker, "load_config", lambda: {})
     monkeypatch.setattr(crawl_job_worker, "setup_logging", lambda _config: None)
-    monkeypatch.setattr(crawl_job_worker, "build_redis_url", lambda _config: "redis://test")
+    monkeypatch.setattr(
+        crawl_job_worker, "build_redis_url", lambda _config: "redis://test"
+    )
     monkeypatch.setattr(
         crawl_job_worker.aioredis,
         "from_url",
