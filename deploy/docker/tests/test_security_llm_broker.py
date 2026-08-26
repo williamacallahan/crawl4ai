@@ -24,9 +24,9 @@ class TestProviderAllowlist:
     def test_server_bounds_slow_provider_attempts(self):
         out = resolve_llm(CONF)
         assert out["extra_args"] == {
-            "timeout": 120,
+            "timeout": 300,
             "num_retries": 0,
-            "max_tokens": 1024,
+            "max_tokens": 4096,
         }
 
     def test_other_family_rejected(self):
