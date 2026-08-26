@@ -43,6 +43,10 @@ def queue_config():
 
 @pytest.fixture
 def redis_url():
+    configured_url = os.getenv("REDIS_URL")
+    if configured_url:
+        yield configured_url
+        return
     executable = shutil.which("redis-server")
     if executable is None:
         pytest.skip("redis-server is not installed")
