@@ -284,7 +284,7 @@ def verify_rollout(
                 _dokploy_url(dokploy_url, "docker.getConfig", containerId=task_id),
                 api_key,
             )
-            labels = task["Config"]["Labels"]
+            labels = task["Spec"]["ContainerSpec"]["Labels"]
             if not isinstance(labels, dict) or any(
                 labels.get(key) != value for key, value in expected_labels.items()
             ):

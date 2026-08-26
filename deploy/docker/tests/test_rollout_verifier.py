@@ -46,10 +46,12 @@ def _application(**overrides):
 def _task_config(container_id: str, labels: dict[str, str] | None = None) -> dict:
     return {
         "Status": {"ContainerStatus": {"ContainerID": container_id}},
-        "Config": {
-            "Labels": rollout_verifier._observability_labels("target")
-            if labels is None
-            else labels
+        "Spec": {
+            "ContainerSpec": {
+                "Labels": rollout_verifier._observability_labels("target")
+                if labels is None
+                else labels
+            }
         },
     }
 
