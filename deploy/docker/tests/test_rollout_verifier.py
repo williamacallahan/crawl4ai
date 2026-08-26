@@ -321,7 +321,7 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_wi
 def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_drift(
     second_tasks, second_health, second_labels
 ):
-    clock = iter([0, 0, 0, 1, 1, 700])
+    clock = iter([0, 0, 0, 1, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
     task_snapshots = iter(
         [
             [_running_task("task-a", "a")],
@@ -409,7 +409,7 @@ def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
 
 
 def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
-    clock = iter([0, 0, 0, 1, 700])
+    clock = iter([0, 0, 0, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
     get_config_calls = 0
     tasks = [
         _running_task("task-current", "a", 5),
@@ -453,7 +453,7 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
 
 
 def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
-    clock = iter([0, 0, 0, 1, 700])
+    clock = iter([0, 0, 0, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
     tasks = [
         _running_task("task-a", "a", 5),
         _running_task("task-b", "b", 5),

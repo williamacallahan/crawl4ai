@@ -23,6 +23,7 @@ REDIS_MOUNT_PATH = "/data"
 REDIS_HEALTHCHECK = ["CMD", "redis-cli", "ping"]
 REDIS_NODE_CONSTRAINT = "node.hostname==haiku-18"
 CRAWL_MAX_REPLICAS_PER_NODE = 2
+ROLLOUT_PROOF_TIMEOUT_SECONDS = 900
 
 
 def _observability_labels(revision: str) -> dict[str, str]:
@@ -216,7 +217,7 @@ def verify_rollout(
             ) as executor:
                 return list(executor.map(probe, range(count)))
 
-    proof_deadline = monotonic() + 600
+    proof_deadline = monotonic() + ROLLOUT_PROOF_TIMEOUT_SECONDS
     candidate: tuple[frozenset[str], frozenset[str], frozenset[str]] | None = None
     stable_rounds = 0
     while monotonic() < proof_deadline:
