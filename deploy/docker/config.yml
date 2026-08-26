@@ -17,6 +17,7 @@ llm:
   # retries once through the gateway, which can select another provider.
   request_timeout_seconds: 300
   request_retries: 0
+  reasoning_effort: "low"
   max_output_tokens: 4096
   job_request_timeout_seconds: 300
   job_request_retries: 0

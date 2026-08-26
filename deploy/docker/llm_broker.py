@@ -64,6 +64,7 @@ def resolve_llm(config: Dict, requested_provider: Optional[str] = None) -> Dict:
         "extra_args": {
             "timeout": config["llm"].get("request_timeout_seconds", 300),
             "num_retries": config["llm"].get("request_retries", 0),
+            "reasoning_effort": config["llm"].get("reasoning_effort", "low"),
             "max_tokens": config["llm"].get("max_output_tokens", 4096),
         },
     }

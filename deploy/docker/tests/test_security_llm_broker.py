@@ -26,6 +26,7 @@ class TestProviderAllowlist:
         assert out["extra_args"] == {
             "timeout": 300,
             "num_retries": 0,
+            "reasoning_effort": "low",
             "max_tokens": 4096,
         }
 
