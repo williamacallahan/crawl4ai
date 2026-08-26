@@ -46,8 +46,9 @@ redis:
 # Redis Stream settings for durable /crawl/job execution. Queued and leased
 # state persists until a terminal completion, which uses task_ttl_seconds.
 crawl_jobs:
-  # The runtime appends :v2 to stream/group. During a rolling upgrade, old
-  # workers drain the unsuffixed v1 stream while v2 workers consume only v2.
+  # The runtime appends :v2 to stream/group. New workers fail startup while the
+  # unsuffixed v1 stream is nonempty, leaving old workers to drain it before the
+  # rollout can advance.
   protocol_version: 2
   stream: "crawl-jobs"
   group: "crawl-workers"
@@ -67,10 +68,10 @@ crawl_jobs:
 limits:
   max_body_bytes: 10485760  # 10 MiB request body cap (413 if exceeded); 0 = unbounded
   wall_clock_s: 0           # per-crawl deadline in seconds (504 on timeout); 0 = no deadline
-  queue:                    # background job queue for /crawl/job and /llm/job
-    maxsize: 1000           # max queued jobs (503 when full); 0 = unbounded
-    workers: 4              # concurrent background workers
-    per_principal: 100      # shared pending/running jobs per caller; 0 = explicit unlimited
+  queue:                    # process-local /llm/job queue; /crawl/job uses crawl_jobs above
+    maxsize: 1              # one queued LLM job; additional work fails fast with 503
+    workers: 1              # Qwen is a serialized enrichment path, never a bulk worker pool
+    per_principal: 100      # shared durable-crawl quota; Qwen concurrency is permit-bound
 
 # Rate Limiting Configuration
 rate_limiting:

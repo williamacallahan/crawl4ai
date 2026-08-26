@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shutil
 import socket
@@ -309,6 +310,56 @@ def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url
         finally:
             release_llm.set()
             await work_queue.stop()
+            await client.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_accepted_llm_task_is_failed_when_shutdown_drains_queue(redis_url, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    import api
+    from work_queue import WorkQueue, get_job_queue, set_job_queue
+
+    monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
+
+    async def exercise():
+        client = aioredis.from_url(redis_url, decode_responses=True)
+        queue = WorkQueue(maxsize=1, workers=1, redis=client)
+        previous_queue = get_job_queue()
+        worker_started = asyncio.Event()
+        try:
+            async def block_worker():
+                worker_started.set()
+                await asyncio.Event().wait()
+
+            await queue.start()
+            set_job_queue(queue)
+            await queue.submit(block_worker)
+            await asyncio.wait_for(worker_started.wait(), timeout=1)
+
+            response = await api.create_new_task(
+                client,
+                BackgroundTasks(),
+                "https://example.com",
+                "extract",
+                None,
+                "0",
+                "https://crawl.example/",
+                {"redis": {"task_ttl_seconds": 60}},
+            )
+            task_id = json.loads(response.body)["task_id"]
+            assert response.status_code == 202
+            assert (await client.hgetall(f"task:{task_id}"))["status"] == "processing"
+
+            await queue.stop()
+
+            task = await client.hgetall(f"task:{task_id}")
+            assert task["status"] == "failed"
+            assert task["error"] == "LLM extraction interrupted by server shutdown"
+        finally:
+            await queue.stop()
+            set_job_queue(previous_queue)
             await client.aclose()
 
     asyncio.run(exercise())

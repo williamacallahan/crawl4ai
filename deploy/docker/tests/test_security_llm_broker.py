@@ -28,6 +28,7 @@ class TestProviderAllowlist:
             "num_retries": 0,
             "reasoning_effort": "low",
             "max_tokens": 4096,
+            "extra_headers": {"X-User-ID": "crawl4ai"},
         }
 
     def test_other_family_rejected(self):

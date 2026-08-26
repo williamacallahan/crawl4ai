@@ -81,6 +81,12 @@ class TestSupervisord:
     def test_gunicorn_request_limits(self, supervisord):
         assert "--limit-request-line" in supervisord
 
+    def test_gunicorn_drain_outlives_the_llm_attempt(self, supervisord):
+        gunicorn = supervisord.split("[program:gunicorn]", maxsplit=1)[1]
+        assert "--graceful-timeout 330" in gunicorn
+        assert "stopsignal=TERM" in gunicorn
+        assert "stopwaitsecs=360" in gunicorn
+
     def test_gunicorn_trusts_dynamic_ingress_proxy_addresses(self, supervisord):
         assert (
             '--forwarded-allow-ips "127.0.0.1,::1,10.0.0.0/8,'

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import configparser
 import json
 import os
 import subprocess
@@ -10,10 +11,20 @@ import time
 import urllib.parse
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 MAX_RESPONSE_BYTES = 65_536
 MAX_REPLICAS = 16
+
+
+def _required_stop_grace_ns() -> int:
+    parser = configparser.RawConfigParser()
+    parser.read(Path(__file__).with_name("supervisord.conf"))
+    return (parser.getint("program:gunicorn", "stopwaitsecs") + 1) * 1_000_000_000
+
+
+REQUIRED_STOP_GRACE_NS = _required_stop_grace_ns()
 
 
 def _curl_json(url: str, api_key: str | None = None) -> Any:
@@ -138,6 +149,11 @@ def verify_rollout(
         if not 1 <= replicas <= MAX_REPLICAS:
             raise ValueError(
                 f"configured replicas must be between 1 and {MAX_REPLICAS}"
+            )
+        stop_grace_ns = int(application.get("stopGracePeriodSwarm") or 0)
+        if stop_grace_ns < REQUIRED_STOP_GRACE_NS:
+            raise ValueError(
+                "configured Swarm stop grace must outlive the supervised process drain"
             )
         app_name = application["appName"]
         tasks = read_json(

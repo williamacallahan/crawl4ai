@@ -6,7 +6,13 @@ from threading import Thread
 
 import pytest
 
-from verify_rollout import MAX_RESPONSE_BYTES, _curl_json, _has_task_error, verify_rollout
+from verify_rollout import (
+    MAX_RESPONSE_BYTES,
+    REQUIRED_STOP_GRACE_NS,
+    _curl_json,
+    _has_task_error,
+    verify_rollout,
+)
 
 
 def _health(instance: str, revision: str = "target") -> dict:
@@ -24,7 +30,11 @@ def _fake_read(handlers):
         if operation not in handlers:
             raise AssertionError(f"unexpected operation: {operation}")
         handler = handlers[operation]
-        return handler(url) if callable(handler) else handler
+        result = handler(url) if callable(handler) else handler
+        if operation == "application.one" and isinstance(result, dict):
+            result = dict(result)
+            result.setdefault("stopGracePeriodSwarm", REQUIRED_STOP_GRACE_NS)
+        return result
 
     return read_json
 
@@ -200,6 +210,30 @@ def test_verifier_rejects_unbounded_replica_counts():
     )
 
     with pytest.raises(ValueError, match="between 1 and 16"):
+        verify_rollout(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            revision="target",
+            health_url="https://crawl.example/health",
+            read_json=read_json,
+            sleep=lambda _seconds: None,
+        )
+
+
+def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
+    read_json = _fake_read(
+        {
+            "deployment.all": [{"status": "done"}],
+            "application.one": {
+                "replicas": 1,
+                "appName": "crawl4ai",
+                "stopGracePeriodSwarm": REQUIRED_STOP_GRACE_NS - 1,
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="must outlive"):
         verify_rollout(
             dokploy_url="https://dokploy.example",
             api_key="secret",

@@ -101,6 +101,9 @@ class FakeRedis:
         self.streams[stream].append((stream_id, dict(fields)))
         return stream_id
 
+    async def xlen(self, stream):
+        return len(self.streams[stream])
+
     async def eval(self, script, numkeys, *keys_and_args):
         self.eval_scripts.append(script)
         keys = keys_and_args[:numkeys]
@@ -561,21 +564,20 @@ def test_enqueue_persists_payload_before_stream_visibility():
     assert "XADD" in redis.eval_scripts[0]
 
 
-def test_protocol_v2_isolates_new_workers_from_legacy_stream_entries():
+def test_protocol_v2_refuses_startup_while_legacy_stream_entries_remain():
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
     asyncio.run(redis.xadd("crawl-jobs", {"task_id": "legacy"}))
 
     queue, task_id = enqueue(redis, queue_config())
-    asyncio.run(queue.ensure_group())
-    entry = asyncio.run(queue.read_new("worker-v2"))[0]
+    with pytest.raises(RuntimeError, match="legacy crawl jobs remain"):
+        asyncio.run(queue.ensure_group())
 
     assert queue.settings.stream == "crawl-jobs:v2"
     assert queue.settings.group == "crawl-workers:v2"
     assert queue.payload_key(task_id).startswith("crawl-job:v2:")
-    assert entry.task_id == task_id
     assert redis.streams["crawl-jobs"] == [("1-0", {"task_id": "legacy"})]
-    assert ("crawl-jobs:v2", "crawl-workers:v2") in redis.groups
+    assert ("crawl-jobs:v2", "crawl-workers:v2") not in redis.groups
 
 
 def test_protocol_names_are_not_double_suffixed_and_other_versions_are_rejected():

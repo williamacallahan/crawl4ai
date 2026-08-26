@@ -503,6 +503,13 @@ class CrawlJobQueue:
 
     async def ensure_group(self) -> None:
         """Create the consumer group without skipping work queued before startup."""
+        if self.settings.protocol_version > 1:
+            suffix = f":v{self.settings.protocol_version}"
+            legacy_stream = self.settings.stream.removesuffix(suffix)
+            if await self.redis.xlen(legacy_stream):
+                raise RuntimeError(
+                    f"legacy crawl jobs remain in {legacy_stream}; refusing v{self.settings.protocol_version} worker startup"
+                )
         try:
             await self.redis.xgroup_create(
                 self.settings.stream,

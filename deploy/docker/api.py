@@ -134,7 +134,7 @@ async def llm_permit(redis, config):
         await redis.eval(_RELEASE_LLM_PERMIT, 1, LLM_PERMIT_KEY, token)
 
 
-async def _enqueue_job(background_tasks, factory, principal=None):
+async def _enqueue_job(background_tasks, factory, principal=None, on_cancel=None):
     """Submit a background job to the bounded work queue (per-principal quota).
 
     Falls back to FastAPI BackgroundTasks when the queue isn't running (tests /
@@ -147,7 +147,7 @@ async def _enqueue_job(background_tasks, factory, principal=None):
         background_tasks.add_task(factory)
         return
     try:
-        await queue.submit(factory, principal)
+        await queue.submit(factory, principal, on_cancel)
     except QuotaExceeded:
         raise HTTPException(status_code=429, detail="Too many concurrent jobs for this caller")
     except QueueFull:
@@ -737,7 +737,7 @@ async def create_new_task(
     await asyncio.to_thread(validate_url_destination, decoded_url)
 
     from datetime import datetime
-    task_id = f"llm_{int(datetime.now().timestamp())}_{id(background_tasks)}"
+    task_id = f"llm_{uuid4().hex}"
 
     task_data = {
         "status": TaskStatus.PROCESSING,
@@ -753,6 +753,12 @@ async def create_new_task(
 
     await hset_with_ttl(redis, f"task:{task_id}", task_data, config)
 
+    async def cancel_task() -> None:
+        await hset_with_ttl(redis, f"task:{task_id}", {
+            "status": TaskStatus.FAILED,
+            "error": "LLM extraction interrupted by server shutdown",
+        }, config)
+
     try:
         await _enqueue_job(
             background_tasks,
@@ -761,6 +767,7 @@ async def create_new_task(
                 provider, webhook_config, temperature, api_base_url,
             ),
             principal=owner,
+            on_cancel=cancel_task,
         )
     except HTTPException:
         # Don't leave an orphan PROCESSING task if we refused to enqueue.
@@ -864,8 +871,6 @@ async def _await_before_deadline(awaitable, deadline_at: Optional[float]):
 
 async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers."""
-    import json
-
     from utils import datetime_handler
     try:
         async for result in results_gen:
@@ -873,10 +878,8 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
                 server_memory_mb = _get_memory_mb()
                 result_dict = result.model_dump()
                 result_dict['server_memory_mb'] = server_memory_mb
-                # Ensure fit_html is JSON-serializable
                 if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
                     result_dict["fit_html"] = None
-                # If PDF exists, encode it to base64
                 if result_dict.get('pdf') is not None:
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
                 logger.info(f"Streaming result for {result_dict.get('url', 'unknown')}")
@@ -894,6 +897,12 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
         yield (json.dumps({
             "status": "failed",
             "error": "Crawl exceeded the time limit",
+        }) + "\n").encode("utf-8")
+    except Exception:
+        logger.exception("Streaming crawl failed")
+        yield (json.dumps({
+            "status": "failed",
+            "error": "Streaming crawl failed",
         }) + "\n").encode("utf-8")
     except asyncio.CancelledError:
         logger.warning("Client disconnected during streaming")
@@ -921,6 +930,14 @@ async def handle_crawl_request(
     result_fields: Optional[List[str]] = None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
+    from governor import wall_clock_seconds
+
+    deadline_seconds = wall_clock_seconds(config)
+    deadline_at = (
+        asyncio.get_running_loop().time() + deadline_seconds
+        if deadline_seconds > 0
+        else None
+    )
     # Track request start
     request_id = f"req_{uuid4().hex[:8]}"
     crawler: Optional[AsyncWebCrawler] = None
@@ -966,11 +983,15 @@ async def handle_crawl_request(
 
         hooks_status = {}
         if hooks_config:
-            crawler = await _new_hook_crawler(loaded_browser_config)
+            crawler = await _await_before_deadline(
+                _new_hook_crawler(loaded_browser_config), deadline_at
+            )
             hooks_status = _attach_declarative_hooks(crawler, hooks_config)
             logger.info(f"Hooks attachment status: {hooks_status['status']}")
         else:
-            crawler = await get_crawler(loaded_browser_config)
+            crawler = await _await_before_deadline(
+                get_crawler(loaded_browser_config), deadline_at
+            )
         
         # Build the config(s) to pass to arun/arun_many
         if crawler_configs and len(urls) > 1:
@@ -993,13 +1014,7 @@ async def handle_crawl_request(
                                 urls[0] if len(urls) == 1 else urls,
                                 config=effective_config,
                                 dispatcher=dispatcher)
-        # Optional per-crawl wall-clock deadline (config limits.wall_clock_s; 0 = none).
-        from governor import wall_clock_seconds
-        _deadline = wall_clock_seconds(config)
-        if _deadline and _deadline > 0:
-            results = await asyncio.wait_for(partial_func(), timeout=_deadline)
-        else:
-            results = await partial_func()
+        results = await _await_before_deadline(partial_func(), deadline_at)
         
         # Ensure results is always a list
         if not isinstance(results, list):

@@ -136,7 +136,7 @@ def job_queue_caps(config: dict) -> dict:
     q = _limits(config).get("queue", {}) or {}
     per_principal = q.get("per_principal", DEFAULT_PER_PRINCIPAL_JOBS)
     return {
-        "maxsize": int(q.get("maxsize", 1000) or 0),
-        "workers": int(q.get("workers", 4) or 1),
+        "maxsize": int(q.get("maxsize", 1) or 0),
+        "workers": int(q.get("workers", 1) or 1),
         "per_principal": int(per_principal) if per_principal is not None else 0,
     }

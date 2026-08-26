@@ -267,6 +267,26 @@ def test_non_streaming_wall_clock_deadline_returns_504(monkeypatch):
     assert released == [pooled]
 
 
+def test_non_streaming_wall_clock_deadline_includes_browser_admission(monkeypatch):
+    pooled = FakeCrawler()
+    released, _dedicated = install_fakes(monkeypatch, pooled)
+
+    async def delayed_get_crawler(_config):
+        await asyncio.sleep(0.05)
+        return pooled
+
+    monkeypatch.setattr(crawler_pool, "get_crawler", delayed_get_crawler)
+    with pytest.raises(HTTPException) as error:
+        run(
+            api.handle_crawl_request(
+                ["https://example.com"], {}, {}, crawl_config(wall_clock_s=0.01)
+            )
+        )
+
+    assert error.value.status_code == 504
+    assert released == []
+
+
 def test_streaming_wall_clock_deadline_emits_failure_and_releases(monkeypatch):
     pooled = FakeCrawler(mode="slow")
     released, _dedicated = install_fakes(monkeypatch, pooled)
@@ -278,6 +298,24 @@ def test_streaming_wall_clock_deadline_emits_failure_and_releases(monkeypatch):
         output = api.stream_results(crawler, results)
         body = json.loads((await anext(output)).decode())
         assert body == {"status": "failed", "error": "Crawl exceeded the time limit"}
+        with pytest.raises(StopAsyncIteration):
+            await anext(output)
+
+    run(exercise())
+    assert released == [pooled]
+
+
+def test_streaming_generator_failure_emits_terminal_failure_and_releases(monkeypatch):
+    pooled = FakeCrawler(mode="error")
+    released, _dedicated = install_fakes(monkeypatch, pooled)
+
+    async def exercise():
+        crawler, results, _hooks = await api.handle_stream_crawl_request(
+            ["https://example.com"], {}, {}, crawl_config()
+        )
+        output = api.stream_results(crawler, results)
+        body = json.loads((await anext(output)).decode())
+        assert body == {"status": "failed", "error": "Streaming crawl failed"}
         with pytest.raises(StopAsyncIteration):
             await anext(output)
 

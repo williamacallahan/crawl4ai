@@ -190,6 +190,31 @@ def test_llm_job_enqueue_returns_accepted_with_canonical_links(monkeypatch):
     assert body["_links"]["status"] == body["_links"]["self"]
 
 
+def test_llm_job_task_ids_are_collision_resistant(monkeypatch):
+    monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
+    monkeypatch.setattr(api, "_enqueue_job", AsyncMock())
+    redis = SimpleNamespace(hset=AsyncMock(), expire=AsyncMock())
+
+    async def create():
+        response = await api.create_new_task(
+            redis,
+            BackgroundTasks(),
+            "https://example.com",
+            "extract",
+            None,
+            "0",
+            "https://crawl.example/",
+            {"redis": {"task_ttl_seconds": 3600}},
+        )
+        return json.loads(response.body)["task_id"]
+
+    async def create_pair():
+        return await asyncio.gather(create(), create())
+
+    first, second = asyncio.run(create_pair())
+    assert first != second
+
+
 @pytest.mark.parametrize(
     ("collection", "expected"),
     [

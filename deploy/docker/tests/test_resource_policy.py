@@ -1,8 +1,10 @@
 import os
 import sys
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from crawl4ai import BrowserConfig, MemoryAdaptiveDispatcher
 
 DOCKER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -11,6 +13,7 @@ if DOCKER_DIR not in sys.path:
 
 import api
 import crawler_pool
+import monitor_routes
 
 
 def _config():
@@ -136,3 +139,130 @@ def test_browser_pool_refuses_growth_when_all_browsers_are_active(monkeypatch):
         assert str(error) == "Crawler browser pool is at capacity"
     else:
         raise AssertionError("Expected browser pool capacity rejection")
+
+
+class _PoolCrawler:
+    def __init__(self, connected=True):
+        browser = MagicMock()
+        browser.is_connected.return_value = connected
+        self.crawler_strategy = SimpleNamespace(
+            browser_manager=SimpleNamespace(browser=browser, default_context=None)
+        )
+        self.active_requests = 0
+        self.closed = False
+
+    async def start(self):
+        pass
+
+    async def close(self):
+        self.closed = True
+        self.crawler_strategy.browser_manager.browser = None
+
+
+def _configure_pool(monkeypatch, factory):
+    monkeypatch.setattr(crawler_pool, "LOCK", asyncio.Lock())
+    monkeypatch.setattr(crawler_pool, "ADMISSION_SEM", asyncio.Semaphore(2))
+    monkeypatch.setattr(crawler_pool, "MAX_BROWSER_INSTANCES", 2)
+    monkeypatch.setattr(crawler_pool, "MEM_LIMIT", 100)
+    monkeypatch.setattr(crawler_pool, "PERMANENT", None)
+    monkeypatch.setattr(crawler_pool, "DEFAULT_CONFIG_SIG", None)
+    monkeypatch.setattr(crawler_pool, "HOT_POOL", {})
+    monkeypatch.setattr(crawler_pool, "COLD_POOL", {})
+    monkeypatch.setattr(crawler_pool, "LAST_USED", {})
+    monkeypatch.setattr(crawler_pool, "USAGE_COUNT", {})
+    monkeypatch.setattr(crawler_pool, "get_container_memory_percent", lambda: 0)
+    monkeypatch.setattr(crawler_pool, "AsyncWebCrawler", factory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool_name", ["HOT_POOL", "COLD_POOL"])
+@pytest.mark.parametrize("stale_state", ["closed", "disconnected"])
+async def test_browser_pool_replaces_unavailable_browser(
+    monkeypatch, pool_name, stale_state
+):
+    created = []
+
+    def factory(**_kwargs):
+        crawler = _PoolCrawler()
+        created.append(crawler)
+        return crawler
+
+    _configure_pool(monkeypatch, factory)
+    config = BrowserConfig()
+    sig = crawler_pool._sig(config)
+    stale = _PoolCrawler(connected=stale_state != "disconnected")
+    if stale_state == "closed":
+        await stale.close()
+    getattr(crawler_pool, pool_name)[sig] = stale
+    crawler_pool.LAST_USED[sig] = 1
+    crawler_pool.USAGE_COUNT[sig] = 1
+
+    crawler = await crawler_pool.get_crawler(config)
+
+    assert crawler is created[0]
+    assert stale.closed
+    assert crawler_pool.COLD_POOL[sig] is crawler
+    await crawler_pool.release_crawler(crawler)
+
+
+@pytest.mark.asyncio
+async def test_permanent_browser_start_failure_closes_partial_browser(monkeypatch):
+    crawler = _PoolCrawler()
+    crawler.start = AsyncMock(side_effect=RuntimeError("start failed"))
+    _configure_pool(monkeypatch, lambda **_kwargs: crawler)
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        await crawler_pool.init_permanent(BrowserConfig())
+
+    assert crawler.closed
+    assert crawler_pool.PERMANENT is None
+
+
+@pytest.mark.asyncio
+async def test_pooled_browser_start_failure_closes_partial_browser(monkeypatch):
+    crawler = _PoolCrawler()
+    crawler.start = AsyncMock(side_effect=asyncio.CancelledError)
+    _configure_pool(monkeypatch, lambda **_kwargs: crawler)
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_pool.get_crawler(BrowserConfig())
+
+    assert crawler.closed
+    assert crawler_pool.COLD_POOL == {}
+    assert crawler_pool.ADMISSION_SEM._value == 2
+
+
+@pytest.mark.asyncio
+async def test_permanent_browser_replacement_and_monitor_restart_do_not_deadlock(
+    monkeypatch,
+):
+    created = []
+
+    def factory(**_kwargs):
+        crawler = _PoolCrawler()
+        created.append(crawler)
+        return crawler
+
+    _configure_pool(monkeypatch, factory)
+    config = BrowserConfig()
+    sig = crawler_pool._sig(config)
+    stale = _PoolCrawler(connected=False)
+    crawler_pool.PERMANENT = stale
+    crawler_pool.DEFAULT_CONFIG_SIG = sig
+
+    crawler = await crawler_pool.get_crawler(config)
+    await crawler_pool.release_crawler(crawler)
+    assert crawler is created[0]
+    assert stale.closed
+
+    monkeypatch.setattr("server.get_default_browser_config", BrowserConfig)
+    response = await asyncio.wait_for(
+        monitor_routes.restart_browser(
+            monitor_routes.KillBrowserRequest(sig="permanent")
+        ),
+        timeout=1,
+    )
+
+    assert response == {"success": True, "restarted": "permanent"}
+    assert crawler.closed
+    assert crawler_pool.PERMANENT is created[1]

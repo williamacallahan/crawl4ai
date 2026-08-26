@@ -73,6 +73,20 @@ def _set_active_requests(crawler: AsyncWebCrawler, active: int) -> None:
     setattr(crawler, "active_requests", active)
 
 
+def _is_live(crawler: AsyncWebCrawler) -> bool:
+    """Return whether the crawler still owns a usable Playwright browser."""
+    try:
+        manager = crawler.crawler_strategy.browser_manager
+        if manager.browser is not None:
+            return manager.browser.is_connected()
+        return (
+            manager.default_context is not None
+            and not manager.default_context.is_closed()
+        )
+    except Exception:
+        return False
+
+
 async def _close_even_if_cancelled(crawler: AsyncWebCrawler) -> None:
     """Finish browser close before propagating caller cancellation."""
     close_task = asyncio.create_task(crawler.close())
@@ -82,6 +96,34 @@ async def _close_even_if_cancelled(crawler: AsyncWebCrawler) -> None:
         with suppress(Exception):
             await close_task
         raise
+
+
+async def _start_or_close(crawler: AsyncWebCrawler, tier: str) -> None:
+    try:
+        await crawler.start()
+    except BaseException:
+        try:
+            await _close_even_if_cancelled(crawler)
+        except Exception:
+            logger.warning(
+                "%s browser cleanup failed after start error", tier, exc_info=True
+            )
+        raise
+
+
+async def _discard_if_unavailable(
+    pool: Dict[str, AsyncWebCrawler], sig: str, tier: str
+) -> bool:
+    crawler = pool[sig]
+    if _is_live(crawler):
+        return False
+    logger.warning(f"{tier} pool browser is unavailable; replacing it (sig={sig[:8]})")
+    pool.pop(sig)
+    with suppress(Exception):
+        await _close_even_if_cancelled(crawler)
+    LAST_USED.pop(sig, None)
+    USAGE_COUNT.pop(sig, None)
+    return True
 
 
 async def _make_browser_capacity() -> None:
@@ -139,17 +181,7 @@ async def get_dedicated_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                 )
             await _make_browser_capacity()
             crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
-            try:
-                await crawler.start()
-            except BaseException:
-                try:
-                    await _close_even_if_cancelled(crawler)
-                except Exception:
-                    logger.warning(
-                        "Dedicated browser cleanup failed after start error",
-                        exc_info=True,
-                    )
-                raise
+            await _start_or_close(crawler, "Dedicated")
 
             sig = f"dedicated:{uuid.uuid4().hex}"
             setattr(crawler, "_docker_request_owned", True)
@@ -220,6 +252,9 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     async with LOCK:
         # Check permanent browser for default config
         if PERMANENT and _is_default_config(sig):
+            if not _is_live(PERMANENT):
+                logger.warning("Permanent browser is unavailable; replacing it")
+                await _init_permanent_locked(cfg, force=True)
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             _set_active_requests(PERMANENT, _active_requests(PERMANENT) + 1)
@@ -227,17 +262,17 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             return PERMANENT
 
         # Check hot pool
-        if sig in HOT_POOL:
+        if sig in HOT_POOL and not await _discard_if_unavailable(HOT_POOL, sig, "Hot"):
+            crawler = HOT_POOL[sig]
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
-            crawler = HOT_POOL[sig]
             active_requests = _active_requests(crawler) + 1
             _set_active_requests(crawler, active_requests)
             logger.info(f"♨️  Using hot pool browser (sig={sig[:8]}, active={active_requests})")
             return crawler
 
         # Check cold pool (promote to hot if used 3+ times)
-        if sig in COLD_POOL:
+        if sig in COLD_POOL and not await _discard_if_unavailable(COLD_POOL, sig, "Cold"):
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
             crawler = COLD_POOL[sig]
@@ -269,7 +304,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         await _make_browser_capacity()
         logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]}, mem={mem_pct:.1f}%)")
         crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
-        await crawler.start()
+        await _start_or_close(crawler, "Pooled")
         _set_active_requests(crawler, 1)
         COLD_POOL[sig] = crawler
         LAST_USED[sig] = time.time()
@@ -289,18 +324,34 @@ async def release_crawler(crawler: AsyncWebCrawler):
     finally:
         ADMISSION_SEM.release()
 
-async def init_permanent(cfg: BrowserConfig):
-    """Initialize permanent default browser."""
+
+async def _init_permanent_locked(cfg: BrowserConfig, *, force: bool = False) -> None:
     global PERMANENT, DEFAULT_CONFIG_SIG
+    if PERMANENT and not force and _is_live(PERMANENT):
+        return
+    if PERMANENT:
+        with suppress(Exception):
+            await _close_even_if_cancelled(PERMANENT)
+        PERMANENT = None
+        if DEFAULT_CONFIG_SIG:
+            LAST_USED.pop(DEFAULT_CONFIG_SIG, None)
+            USAGE_COUNT.pop(DEFAULT_CONFIG_SIG, None)
+
+    sig = _sig(cfg)
+    logger.info("🔥 Creating permanent default browser")
+    crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
+    await _start_or_close(crawler, "Permanent")
+    PERMANENT = crawler
+    DEFAULT_CONFIG_SIG = sig
+    LAST_USED[sig] = time.time()
+    USAGE_COUNT[sig] = 0
+
+
+async def init_permanent(cfg: BrowserConfig, *, force: bool = False) -> None:
+    """Initialize or atomically replace the permanent default browser."""
     async with LOCK:
-        if PERMANENT:
-            return
-        DEFAULT_CONFIG_SIG = _sig(cfg)
-        logger.info("🔥 Creating permanent default browser")
-        PERMANENT = AsyncWebCrawler(config=cfg, thread_safe=False)
-        await PERMANENT.start()
-        LAST_USED[DEFAULT_CONFIG_SIG] = time.time()
-        USAGE_COUNT[DEFAULT_CONFIG_SIG] = 0
+        await _init_permanent_locked(cfg, force=force)
+
 
 async def close_all():
     """Close all browsers."""

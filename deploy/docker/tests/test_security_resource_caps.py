@@ -73,7 +73,7 @@ class TestConfigCaps:
     def test_job_queue_caps_defaults(self):
         from governor import job_queue_caps
         caps = job_queue_caps({})
-        assert caps == {"maxsize": 1000, "workers": 4, "per_principal": 100}
+        assert caps == {"maxsize": 1, "workers": 1, "per_principal": 100}
 
     def test_zero_means_unbounded(self):
         from governor import job_queue_caps, wall_clock_seconds
@@ -144,6 +144,37 @@ class TestWorkQueue:
             assert q._counts.get("p", 0) == 0
         finally:
             await q.stop()
+
+    async def test_stop_terminalizes_active_and_queued_jobs(self):
+        import asyncio
+
+        from work_queue import WorkQueue
+
+        q = WorkQueue(maxsize=2, workers=1)
+        await q.start()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        cancelled = []
+
+        async def active_job():
+            started.set()
+            await release.wait()
+
+        async def queued_job():
+            raise AssertionError("queued job must not start during shutdown")
+
+        async def cancelled_active():
+            cancelled.append("active")
+
+        async def cancelled_queued():
+            cancelled.append("queued")
+
+        await q.submit(active_job, on_cancel=cancelled_active)
+        await started.wait()
+        await q.submit(queued_job, on_cancel=cancelled_queued)
+        await q.stop()
+
+        assert sorted(cancelled) == ["active", "queued"]
 
 
 @pytest.mark.asyncio

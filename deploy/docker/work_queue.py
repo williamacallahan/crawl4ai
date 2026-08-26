@@ -26,6 +26,7 @@ from uuid import uuid4
 logger = logging.getLogger("crawl4ai.workqueue")
 
 JobFactory = Callable[[], Awaitable[None]]
+CancellationCallback = Callable[[], Awaitable[None]]
 
 PRINCIPAL_QUOTA_COUNTS_KEY = "crawl4ai:jobs:principal-counts:v1"
 PRINCIPAL_QUOTA_CLAIMS_KEY = "crawl4ai:jobs:principal-claims:v1"
@@ -117,7 +118,9 @@ class WorkQueue:
         self.workers = max(1, int(workers))
         self.per_principal = max(0, int(per_principal))  # 0 = unlimited
         self.redis = redis
-        self._q: asyncio.Queue[tuple[str | None, JobFactory, str | None]] | None = None
+        self._q: asyncio.Queue[
+            tuple[str | None, JobFactory, CancellationCallback | None, str | None]
+        ] | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._counts: dict[str, int] = {}
 
@@ -144,10 +147,11 @@ class WorkQueue:
         if queue is not None:
             while True:
                 try:
-                    principal, _factory, claim_token = queue.get_nowait()
+                    principal, _factory, on_cancel, claim_token = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
                 try:
+                    await self._cancel(on_cancel)
                     await self._release(principal, claim_token)
                 finally:
                     queue.task_done()
@@ -157,9 +161,12 @@ class WorkQueue:
         queue = self._q
         assert queue is not None
         while True:
-            principal, factory, claim_token = await queue.get()
+            principal, factory, on_cancel, claim_token = await queue.get()
             try:
                 await factory()
+            except asyncio.CancelledError:
+                await self._cancel(on_cancel)
+                raise
             except Exception:
                 logger.exception("background job failed")
             finally:
@@ -178,7 +185,20 @@ class WorkQueue:
         else:
             self._counts[principal] = n
 
-    async def submit(self, factory: JobFactory, principal: str | None = None) -> None:
+    async def _cancel(self, callback: CancellationCallback | None) -> None:
+        if callback is None:
+            return
+        try:
+            await callback()
+        except Exception:
+            logger.exception("background job cancellation callback failed")
+
+    async def submit(
+        self,
+        factory: JobFactory,
+        principal: str | None = None,
+        on_cancel: CancellationCallback | None = None,
+    ) -> None:
         """Enqueue a job. Raises QuotaExceeded / QueueFull (mapped to 429 / 503)."""
         queue = self._q
         if queue is None:
@@ -202,7 +222,7 @@ class WorkQueue:
             await self._release(principal, claim_token)
             raise RuntimeError("work queue stopped during admission")
         try:
-            queue.put_nowait((principal, factory, claim_token))
+            queue.put_nowait((principal, factory, on_cancel, claim_token))
         except asyncio.QueueFull:
             await self._release(principal, claim_token)
             raise QueueFull()

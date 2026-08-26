@@ -6,7 +6,6 @@ from auth import require_admin
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from monitor import get_monitor
 from pydantic import BaseModel
-from utils import get_browser_extra_args
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/monitor", tags=["monitor"])
@@ -276,27 +275,14 @@ async def restart_browser(req: KillBrowserRequest):
             HOT_POOL,
             LAST_USED,
             LOCK,
-            PERMANENT,
             USAGE_COUNT,
             init_permanent,
         )
-
-        from crawl4ai import BrowserConfig
-
         # Handle permanent browser restart
         if req.sig == "permanent" or (DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig)):
-            async with LOCK:
-                if PERMANENT:
-                    with suppress(Exception):
-                        await PERMANENT.close()
+            from server import get_default_browser_config
 
-                # Reinitialize permanent
-                from utils import load_config
-                config = load_config()
-                await init_permanent(BrowserConfig(
-                    extra_args=get_browser_extra_args(config),
-                    **config["crawler"]["browser"].get("kwargs", {}),
-                ))
+            await init_permanent(get_default_browser_config(), force=True)
 
             logger.info("🔄 Restarted permanent browser")
             return {"success": True, "restarted": "permanent"}
