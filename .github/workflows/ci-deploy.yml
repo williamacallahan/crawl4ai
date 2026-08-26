@@ -47,10 +47,10 @@ jobs:
         run: |
           redis_container="crawl4ai-ci-redis-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker run --rm --detach --name "$redis_container" \
+            --network "container:$HOSTNAME" \
             docker.io/library/redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf >/dev/null
           trap 'docker rm --force "$redis_container" >/dev/null 2>&1 || true' EXIT
-          redis_host=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$redis_container")
-          REDIS_URL="redis://$redis_host:6379/0" \
+          REDIS_URL=redis://127.0.0.1:6379/0 \
           PYTHONPATH="$PWD:$PWD/deploy/docker" .venv/bin/python -m pytest -q --no-header \
             deploy/docker/tests/test_auth.py \
             deploy/docker/tests/test_crawl_hook_lifecycle.py \
