@@ -16,6 +16,72 @@ from typing import Any
 
 MAX_RESPONSE_BYTES = 65_536
 MAX_REPLICAS = 16
+LLM_PROVIDER = "openai/qwen3.8-27b"
+LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
+REDIS_VOLUME = "crawl4ai-redis-data"
+REDIS_MOUNT_PATH = "/data"
+REDIS_HEALTHCHECK = ["CMD", "redis-cli", "ping"]
+REDIS_NODE_CONSTRAINT = "node.hostname==haiku-18"
+
+
+def _observability_labels(revision: str) -> dict[str, str]:
+    return {
+        "otel.logs.enabled": "true",
+        "otel.service.name": "crawl4ai",
+        "otel.deployment.environment.name": "production",
+        "otel.service.version": revision,
+    }
+
+
+def _environment_values(environment: str) -> dict[str, str]:
+    values = {}
+    for line in environment.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    return values
+
+
+def _verify_release_configuration(application: Any, revision: str) -> None:
+    if not isinstance(application, dict):
+        raise ValueError("application configuration response is invalid")
+    if application.get("labelsSwarm") != _observability_labels(revision):
+        raise ValueError("observability labels do not match the release")
+    environment = application.get("env")
+    if not isinstance(environment, str):
+        raise ValueError("LLM environment is not configured")
+    values = _environment_values(environment)
+    if values.get("LLM_PROVIDER") != LLM_PROVIDER:
+        raise ValueError("LLM_PROVIDER does not match the release")
+    if values.get("LLM_BASE_URL") != LLM_BASE_URL:
+        raise ValueError("LLM_BASE_URL does not match the release")
+    if not values.get("LLM_API_KEY", "").strip():
+        raise ValueError("LLM_API_KEY must be nonempty")
+
+
+def _verify_redis_configuration(application: Any) -> None:
+    if not isinstance(application, dict):
+        raise ValueError("external Redis configuration response is invalid")
+    mounts = application.get("mounts")
+    if not isinstance(mounts, list) or not any(
+        isinstance(mount, dict)
+        and mount.get("type") == "volume"
+        and mount.get("volumeName") == REDIS_VOLUME
+        and mount.get("mountPath") == REDIS_MOUNT_PATH
+        for mount in mounts
+    ):
+        raise ValueError("external Redis must mount crawl4ai-redis-data at /data")
+    healthcheck = application.get("healthCheckSwarm")
+    if not isinstance(healthcheck, dict) or healthcheck.get("Test") != REDIS_HEALTHCHECK:
+        raise ValueError("external Redis must use redis-cli ping healthcheck")
+    placement = application.get("placementSwarm")
+    if not isinstance(placement, dict):
+        raise ValueError("external Redis placement is not configured")
+    constraints = placement.get("Constraints")
+    if not isinstance(constraints, list) or REDIS_NODE_CONSTRAINT not in constraints:
+        raise ValueError("external Redis must be placed on haiku-18")
+    if placement.get("MaxReplicas") != 1:
+        raise ValueError("external Redis MaxReplicas must be 1")
 
 
 def _required_stop_grace_ns() -> int:
@@ -100,6 +166,7 @@ def verify_rollout(
     dokploy_url: str,
     api_key: str,
     application_id: str,
+    redis_application_id: str,
     revision: str,
     health_url: str,
     read_json: Callable[[str, str | None], Any] = _curl_json,
@@ -123,6 +190,8 @@ def verify_rollout(
     else:
         raise TimeoutError("Dokploy deployment did not finish within 10 minutes")
 
+    expected_labels = _observability_labels(revision)
+
     if probe_health is None:
 
         def probe_health(url: str, count: int) -> list[Any]:
@@ -138,13 +207,42 @@ def verify_rollout(
                 return list(executor.map(probe, range(count)))
 
     proof_deadline = monotonic() + 600
-    candidate: tuple[frozenset[str], frozenset[str]] | None = None
+    candidate: tuple[frozenset[str], frozenset[str], frozenset[str]] | None = None
     stable_rounds = 0
     while monotonic() < proof_deadline:
         application = read_json(
             _dokploy_url(dokploy_url, "application.one", applicationId=application_id),
             api_key,
         )
+        _verify_release_configuration(application, revision)
+        redis_application = read_json(
+            _dokploy_url(
+                dokploy_url, "application.one", applicationId=redis_application_id
+            ),
+            api_key,
+        )
+        _verify_redis_configuration(redis_application)
+        redis_tasks = read_json(
+            _dokploy_url(
+                dokploy_url,
+                "docker.getServiceContainersByAppName",
+                appName=redis_application["appName"],
+            ),
+            api_key,
+        )
+        redis_running = frozenset(
+            task["containerId"]
+            for task in redis_tasks
+            if task.get("state") == "running"
+            and str(task.get("currentState", "")).startswith("Running ")
+            and task.get("node")
+            and not _has_task_error(task)
+        )
+        if len(redis_running) != 1:
+            candidate = None
+            stable_rounds = 0
+            sleep(5)
+            continue
         replicas = int(application["replicas"])
         if not 1 <= replicas <= MAX_REPLICAS:
             raise ValueError(
@@ -186,6 +284,11 @@ def verify_rollout(
                 _dokploy_url(dokploy_url, "docker.getConfig", containerId=task_id),
                 api_key,
             )
+            labels = task["Config"]["Labels"]
+            if not isinstance(labels, dict) or any(
+                labels.get(key) != value for key, value in expected_labels.items()
+            ):
+                raise ValueError("container observability labels do not match release")
             return task["Status"]["ContainerStatus"]["ContainerID"][:12]
 
         try:
@@ -209,7 +312,7 @@ def verify_rollout(
             if matches_revision
         )
         complete = public_instances == authoritative_instances and all(matches)
-        snapshot = (actual_running_tasks, public_instances)
+        snapshot = (actual_running_tasks, public_instances, redis_running)
         if complete and snapshot == candidate:
             stable_rounds += 1
         elif complete:
@@ -232,6 +335,7 @@ def main() -> None:
         dokploy_url=os.environ["DOKPLOY_URL"],
         api_key=os.environ["DOKPLOY_API_KEY"],
         application_id=os.environ["APPLICATION_ID"],
+        redis_application_id=os.environ["REDIS_APPLICATION_ID"],
         revision=os.environ["GITHUB_SHA"],
         health_url=os.environ.get("HEALTH_URL", "https://crawl4ai.haiku.host/health"),
     )

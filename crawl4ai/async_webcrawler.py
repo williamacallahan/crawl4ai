@@ -28,6 +28,7 @@ from .async_crawler_strategy import (
     AsyncCrawlerStrategy,
     AsyncPlaywrightCrawlerStrategy,
     AsyncCrawlResponse,
+    TargetNavigationError,
 )
 from .cache_context import CacheMode, CacheContext
 from .markdown_generation_strategy import (
@@ -343,7 +344,7 @@ class AsyncWebCrawler:
 
                     self.logger.url_status(
                         url=cache_context.display_url,
-                        success=bool(html),
+                        success=cached_result.success,
                         timing=time.perf_counter() - start_time,
                         tag="FETCH",
                     )
@@ -408,6 +409,7 @@ class AsyncWebCrawler:
                     _original_proxy_config = config.proxy_config
                     _block_reason = ""
                     _done = False
+                    _target_outcome = False
                     crawl_result = None
                     _crawl_stats = {
                         "attempts": 0,
@@ -423,7 +425,7 @@ class AsyncWebCrawler:
 
                         if _attempt > 0:
                             _crawl_stats["retries"] = _attempt
-                            self.logger.warning(
+                            self.logger.info(
                                 message="Anti-bot retry {attempt}/{max_retries} for {url} — {reason}",
                                 tag="ANTIBOT",
                                 params={
@@ -465,12 +467,21 @@ class AsyncWebCrawler:
                                 pdf_data = async_response.pdf_data
                                 js_execution_result = async_response.js_execution_result
 
-                                self.logger.url_status(
-                                    url=cache_context.display_url,
-                                    success=bool(html),
-                                    timing=time.perf_counter() - t1,
-                                    tag="FETCH",
-                                )
+                                if _is_raw_url:
+                                    _blocked = False
+                                    _block_reason = ""
+                                else:
+                                    _blocked, _block_reason = is_blocked(
+                                        async_response.status_code, html)
+                                _target_outcome = _blocked
+
+                                if not _blocked:
+                                    self.logger.url_status(
+                                        url=cache_context.display_url,
+                                        success=bool(html),
+                                        timing=time.perf_counter() - t1,
+                                        tag="FETCH",
+                                    )
 
                                 crawl_result = await self.aprocess_html(
                                     url=url, html=html,
@@ -504,15 +515,6 @@ class AsyncWebCrawler:
                                 crawl_result.session_id = getattr(config, "session_id", None)
                                 crawl_result.cache_status = "miss"
 
-                                # Check if blocked (skip for raw: URLs —
-                                # caller-provided content, anti-bot N/A)
-                                if _is_raw_url:
-                                    _blocked = False
-                                    _block_reason = ""
-                                else:
-                                    _blocked, _block_reason = is_blocked(
-                                        async_response.status_code, html)
-
                                 _crawl_stats["proxies_used"].append({
                                     "proxy": _proxy.server if _proxy else None,
                                     "status_code": async_response.status_code,
@@ -526,22 +528,30 @@ class AsyncWebCrawler:
                                     break  # Success — exit proxy loop
 
                             except Exception as _crawl_err:
+                                _target_outcome = (
+                                    _proxy is None
+                                    and isinstance(_crawl_err, TargetNavigationError)
+                                )
                                 _crawl_stats["proxies_used"].append({
                                     "proxy": _proxy.server if _proxy else None,
                                     "status_code": None,
                                     "blocked": True,
                                     "reason": str(_crawl_err),
                                 })
-                                self.logger.error_status(
-                                    url=url,
-                                    error=f"Proxy {_proxy.server if _proxy else 'direct'} failed: {_crawl_err}",
-                                    tag="ANTIBOT",
-                                )
+                                if not _target_outcome:
+                                    self.logger.error_status(
+                                        url=url,
+                                        error=f"Proxy {_proxy.server if _proxy else 'direct'} failed: {_crawl_err}",
+                                        tag="ANTIBOT",
+                                    )
                                 _block_reason = str(_crawl_err)
-                                # If this is the only proxy and only attempt, re-raise
-                                # so the caller gets the real error (not a silent swallow).
-                                # But if there are more proxies or retries to try, continue.
-                                if len(_proxy_list) <= 1 and _max_attempts <= 1:
+                                # Unexpected one-shot failures keep their full context.
+                                # Proven target refusals continue to the shared result path.
+                                if (
+                                    not _target_outcome
+                                    and len(_proxy_list) <= 1
+                                    and _max_attempts <= 1
+                                ):
                                     raise
 
                     # Restore original proxy_config
@@ -602,6 +612,7 @@ class AsyncWebCrawler:
                                     crawl_result.session_id = getattr(config, "session_id", None)
                                     crawl_result.cache_status = "miss"
                                     _crawl_stats["resolved_by"] = "fallback_fetch"
+                                    _target_outcome = False
                             except Exception as _fallback_err:
                                 self.logger.error_status(
                                     url=url,
@@ -627,8 +638,7 @@ class AsyncWebCrawler:
                         # html" as a block.
                         _has_download = bool(getattr(crawl_result, "downloaded_files", None))
                         if not _fallback_succeeded and not _is_raw_url and not _has_download:
-                            _blocked, _block_reason = is_blocked(
-                                crawl_result.status_code, crawl_result.html or "")
+                            _target_outcome = _blocked
                             if _blocked:
                                 crawl_result.success = False
                                 crawl_result.error_message = f"Blocked by anti-bot protection: {_block_reason}"
@@ -637,12 +647,18 @@ class AsyncWebCrawler:
                         # All proxies threw exceptions and fallback either wasn't
                         # configured or also failed.  Build a minimal result so the
                         # caller gets crawl_stats instead of None.
+                        if _target_outcome:
+                            failure_message = _block_reason
+                        elif _block_reason:
+                            failure_message = f"All proxies failed: {_block_reason}"
+                        else:
+                            failure_message = "All proxies failed"
                         crawl_result = CrawlResult(
                             url=url,
                             html="",
                             success=False,
                             status_code=None,
-                            error_message=f"All proxies failed: {_block_reason}" if _block_reason else "All proxies failed",
+                            error_message=failure_message,
                         )
                         crawl_result.crawl_stats = _crawl_stats
 
@@ -655,18 +671,31 @@ class AsyncWebCrawler:
 
                     # Log failure reason before COMPLETE so users can see why it failed.
                     if crawl_result and not crawl_result.success and crawl_result.error_message:
-                        self.logger.error_status(
-                            url=cache_context.display_url,
-                            error=crawl_result.error_message,
-                            tag="ERROR",
-                        )
+                        if _target_outcome:
+                            self.logger.info(
+                                f"{cache_context.display_url[:100]} | Target refusal: {crawl_result.error_message}",
+                                tag="TARGET",
+                            )
+                        else:
+                            self.logger.error_status(
+                                url=cache_context.display_url,
+                                error=crawl_result.error_message,
+                                tag="ERROR",
+                            )
 
-                    self.logger.url_status(
-                        url=cache_context.display_url,
-                        success=crawl_result.success if crawl_result else False,
-                        timing=time.perf_counter() - start_time,
-                        tag="COMPLETE",
-                    )
+                    elapsed = time.perf_counter() - start_time
+                    if crawl_result and not crawl_result.success and _target_outcome:
+                        self.logger.info(
+                            f"{cache_context.display_url[:100]} | ✗ | ⏱: {elapsed:.2f}s",
+                            tag="COMPLETE",
+                        )
+                    else:
+                        self.logger.url_status(
+                            url=cache_context.display_url,
+                            success=crawl_result.success if crawl_result else False,
+                            timing=elapsed,
+                            tag="COMPLETE",
+                        )
 
                     # Update cache if appropriate
                     if cache_context.should_write() and not bool(cached_result):
@@ -681,9 +710,6 @@ class AsyncWebCrawler:
                         timing=time.perf_counter() - start_time,
                         tag="COMPLETE"
                     )
-                    # Same binary-download awareness as the live-fetch path
-                    # — a cached PDF/archive should replay as success.
-                    cached_result.success = bool(html) or bool(getattr(cached_result, "downloaded_files", None))
                     cached_result.session_id = getattr(
                         config, "session_id", None)
                     # For raw: URLs, don't fall back to the raw HTML string as redirected_url

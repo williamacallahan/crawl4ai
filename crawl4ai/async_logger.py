@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional, Dict, Any, List
 import os
-import sys
 from datetime import datetime
 from urllib.parse import unquote
 from rich.console import Console
@@ -378,7 +377,8 @@ class AsyncFileLogger(AsyncLoggerBase):
         """Log URL fetch status to file."""
         status = "SUCCESS" if success else "FAILED"
         message = f"{url[:url_length]}... | Status: {status} | Time: {timing:.2f}s"
-        self._write_to_file("URL_STATUS", message, tag)
+        level = "URL_STATUS" if success else "ERROR"
+        self._write_to_file(level, message, tag)
 
     def error_status(self, url: str, error: str, tag: str = "ERROR", url_length: int = 100):
         """Log error status to file."""

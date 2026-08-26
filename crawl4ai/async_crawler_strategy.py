@@ -39,6 +39,21 @@ from .ssl_certificate import SSLCertificate
 from .user_agent_generator import UAGen, ValidUAGenerator
 
 
+_TARGET_NAVIGATION_REFUSALS: Final = (
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_CONNECTION_REFUSED",
+    "net::ERR_CERT_AUTHORITY_INVALID",
+    "net::ERR_CERT_COMMON_NAME_INVALID",
+    "net::ERR_CERT_DATE_INVALID",
+    "net::ERR_SSL_PROTOCOL_ERROR",
+    "net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH",
+)
+
+
+class TargetNavigationError(RuntimeError):
+    """A direct target origin refused browser navigation."""
+
+
 class AsyncCrawlerStrategy(ABC):
     """
     Abstract base class for crawler strategies.
@@ -772,15 +787,23 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     except Error as e:
                         # Allow navigation to be aborted when downloading files
                         # This is expected behavior for downloads in some browser engines
-                        if 'net::ERR_ABORTED' in str(e) and self.browser_config.accept_downloads:
+                        error_detail = str(e)
+                        if 'net::ERR_ABORTED' in error_detail and self.browser_config.accept_downloads:
                             self.logger.info(
                                 message=f"Navigation aborted, likely due to file download: {url}",
                                 tag="GOTO",
                                 params={"url": url},
                             )
                             response = None
+                        elif config.proxy_config is None and any(
+                            refusal in error_detail
+                            for refusal in _TARGET_NAVIGATION_REFUSALS
+                        ):
+                            raise TargetNavigationError(
+                                f"Target navigation refused: {error_detail}"
+                            ) from e
                         else:
-                            raise RuntimeError(f"Failed on navigating ACS-GOTO:\n{str(e)}")
+                            raise RuntimeError(f"Failed on navigating ACS-GOTO:\n{error_detail}")
 
                     # ──────────────────────────────────────────────────────────────
                     # Walk the redirect chain.  Playwright returns only the last

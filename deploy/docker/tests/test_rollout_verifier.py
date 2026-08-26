@@ -6,6 +6,7 @@ from threading import Thread
 
 import pytest
 
+import verify_rollout as rollout_verifier
 from verify_rollout import (
     MAX_RESPONSE_BYTES,
     REQUIRED_STOP_GRACE_NS,
@@ -13,6 +14,54 @@ from verify_rollout import (
     _has_task_error,
     verify_rollout,
 )
+
+
+def _application(**overrides):
+    application = {
+        "replicas": 1,
+        "appName": "crawl4ai",
+        "labelsSwarm": rollout_verifier._observability_labels("target"),
+        "env": (
+            f"LLM_PROVIDER={rollout_verifier.LLM_PROVIDER}\n"
+            f"LLM_BASE_URL={rollout_verifier.LLM_BASE_URL}\n"
+            "LLM_API_KEY=nonempty"
+        ),
+        "mounts": [
+            {
+                "type": "volume",
+                "volumeName": rollout_verifier.REDIS_VOLUME,
+                "mountPath": rollout_verifier.REDIS_MOUNT_PATH,
+            }
+        ],
+        "healthCheckSwarm": {"Test": rollout_verifier.REDIS_HEALTHCHECK},
+        "placementSwarm": {
+            "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
+            "MaxReplicas": 1,
+        },
+    }
+    application.update(overrides)
+    return application
+
+
+def _task_config(container_id: str, labels: dict[str, str] | None = None) -> dict:
+    return {
+        "Status": {"ContainerStatus": {"ContainerID": container_id}},
+        "Config": {
+            "Labels": rollout_verifier._observability_labels("target")
+            if labels is None
+            else labels
+        },
+    }
+
+
+def _running_task(task_id: str, node: str, seconds: int = 1) -> dict:
+    return {
+        "containerId": task_id,
+        "state": "running",
+        "currentState": f"Running {seconds}s",
+        "node": node,
+        "error": "",
+    }
 
 
 def _health(instance: str, revision: str = "target") -> dict:
@@ -27,12 +76,19 @@ def _health(instance: str, revision: str = "target") -> dict:
 def _fake_read(handlers):
     def read_json(url, _api_key):
         operation = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
+        if (
+            operation == "docker.getServiceContainersByAppName"
+            and "appName=crawl4ai-redis" in url
+        ):
+            return [_running_task("redis-task", "haiku-18")]
         if operation not in handlers:
             raise AssertionError(f"unexpected operation: {operation}")
         handler = handlers[operation]
         result = handler(url) if callable(handler) else handler
         if operation == "application.one" and isinstance(result, dict):
-            result = dict(result)
+            result = _application(**result)
+            if "applicationId=redis" in url:
+                result["appName"] = "crawl4ai-redis"
             result.setdefault("stopGracePeriodSwarm", REQUIRED_STOP_GRACE_NS)
         return result
 
@@ -74,28 +130,124 @@ def test_curl_json_rejects_streamed_responses_over_64_kib():
         server.server_close()
 
 
-def test_verifier_requires_two_identical_complete_task_and_instance_snapshots():
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"labelsSwarm": {}}, "observability labels"),
+        (
+            {
+                "env": (
+                    "LLM_PROVIDER=openai/gpt-4o-mini\n"
+                    "LLM_BASE_URL=https://api.llm-gateway.iocloudhost.net/v1\n"
+                    "LLM_API_KEY=nonempty"
+                )
+            },
+            "LLM_PROVIDER",
+        ),
+        (
+            {
+                "env": (
+                    "LLM_PROVIDER=openai/qwen3.8-27b\n"
+                    "LLM_BASE_URL=https://wrong.example/v1\n"
+                    "LLM_API_KEY=nonempty"
+                )
+            },
+            "LLM_BASE_URL",
+        ),
+        (
+            {
+                "env": (
+                    "LLM_PROVIDER=openai/qwen3.8-27b\n"
+                    "LLM_BASE_URL=https://api.llm-gateway.iocloudhost.net/v1\n"
+                    "LLM_API_KEY="
+                )
+            },
+            "LLM_API_KEY must be nonempty",
+        ),
+    ],
+)
+def test_verifier_rejects_invalid_release_observability_configuration(overrides, message):
+    read_json = _fake_read(
+        {
+            "deployment.all": [{"status": "done"}],
+            "application.one": overrides,
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        verify_rollout(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            redis_application_id="redis",
+            revision="target",
+            health_url="https://crawl.example/health",
+            read_json=read_json,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"mounts": []}, "crawl4ai-redis-data"),
+        ({"healthCheckSwarm": {"Test": ["CMD-SHELL", "redis-cli ping"]}}, "healthcheck"),
+        ({"placementSwarm": {"Constraints": [], "MaxReplicas": 1}}, "haiku-18"),
+        (
+            {
+                "placementSwarm": {
+                    "Constraints": ["node.hostname==haiku-18"],
+                    "MaxReplicas": 2,
+                }
+            },
+            "MaxReplicas",
+        ),
+    ],
+)
+def test_verifier_rejects_invalid_external_redis_configuration(overrides, message):
+    def application_for_id(url):
+        return overrides if "applicationId=redis" in url else {}
+
+    read_json = _fake_read(
+        {
+            "deployment.all": [{"status": "done"}],
+            "application.one": application_for_id,
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        verify_rollout(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            redis_application_id="redis",
+            revision="target",
+            health_url="https://crawl.example/health",
+            read_json=read_json,
+        )
+
+
+def test_main_reads_external_redis_application_id(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy.example")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "secret")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    monkeypatch.setenv("REDIS_APPLICATION_ID", "redis")
+    monkeypatch.setenv("GITHUB_SHA", "target")
+    monkeypatch.setattr(
+        rollout_verifier, "verify_rollout", lambda **kwargs: captured.update(kwargs)
+    )
+
+    rollout_verifier.main()
+
+    assert captured["redis_application_id"] == "redis"
+
+
+def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_with_runtime_labels():
     container_id = "a" * 64
     task_snapshots = iter(
         [
-            [
-                {
-                    "containerId": "task-a",
-                    "state": "running",
-                    "currentState": "Running 1s",
-                    "node": "a",
-                    "error": "",
-                }
-            ],
-            [
-                {
-                    "containerId": "task-a",
-                    "state": "running",
-                    "currentState": "Running 6s",
-                    "node": "a",
-                    "error": "",
-                }
-            ],
+            [_running_task("task-a", "a")],
+            [_running_task("task-a", "a", 6)],
         ]
     )
 
@@ -104,9 +256,13 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots():
             "deployment.all": [{"status": "done"}],
             "application.one": {"replicas": 1, "appName": "crawl4ai"},
             "docker.getServiceContainersByAppName": lambda _url: next(task_snapshots),
-            "docker.getConfig": {
-                "Status": {"ContainerStatus": {"ContainerID": container_id}}
-            },
+            "docker.getConfig": _task_config(
+                container_id,
+                {
+                    **rollout_verifier._observability_labels("target"),
+                    "com.docker.swarm.task.id": "task-a",
+                },
+            ),
         }
     )
 
@@ -114,6 +270,7 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots():
         dokploy_url="https://dokploy.example",
         api_key="secret",
         application_id="app",
+        redis_application_id="redis",
         revision="target",
         health_url="https://crawl.example/health",
         read_json=read_json,
@@ -123,60 +280,44 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots():
 
 
 @pytest.mark.parametrize(
-    "second_tasks,second_health",
+    "second_tasks,second_health,second_labels",
     [
         (
-            [
-                {
-                    "containerId": "task-b",
-                    "state": "running",
-                    "currentState": "Running 1s",
-                    "node": "b",
-                    "error": "",
-                }
-            ],
+            [_running_task("task-b", "b")],
             _health("b" * 12),
+            None,
         ),
         (
-            [
-                {
-                    "containerId": "task-a",
-                    "state": "running",
-                    "currentState": "Running 6s",
-                    "node": "a",
-                    "error": "",
-                }
-            ],
+            [_running_task("task-a", "a", 6)],
             _health("a" * 12, "rolled-back"),
+            None,
+        ),
+        (
+            [_running_task("task-a", "a", 6)],
+            _health("a" * 12),
+            rollout_verifier._observability_labels("wrong"),
         ),
     ],
 )
-def test_verifier_rejects_membership_churn_and_revision_rollback(
-    second_tasks, second_health
+def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_drift(
+    second_tasks, second_health, second_labels
 ):
     clock = iter([0, 0, 0, 1, 1, 700])
     task_snapshots = iter(
         [
-            [
-                {
-                    "containerId": "task-a",
-                    "state": "running",
-                    "currentState": "Running 1s",
-                    "node": "a",
-                    "error": "",
-                }
-            ],
+            [_running_task("task-a", "a")],
             second_tasks,
         ]
     )
     health_snapshots = iter([_health("a" * 12), second_health])
+    config_labels = iter([None, second_labels])
 
     def task_config(url):
         task_id = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)[
             "containerId"
         ][0]
         container_id = ("a" if task_id == "task-a" else "b") * 64
-        return {"Status": {"ContainerStatus": {"ContainerID": container_id}}}
+        return _task_config(container_id, next(config_labels))
 
     read_json = _fake_read(
         {
@@ -192,6 +333,7 @@ def test_verifier_rejects_membership_churn_and_revision_rollback(
             dokploy_url="https://dokploy.example",
             api_key="secret",
             application_id="app",
+            redis_application_id="redis",
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
@@ -214,6 +356,7 @@ def test_verifier_rejects_unbounded_replica_counts():
             dokploy_url="https://dokploy.example",
             api_key="secret",
             application_id="app",
+            redis_application_id="redis",
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
@@ -238,6 +381,7 @@ def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
             dokploy_url="https://dokploy.example",
             api_key="secret",
             application_id="app",
+            redis_application_id="redis",
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
@@ -249,13 +393,7 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
     clock = iter([0, 0, 0, 1, 700])
     get_config_calls = 0
     tasks = [
-        {
-            "containerId": "task-current",
-            "state": "running",
-            "currentState": "Running 5s",
-            "node": "a",
-            "error": "",
-        },
+        _running_task("task-current", "a", 5),
         {
             "containerId": "task-stale",
             "state": "shutdown",
@@ -284,6 +422,7 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
             dokploy_url="https://dokploy.example",
             api_key="secret",
             application_id="app",
+            redis_application_id="redis",
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
@@ -297,20 +436,8 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
 def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
     clock = iter([0, 0, 0, 1, 700])
     tasks = [
-        {
-            "containerId": "task-a",
-            "state": "running",
-            "currentState": "Running 5s",
-            "node": "a",
-            "error": "",
-        },
-        {
-            "containerId": "task-b",
-            "state": "running",
-            "currentState": "Running 5s",
-            "node": "b",
-            "error": "",
-        },
+        _running_task("task-a", "a", 5),
+        _running_task("task-b", "b", 5),
         {
             "containerId": "task-pending",
             "state": "running",
@@ -339,6 +466,7 @@ def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
             dokploy_url="https://dokploy.example",
             api_key="secret",
             application_id="app",
+            redis_application_id="redis",
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,

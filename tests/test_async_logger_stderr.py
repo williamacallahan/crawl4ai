@@ -8,7 +8,6 @@ import io
 import sys
 from pathlib import Path
 
-import pytest
 from rich.console import Console
 
 # Load async_logger directly without triggering the full crawl4ai __init__
@@ -21,7 +20,16 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 
 AsyncLogger = _mod.AsyncLogger
+AsyncFileLogger = _mod.AsyncFileLogger
 LogLevel = _mod.LogLevel
+
+
+class _RecordingConsole:
+    def __init__(self):
+        self.lines = []
+
+    def print(self, line):
+        self.lines.append(line)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +123,48 @@ class TestAsyncLoggerVerboseFalse:
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == ""
+
+
+class TestAsyncLoggerSeverity:
+    def test_generic_failures_never_infer_severity_from_text_or_tag(self):
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+
+        logger.error_status(
+            "https://example.com",
+            "Blocked by anti-bot protection: challenge page",
+        )
+        logger.error_status(
+            "https://example.com", "page.goto: net::ERR_CONNECTION_REFUSED"
+        )
+        logger.url_status("https://example.com", False, 1.0, tag="COMPLETE")
+        logger.error_status("https://example.com", "Redis connection refused")
+
+        assert all(line.startswith("[red]") for line in console.lines)
+        assert "Blocked by anti-bot protection" in console.lines[0]
+        assert "net::ERR_CONNECTION_REFUSED" in console.lines[1]
+
+    def test_file_logger_generic_failures_are_errors(self, tmp_path):
+        log_file = tmp_path / "severity.log"
+        logger = AsyncFileLogger(str(log_file))
+
+        logger.error_status(
+            "https://example.com",
+            "Blocked by anti-bot protection: challenge page",
+        )
+        logger.error_status(
+            "https://example.com", "page.goto: net::ERR_CONNECTION_REFUSED"
+        )
+        logger.url_status("https://example.com", False, 1.0, tag="COMPLETE")
+
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3
+        assert all("[ERROR]" in line for line in lines)
+
+    def test_filtered_messages_are_not_formatted(self):
+        logger = AsyncLogger(log_level=LogLevel.WARNING)
+
+        logger.info("{missing}", params={"other": "value"})
 
 
 class TestAsyncLoggerFileLogging:

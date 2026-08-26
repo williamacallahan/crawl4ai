@@ -23,6 +23,7 @@ permissions:
 env:
   IMAGE: docker.iocloudhost.net/crawl4ai
   APPLICATION_ID: YTAj7y39GXOkUtoHpYYXw
+  REDIS_APPLICATION_ID: D5WPQqgJYaonrZ6Pth2Cy
 
 jobs:
   test:
@@ -44,14 +45,19 @@ jobs:
 
       - name: Unit gate
         run: |
+          command -v redis-server >/dev/null
           PYTHONPATH="$PWD:$PWD/deploy/docker" .venv/bin/python -m pytest -q --no-header \
             deploy/docker/tests/test_auth.py \
+            deploy/docker/tests/test_crawl_hook_lifecycle.py \
             deploy/docker/tests/test_crawl_job_queue.py \
+            deploy/docker/tests/test_crawl_job_queue_redis.py \
             deploy/docker/tests/test_crawl_job_contract.py \
             deploy/docker/tests/test_rollout_verifier.py \
             deploy/docker/tests/test_runtime_ui_repairs.py \
             deploy/docker/tests/test_server_crawler_defaults.py \
             deploy/docker/tests/test_resource_policy.py \
+            tests/test_async_logger_stderr.py \
+            tests/test_crawl_failure_severity.py \
             tests/test_memory_cgroup.py
 
   # Each architecture builds on a runner of that architecture. QEMU emulation is
@@ -168,13 +174,13 @@ jobs:
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
         run: |
           set -euo pipefail
-          curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 \
+          printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.update" \
-            -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s"}' "$APPLICATION_ID" "$IMAGE" "$GITHUB_SHA")" >/dev/null
-          curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 \
+            -H 'content-type: application/json' \
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s","labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"}}' "$APPLICATION_ID" "$IMAGE" "$GITHUB_SHA" "$GITHUB_SHA")" >/dev/null
+          printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
-            -H "x-api-key: $DOKPLOY_API_KEY" -H 'content-type: application/json' \
+            -H 'content-type: application/json' \
             --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
           echo "deploy queued for ${IMAGE}:${GITHUB_SHA}"
 
