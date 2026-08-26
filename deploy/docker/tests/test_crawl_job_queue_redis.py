@@ -45,8 +45,18 @@ def queue_config():
 def redis_url():
     configured_url = os.getenv("REDIS_URL")
     if configured_url:
-        yield configured_url
-        return
+        client = redis.from_url(configured_url)
+        try:
+            for _attempt in range(100):
+                try:
+                    if client.ping():
+                        yield configured_url
+                        return
+                except redis.ConnectionError:
+                    time.sleep(0.01)
+            pytest.fail("configured Redis did not become ready")
+        finally:
+            client.close()
     executable = shutil.which("redis-server")
     if executable is None:
         pytest.skip("redis-server is not installed")
