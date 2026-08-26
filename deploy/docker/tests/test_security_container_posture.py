@@ -81,6 +81,12 @@ class TestSupervisord:
     def test_gunicorn_request_limits(self, supervisord):
         assert "--limit-request-line" in supervisord
 
+    def test_gunicorn_trusts_dynamic_ingress_proxy_addresses(self, supervisord):
+        assert (
+            '--forwarded-allow-ips "127.0.0.1,::1,10.0.0.0/8,'
+            '172.16.0.0/12,192.168.0.0/16"' in supervisord
+        )
+
 
 class TestCompose:
     def test_cap_drop_all(self, compose):
