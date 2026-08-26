@@ -62,7 +62,8 @@ def resolve_llm(config: Dict, requested_provider: Optional[str] = None) -> Dict:
         "api_token": get_llm_api_key(config, provider),   # server credential
         "temperature": get_llm_temperature(config, provider),
         "extra_args": {
-            "timeout": config["llm"].get("request_timeout_seconds", 25),
+            "timeout": config["llm"].get("request_timeout_seconds", 120),
             "num_retries": config["llm"].get("request_retries", 0),
+            "max_tokens": config["llm"].get("max_output_tokens", 1024),
         },
     }

@@ -389,6 +389,7 @@ async def process_llm_extraction(
             **_llm["extra_args"],
             "timeout": config["llm"].get("job_request_timeout_seconds", 120),
             "num_retries": config["llm"].get("job_request_retries", 0),
+            "max_tokens": config["llm"].get("job_max_output_tokens", 4096),
         }
         llm_strategy = LLMExtractionStrategy(
             llm_config=LLMConfig(

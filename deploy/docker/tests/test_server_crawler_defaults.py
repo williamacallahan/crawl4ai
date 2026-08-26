@@ -142,7 +142,7 @@ def test_llm_markdown_uses_one_async_provider_call(monkeypatch):
             "api_token": "test-only",
             "temperature": None,
             "base_url": "https://gateway.example/v1",
-            "extra_args": {"timeout": 25, "num_retries": 0},
+            "extra_args": {"timeout": 120, "num_retries": 0, "max_tokens": 1024},
         },
     )
 
@@ -198,7 +198,7 @@ def test_quick_llm_uses_server_render_readiness_default(monkeypatch):
             "api_token": "test-only",
             "temperature": 0.0,
             "base_url": None,
-            "extra_args": {"timeout": 25, "num_retries": 0},
+            "extra_args": {"timeout": 120, "num_retries": 0, "max_tokens": 1024},
         },
     )
     monkeypatch.setattr(crawler_pool, "get_crawler", get_crawler)
@@ -277,7 +277,11 @@ def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch):
         )
     )
 
-    assert captured["extra_args"] == {"timeout": 120, "num_retries": 0}
+    assert captured["extra_args"] == {
+        "timeout": 120,
+        "num_retries": 0,
+        "max_tokens": 4096,
+    }
     assert captured["apply_chunking"] is False
     final_mapping = redis.hset.await_args_list[-1].kwargs["mapping"]
     assert final_mapping == {

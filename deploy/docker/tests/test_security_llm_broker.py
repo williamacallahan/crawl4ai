@@ -23,7 +23,11 @@ class TestProviderAllowlist:
 
     def test_server_bounds_slow_provider_attempts(self):
         out = resolve_llm(CONF)
-        assert out["extra_args"] == {"timeout": 25, "num_retries": 0}
+        assert out["extra_args"] == {
+            "timeout": 120,
+            "num_retries": 0,
+            "max_tokens": 1024,
+        }
 
     def test_other_family_rejected(self):
         with pytest.raises(LLMProviderNotAllowed):
