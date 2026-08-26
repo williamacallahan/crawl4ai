@@ -22,6 +22,7 @@ REDIS_VOLUME = "crawl4ai-redis-data"
 REDIS_MOUNT_PATH = "/data"
 REDIS_HEALTHCHECK = ["CMD", "redis-cli", "ping"]
 REDIS_NODE_CONSTRAINT = "node.hostname==haiku-18"
+CRAWL_MAX_REPLICAS_PER_NODE = 2
 
 
 def _observability_labels(revision: str) -> dict[str, str]:
@@ -57,6 +58,15 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
         raise ValueError("LLM_BASE_URL does not match the release")
     if not values.get("LLM_API_KEY", "").strip():
         raise ValueError("LLM_API_KEY must be nonempty")
+    placement = application.get("placementSwarm")
+    if not isinstance(placement, dict) or placement.get("MaxReplicas") != CRAWL_MAX_REPLICAS_PER_NODE:
+        raise ValueError("Crawl4AI placement must allow one temporary overlap task")
+    for field in ("updateConfigSwarm", "rollbackConfigSwarm"):
+        config = application.get(field)
+        if not isinstance(config, dict) or config.get("Order") != "start-first":
+            raise ValueError(f"{field} must use start-first order")
+        if config.get("Parallelism") != 1 or config.get("MaxFailureRatio") != 0:
+            raise ValueError(f"{field} must replace one task at a time and fail closed")
 
 
 def _verify_redis_configuration(application: Any) -> None:

@@ -182,7 +182,7 @@ jobs:
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.update" \
             -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s","labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"}}' "$APPLICATION_ID" "$IMAGE" "$GITHUB_SHA" "$GITHUB_SHA")" >/dev/null
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s","labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"placementSwarm":{"MaxReplicas":2},"updateConfigSwarm":{"Parallelism":1,"Delay":0,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":0,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"}}' "$APPLICATION_ID" "$IMAGE" "$GITHUB_SHA" "$GITHUB_SHA")" >/dev/null
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H 'content-type: application/json' \

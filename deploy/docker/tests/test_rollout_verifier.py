@@ -35,9 +35,11 @@ def _application(**overrides):
         ],
         "healthCheckSwarm": {"Test": rollout_verifier.REDIS_HEALTHCHECK},
         "placementSwarm": {
-            "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
-            "MaxReplicas": 1,
+            "Constraints": [],
+            "MaxReplicas": rollout_verifier.CRAWL_MAX_REPLICAS_PER_NODE,
         },
+        "updateConfigSwarm": {"Order": "start-first", "Parallelism": 1, "MaxFailureRatio": 0},
+        "rollbackConfigSwarm": {"Order": "start-first", "Parallelism": 1, "MaxFailureRatio": 0},
     }
     application.update(overrides)
     return application
@@ -88,9 +90,15 @@ def _fake_read(handlers):
         handler = handlers[operation]
         result = handler(url) if callable(handler) else handler
         if operation == "application.one" and isinstance(result, dict):
+            supplied = result
             result = _application(**result)
             if "applicationId=redis" in url:
                 result["appName"] = "crawl4ai-redis"
+                if "placementSwarm" not in supplied:
+                    result["placementSwarm"] = {
+                        "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
+                        "MaxReplicas": 1,
+                    }
             result.setdefault("stopGracePeriodSwarm", REQUIRED_STOP_GRACE_NS)
         return result
 
@@ -165,6 +173,15 @@ def test_curl_json_rejects_streamed_responses_over_64_kib():
                 )
             },
             "LLM_API_KEY must be nonempty",
+        ),
+        ({"placementSwarm": {"MaxReplicas": 1}}, "temporary overlap task"),
+        (
+            {"updateConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
+            "updateConfigSwarm must use start-first",
+        ),
+        (
+            {"rollbackConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
+            "rollbackConfigSwarm must use start-first",
         ),
     ],
 )
