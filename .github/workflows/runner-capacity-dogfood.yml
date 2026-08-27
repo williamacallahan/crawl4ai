@@ -1,0 +1,114 @@
+name: Runner capacity dogfood
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  occupy:
+    name: Occupy ${{ matrix.node_label }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        node_label: [canonical-haiku-0, canonical-haiku-5, canonical-haiku-4]
+    runs-on: [self-hosted, Linux, X64, williamacallahan, '${{ matrix.node_label }}']
+    timeout-minutes: 2
+    steps:
+      - name: Record runner identity and occupy it
+        run: |
+          set -euo pipefail
+          printf 'node_label=%s\n' '${{ matrix.node_label }}'
+          printf 'runner_name=%s\n' "$RUNNER_NAME"
+          printf 'runner_os=%s\n' "$RUNNER_OS"
+          printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+          sleep 30
+
+  verify:
+    name: Verify canonical runner capacity
+    if: ${{ always() }}
+    needs: occupy
+    runs-on: ubuntu-latest
+    permissions: { actions: read }
+    timeout-minutes: 2
+    steps:
+      - name: Verify three unique, overlapping runner jobs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        with:
+          script: |
+            const expectedNodeLabels = new Set([
+              'canonical-haiku-0',
+              'canonical-haiku-5',
+              'canonical-haiku-4',
+            ]);
+            const occupationPrefix = 'Occupy ';
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+              per_page: 100,
+            });
+            const occupationJobs = jobs.filter((job) => job.name.startsWith(occupationPrefix));
+            const failures = [];
+
+            if (occupationJobs.length !== expectedNodeLabels.size) {
+              failures.push(
+                `Expected exactly ${expectedNodeLabels.size} occupy jobs; found ${occupationJobs.length}.`,
+              );
+            }
+
+            const runnerIds = new Set();
+            const startedAt = [];
+            const completedAt = [];
+            const seenNodeLabels = new Set();
+
+            for (const job of occupationJobs) {
+              const nodeLabel = job.name.slice(occupationPrefix.length);
+              const labels = new Set(job.labels ?? []);
+              const matchingNodeLabels = [...expectedNodeLabels].filter((label) => labels.has(label));
+
+              if (!expectedNodeLabels.has(nodeLabel) || seenNodeLabels.has(nodeLabel)) {
+                failures.push(`Unexpected or duplicate occupy job name: ${job.name}.`);
+              }
+              seenNodeLabels.add(nodeLabel);
+              if (job.status !== 'completed' || job.conclusion !== 'success') {
+                failures.push(`${job.name} did not succeed: ${job.status}/${job.conclusion}.`);
+              }
+              if (!['self-hosted', 'Linux', 'X64', 'williamacallahan'].every((label) => labels.has(label))) {
+                failures.push(`${job.name} is missing a required runner label.`);
+              }
+              if (matchingNodeLabels.length !== 1 || matchingNodeLabels[0] !== nodeLabel) {
+                failures.push(`${job.name} does not match exactly its canonical node label.`);
+              }
+
+              const runnerId = Number(job.runner_id);
+              if (!Number.isSafeInteger(runnerId) || runnerId <= 0) {
+                failures.push(`${job.name} has an invalid runner_id: ${job.runner_id}.`);
+              } else {
+                runnerIds.add(runnerId);
+              }
+
+              const jobStartedAt = Date.parse(job.started_at);
+              const jobCompletedAt = Date.parse(job.completed_at);
+              if (Number.isNaN(jobStartedAt) || Number.isNaN(jobCompletedAt)) {
+                failures.push(`${job.name} is missing valid start or completion timestamps.`);
+              } else {
+                startedAt.push(jobStartedAt);
+                completedAt.push(jobCompletedAt);
+              }
+            }
+
+            if (seenNodeLabels.size !== expectedNodeLabels.size) {
+              failures.push('The occupy jobs did not cover each expected canonical node label exactly once.');
+            }
+            if (runnerIds.size !== expectedNodeLabels.size) {
+              failures.push(`Expected ${expectedNodeLabels.size} unique nonzero runner_id values; found ${runnerIds.size}.`);
+            }
+            if (
+              startedAt.length === expectedNodeLabels.size &&
+              completedAt.length === expectedNodeLabels.size &&
+              Math.max(...startedAt) >= Math.min(...completedAt)
+            ) {
+              failures.push('Occupy jobs did not overlap: max(started_at) must be before min(completed_at).');
+            }
+
+            if (failures.length > 0) throw new Error(failures.join('\n'));
+            core.info(`Verified runner IDs: ${[...runnerIds].join(', ')}.`);
