@@ -12,6 +12,7 @@ on:
       - 'docs/**'
       - '.claude/**'
       - '.github/workflows/runner-capacity-dogfood.yml'
+      - '.github/workflows/ci-deploy.yml'
   workflow_dispatch:
 
 concurrency:
