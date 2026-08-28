@@ -437,6 +437,9 @@ async def add_security_headers(request: Request, call_next):
 # transports and the metrics endpoint, for HTTP and WebSocket alike. Only the
 # health/token endpoints and the exact UI redirects are public.
 HEALTH_PATH = config["observability"]["health_check"]["endpoint"]
+DRAIN_PATH = pathlib.Path(
+    os.environ.get("CRAWL4AI_DRAIN_PATH", "/tmp/crawl4ai-draining")
+)
 
 
 # ── request body-size limit (DoS) ─────────────────────────────────────
@@ -934,29 +937,26 @@ async def get_hooks_info():
     })
 
 
-@app.get(config["observability"]["health_check"]["endpoint"])
+@app.get(HEALTH_PATH)
 async def health():
     payload = {
-        "status": "ok",
+        "status": "unhealthy",
         "timestamp": time.time(),
         "version": __version__,
         "revision": os.environ.get("C4AI_GIT_SHA", ""),
         "instance": os.environ.get("HOSTNAME", ""),
-        "components": {"api": "ready"},
+        "components": {"api": "unavailable"},
     }
-    # TestClient can intentionally skip lifespan for route-only tests.  A real
-    # server activates readiness checks during lifespan and probes the same
-    # effective Redis client used by jobs/monitoring (including external host,
-    # ACL credentials and TLS), rather than an unauthenticated localhost CLI.
-    if getattr(app.state, "readiness_checks_active", False):
-        try:
-            await asyncio.wait_for(redis.ping(), timeout=2.0)
-            payload["components"]["redis"] = "ready"
-        except Exception:
-            payload["status"] = "unhealthy"
-            payload["components"]["redis"] = "unavailable"
-            return JSONResponse(payload, status_code=503)
-    return payload
+    if DRAIN_PATH.exists() or not getattr(app.state, "readiness_checks_active", False):
+        return JSONResponse(payload, status_code=503)
+    try:
+        await asyncio.wait_for(redis.ping(), timeout=2.0)
+        payload["status"] = "ok"
+        payload["components"] = {"api": "ready", "redis": "ready"}
+        return payload
+    except Exception:
+        payload["components"]["redis"] = "unavailable"
+        return JSONResponse(payload, status_code=503)
 
 
 @app.get(config["observability"]["prometheus"]["endpoint"])

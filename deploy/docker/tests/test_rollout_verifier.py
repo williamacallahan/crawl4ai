@@ -15,6 +15,30 @@ from verify_rollout import (
     verify_rollout,
 )
 
+ORIGINAL_INSPECT_TASK_RUNTIME = rollout_verifier._inspect_task_runtime
+
+
+@pytest.fixture(autouse=True)
+def _task_runtime(monkeypatch):
+    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 1)
+    def inspect(task_id, _network_id):
+        instance = ("b" if "b" in task_id else "a") * 12
+        address = "10.0.1.12" if instance.startswith("b") else "10.0.1.11"
+        return (
+            instance,
+            frozenset({address}),
+            rollout_verifier._observability_labels("target"),
+        )
+
+    monkeypatch.setattr(rollout_verifier, "_inspect_task_runtime", inspect)
+    monkeypatch.setattr(rollout_verifier, "_dokploy_network_id", lambda: "network")
+
+
+def test_release_requires_exactly_three_replicas(monkeypatch):
+    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
+    with pytest.raises(ValueError, match="exactly three"):
+        rollout_verifier._verify_release_configuration(_application(replicas=2), "target")
+
 
 def _application(**overrides):
     application = {
@@ -33,7 +57,7 @@ def _application(**overrides):
                 "mountPath": rollout_verifier.REDIS_MOUNT_PATH,
             }
         ],
-        "healthCheckSwarm": {"Test": rollout_verifier.REDIS_HEALTHCHECK},
+        "healthCheckSwarm": {"Test": rollout_verifier.CRAWL_HEALTHCHECK},
         "placementSwarm": {
             "Constraints": [],
             "MaxReplicas": rollout_verifier.CRAWL_MAX_REPLICAS_PER_NODE,
@@ -43,19 +67,6 @@ def _application(**overrides):
     }
     application.update(overrides)
     return application
-
-
-def _task_config(container_id: str, labels: dict[str, str] | None = None) -> dict:
-    return {
-        "Status": {"ContainerStatus": {"ContainerID": container_id}},
-        "Spec": {
-            "ContainerSpec": {
-                "Labels": rollout_verifier._observability_labels("target")
-                if labels is None
-                else labels
-            }
-        },
-    }
 
 
 def _running_task(task_id: str, node: str, seconds: int = 1) -> dict:
@@ -94,6 +105,10 @@ def _fake_read(handlers):
             result = _application(**result)
             if "applicationId=redis" in url:
                 result["appName"] = "crawl4ai-redis"
+                if "healthCheckSwarm" not in supplied:
+                    result["healthCheckSwarm"] = {
+                        "Test": rollout_verifier.REDIS_HEALTHCHECK
+                    }
                 if "placementSwarm" not in supplied:
                     result["placementSwarm"] = {
                         "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
@@ -116,6 +131,30 @@ def _fake_read(handlers):
 )
 def test_task_error_ignores_only_empty_dokploy_error_boilerplate(error, expected):
     assert _has_task_error({"error": error}) is expected
+
+
+def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
+    output = (
+        '"' + "a" * 64 + '"\t'
+        + '{"otel.service.version":"target"}\t'
+        + '[{"Network":{"ID":"other"},"Addresses":["10.9.0.2/24"]},'
+        + '{"Network":{"ID":"network"},"Addresses":["10.0.1.11/24"]}]\n'
+    )
+    monkeypatch.setattr(
+        rollout_verifier.subprocess,
+        "run",
+        lambda *_args, **_kwargs: rollout_verifier.subprocess.CompletedProcess(
+            [], 0, output, ""
+        ),
+    )
+
+    instance, addresses, labels = ORIGINAL_INSPECT_TASK_RUNTIME(
+        "task", "network"
+    )
+
+    assert instance == "a" * 12
+    assert addresses == frozenset({"10.0.1.11"})
+    assert labels == {"otel.service.version": "target"}
 
 
 def test_curl_json_rejects_streamed_responses_over_64_kib():
@@ -174,7 +213,8 @@ def test_curl_json_rejects_streamed_responses_over_64_kib():
             },
             "LLM_API_KEY must be nonempty",
         ),
-        ({"placementSwarm": {"MaxReplicas": 1}}, "temporary overlap task"),
+        ({"placementSwarm": {"MaxReplicas": 2}}, "one replica per node"),
+        ({"healthCheckSwarm": {"Test": ["CMD", "true"]}}, "admission healthcheck"),
         (
             {"updateConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
             "updateConfigSwarm must use start-first",
@@ -245,22 +285,6 @@ def test_verifier_rejects_invalid_external_redis_configuration(overrides, messag
         )
 
 
-def test_main_reads_external_redis_application_id(monkeypatch):
-    captured = {}
-    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy.example")
-    monkeypatch.setenv("DOKPLOY_API_KEY", "secret")
-    monkeypatch.setenv("APPLICATION_ID", "app")
-    monkeypatch.setenv("REDIS_APPLICATION_ID", "redis")
-    monkeypatch.setenv("GITHUB_SHA", "target")
-    monkeypatch.setattr(
-        rollout_verifier, "verify_rollout", lambda **kwargs: captured.update(kwargs)
-    )
-
-    rollout_verifier.main()
-
-    assert captured["redis_application_id"] == "redis"
-
-
 def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_with_runtime_labels():
     container_id = "a" * 64
     task_snapshots = iter(
@@ -275,13 +299,6 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_wi
             "deployment.all": [{"status": "done"}],
             "application.one": {"replicas": 1, "appName": "crawl4ai"},
             "docker.getServiceContainersByAppName": lambda _url: next(task_snapshots),
-            "docker.getConfig": _task_config(
-                container_id,
-                {
-                    **rollout_verifier._observability_labels("target"),
-                    "com.docker.swarm.task.id": "task-a",
-                },
-            ),
         }
     )
 
@@ -299,27 +316,33 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_wi
 
 
 @pytest.mark.parametrize(
-    "second_tasks,second_health,second_labels",
+    "second_tasks,second_health,second_labels,error_type,error_message",
     [
         (
             [_running_task("task-b", "b")],
             _health("b" * 12),
             None,
+            TimeoutError,
+            "did not stabilize",
         ),
         (
             [_running_task("task-a", "a", 6)],
             _health("a" * 12, "rolled-back"),
             None,
+            TimeoutError,
+            "did not stabilize",
         ),
         (
             [_running_task("task-a", "a", 6)],
             _health("a" * 12),
             rollout_verifier._observability_labels("wrong"),
+            ValueError,
+            "observability labels",
         ),
     ],
 )
 def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_drift(
-    second_tasks, second_health, second_labels
+    second_tasks, second_health, second_labels, error_type, error_message
 ):
     clock = iter([0, 0, 0, 1, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
     task_snapshots = iter(
@@ -331,23 +354,26 @@ def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_dr
     health_snapshots = iter([_health("a" * 12), second_health])
     config_labels = iter([None, second_labels])
 
-    def task_config(url):
-        task_id = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)[
-            "containerId"
-        ][0]
+    def inspect_task(task_id, _network_id):
         container_id = ("a" if task_id == "task-a" else "b") * 64
-        return _task_config(container_id, next(config_labels))
+        labels = next(config_labels)
+        return (
+            container_id[:12],
+            frozenset({"10.0.1.11" if task_id == "task-a" else "10.0.1.12"}),
+            rollout_verifier._observability_labels("target")
+            if labels is None
+            else labels,
+        )
 
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
             "application.one": {"replicas": 1, "appName": "crawl4ai"},
             "docker.getServiceContainersByAppName": lambda _url: next(task_snapshots),
-            "docker.getConfig": task_config,
         }
     )
 
-    with pytest.raises(TimeoutError, match="did not stabilize"):
+    with pytest.raises(error_type, match=error_message):
         verify_rollout(
             dokploy_url="https://dokploy.example",
             api_key="secret",
@@ -359,10 +385,11 @@ def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_dr
             probe_health=lambda _url, count: [next(health_snapshots)] * count,
             sleep=lambda _seconds: None,
             monotonic=lambda: next(clock),
+            inspect_task_runtime=inspect_task,
         )
 
 
-def test_verifier_rejects_unbounded_replica_counts():
+def test_verifier_rejects_replica_counts_other_than_three():
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
@@ -370,7 +397,7 @@ def test_verifier_rejects_unbounded_replica_counts():
         }
     )
 
-    with pytest.raises(ValueError, match="between 1 and 16"):
+    with pytest.raises(ValueError, match="exactly three"):
         verify_rollout(
             dokploy_url="https://dokploy.example",
             api_key="secret",
@@ -410,7 +437,6 @@ def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
 
 def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
     clock = iter([0, 0, 0, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
-    get_config_calls = 0
     tasks = [
         _running_task("task-current", "a", 5),
         {
@@ -422,17 +448,11 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
         },
     ]
 
-    def task_config(_url):
-        nonlocal get_config_calls
-        get_config_calls += 1
-        return {"Status": {"ContainerStatus": {"ContainerID": "a" * 64}}}
-
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
             "application.one": {"replicas": 1, "appName": "crawl4ai"},
             "docker.getServiceContainersByAppName": tasks,
-            "docker.getConfig": task_config,
         }
     )
 
@@ -449,7 +469,6 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
             sleep=lambda _seconds: None,
             monotonic=lambda: next(clock),
         )
-    assert get_config_calls == 0
 
 
 def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
@@ -466,7 +485,7 @@ def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
         },
     ]
 
-    def unexpected_inspection(_url):
+    def unexpected_inspection(_task, _network):
         raise AssertionError(
             "impossible task sets must short-circuit before inspection"
         )
@@ -474,9 +493,8 @@ def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 2, "appName": "crawl4ai"},
+            "application.one": {"replicas": 1, "appName": "crawl4ai"},
             "docker.getServiceContainersByAppName": tasks,
-            "docker.getConfig": unexpected_inspection,
         }
     )
 
@@ -493,4 +511,5 @@ def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
             * (count // 2),
             sleep=lambda _seconds: None,
             monotonic=lambda: next(clock),
+            inspect_task_runtime=unexpected_inspection,
         )

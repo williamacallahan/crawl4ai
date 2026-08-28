@@ -39,6 +39,11 @@ def supervisord():
     return _read(os.path.join(DOCKER_DIR, "supervisord.conf"))
 
 
+@pytest.fixture(scope="module")
+def ingress_dockerfile():
+    return _read(os.path.join(REPO_ROOT, "deploy", "ingress", "Dockerfile"))
+
+
 class TestDockerfile:
     def test_no_redis_expose(self, dockerfile):
         # No active EXPOSE 6379 line (commented references are fine).
@@ -65,6 +70,27 @@ class TestDockerfile:
 
     def test_runs_as_non_root(self, dockerfile):
         assert re.search(r"^USER\s+appuser", dockerfile, re.MULTILINE)
+
+
+class TestIngressDockerfile:
+    def test_uses_pinned_official_haproxy_3_2_multiarch_image(
+        self, ingress_dockerfile
+    ):
+        assert re.search(
+            r"^FROM haproxy:3\.2\.\d+-alpine[\d.]+@sha256:[0-9a-f]{64}$",
+            ingress_dockerfile,
+            re.MULTILINE,
+        )
+
+    def test_runs_as_non_root(self, ingress_dockerfile):
+        assert re.search(r"^USER\s+haproxy$", ingress_dockerfile, re.MULTILINE)
+
+    def test_copies_only_source_owned_configuration(self, ingress_dockerfile):
+        assert (
+            "COPY --chown=haproxy:haproxy deploy/ingress/haproxy.cfg "
+            "/usr/local/etc/haproxy/haproxy.cfg" in ingress_dockerfile
+        )
+        assert "RUN " not in ingress_dockerfile
 
 
 class TestSupervisord:

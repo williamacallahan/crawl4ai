@@ -6,7 +6,9 @@ import concurrent.futures
 import configparser
 import json
 import os
+import re
 import subprocess
+import sys
 import time
 import urllib.parse
 import uuid
@@ -14,15 +16,22 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-MAX_RESPONSE_BYTES = 65_536
+from readiness_routing import (
+    MAX_RESPONSE_BYTES,
+    ingress_backends,
+    verify_monitor_evidence,
+)
+
 MAX_REPLICAS = 16
+CRAWL_REPLICAS = 3
 LLM_PROVIDER = "openai/qwen3.8-27b"
 LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 REDIS_VOLUME = "crawl4ai-redis-data"
 REDIS_MOUNT_PATH = "/data"
 REDIS_HEALTHCHECK = ["CMD", "redis-cli", "ping"]
 REDIS_NODE_CONSTRAINT = "node.hostname==haiku-18"
-CRAWL_MAX_REPLICAS_PER_NODE = 2
+CRAWL_HEALTHCHECK = ["CMD", "curl", "-f", "http://localhost:11235/health"]
+CRAWL_MAX_REPLICAS_PER_NODE = 1
 ROLLOUT_PROOF_TIMEOUT_SECONDS = 900
 
 
@@ -49,6 +58,8 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
         raise ValueError("application configuration response is invalid")
     if application.get("labelsSwarm") != _observability_labels(revision):
         raise ValueError("observability labels do not match the release")
+    if application.get("replicas") != CRAWL_REPLICAS:
+        raise ValueError("Crawl4AI must keep exactly three replicas")
     environment = application.get("env")
     if not isinstance(environment, str):
         raise ValueError("LLM environment is not configured")
@@ -61,7 +72,10 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
         raise ValueError("LLM_API_KEY must be nonempty")
     placement = application.get("placementSwarm")
     if not isinstance(placement, dict) or placement.get("MaxReplicas") != CRAWL_MAX_REPLICAS_PER_NODE:
-        raise ValueError("Crawl4AI placement must allow one temporary overlap task")
+        raise ValueError("Crawl4AI placement must keep one replica per node")
+    healthcheck = application.get("healthCheckSwarm")
+    if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
+        raise ValueError("Crawl4AI must use the routing admission healthcheck")
     for field in ("updateConfigSwarm", "rollbackConfigSwarm"):
         config = application.get(field)
         if not isinstance(config, dict) or config.get("Order") != "start-first":
@@ -98,7 +112,15 @@ def _verify_redis_configuration(application: Any) -> None:
 def _required_stop_grace_ns() -> int:
     parser = configparser.RawConfigParser()
     parser.read(Path(__file__).with_name("supervisord.conf"))
-    return (parser.getint("program:gunicorn", "stopwaitsecs") + 1) * 1_000_000_000
+    entrypoint = Path(__file__).with_name("entrypoint.sh").read_text()
+    match = re.search(r"CRAWL4AI_DRAIN_DELAY_SECONDS:-([0-9]+)", entrypoint)
+    if match is None:
+        raise ValueError("entrypoint drain delay is not configured")
+    return (
+        parser.getint("program:gunicorn", "stopwaitsecs")
+        + int(match.group(1))
+        + 1
+    ) * 1_000_000_000
 
 
 REQUIRED_STOP_GRACE_NS = _required_stop_grace_ns()
@@ -172,6 +194,44 @@ def _has_task_error(task: dict[str, Any]) -> bool:
     return bool(error.removeprefix("Error:").strip())
 
 
+def _inspect_task_runtime(
+    task_id: str, network_id: str
+) -> tuple[str, frozenset[str], dict[str, str]]:
+    result = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            task_id,
+            "--format",
+            "{{json .Status.ContainerStatus.ContainerID}}\t"
+            "{{json .Spec.ContainerSpec.Labels}}\t{{json .NetworksAttachments}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    container, labels, attachments = result.stdout.rstrip("\n").split("\t", 2)
+    addresses = frozenset(
+        address.split("/", 1)[0]
+        for attachment in json.loads(attachments) or []
+        if attachment.get("Network", {}).get("ID") == network_id
+        for address in attachment.get("Addresses", [])
+    )
+    return json.loads(container)[:12], addresses, json.loads(labels) or {}
+
+
+def _dokploy_network_id() -> str:
+    network = subprocess.run(
+        ["docker", "network", "inspect", "dokploy-network", "--format", "{{.ID}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not network:
+        raise ValueError("dokploy-network could not be resolved")
+    return network
+
+
 def verify_rollout(
     *,
     dokploy_url: str,
@@ -184,8 +244,15 @@ def verify_rollout(
     probe_health: Callable[[str, int], list[Any]] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    monitor_evidence_path: Path | None = None,
+    ingress_stats_url: str | None = None,
+    inspect_task_runtime: Callable[
+        [str, str], tuple[str, frozenset[str], dict[str, str]]
+    ]
+    | None = None,
 ) -> None:
     """Require a stable task set and matching public instances at one revision."""
+    inspect_task_runtime = inspect_task_runtime or _inspect_task_runtime
     deployment_deadline = monotonic() + 600
     while monotonic() < deployment_deadline:
         deployments = read_json(
@@ -202,6 +269,7 @@ def verify_rollout(
         raise TimeoutError("Dokploy deployment did not finish within 10 minutes")
 
     expected_labels = _observability_labels(revision)
+    network = _dokploy_network_id()
 
     if probe_health is None:
 
@@ -290,30 +358,32 @@ def verify_rollout(
             sleep(5)
             continue
 
-        def inspect_task(task_id: str) -> str:
-            task = read_json(
-                _dokploy_url(dokploy_url, "docker.getConfig", containerId=task_id),
-                api_key,
-            )
-            labels = task["Spec"]["ContainerSpec"]["Labels"]
+        def inspect_task(task_id: str) -> tuple[str, frozenset[str]]:
+            instance, addresses, labels = inspect_task_runtime(task_id, network)
             if not isinstance(labels, dict) or any(
                 labels.get(key) != value for key, value in expected_labels.items()
             ):
                 raise ValueError("container observability labels do not match release")
-            return task["Status"]["ContainerStatus"]["ContainerID"][:12]
+            if not addresses:
+                raise ValueError("Crawl4AI task has no overlay address")
+            return instance, addresses
 
-        try:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=replicas
-            ) as executor:
-                authoritative_instances = frozenset(
-                    executor.map(inspect_task, actual_running_tasks)
-                )
-        except Exception:
-            candidate = None
-            stable_rounds = 0
-            sleep(5)
-            continue
+        with concurrent.futures.ThreadPoolExecutor(max_workers=replicas) as executor:
+            inspected_tasks = list(executor.map(inspect_task, actual_running_tasks))
+        authoritative_instances = frozenset(instance for instance, _ in inspected_tasks)
+        authoritative_addresses = frozenset(
+            address for _, addresses in inspected_tasks for address in addresses
+        )
+
+        if ingress_stats_url is not None:
+            admitted_backends = frozenset(ingress_backends(ingress_stats_url))
+            if admitted_backends != authoritative_addresses:
+                candidate = None
+                stable_rounds = 0
+                sleep(5)
+                continue
+        else:
+            admitted_backends = authoritative_addresses
 
         responses = probe_health(health_url, max(4, replicas * 4))
         matches = [_is_exact_health(health, revision) for health in responses]
@@ -333,7 +403,22 @@ def verify_rollout(
             candidate = None
             stable_rounds = 0
         if stable_rounds >= 2:
-            print(f"verified stable {replicas}-replica rollout at {revision}")
+            verify_monitor_evidence(
+                monitor_evidence_path,
+                authoritative_instances,
+                admitted_backends,
+            )
+            print(
+                json.dumps(
+                    {
+                        "revision": revision,
+                        "tasks": sorted(actual_running_tasks),
+                        "instances": sorted(authoritative_instances),
+                        "admittedBackends": sorted(admitted_backends),
+                    },
+                    separators=(",", ":"),
+                )
+            )
             return
         sleep(5)
     raise TimeoutError(
@@ -341,7 +426,10 @@ def verify_rollout(
     )
 
 
-def main() -> None:
+def main(arguments: list[str] | None = None) -> None:
+    arguments = sys.argv[1:] if arguments is None else arguments
+    if arguments:
+        raise ValueError(f"Unsupported verifier arguments: {arguments}")
     verify_rollout(
         dokploy_url=os.environ["DOKPLOY_URL"],
         api_key=os.environ["DOKPLOY_API_KEY"],
@@ -349,6 +437,12 @@ def main() -> None:
         redis_application_id=os.environ["REDIS_APPLICATION_ID"],
         revision=os.environ["GITHUB_SHA"],
         health_url=os.environ.get("HEALTH_URL", "https://crawl4ai.haiku.host/health"),
+        monitor_evidence_path=(
+            Path(os.environ["ROLLOUT_MONITOR_PATH"])
+            if os.environ.get("ROLLOUT_MONITOR_PATH")
+            else None
+        ),
+        ingress_stats_url=os.environ.get("INGRESS_STATS_URL"),
     )
 
 

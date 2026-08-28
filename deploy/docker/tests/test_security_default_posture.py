@@ -91,7 +91,7 @@ class TestDefaultDeployIsSafe:
     def test_health_check_is_public(self, stock_client):
         """The health endpoint is the one intentionally public route."""
         r = stock_client.get(HEALTH)
-        assert r.status_code == 200
+        assert r.status_code == 503
 
     @pytest.mark.parametrize("path", PUBLIC_UI_PATHS, ids=PUBLIC_UI_PATHS)
     def test_ui_shell_is_public(self, stock_client, path):

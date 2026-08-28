@@ -63,4 +63,20 @@ else
 fi
 export GUNICORN_BIND
 
-exec supervisord -c supervisord.conf --pidfile /tmp/supervisord.pid
+DRAIN_PATH="${CRAWL4AI_DRAIN_PATH:-/tmp/crawl4ai-draining}"
+rm -f "${DRAIN_PATH}"
+supervisord -c supervisord.conf --pidfile /tmp/supervisord.pid &
+SUPERVISORD_PID=$!
+
+begin_drain() {
+    trap '' TERM INT
+    touch "${DRAIN_PATH}"
+    # HAProxy's 500 ms check plus 400 ms timeout fits inside this withdrawal delay.
+    sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"
+    kill -TERM "${SUPERVISORD_PID}" 2>/dev/null || true
+    wait "${SUPERVISORD_PID}" || exit $?
+    exit 0
+}
+
+trap begin_drain TERM INT
+wait "${SUPERVISORD_PID}"
