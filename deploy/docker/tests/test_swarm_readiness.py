@@ -44,9 +44,7 @@ def test_monitor_records_and_rejects_a_public_failure(monkeypatch, tmp_path):
                     }
                 ],
                 "traefik": {
-                    "services": [
-                        {"serverStatus": {"http://10.0.0.1:11235": "UP"}}
-                    ]
+                    "services": []
                 },
             }
         result = next(health)

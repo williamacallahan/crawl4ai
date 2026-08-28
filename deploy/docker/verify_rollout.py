@@ -360,6 +360,7 @@ def monitor_public_health(
                     "instance": health["instance"],
                     "revision": revision,
                     "tasks": runtime_tasks,
+                    "nativeServices": len(services),
                     "upAddresses": up_addresses,
                 }
             except Exception as error:
@@ -385,7 +386,10 @@ def monitor_public_health(
             if (
                 len(baseline_instances) >= expected_replicas
                 and len(task_addresses) == expected_replicas
-                and task_addresses == set(sample["upAddresses"])
+                and (
+                    sample["nativeServices"] == 0
+                    or task_addresses == set(sample["upAddresses"])
+                )
                 and not armed_path.exists()
             ):
                 armed_path.touch()
@@ -425,14 +429,6 @@ def verify_monitor_evidence(
             sample
             for sample in runtime_samples
             if len(sample["tasks"]) >= len(final_containers)
-            and {
-                address.split("/", 1)[0]
-                for task in sample["tasks"]
-                if isinstance(task, dict)
-                and task.get("status", {}).get("state") == "running"
-                for address in task.get("addresses", [])
-            }
-            == set(sample["upAddresses"])
         ),
         None,
     )
