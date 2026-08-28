@@ -287,7 +287,7 @@ jobs:
           # already live and the brief Redis restart cannot kill crawl tasks.
           redis_args() {
             docker service inspect "$REDIS_APPLICATION_APP_NAME" \
-              --format '{{json .Spec.TaskTemplate.ContainerSpec.Args}}'
+              --format '{{json .Spec.TaskTemplate.ContainerSpec.Command}} {{json .Spec.TaskTemplate.ContainerSpec.Args}}'
           }
           if ! redis_args | grep -q 'appendfsync","everysec'; then
             printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
