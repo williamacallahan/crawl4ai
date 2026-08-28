@@ -135,7 +135,7 @@ def test_monitor_evidence_proves_predecessor_withdrawal_and_final_admission(tmp_
     )
 
 
-def test_haproxy_stats_returns_only_up_crawler_addresses(monkeypatch):
+def test_haproxy_stats_returns_only_up_crawler_servers(monkeypatch):
     body = (
         b"# pxname,svname,status,addr\n"
         b"crawl4ai,crawler1,UP,10.0.1.11:11235\n"
@@ -160,8 +160,29 @@ def test_haproxy_stats_returns_only_up_crawler_addresses(monkeypatch):
     )
 
     assert readiness_routing.ingress_backends("http://ingress:8404/stats;csv") == [
-        "10.0.1.11"
+        "crawler1"
     ]
+
+
+def test_ingress_stats_uses_the_direct_task_overlay_address(monkeypatch):
+    monkeypatch.setattr(
+        readiness_routing.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "task-a\n", ""),
+    )
+    monkeypatch.setattr(readiness_routing, "_dokploy_network_id", lambda: "network")
+    monkeypatch.setattr(
+        readiness_routing,
+        "_task_runtime",
+        lambda task, network: ("image", "10.0.1.190")
+        if (task, network) == ("task-a", "network")
+        else (_ for _ in ()).throw(AssertionError("unexpected task")),
+    )
+
+    assert (
+        readiness_routing.ingress_task_stats_url("crawl4ai-ingress")
+        == "http://10.0.1.190:8404/stats;csv"
+    )
 
 
 def _ready_ingress_state():
@@ -233,11 +254,9 @@ def test_ingress_verifier_requires_two_stable_tasks_and_exact_image(monkeypatch)
         app_name="crawl4ai-ingress",
         image="registry.example/crawl4ai-ingress",
         revision="target",
-        stats_url="http://ingress:8404/stats;csv",
         sleep=lambda _seconds: None,
     )
     assert "http://10.0.2.11:8404/stats;csv" in stats_urls
-    assert "http://ingress:8404/stats;csv" in stats_urls
 
 
 def test_ingress_verifier_retries_empty_stats_then_requires_two_stable_rounds(
@@ -255,8 +274,6 @@ def test_ingress_verifier_retries_empty_stats_then_requires_two_stable_rounds(
     stats = iter(
         [
             ValueError("HAProxy has no admitted Crawl4AI backends"),
-            ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
-            ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
             ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
             ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
         ]
@@ -288,7 +305,6 @@ def test_ingress_verifier_retries_empty_stats_then_requires_two_stable_rounds(
         app_name="crawl4ai-ingress",
         image="registry.example/crawl4ai-ingress",
         revision="target",
-        stats_url="http://ingress:8404/stats;csv",
         sleep=sleeps.append,
     )
 

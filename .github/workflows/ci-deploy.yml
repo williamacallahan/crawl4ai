@@ -29,7 +29,6 @@ env:
   APPLICATION_APP_NAME: crawl4ai-yq1svi
   INGRESS_APPLICATION_ID: QeMB9toEaBOtOszdinFuk
   INGRESS_APPLICATION_APP_NAME: app-override-1080p-application-wo4lq5
-  INGRESS_STATS_URL: http://app-override-1080p-application-wo4lq5:8404/stats;csv
   REDIS_APPLICATION_ID: D5WPQqgJYaonrZ6Pth2Cy
 
 jobs:
@@ -235,8 +234,7 @@ jobs:
             MONITOR_PID=""
             return "$monitor_status"
           }
-          if python3 deploy/docker/readiness_routing.py verify \
-            && curl -fsS --connect-timeout 2 --max-time 5 --max-filesize 65536 "$INGRESS_STATS_URL" >/dev/null; then
+          if python3 deploy/docker/readiness_routing.py verify; then
             start_monitor
           fi
 

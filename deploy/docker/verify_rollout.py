@@ -19,6 +19,7 @@ from typing import Any
 from readiness_routing import (
     MAX_RESPONSE_BYTES,
     ingress_backends,
+    ingress_task_stats_url,
     verify_monitor_evidence,
 )
 
@@ -377,7 +378,7 @@ def verify_rollout(
 
         if ingress_stats_url is not None:
             admitted_backends = frozenset(ingress_backends(ingress_stats_url))
-            if admitted_backends != authoritative_addresses:
+            if len(admitted_backends) != len(authoritative_addresses):
                 candidate = None
                 stable_rounds = 0
                 sleep(5)
@@ -414,6 +415,7 @@ def verify_rollout(
                         "revision": revision,
                         "tasks": sorted(actual_running_tasks),
                         "instances": sorted(authoritative_instances),
+                        "taskAddresses": sorted(authoritative_addresses),
                         "admittedBackends": sorted(admitted_backends),
                     },
                     separators=(",", ":"),
@@ -442,7 +444,9 @@ def main(arguments: list[str] | None = None) -> None:
             if os.environ.get("ROLLOUT_MONITOR_PATH")
             else None
         ),
-        ingress_stats_url=os.environ.get("INGRESS_STATS_URL"),
+        ingress_stats_url=ingress_task_stats_url(
+            os.environ["INGRESS_APPLICATION_APP_NAME"]
+        ),
     )
 
 

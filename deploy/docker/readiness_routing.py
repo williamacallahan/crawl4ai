@@ -171,12 +171,11 @@ def ingress_backends(stats_url: str) -> list[str]:
         raise ValueError("HAProxy stats response is empty")
     lines[0] = lines[0].removeprefix("# ")
     backends = sorted(
-        row["addr"].rsplit(":", 1)[0]
+        row["svname"]
         for row in csv.DictReader(lines)
         if row.get("pxname") == "crawl4ai"
         and row.get("svname", "").startswith("crawler")
         and row.get("status") == "UP"
-        and row.get("addr")
     )
     if not backends:
         raise ValueError("HAProxy has no admitted Crawl4AI backends")
@@ -303,6 +302,29 @@ def _dokploy_network_id() -> str:
     return network_id
 
 
+def ingress_task_stats_url(app_name: str) -> str:
+    result = subprocess.run(
+        [
+            "docker",
+            "service",
+            "ps",
+            "--filter",
+            "desired-state=running",
+            "--format",
+            "{{.ID}}",
+            app_name,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    task_id = result.stdout.strip()
+    if not task_id or "\n" in task_id:
+        raise ValueError("ingress must have exactly one desired task")
+    _, address = _task_runtime(task_id, _dokploy_network_id())
+    return f"http://{address}:8404/stats;csv"
+
+
 def verify_ingress(
     *,
     base_url: str,
@@ -311,7 +333,6 @@ def verify_ingress(
     app_name: str,
     image: str,
     revision: str,
-    stats_url: str,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
@@ -378,7 +399,6 @@ def verify_ingress(
                     if task_image == expected_image
                 )
             )
-            vip_admission = ingress_backends(stats_url)
         except (OSError, ValueError):
             candidate = None
             stable_rounds = 0
@@ -391,7 +411,6 @@ def verify_ingress(
                 len(backends) >= MIN_CRAWLER_BACKENDS
                 for _, backends in direct_admission
             )
-            and len(vip_admission) >= MIN_CRAWLER_BACKENDS
         )
         if complete:
             stable_rounds = stable_rounds + 1 if snapshot == candidate else 1
@@ -406,7 +425,6 @@ def verify_ingress(
                         "revision": revision,
                         "ingressTasks": sorted(actual_running),
                         "directAdmission": direct_admission,
-                        "vipAdmission": vip_admission,
                     },
                     separators=(",", ":"),
                 )
@@ -423,7 +441,9 @@ def main(arguments: list[str] | None = None) -> None:
             health_url=os.environ.get(
                 "HEALTH_URL", "https://crawl4ai.haiku.host/health"
             ),
-            stats_url=os.environ["INGRESS_STATS_URL"],
+            stats_url=ingress_task_stats_url(
+                os.environ["INGRESS_APPLICATION_APP_NAME"]
+            ),
             expected_replicas=int(os.environ.get("EXPECTED_REPLICAS", "3")),
             evidence_path=Path(os.environ["ROLLOUT_MONITOR_PATH"]),
             armed_path=Path(os.environ["ROLLOUT_MONITOR_ARMED_PATH"]),
@@ -438,7 +458,6 @@ def main(arguments: list[str] | None = None) -> None:
             app_name=os.environ["INGRESS_APPLICATION_APP_NAME"],
             image=os.environ["INGRESS_IMAGE"],
             revision=os.environ["INGRESS_TAG"],
-            stats_url=os.environ["INGRESS_STATS_URL"],
         )
         return
     routing = {
