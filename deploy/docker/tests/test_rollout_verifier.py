@@ -461,7 +461,7 @@ def test_verifier_rejects_traefik_admission_outside_the_current_task_set():
 def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_drift(
     second_tasks, second_health, second_labels, error_type, error_message
 ):
-    clock = iter([0, 0, 0, 1, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
+    clock = iter([0, 0, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
     task_snapshots = iter(
         [
             [_running_task("task-a", "a")],

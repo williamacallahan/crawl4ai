@@ -196,6 +196,9 @@ jobs:
           export ROLLOUT_MONITOR_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.jsonl"
           export ROLLOUT_MONITOR_ARMED_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.armed"
           export ROLLOUT_MONITOR_STOP_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.stop"
+          export ROLLOUT_MONITOR_REQUIRE_NATIVE_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.require-native"
+          export ROLLOUT_MONITOR_NATIVE_PROOF_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.native-proof"
+          export ROLLOUT_MONITOR_NATIVE_PROOF_READY_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.native-proof-ready"
           MONITOR_PID=""
           finish_monitor() {
             test -n "$MONITOR_PID" || return 0
@@ -205,26 +208,69 @@ jobs:
             MONITOR_PID=""
             return "$monitor_status"
           }
+          start_monitor() {
+            local mode="$1"
+            export ROLLOUT_MONITOR_PATH="$2"
+            rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH" "$ROLLOUT_MONITOR_REQUIRE_NATIVE_PATH" "$ROLLOUT_MONITOR_NATIVE_PROOF_PATH" "$ROLLOUT_MONITOR_NATIVE_PROOF_READY_PATH"
+            python3 deploy/docker/verify_rollout.py "$mode" &
+            MONITOR_PID=$!
+            wait_for_monitor
+          }
+          wait_for_monitor() {
+            for _ in {1..30}; do
+              test -f "$ROLLOUT_MONITOR_ARMED_PATH" && break
+              kill -0 "$MONITOR_PID"
+              sleep 1
+            done
+            test -f "$ROLLOUT_MONITOR_ARMED_PATH"
+          }
+          begin_native_proof() {
+            touch "$ROLLOUT_MONITOR_NATIVE_PROOF_PATH"
+            for _ in {1..30}; do
+              test -f "$ROLLOUT_MONITOR_NATIVE_PROOF_READY_PATH" && break
+              kill -0 "$MONITOR_PID"
+              sleep 1
+            done
+            test -f "$ROLLOUT_MONITOR_NATIVE_PROOF_READY_PATH"
+          }
 
-          rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
-          python3 deploy/docker/verify_rollout.py monitor &
-          MONITOR_PID=$!
           trap finish_monitor EXIT
-          for _ in {1..30}; do
-            test -f "$ROLLOUT_MONITOR_ARMED_PATH" && break
-            kill -0 "$MONITOR_PID"
-            sleep 1
-          done
-          test -f "$ROLLOUT_MONITOR_ARMED_PATH"
+          routing_mode=$(python3 deploy/docker/verify_rollout.py routing-mode)
+          if [ "$routing_mode" = native ]; then
+            start_monitor monitor-native "$RUNNER_TEMP/crawl4ai-rollout-monitor.jsonl"
+            begin_native_proof
+          else
+            start_monitor monitor "$RUNNER_TEMP/crawl4ai-rollout-monitor.jsonl"
+          fi
 
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.update" \
             -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health/route"],"Interval":1000000000,"Timeout":1000000000,"StartPeriod":120000000000,"Retries":1},"readinessCheckSwarm":{"Path":"/health/route","Interval":500000000,"UnhealthyInterval":250000000,"Timeout":400000000,"Status":200},"placementSwarm":{"MaxReplicas":1},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health/route"],"Interval":1000000000,"Timeout":1000000000,"StartPeriod":120000000000,"Retries":1},"placementSwarm":{"MaxReplicas":1},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
+          export ROLLOUT_SERVICE_CURSOR
+          ROLLOUT_SERVICE_CURSOR=$(python3 deploy/docker/verify_rollout.py service-cursor)
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H 'content-type: application/json' \
             --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
+          if [ "$routing_mode" = legacy ]; then
+            python3 deploy/docker/verify_rollout.py bootstrap
+            touch "$ROLLOUT_MONITOR_REQUIRE_NATIVE_PATH"
+            rm -f "$ROLLOUT_MONITOR_ARMED_PATH"
+
+            printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 75 --max-filesize 65536 --config - \
+              -X POST "$DOKPLOY_URL/api/application.update" \
+              -H 'content-type: application/json' \
+              --data "$(printf '{"applicationId":"%s","readinessCheckSwarm":{"Path":"/health/route","Interval":500000000,"UnhealthyInterval":250000000,"Timeout":400000000,"Status":200}}' "$APPLICATION_ID")" >/dev/null
+
+            wait_for_monitor
+            begin_native_proof
+            ROLLOUT_SERVICE_CURSOR=$(python3 deploy/docker/verify_rollout.py service-cursor)
+            printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
+              -X POST "$DOKPLOY_URL/api/application.deploy" \
+              -H 'content-type: application/json' \
+              --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
+          fi
           python3 deploy/docker/verify_rollout.py
           finish_monitor
           trap - EXIT
