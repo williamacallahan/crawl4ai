@@ -5,6 +5,7 @@ import re
 import json
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -362,7 +363,7 @@ def test_entrypoint_marks_drain_before_terminating_supervisord(tmp_path):
     (tmp_path / "config.yml").write_text("security:\n  jwt_enabled: false\n")
     environment = {
         **os.environ,
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "PATH": f"{tmp_path}:{Path(sys.executable).parent}:{os.environ['PATH']}",
         "REDIS_HOST": "external-redis",
         "CRAWL4AI_API_TOKEN": "test-token",
         "CRAWL4AI_DRAIN_PATH": str(drain_path),
