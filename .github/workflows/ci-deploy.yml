@@ -279,4 +279,4 @@ jobs:
         with:
           name: crawl4ai-rollout-${{ github.sha }}
           path: ${{ runner.temp }}/crawl4ai-rollout-monitor.jsonl
-          if-no-files-found: error
+          if-no-files-found: warn

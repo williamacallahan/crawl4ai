@@ -164,8 +164,8 @@ def test_haproxy_stats_returns_only_up_crawler_addresses(monkeypatch):
     ]
 
 
-def test_ingress_verifier_requires_two_stable_tasks_and_exact_image(monkeypatch):
-    application = {
+def _ready_ingress_state():
+    return {
         "dockerImage": "registry.example/crawl4ai-ingress:target",
         "replicas": 1,
         "healthCheckSwarm": {"Test": readiness_routing.INGRESS_HEALTHCHECK},
@@ -183,8 +183,7 @@ def test_ingress_verifier_requires_two_stable_tasks_and_exact_image(monkeypatch)
             "Parallelism": 1,
             "MaxFailureRatio": 0,
         },
-    }
-    tasks = [
+    }, [
         {
             "containerId": "task-a",
             "state": "running",
@@ -193,6 +192,10 @@ def test_ingress_verifier_requires_two_stable_tasks_and_exact_image(monkeypatch)
             "error": "",
         },
     ]
+
+
+def test_ingress_verifier_requires_two_stable_tasks_and_exact_image(monkeypatch):
+    application, tasks = _ready_ingress_state()
 
     def request(_base_url, _api_key, operation, **_params):
         return {
@@ -235,6 +238,61 @@ def test_ingress_verifier_requires_two_stable_tasks_and_exact_image(monkeypatch)
     )
     assert "http://10.0.2.11:8404/stats;csv" in stats_urls
     assert "http://ingress:8404/stats;csv" in stats_urls
+
+
+def test_ingress_verifier_retries_empty_stats_then_requires_two_stable_rounds(
+    monkeypatch,
+):
+    application, tasks = _ready_ingress_state()
+
+    def request(_base_url, _api_key, operation, **_params):
+        return {
+            "deployment.all": [{"status": "done"}],
+            "application.one": application,
+            "docker.getServiceContainersByAppName": tasks,
+        }[operation]
+
+    stats = iter(
+        [
+            ValueError("HAProxy has no admitted Crawl4AI backends"),
+            ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
+            ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
+            ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
+            ["10.0.1.11", "10.0.1.12", "10.0.1.13"],
+        ]
+    )
+
+    def backends(_url):
+        result = next(stats)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(readiness_routing, "_dokploy_request", request)
+    monkeypatch.setattr(readiness_routing, "ingress_backends", backends)
+    monkeypatch.setattr(readiness_routing, "_dokploy_network_id", lambda: "network")
+    monkeypatch.setattr(
+        readiness_routing,
+        "_task_runtime",
+        lambda _task, _network: (
+            "registry.example/crawl4ai-ingress:target",
+            "10.0.2.11",
+        ),
+    )
+    sleeps = []
+
+    readiness_routing.verify_ingress(
+        base_url="https://dokploy.example",
+        api_key="secret",
+        application_id="ingress",
+        app_name="crawl4ai-ingress",
+        image="registry.example/crawl4ai-ingress",
+        revision="target",
+        stats_url="http://ingress:8404/stats;csv",
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == [5, 5]
 
 
 def test_haproxy_discovers_and_admits_only_healthy_swarm_tasks():

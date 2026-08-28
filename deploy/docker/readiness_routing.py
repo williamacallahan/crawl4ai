@@ -367,17 +367,23 @@ def verify_ingress(
         expected_image = f"{image}:{revision}"
         network_id = _dokploy_network_id()
         task_runtime = [_task_runtime(task, network_id) for task in actual_running]
-        direct_admission = tuple(
-            sorted(
-                (
-                    address,
-                    tuple(ingress_backends(f"http://{address}:8404/stats;csv")),
+        try:
+            direct_admission = tuple(
+                sorted(
+                    (
+                        address,
+                        tuple(ingress_backends(f"http://{address}:8404/stats;csv")),
+                    )
+                    for task_image, address in task_runtime
+                    if task_image == expected_image
                 )
-                for task_image, address in task_runtime
-                if task_image == expected_image
             )
-        )
-        vip_admission = ingress_backends(stats_url)
+            vip_admission = ingress_backends(stats_url)
+        except (OSError, ValueError):
+            candidate = None
+            stable_rounds = 0
+            sleep(5)
+            continue
         snapshot = (actual_running, direct_admission)
         complete = (
             len(direct_admission) == INGRESS_REPLICAS
