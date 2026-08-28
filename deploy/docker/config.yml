@@ -45,6 +45,9 @@ redis:
 
 # Redis Stream settings for durable /crawl/job execution. Queued and leased
 # state persists until a terminal completion, which uses task_ttl_seconds.
+# Durability bound: Redis persists with appendfsync everysec (fsync-per-write
+# stalls the single Redis thread and takes every replica's /health down), so a
+# Redis host crash can lose up to ~1s of freshly accepted job state.
 crawl_jobs:
   # The runtime appends :v2 to stream/group. New workers fail startup while the
   # unsuffixed v1 stream is nonempty, leaving old workers to drain it before the

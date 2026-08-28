@@ -25,7 +25,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --dir /data --appendonly yes --appendfsync always --loglevel notice
+    command: redis-server --dir /data --appendonly yes --appendfsync everysec --loglevel notice
     volumes:
       - crawl4ai-redis:/data
     healthcheck:

@@ -62,6 +62,26 @@ class TestCorsDenyByDefault:
 
 
 class TestErrorSanitization:
+    def test_public_error_detail_passes_upstream_reasons(self):
+        from utils import public_error_detail
+
+        message = "Blocked by anti-bot protection: Cloudflare JS challenge"
+        assert public_error_detail(message) == message
+        assert len(public_error_detail("x" * 2000)) == 500
+
+    def test_public_error_detail_genericizes_internal_shapes(self):
+        from utils import public_error_detail
+
+        internal = (
+            "Unexpected error in _crawl_web at line 806 in _crawl_web "
+            "(/app/crawl4ai/async_crawler_strategy.py):\nError: boom\n\n"
+            "Code context:\n 805 | raise\n"
+        )
+        assert public_error_detail(internal) == "Crawl failed"
+        assert public_error_detail(None) == "Crawl failed"
+        assert public_error_detail("  ") == "Crawl failed"
+        assert public_error_detail('File "/app/server.py", line 1') == "Crawl failed"
+
     def test_5xx_is_generic_with_correlation_id(self, stock_client, server_module):
         from auth import create_access_token
         h = {"Authorization": f"Bearer {create_access_token({'sub': 'u@x.com'}, scope='admin')}"}

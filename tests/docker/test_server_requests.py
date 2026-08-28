@@ -680,10 +680,10 @@ class TestCrawlEndpoints:
         }
         
         response = await async_client.post("/crawl", json=payload)
-        # Should return 200 with failed results, not 500
+        # All URLs failed upstream -> 502 with the first failure reason
         print(f"Status code: {response.status_code}")
         print(f"Response: {response.text}")
-        assert response.status_code == 500
+        assert response.status_code == 502
         data = response.json()
         assert data["detail"].startswith("Crawl request failed:")
 
@@ -782,40 +782,64 @@ class TestCrawlEndpoints:
         # Test non-existent URL
         nonexistent_payload = {"url": "https://nonexistent-domain-12345.com", "f": "fit"}
         response = await async_client.post("/md", json=nonexistent_payload)
-        # Should return 500 for crawl failure
-        assert response.status_code == 500
+        # Upstream crawl failure surfaces as 502 with its reason
+        assert response.status_code == 502
 
     async def test_html_endpoint_error_handling(self, async_client: httpx.AsyncClient):
         """Test error handling for HTML endpoint."""
         # Test invalid URL
         invalid_payload = {"url": "invalid-url"}
         response = await async_client.post("/html", json=invalid_payload)
-        # Should return 500 for crawl failure
-        assert response.status_code == 500
+        # Scheme validation rejects it before any crawl
+        assert response.status_code == 400
+
+        # Upstream crawl failure surfaces as 502 with its reason
+        response = await async_client.post(
+            "/html", json={"url": "https://nonexistent-domain-12345.com"}
+        )
+        assert response.status_code == 502
 
     async def test_screenshot_endpoint_error_handling(self, async_client: httpx.AsyncClient):
         """Test error handling for screenshot endpoint."""
         # Test invalid URL
         invalid_payload = {"url": "invalid-url"}
         response = await async_client.post("/screenshot", json=invalid_payload)
-        # Should return 500 for crawl failure
-        assert response.status_code == 500
+        # Scheme validation rejects it before any crawl
+        assert response.status_code == 400
+
+        # Upstream crawl failure surfaces as 502 with its reason
+        response = await async_client.post(
+            "/screenshot", json={"url": "https://nonexistent-domain-12345.com"}
+        )
+        assert response.status_code == 502
 
     async def test_pdf_endpoint_error_handling(self, async_client: httpx.AsyncClient):
         """Test error handling for PDF endpoint."""
         # Test invalid URL
         invalid_payload = {"url": "invalid-url"}
         response = await async_client.post("/pdf", json=invalid_payload)
-        # Should return 500 for crawl failure
-        assert response.status_code == 500
+        # Scheme validation rejects it before any crawl
+        assert response.status_code == 400
+
+        # Upstream crawl failure surfaces as 502 with its reason
+        response = await async_client.post(
+            "/pdf", json={"url": "https://nonexistent-domain-12345.com"}
+        )
+        assert response.status_code == 502
 
     async def test_execute_js_endpoint_error_handling(self, async_client: httpx.AsyncClient):
         """Test error handling for execute_js endpoint."""
         # Test invalid URL
         invalid_payload = {"url": "invalid-url", "scripts": ["return document.title;"]}
         response = await async_client.post("/execute_js", json=invalid_payload)
-        # Should return 500 for crawl failure
-        assert response.status_code == 500
+        # Scheme validation rejects it before any crawl
+        assert response.status_code == 400
+
+        # Upstream crawl failure surfaces as 502 with its reason
+        response = await async_client.post(
+            "/execute_js", json={"url": "https://nonexistent-domain-12345.com", "scripts": ["return document.title;"]}
+        )
+        assert response.status_code == 502
 
     async def test_llm_endpoint_error_handling(self, async_client: httpx.AsyncClient):
         """Test error handling for LLM endpoint."""
@@ -825,8 +849,8 @@ class TestCrawlEndpoints:
         
         # Test invalid URL
         response = await async_client.get("/llm/invalid-url?q=test")
-        # Should return 500 for crawl failure
-        assert response.status_code == 500
+        # Upstream crawl failure surfaces as 502 with its reason
+        assert response.status_code == 502
 
     async def test_ask_endpoint_error_handling(self, async_client: httpx.AsyncClient):
         """Test error handling for ask endpoint."""

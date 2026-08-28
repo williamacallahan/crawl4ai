@@ -41,6 +41,18 @@ def build_redis_url(config: dict) -> str:
     return f"{scheme}://{auth}{host}:{port}/{db}"
 
 
+# Pooled connections idled out by the Swarm overlay raise ConnectionResetError
+# on first reuse, which turns /health into a transient 503. health_check_interval
+# makes redis-py PING a connection idle longer than this before reusing it, and
+# keepalive stops middleboxes from idling the socket out in the first place.
+RESILIENT_CLIENT_KWARGS = {
+    "health_check_interval": 30,
+    "socket_keepalive": True,
+    "socket_connect_timeout": 2.0,
+    "retry_on_timeout": True,
+}
+
+
 def build_rate_limit_storage_uri(config: dict) -> str:
     """Return a rate-limit storage URI that can auth to protected Redis.
 

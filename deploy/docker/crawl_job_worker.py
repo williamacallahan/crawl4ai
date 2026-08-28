@@ -20,7 +20,7 @@ from crawler_pool import close_all
 from egress_proxy import start_pinning_proxy, stop_pinning_proxy
 from fastapi import HTTPException, status
 from redis import asyncio as aioredis
-from redis_config import build_redis_url
+from redis_config import RESILIENT_CLIENT_KWARGS, build_redis_url
 from utils import load_config, setup_logging
 from webhook import WebhookDeliveryService
 
@@ -258,7 +258,9 @@ class CrawlJobWorker:
 async def run_worker() -> None:
     config = load_config()
     setup_logging(config)
-    redis = aioredis.from_url(build_redis_url(config), decode_responses=True)
+    redis = aioredis.from_url(
+        build_redis_url(config), decode_responses=True, **RESILIENT_CLIENT_KWARGS
+    )
     queue = CrawlJobQueue(redis, config)
     consumer = f"{socket.gethostname()}-{os.getpid()}"
     proxy = None

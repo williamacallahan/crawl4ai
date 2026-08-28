@@ -57,7 +57,13 @@ def _application(**overrides):
                 "mountPath": rollout_verifier.REDIS_MOUNT_PATH,
             }
         ],
-        "healthCheckSwarm": {"Test": rollout_verifier.CRAWL_HEALTHCHECK},
+        "healthCheckSwarm": {
+            "Test": rollout_verifier.CRAWL_HEALTHCHECK,
+            "Interval": 10_000_000_000,
+            "Timeout": 5_000_000_000,
+            "Retries": 5,
+        },
+        "command": "redis-server --dir /data --appendonly yes --appendfsync everysec --loglevel notice",
         "placementSwarm": {
             "Constraints": [],
             "MaxReplicas": rollout_verifier.CRAWL_MAX_REPLICAS_PER_NODE,
@@ -216,6 +222,17 @@ def test_curl_json_rejects_streamed_responses_over_64_kib():
         ({"placementSwarm": {"MaxReplicas": 2}}, "one replica per node"),
         ({"healthCheckSwarm": {"Test": ["CMD", "true"]}}, "admission healthcheck"),
         (
+            {
+                "healthCheckSwarm": {
+                    "Test": rollout_verifier.CRAWL_HEALTHCHECK,
+                    "Interval": 1_000_000_000,
+                    "Timeout": 1_000_000_000,
+                    "Retries": 1,
+                }
+            },
+            "tolerate transient blips",
+        ),
+        (
             {"updateConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
             "updateConfigSwarm must use start-first",
         ),
@@ -250,6 +267,10 @@ def test_verifier_rejects_invalid_release_observability_configuration(overrides,
     [
         ({"mounts": []}, "crawl4ai-redis-data"),
         ({"healthCheckSwarm": {"Test": ["CMD-SHELL", "redis-cli ping"]}}, "healthcheck"),
+        (
+            {"command": "redis-server --dir /data --appendonly yes --appendfsync always"},
+            "appendfsync everysec",
+        ),
         ({"placementSwarm": {"Constraints": [], "MaxReplicas": 1}}, "haiku-18"),
         (
             {

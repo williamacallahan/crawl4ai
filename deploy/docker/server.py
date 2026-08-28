@@ -58,6 +58,9 @@ from redis_config import (
     build_rate_limit_storage_uri as _build_rate_limit_storage_uri,
 )
 from redis_config import (
+    RESILIENT_CLIENT_KWARGS as _REDIS_RESILIENT_KWARGS,
+)
+from redis_config import (
     build_redis_url as _build_redis_url,
 )
 from schemas import (
@@ -74,6 +77,7 @@ from starlette.exceptions import HTTPException as _StarletteHTTPException
 from utils import (
     get_browser_extra_args,
     load_config,
+    public_error_detail,
     setup_logging,
     validate_url_destination,
     validate_webhook_url,
@@ -352,7 +356,7 @@ async def monitor_ui_redirect():
     return RedirectResponse("/dashboard")
 
 # ─────────────────── infra / middleware  ─────────────────────
-redis = aioredis.from_url(_build_redis_url(config))
+redis = aioredis.from_url(_build_redis_url(config), **_REDIS_RESILIENT_KWARGS)
 
 limiter = Limiter(
     key_func=get_remote_address,
@@ -687,12 +691,17 @@ async def generate_html(
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
-            raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
+            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
+            # timeout): a gateway failure with its reason, not an internal 500
+            # whose detail the central handler must genericize away.
+            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
 
         raw_html = results[0].html
         from crawl4ai.utils import preprocess_html_for_schema
         processed_html = preprocess_html_for_schema(raw_html)
         return JSONResponse({"html": processed_html, "url": body.url, "success": True})
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, detail=str(e))
     finally:
@@ -756,7 +765,10 @@ async def generate_screenshot(
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
-            raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
+            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
+            # timeout): a gateway failure with its reason, not an internal 500
+            # whose detail the central handler must genericize away.
+            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
         screenshot_data = results[0].screenshot
         art = await asyncio.to_thread(
             _store_artifact,
@@ -795,7 +807,10 @@ async def generate_pdf(
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
-            raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
+            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
+            # timeout): a gateway failure with its reason, not an internal 500
+            # whose detail the central handler must genericize away.
+            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
         pdf_data = results[0].pdf
         art = await asyncio.to_thread(_store_artifact, "pdf", pdf_data)
         return {"success": True, "pdf": base64.b64encode(pdf_data).decode(), **art}
@@ -874,9 +889,14 @@ async def execute_js(
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
-            raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
+            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
+            # timeout): a gateway failure with its reason, not an internal 500
+            # whose detail the central handler must genericize away.
+            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
         data = results[0].model_dump()
         return JSONResponse(data)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, detail=str(e))
     finally:
@@ -954,7 +974,10 @@ async def health():
         payload["status"] = "ok"
         payload["components"] = {"api": "ready", "redis": "ready"}
         return payload
-    except Exception:
+    except Exception as exc:
+        # Log the failure class: a fast ConnectionError points at the overlay /
+        # stale pooled connection, a TimeoutError at a stalled Redis.
+        logger.warning("health: redis ping failed: %r", exc)
         payload["components"]["redis"] = "unavailable"
         return JSONResponse(payload, status_code=503)
 
@@ -1006,7 +1029,12 @@ async def crawl(
     )
     # check if all of the results are not successful
     if all(not result["success"] for result in results["results"]):
-        raise HTTPException(500, f"Crawl request failed: {results['results'][0]['error_message']}")
+        # Every URL failed upstream: surface the first reason as a gateway
+        # error instead of a genericized internal 500.
+        raise HTTPException(
+            502,
+            f"Crawl request failed: {public_error_detail(results['results'][0]['error_message'])}",
+        )
     return JSONResponse(results)
 
 

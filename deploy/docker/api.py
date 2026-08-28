@@ -30,6 +30,7 @@ from utils import (
     get_browser_extra_args,
     get_redis_task_ttl,
     is_task_id,
+    public_error_detail,
     should_cleanup_task,
     validate_llm_provider,
     validate_url_destination,
@@ -294,9 +295,11 @@ async def handle_llm_qa(
             config=crawler_config,
         )
         if not result.success:
+            # Upstream fetch failed: report the reason as a gateway error, not
+            # a genericized internal 500.
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.error_message
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=public_error_detail(result.error_message)
             )
         content = result.markdown.fit_markdown or result.markdown.raw_markdown
 
@@ -562,9 +565,11 @@ async def handle_markdown_request(
         )
 
         if not result.success:
+            # Upstream fetch failed: report the reason as a gateway error, not
+            # a genericized internal 500.
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.error_message
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=public_error_detail(result.error_message)
             )
 
         if filter_type == FilterType.LLM:

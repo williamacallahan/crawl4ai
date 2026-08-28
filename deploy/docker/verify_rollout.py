@@ -32,6 +32,8 @@ REDIS_MOUNT_PATH = "/data"
 REDIS_HEALTHCHECK = ["CMD", "redis-cli", "ping"]
 REDIS_NODE_CONSTRAINT = "node.hostname==haiku-18"
 CRAWL_HEALTHCHECK = ["CMD", "curl", "-f", "http://localhost:11235/health"]
+CRAWL_HEALTHCHECK_MIN_RETRIES = 3
+CRAWL_HEALTHCHECK_MIN_INTERVAL_NS = 5_000_000_000
 CRAWL_MAX_REPLICAS_PER_NODE = 1
 ROLLOUT_PROOF_TIMEOUT_SECONDS = 900
 
@@ -77,6 +79,15 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
     healthcheck = application.get("healthCheckSwarm")
     if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
         raise ValueError("Crawl4AI must use the routing admission healthcheck")
+    # A 1s/1-retry probe kills tasks on a single transient /health 503;
+    # require tolerance for short blips.
+    if (
+        healthcheck.get("Retries", 0) < CRAWL_HEALTHCHECK_MIN_RETRIES
+        or healthcheck.get("Interval", 0) < CRAWL_HEALTHCHECK_MIN_INTERVAL_NS
+    ):
+        raise ValueError(
+            "Crawl4AI healthcheck must tolerate transient blips (Retries>=3, Interval>=5s)"
+        )
     for field in ("updateConfigSwarm", "rollbackConfigSwarm"):
         config = application.get(field)
         if not isinstance(config, dict) or config.get("Order") != "start-first":
@@ -100,6 +111,11 @@ def _verify_redis_configuration(application: Any) -> None:
     healthcheck = application.get("healthCheckSwarm")
     if not isinstance(healthcheck, dict) or healthcheck.get("Test") != REDIS_HEALTHCHECK:
         raise ValueError("external Redis must use redis-cli ping healthcheck")
+    command = application.get("command")
+    if not isinstance(command, str) or "--appendfsync everysec" not in command:
+        # fsync-per-write blocks the single Redis thread on disk stalls, which
+        # 503s every replica's /health at once.
+        raise ValueError("external Redis must persist with --appendfsync everysec")
     placement = application.get("placementSwarm")
     if not isinstance(placement, dict):
         raise ValueError("external Redis placement is not configured")

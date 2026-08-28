@@ -212,6 +212,23 @@ def is_task_id(value: str) -> bool:
     """Check if the value matches task ID pattern."""
     return value.startswith("llm_") and "_" in value
 
+_INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", 'File "', ".py")
+
+
+def public_error_detail(error_message: Optional[str]) -> str:
+    """Client-safe form of a failed CrawlResult's error_message.
+
+    The library's catch-all error_message (get_error_context) embeds container
+    file paths, source snippets and raw exception text; those must never reach
+    a client. Upstream-failure messages (anti-bot, navigation refusal, DNS,
+    timeouts) pass through, capped.
+    """
+    message = (error_message or "").strip()
+    if not message or any(marker in message for marker in _INTERNAL_ERROR_MARKERS):
+        return "Crawl failed"
+    return message[:500]
+
+
 def datetime_handler(obj: any) -> Optional[str]:
     """Handle datetime serialization for JSON."""
     if hasattr(obj, 'isoformat'):
