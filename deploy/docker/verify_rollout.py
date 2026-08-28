@@ -438,6 +438,7 @@ def verify_monitor_evidence(
         address.split("/", 1)[0]
         for task in baseline_runtime["tasks"]
         if isinstance(task, dict)
+        and task.get("status", {}).get("state") == "running"
         for address in task.get("addresses", [])
     }
     replacement_addresses = final_addresses - baseline_addresses
