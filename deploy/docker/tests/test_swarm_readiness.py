@@ -95,7 +95,7 @@ def test_monitor_evidence_proves_predecessor_withdrawal_and_replacement_coverage
         {
             "ok": True,
             "instance": "old-a",
-            "tasks": old,
+            "tasks": [*old, task("historical", "10.0.0.99", "shutdown")],
             "upAddresses": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
         },
         {
