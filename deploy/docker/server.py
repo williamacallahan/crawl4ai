@@ -437,6 +437,7 @@ async def add_security_headers(request: Request, call_next):
 # transports and the metrics endpoint, for HTTP and WebSocket alike. Only the
 # health/token endpoints and the exact UI redirects are public.
 HEALTH_PATH = config["observability"]["health_check"]["endpoint"]
+ROUTING_HEALTH_PATH = f"{HEALTH_PATH.rstrip('/')}/route"
 DRAIN_PATH = pathlib.Path(
     os.environ.get("CRAWL4AI_DRAIN_PATH", "/tmp/crawl4ai-draining")
 )
@@ -450,7 +451,7 @@ app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body_bytes_from_config
 app.add_middleware(
     AuthGateMiddleware,
     token_provider=_current_api_token,
-    public_paths={HEALTH_PATH, "/token", "/", "/monitor"},
+    public_paths={HEALTH_PATH, ROUTING_HEALTH_PATH, "/token", "/", "/monitor"},
     public_prefixes=_UI_PREFIXES,
 )
 
@@ -937,8 +938,7 @@ async def get_hooks_info():
     })
 
 
-@app.get(HEALTH_PATH)
-async def health():
+async def _health(*, routing: bool):
     payload = {
         "status": "unhealthy",
         "timestamp": time.time(),
@@ -947,16 +947,35 @@ async def health():
         "instance": os.environ.get("HOSTNAME", ""),
         "components": {"api": "unavailable"},
     }
-    if DRAIN_PATH.exists() or not getattr(app.state, "readiness_checks_active", False):
+    if not getattr(app.state, "readiness_checks_active", False):
         return JSONResponse(payload, status_code=503)
+    if routing:
+        payload["components"]["api"] = "draining" if DRAIN_PATH.exists() else "ready"
+        if DRAIN_PATH.exists():
+            return JSONResponse(payload, status_code=503)
+        payload["status"] = "ok"
+        return payload
     try:
         await asyncio.wait_for(redis.ping(), timeout=2.0)
         payload["status"] = "ok"
-        payload["components"] = {"api": "ready", "redis": "ready"}
+        payload["components"] = {
+            "api": "draining" if DRAIN_PATH.exists() else "ready",
+            "redis": "ready",
+        }
         return payload
     except Exception:
         payload["components"]["redis"] = "unavailable"
         return JSONResponse(payload, status_code=503)
+
+
+@app.get(HEALTH_PATH)
+async def health():
+    return await _health(routing=False)
+
+
+@app.get(ROUTING_HEALTH_PATH)
+async def routing_health():
+    return await _health(routing=True)
 
 
 @app.get(config["observability"]["prometheus"]["endpoint"])

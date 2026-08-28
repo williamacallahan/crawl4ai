@@ -71,7 +71,7 @@ SUPERVISORD_PID=$!
 begin_drain() {
     trap '' TERM INT
     touch "${DRAIN_PATH}"
-    # HAProxy's 500 ms check plus 400 ms timeout fits inside this withdrawal delay.
+    # Traefik's 500 ms check plus 400 ms timeout fits inside this withdrawal delay.
     sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"
     kill -TERM "${SUPERVISORD_PID}" 2>/dev/null || true
     wait "${SUPERVISORD_PID}" || exit $?

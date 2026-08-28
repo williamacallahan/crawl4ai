@@ -31,42 +31,106 @@ def _task_runtime(monkeypatch):
         )
 
     monkeypatch.setattr(rollout_verifier, "_inspect_task_runtime", inspect)
-    monkeypatch.setattr(rollout_verifier, "_dokploy_network_id", lambda: "network")
 
 
-def test_release_requires_exactly_three_replicas(monkeypatch):
-    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
-    with pytest.raises(ValueError, match="exactly three"):
-        rollout_verifier._verify_release_configuration(_application(replicas=2), "target")
+def _readiness_root_labels():
+    prefix = "traefik.http.services.crawl4ai-1.loadbalancer"
+    readiness = rollout_verifier.CRAWL_READINESS_CHECK
+    return {
+        "traefik.enable": "true",
+        "traefik.swarm.network": "dokploy-network",
+        "traefik.swarm.lbswarm": "false",
+        "traefik.http.routers.crawl4ai-1-websecure.rule": "Host(`crawl.example`)",
+        f"{prefix}.server.port": "11235",
+        f"{prefix}.healthcheck.path": readiness["Path"],
+        f"{prefix}.healthcheck.interval": f'{readiness["Interval"]}ns',
+        f"{prefix}.healthcheck.unhealthyinterval": f'{readiness["UnhealthyInterval"]}ns',
+        f"{prefix}.healthcheck.timeout": f'{readiness["Timeout"]}ns',
+        f"{prefix}.healthcheck.status": str(readiness["Status"]),
+        f"{prefix}.healthcheck.initialstatus": "down",
+    }
 
 
-def _application(**overrides):
-    application = {
+def _runtime_state(*, traefik=None, **overrides):
+    service = {
         "replicas": 1,
-        "appName": "crawl4ai",
-        "labelsSwarm": rollout_verifier._observability_labels("target"),
-        "env": (
-            f"LLM_PROVIDER={rollout_verifier.LLM_PROVIDER}\n"
-            f"LLM_BASE_URL={rollout_verifier.LLM_BASE_URL}\n"
-            "LLM_API_KEY=nonempty"
-        ),
-        "mounts": [
-            {
-                "type": "volume",
-                "volumeName": rollout_verifier.REDIS_VOLUME,
-                "mountPath": rollout_verifier.REDIS_MOUNT_PATH,
-            }
-        ],
-        "healthCheckSwarm": {"Test": rollout_verifier.CRAWL_HEALTHCHECK},
-        "placementSwarm": {
+        "taskLabels": rollout_verifier._observability_labels("target"),
+        "rootLabels": _readiness_root_labels(),
+        "image": "registry.example/crawl4ai@sha256:" + "d" * 64,
+        "healthCheck": {
+            "Test": rollout_verifier.CRAWL_HEALTHCHECK_TEST,
+            **rollout_verifier.CRAWL_HEALTHCHECK_TIMING,
+        },
+        "placement": {
             "Constraints": [],
             "MaxReplicas": rollout_verifier.CRAWL_MAX_REPLICAS_PER_NODE,
         },
-        "updateConfigSwarm": {"Order": "start-first", "Parallelism": 1, "MaxFailureRatio": 0},
-        "rollbackConfigSwarm": {"Order": "start-first", "Parallelism": 1, "MaxFailureRatio": 0},
+        "updateConfig": {
+            "Order": "start-first",
+            "Parallelism": 1,
+            "Delay": 150_000_000_000,
+            "FailureAction": "rollback",
+            "Monitor": 150_000_000_000,
+            "MaxFailureRatio": 0,
+        },
+        "rollbackConfig": {
+            "Order": "start-first",
+            "Parallelism": 1,
+            "Delay": 150_000_000_000,
+            "FailureAction": "pause",
+            "Monitor": 150_000_000_000,
+            "MaxFailureRatio": 0,
+        },
+        "stopGracePeriod": REQUIRED_STOP_GRACE_NS,
+        "volumeMounts": [],
     }
-    application.update(overrides)
-    return application
+    service.update(overrides)
+    return {
+        "application": {"appName": "crawl4ai"},
+        "service": service,
+        "traefik": traefik
+        or {
+            "routers": [
+                {
+                    "routerId": "crawl4ai-1-websecure@swarm",
+                    "status": "enabled",
+                    "service": "crawl4ai-1@swarm",
+                }
+            ],
+            "services": [
+                {
+                    "serviceId": "crawl4ai-1@swarm",
+                    "status": "enabled",
+                    "serverStatus": {"http://10.0.1.11:11235/": "UP"},
+                }
+            ],
+        },
+    }
+
+
+def _redis_runtime_state(**overrides):
+    service = {
+        "replicas": 1,
+        "taskLabels": {},
+        "rootLabels": {},
+        "image": "redis:7.4",
+        "healthCheck": {"Interval": 1_000_000_000},
+        "placement": {
+            "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
+            "MaxReplicas": 1,
+        },
+        "volumeMounts": [
+            {
+                "Type": "volume",
+                "Source": rollout_verifier.REDIS_VOLUME,
+                "Target": rollout_verifier.REDIS_MOUNT_PATH,
+            }
+        ],
+    }
+    service.update(overrides)
+    state = _runtime_state(traefik={"routers": [], "services": []}, **service)
+    state["application"]["appName"] = "crawl4ai-redis"
+    return state
 
 
 def _running_task(task_id: str, node: str, seconds: int = 1) -> dict:
@@ -100,21 +164,12 @@ def _fake_read(handlers):
             raise AssertionError(f"unexpected operation: {operation}")
         handler = handlers[operation]
         result = handler(url) if callable(handler) else handler
-        if operation == "application.one" and isinstance(result, dict):
-            supplied = result
-            result = _application(**result)
-            if "applicationId=redis" in url:
-                result["appName"] = "crawl4ai-redis"
-                if "healthCheckSwarm" not in supplied:
-                    result["healthCheckSwarm"] = {
-                        "Test": rollout_verifier.REDIS_HEALTHCHECK
-                    }
-                if "placementSwarm" not in supplied:
-                    result["placementSwarm"] = {
-                        "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
-                        "MaxReplicas": 1,
-                    }
-            result.setdefault("stopGracePeriodSwarm", REQUIRED_STOP_GRACE_NS)
+        if operation == "application.runtimeServiceState" and isinstance(result, dict):
+            result = (
+                _redis_runtime_state(**result)
+                if "applicationId=redis" in url
+                else _runtime_state(**result)
+            )
         return result
 
     return read_json
@@ -182,46 +237,59 @@ def test_curl_json_rejects_streamed_responses_over_64_kib():
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"labelsSwarm": {}}, "observability labels"),
+        ({"replicas": 2}, "exactly three"),
+        ({"taskLabels": {}}, "observability labels"),
+        ({"image": "registry.example/crawl4ai:wrong"}, "image does not match"),
+        ({"placement": {"MaxReplicas": 2}}, "one replica per node"),
+        ({"healthCheck": None}, "admission healthcheck"),
+        ({"rootLabels": {}}, "native fail-closed"),
         (
-            {
-                "env": (
-                    "LLM_PROVIDER=openai/gpt-4o-mini\n"
-                    "LLM_BASE_URL=https://api.llm-gateway.iocloudhost.net/v1\n"
-                    "LLM_API_KEY=nonempty"
-                )
-            },
-            "LLM_PROVIDER",
+            {"traefik": {"routers": [], "services": []}},
+            "runtime routing is unavailable",
+        ),
+        (
+            {"updateConfig": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
+            "updateConfig must use start-first",
+        ),
+        (
+            {"rollbackConfig": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
+            "rollbackConfig must use start-first",
         ),
         (
             {
-                "env": (
-                    "LLM_PROVIDER=openai/qwen3.8-27b\n"
-                    "LLM_BASE_URL=https://wrong.example/v1\n"
-                    "LLM_API_KEY=nonempty"
-                )
+                "updateConfig": {
+                    **_runtime_state()["service"]["updateConfig"],
+                    "FailureAction": "continue",
+                }
             },
-            "LLM_BASE_URL",
+            "fail closed with rollback",
         ),
         (
             {
-                "env": (
-                    "LLM_PROVIDER=openai/qwen3.8-27b\n"
-                    "LLM_BASE_URL=https://api.llm-gateway.iocloudhost.net/v1\n"
-                    "LLM_API_KEY="
-                )
+                "rollbackConfig": {
+                    **_runtime_state()["service"]["rollbackConfig"],
+                    "FailureAction": "rollback",
+                }
             },
-            "LLM_API_KEY must be nonempty",
-        ),
-        ({"placementSwarm": {"MaxReplicas": 2}}, "one replica per node"),
-        ({"healthCheckSwarm": {"Test": ["CMD", "true"]}}, "admission healthcheck"),
-        (
-            {"updateConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
-            "updateConfigSwarm must use start-first",
+            "fail closed with pause",
         ),
         (
-            {"rollbackConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
-            "rollbackConfigSwarm must use start-first",
+            {
+                "updateConfig": {
+                    **_runtime_state()["service"]["updateConfig"],
+                    "Monitor": rollout_verifier.CRAWL_UPDATE_MONITOR_NS - 1,
+                }
+            },
+            "monitor must cover candidate startup",
+        ),
+        (
+            {
+                "rollbackConfig": {
+                    **_runtime_state()["service"]["rollbackConfig"],
+                    "Delay": rollout_verifier.CRAWL_UPDATE_DELAY_NS - 1,
+                }
+            },
+            "delay must preserve peers",
         ),
     ],
 )
@@ -229,7 +297,7 @@ def test_verifier_rejects_invalid_release_observability_configuration(overrides,
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": overrides,
+            "application.runtimeServiceState": overrides,
         }
     )
 
@@ -242,18 +310,19 @@ def test_verifier_rejects_invalid_release_observability_configuration(overrides,
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
+            network_id="network",
         )
 
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"mounts": []}, "crawl4ai-redis-data"),
-        ({"healthCheckSwarm": {"Test": ["CMD-SHELL", "redis-cli ping"]}}, "healthcheck"),
-        ({"placementSwarm": {"Constraints": [], "MaxReplicas": 1}}, "haiku-18"),
+        ({"volumeMounts": []}, "crawl4ai-redis-data"),
+        ({"healthCheck": None}, "healthcheck"),
+        ({"placement": {"Constraints": [], "MaxReplicas": 1}}, "haiku-18"),
         (
             {
-                "placementSwarm": {
+                "placement": {
                     "Constraints": ["node.hostname==haiku-18"],
                     "MaxReplicas": 2,
                 }
@@ -269,7 +338,7 @@ def test_verifier_rejects_invalid_external_redis_configuration(overrides, messag
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": application_for_id,
+            "application.runtimeServiceState": application_for_id,
         }
     )
 
@@ -282,6 +351,7 @@ def test_verifier_rejects_invalid_external_redis_configuration(overrides, messag
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
+            network_id="network",
         )
 
 
@@ -297,7 +367,7 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_wi
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
+            "application.runtimeServiceState": {},
             "docker.getServiceContainersByAppName": lambda _url: next(task_snapshots),
         }
     )
@@ -310,9 +380,56 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_wi
         revision="target",
         health_url="https://crawl.example/health",
         read_json=read_json,
+        network_id="network",
         probe_health=lambda _url, count: [_health(container_id[:12])] * count,
         sleep=lambda _seconds: None,
     )
+
+
+def test_verifier_rejects_traefik_admission_outside_the_current_task_set():
+    clock = iter([0, 0, 0, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
+    traefik = {
+        "routers": [
+            {
+                "routerId": "crawl4ai-1-websecure@swarm",
+                "status": "enabled",
+                "service": "crawl4ai-1@swarm",
+            }
+        ],
+        "services": [
+            {
+                "serviceId": "crawl4ai-1@swarm",
+                "status": "enabled",
+                "serverStatus": {"http://10.0.1.99:11235/": "UP"},
+            }
+        ],
+    }
+
+    def runtime_for_id(url):
+        return {} if "applicationId=redis" in url else {"traefik": traefik}
+
+    read_json = _fake_read(
+        {
+            "deployment.all": [{"status": "done"}],
+            "application.runtimeServiceState": runtime_for_id,
+            "docker.getServiceContainersByAppName": [_running_task("task-a", "a")],
+        }
+    )
+
+    with pytest.raises(TimeoutError, match="did not stabilize"):
+        verify_rollout(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            redis_application_id="redis",
+            revision="target",
+            health_url="https://crawl.example/health",
+            read_json=read_json,
+            network_id="network",
+            probe_health=lambda _url, count: [_health("a" * 12)] * count,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(clock),
+        )
 
 
 @pytest.mark.parametrize(
@@ -368,7 +485,7 @@ def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_dr
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
+            "application.runtimeServiceState": {},
             "docker.getServiceContainersByAppName": lambda _url: next(task_snapshots),
         }
     )
@@ -382,6 +499,7 @@ def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_dr
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
+            network_id="network",
             probe_health=lambda _url, count: [next(health_snapshots)] * count,
             sleep=lambda _seconds: None,
             monotonic=lambda: next(clock),
@@ -389,35 +507,12 @@ def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_dr
         )
 
 
-def test_verifier_rejects_replica_counts_other_than_three():
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 17, "appName": "crawl4ai"},
-        }
-    )
-
-    with pytest.raises(ValueError, match="exactly three"):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            health_url="https://crawl.example/health",
-            read_json=read_json,
-            sleep=lambda _seconds: None,
-        )
-
-
 def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": {
-                "replicas": 1,
-                "appName": "crawl4ai",
-                "stopGracePeriodSwarm": REQUIRED_STOP_GRACE_NS - 1,
+            "application.runtimeServiceState": {
+                "stopGracePeriod": REQUIRED_STOP_GRACE_NS - 1,
             },
         }
     )
@@ -431,6 +526,7 @@ def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
+            network_id="network",
             sleep=lambda _seconds: None,
         )
 
@@ -451,7 +547,7 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
+            "application.runtimeServiceState": {},
             "docker.getServiceContainersByAppName": tasks,
         }
     )
@@ -465,6 +561,7 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
+            network_id="network",
             probe_health=lambda _url, count: [_health("a" * 12)] * count,
             sleep=lambda _seconds: None,
             monotonic=lambda: next(clock),
@@ -493,7 +590,7 @@ def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
+            "application.runtimeServiceState": {},
             "docker.getServiceContainersByAppName": tasks,
         }
     )
@@ -507,6 +604,7 @@ def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
             revision="target",
             health_url="https://crawl.example/health",
             read_json=read_json,
+            network_id="network",
             probe_health=lambda _url, count: [_health("a" * 12), _health("b" * 12)]
             * (count // 2),
             sleep=lambda _seconds: None,

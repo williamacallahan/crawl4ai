@@ -16,24 +16,35 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from readiness_routing import (
-    MAX_RESPONSE_BYTES,
-    ingress_backends,
-    ingress_task_stats_url,
-    verify_monitor_evidence,
-)
-
-MAX_REPLICAS = 16
+MAX_RESPONSE_BYTES = 65_536
 CRAWL_REPLICAS = 3
-LLM_PROVIDER = "openai/qwen3.8-27b"
-LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 REDIS_VOLUME = "crawl4ai-redis-data"
 REDIS_MOUNT_PATH = "/data"
-REDIS_HEALTHCHECK = ["CMD", "redis-cli", "ping"]
 REDIS_NODE_CONSTRAINT = "node.hostname==haiku-18"
-CRAWL_HEALTHCHECK = ["CMD", "curl", "-f", "http://localhost:11235/health"]
+CRAWL_HEALTHCHECK_TIMING = {
+    "Interval": 1_000_000_000,
+    "Timeout": 1_000_000_000,
+    "StartPeriod": 120_000_000_000,
+    "Retries": 1,
+}
+CRAWL_HEALTHCHECK_TEST = [
+    "CMD",
+    "curl",
+    "-f",
+    "http://localhost:11235/health/route",
+]
+CRAWL_READINESS_CHECK = {
+    "Path": "/health/route",
+    "Interval": 500_000_000,
+    "UnhealthyInterval": 250_000_000,
+    "Timeout": 400_000_000,
+    "Status": 200,
+}
 CRAWL_MAX_REPLICAS_PER_NODE = 1
+CRAWL_UPDATE_DELAY_NS = 150_000_000_000
+CRAWL_UPDATE_MONITOR_NS = 150_000_000_000
 ROLLOUT_PROOF_TIMEOUT_SECONDS = 900
+MONITOR_INTERVAL_SECONDS = 0.5
 
 
 def _observability_labels(revision: str) -> dict[str, str]:
@@ -45,62 +56,162 @@ def _observability_labels(revision: str) -> dict[str, str]:
     }
 
 
-def _environment_values(environment: str) -> dict[str, str]:
-    values = {}
-    for line in environment.splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            values[key] = value
-    return values
+def _runtime_service_state(state: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(state, dict):
+        raise ValueError("application runtime state response is invalid")
+    application = state.get("application")
+    service = state.get("service")
+    if not isinstance(application, dict) or not isinstance(service, dict):
+        raise ValueError("application runtime state response is invalid")
+    return application, service
 
 
-def _verify_release_configuration(application: Any, revision: str) -> None:
-    if not isinstance(application, dict):
-        raise ValueError("application configuration response is invalid")
-    if application.get("labelsSwarm") != _observability_labels(revision):
+def _verify_release_configuration(
+    state: Any, revision: str, expected_image: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any], tuple[frozenset[str], ...]]:
+    application, service = _runtime_service_state(state)
+    task_labels = service.get("taskLabels")
+    expected_labels = _observability_labels(revision)
+    if not isinstance(task_labels, dict) or any(
+        task_labels.get(key) != value for key, value in expected_labels.items()
+    ):
         raise ValueError("observability labels do not match the release")
-    if application.get("replicas") != CRAWL_REPLICAS:
+    image = service.get("image")
+    if (
+        not isinstance(image, str)
+        or not re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", image)
+        or (expected_image is not None and image != expected_image)
+    ):
+        raise ValueError("Crawl4AI image does not match the release")
+    if service.get("replicas") != CRAWL_REPLICAS:
         raise ValueError("Crawl4AI must keep exactly three replicas")
-    environment = application.get("env")
-    if not isinstance(environment, str):
-        raise ValueError("LLM environment is not configured")
-    values = _environment_values(environment)
-    if values.get("LLM_PROVIDER") != LLM_PROVIDER:
-        raise ValueError("LLM_PROVIDER does not match the release")
-    if values.get("LLM_BASE_URL") != LLM_BASE_URL:
-        raise ValueError("LLM_BASE_URL does not match the release")
-    if not values.get("LLM_API_KEY", "").strip():
-        raise ValueError("LLM_API_KEY must be nonempty")
-    placement = application.get("placementSwarm")
+    placement = service.get("placement")
     if not isinstance(placement, dict) or placement.get("MaxReplicas") != CRAWL_MAX_REPLICAS_PER_NODE:
         raise ValueError("Crawl4AI placement must keep one replica per node")
-    healthcheck = application.get("healthCheckSwarm")
-    if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
+    health_check = service.get("healthCheck")
+    if not isinstance(health_check, dict) or health_check.get("Test") != CRAWL_HEALTHCHECK_TEST:
         raise ValueError("Crawl4AI must use the routing admission healthcheck")
-    for field in ("updateConfigSwarm", "rollbackConfigSwarm"):
-        config = application.get(field)
+    if {key: health_check.get(key) for key in CRAWL_HEALTHCHECK_TIMING} != CRAWL_HEALTHCHECK_TIMING:
+        raise ValueError("Crawl4AI must use the routing admission healthcheck")
+    root_labels = service.get("rootLabels")
+    if not isinstance(root_labels, dict) or any(
+        root_labels.get(key) != value
+        for key, value in {
+            "traefik.enable": "true",
+            "traefik.swarm.network": "dokploy-network",
+            "traefik.swarm.lbswarm": "false",
+        }.items()
+    ):
+        raise ValueError("Crawl4AI must use native fail-closed Swarm readiness routing")
+    readiness_services = {
+        key.removesuffix(".healthcheck.path")
+        for key in root_labels
+        if key.endswith(".loadbalancer.healthcheck.path")
+    }
+    readiness_labels = {
+        "server.port": "11235",
+        "healthcheck.path": CRAWL_READINESS_CHECK["Path"],
+        "healthcheck.interval": f'{CRAWL_READINESS_CHECK["Interval"]}ns',
+        "healthcheck.unhealthyinterval": f'{CRAWL_READINESS_CHECK["UnhealthyInterval"]}ns',
+        "healthcheck.timeout": f'{CRAWL_READINESS_CHECK["Timeout"]}ns',
+        "healthcheck.status": str(CRAWL_READINESS_CHECK["Status"]),
+        "healthcheck.initialstatus": "down",
+    }
+    if not readiness_services or any(
+        root_labels.get(f"{prefix}.{suffix}") != value
+        for prefix in readiness_services
+        for suffix, value in readiness_labels.items()
+    ):
+        raise ValueError("Crawl4AI must use native fail-closed Swarm readiness routing")
+    readiness_service_ids = {
+        f'{prefix.removeprefix("traefik.http.services.").removesuffix(".loadbalancer")}@swarm'
+        for prefix in readiness_services
+    }
+    readiness_router_ids = {
+        f'{key.removeprefix("traefik.http.routers.").removesuffix(".rule")}@swarm'
+        for key in root_labels
+        if key.startswith("traefik.http.routers.") and key.endswith(".rule")
+    }
+    traefik = state.get("traefik")
+    routers = traefik.get("routers") if isinstance(traefik, dict) else None
+    services = traefik.get("services") if isinstance(traefik, dict) else None
+    if not isinstance(routers, list) or not routers or not isinstance(services, list) or not services:
+        raise ValueError("Crawl4AI Traefik runtime routing is unavailable")
+    service_ids = {
+        service.get("serviceId")
+        for service in services
+        if isinstance(service, dict)
+        and service.get("status") == "enabled"
+        and str(service.get("serviceId", "")).endswith("@swarm")
+    }
+    router_services = {
+        router.get("service")
+        for router in routers
+        if isinstance(router, dict)
+        and router.get("status") == "enabled"
+        and str(router.get("routerId", "")).endswith("@swarm")
+    }
+    router_ids = {
+        router.get("routerId") for router in routers if isinstance(router, dict)
+    }
+    if (
+        len(service_ids) != len(services)
+        or any(
+            not isinstance(router, dict)
+            or router.get("status") != "enabled"
+            or not str(router.get("routerId", "")).endswith("@swarm")
+            for router in routers
+        )
+        or service_ids != readiness_service_ids
+        or router_ids != readiness_router_ids
+        or router_services != service_ids
+    ):
+        raise ValueError("Crawl4AI Traefik routers and services are not enabled")
+    admitted_services = []
+    for traefik_service in services:
+        server_status = traefik_service.get("serverStatus")
+        if not isinstance(server_status, dict):
+            raise ValueError("Crawl4AI Traefik server status is unavailable")
+        admitted = set()
+        for url, status in server_status.items():
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.port != 11235:
+                raise ValueError("Crawl4AI Traefik server status contains an invalid backend")
+            if status == "UP":
+                admitted.add(parsed.hostname)
+        admitted_services.append(frozenset(admitted))
+    for field in ("updateConfig", "rollbackConfig"):
+        config = service.get(field)
         if not isinstance(config, dict) or config.get("Order") != "start-first":
             raise ValueError(f"{field} must use start-first order")
         if config.get("Parallelism") != 1 or config.get("MaxFailureRatio") != 0:
             raise ValueError(f"{field} must replace one task at a time and fail closed")
+        failure_action = "rollback" if field == "updateConfig" else "pause"
+        if config.get("FailureAction") != failure_action:
+            raise ValueError(f"{field} must fail closed with {failure_action}")
+        if int(config.get("Monitor") or 0) < CRAWL_UPDATE_MONITOR_NS:
+            raise ValueError(f"{field} monitor must cover candidate startup")
+        if int(config.get("Delay") or 0) < CRAWL_UPDATE_DELAY_NS:
+            raise ValueError(f"{field} delay must preserve peers through candidate admission")
+    return application, service, tuple(admitted_services)
 
 
-def _verify_redis_configuration(application: Any) -> None:
-    if not isinstance(application, dict):
-        raise ValueError("external Redis configuration response is invalid")
-    mounts = application.get("mounts")
+def _verify_redis_configuration(
+    state: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    application, service = _runtime_service_state(state)
+    mounts = service.get("volumeMounts")
     if not isinstance(mounts, list) or not any(
         isinstance(mount, dict)
-        and mount.get("type") == "volume"
-        and mount.get("volumeName") == REDIS_VOLUME
-        and mount.get("mountPath") == REDIS_MOUNT_PATH
+        and mount.get("Type") == "volume"
+        and mount.get("Source") == REDIS_VOLUME
+        and mount.get("Target") == REDIS_MOUNT_PATH
         for mount in mounts
     ):
         raise ValueError("external Redis must mount crawl4ai-redis-data at /data")
-    healthcheck = application.get("healthCheckSwarm")
-    if not isinstance(healthcheck, dict) or healthcheck.get("Test") != REDIS_HEALTHCHECK:
+    if not isinstance(service.get("healthCheck"), dict):
         raise ValueError("external Redis must use redis-cli ping healthcheck")
-    placement = application.get("placementSwarm")
+    placement = service.get("placement")
     if not isinstance(placement, dict):
         raise ValueError("external Redis placement is not configured")
     constraints = placement.get("Constraints")
@@ -108,6 +219,9 @@ def _verify_redis_configuration(application: Any) -> None:
         raise ValueError("external Redis must be placed on haiku-18")
     if placement.get("MaxReplicas") != 1:
         raise ValueError("external Redis MaxReplicas must be 1")
+    if service.get("replicas") != 1:
+        raise ValueError("external Redis must keep exactly one replica")
+    return application, service
 
 
 def _required_stop_grace_ns() -> int:
@@ -195,6 +309,186 @@ def _has_task_error(task: dict[str, Any]) -> bool:
     return bool(error.removeprefix("Error:").strip())
 
 
+def monitor_public_health(
+    *,
+    health_url: str,
+    expected_replicas: int,
+    evidence_path: Path,
+    armed_path: Path,
+    stop_path: Path,
+    dokploy_url: str,
+    api_key: str,
+    application_id: str,
+    read_json: Callable[[str, str | None], Any] = _curl_json,
+) -> None:
+    baseline_instances: set[str] = set()
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    with evidence_path.open("w") as evidence:
+        while not stop_path.exists():
+            started = time.monotonic()
+            try:
+                health = read_json(f"{health_url}?rollout={uuid.uuid4()}", None)
+                revision = health.get("revision") if isinstance(health, dict) else None
+                if not revision or not _is_exact_health(health, revision):
+                    raise ValueError("public health response is malformed")
+                runtime = read_json(
+                    _dokploy_url(
+                        dokploy_url,
+                        "application.runtimeServiceState",
+                        applicationId=application_id,
+                    ),
+                    api_key,
+                )
+                runtime_tasks = runtime.get("tasks") if isinstance(runtime, dict) else None
+                traefik = runtime.get("traefik") if isinstance(runtime, dict) else None
+                services = traefik.get("services") if isinstance(traefik, dict) else None
+                if not isinstance(runtime_tasks, list) or not isinstance(services, list):
+                    raise ValueError("runtime routing timeline is unavailable")
+                up_addresses = sorted(
+                    {
+                        urllib.parse.urlsplit(url).hostname
+                        for service in services
+                        if isinstance(service, dict)
+                        for url, status in (service.get("serverStatus") or {}).items()
+                        if status == "UP" and urllib.parse.urlsplit(url).hostname
+                    }
+                )
+                sample = {
+                    "ok": True,
+                    "timestamp": time.time(),
+                    "latencySeconds": time.monotonic() - started,
+                    "instance": health["instance"],
+                    "revision": revision,
+                    "tasks": runtime_tasks,
+                    "upAddresses": up_addresses,
+                }
+            except Exception as error:
+                sample = {
+                    "ok": False,
+                    "timestamp": time.time(),
+                    "latencySeconds": time.monotonic() - started,
+                    "error": type(error).__name__,
+                }
+            evidence.write(json.dumps(sample, separators=(",", ":")) + "\n")
+            evidence.flush()
+            os.fsync(evidence.fileno())
+            if not sample["ok"]:
+                raise RuntimeError("public health monitor observed a failed request")
+            baseline_instances.add(sample["instance"])
+            task_addresses = {
+                address.split("/", 1)[0]
+                for task in sample["tasks"]
+                if isinstance(task, dict)
+                and task.get("status", {}).get("state") == "running"
+                for address in task.get("addresses", [])
+            }
+            if (
+                len(baseline_instances) >= expected_replicas
+                and len(task_addresses) == expected_replicas
+                and task_addresses == set(sample["upAddresses"])
+                and not armed_path.exists()
+            ):
+                armed_path.touch()
+            time.sleep(MONITOR_INTERVAL_SECONDS)
+
+
+def verify_monitor_evidence(
+    evidence_path: Path | None,
+    final_instances: frozenset[str],
+    final_containers: frozenset[str],
+    final_addresses: frozenset[str],
+) -> None:
+    if evidence_path is None:
+        return
+    samples = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    if not samples or any(not sample.get("ok") for sample in samples):
+        raise RuntimeError("public health monitor did not remain successful")
+    observed_instances = list(
+        dict.fromkeys(sample.get("instance") for sample in samples if sample.get("instance"))
+    )
+    if not final_instances <= set(observed_instances):
+        raise RuntimeError("public monitor did not observe every replacement task")
+    baseline_instances = frozenset(observed_instances[: len(final_instances)])
+    if len(baseline_instances) != len(final_instances):
+        raise RuntimeError("public monitor did not capture the complete predecessor set")
+    if not baseline_instances.isdisjoint(final_instances):
+        raise RuntimeError("public monitor did not prove full predecessor withdrawal")
+
+    runtime_samples = [
+        sample
+        for sample in samples
+        if isinstance(sample.get("tasks"), list)
+        and isinstance(sample.get("upAddresses"), list)
+    ]
+    baseline_runtime = next(
+        (
+            sample
+            for sample in runtime_samples
+            if len(sample["tasks"]) >= len(final_containers)
+            and {
+                address.split("/", 1)[0]
+                for task in sample["tasks"]
+                if isinstance(task, dict)
+                and task.get("status", {}).get("state") == "running"
+                for address in task.get("addresses", [])
+            }
+            == set(sample["upAddresses"])
+        ),
+        None,
+    )
+    if baseline_runtime is None:
+        raise RuntimeError("runtime monitor did not capture the admitted predecessor set")
+    baseline_addresses = {
+        address.split("/", 1)[0]
+        for task in baseline_runtime["tasks"]
+        if isinstance(task, dict)
+        for address in task.get("addresses", [])
+    }
+    replacement_addresses = final_addresses - baseline_addresses
+    for replacement in replacement_addresses:
+        first_seen = next(
+            (
+                index
+                for index, sample in enumerate(runtime_samples)
+                if any(
+                    replacement
+                    in {
+                        address.split("/", 1)[0]
+                        for address in task.get("addresses", [])
+                    }
+                    and task.get("status", {}).get("state") == "running"
+                    for task in sample["tasks"]
+                    if isinstance(task, dict)
+                )
+            ),
+            None,
+        )
+        if first_seen is None or replacement in runtime_samples[first_seen]["upAddresses"]:
+            raise RuntimeError("runtime monitor did not prove fail-closed candidate admission")
+        if not any(
+            replacement in sample["upAddresses"]
+            for sample in runtime_samples[first_seen + 1 :]
+        ):
+            raise RuntimeError("runtime monitor did not observe candidate admission")
+
+    for predecessor in baseline_addresses - final_addresses:
+        if not any(
+            predecessor not in sample["upAddresses"]
+            and any(
+                predecessor
+                in {
+                    address.split("/", 1)[0]
+                    for address in task.get("addresses", [])
+                }
+                and task.get("status", {}).get("state") == "running"
+                for task in sample["tasks"]
+                if isinstance(task, dict)
+            )
+            for sample in runtime_samples
+        ):
+            raise RuntimeError("runtime monitor did not prove predecessor withdrawal before exit")
+
+
 def _inspect_task_runtime(
     task_id: str, network_id: str
 ) -> tuple[str, frozenset[str], dict[str, str]]:
@@ -221,18 +515,6 @@ def _inspect_task_runtime(
     return json.loads(container)[:12], addresses, json.loads(labels) or {}
 
 
-def _dokploy_network_id() -> str:
-    network = subprocess.run(
-        ["docker", "network", "inspect", "dokploy-network", "--format", "{{.ID}}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if not network:
-        raise ValueError("dokploy-network could not be resolved")
-    return network
-
-
 def verify_rollout(
     *,
     dokploy_url: str,
@@ -246,7 +528,8 @@ def verify_rollout(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     monitor_evidence_path: Path | None = None,
-    ingress_stats_url: str | None = None,
+    network_id: str | None = None,
+    expected_image: str | None = None,
     inspect_task_runtime: Callable[
         [str, str], tuple[str, frozenset[str], dict[str, str]]
     ]
@@ -270,7 +553,22 @@ def verify_rollout(
         raise TimeoutError("Dokploy deployment did not finish within 10 minutes")
 
     expected_labels = _observability_labels(revision)
-    network = _dokploy_network_id()
+    if network_id is None:
+        network_id = subprocess.run(
+            [
+                "docker",
+                "network",
+                "inspect",
+                "dokploy-network",
+                "--format",
+                "{{.ID}}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if not network_id:
+            raise ValueError("dokploy-network could not be resolved")
 
     if probe_health is None:
 
@@ -290,18 +588,26 @@ def verify_rollout(
     candidate: tuple[frozenset[str], frozenset[str], frozenset[str]] | None = None
     stable_rounds = 0
     while monotonic() < proof_deadline:
-        application = read_json(
-            _dokploy_url(dokploy_url, "application.one", applicationId=application_id),
-            api_key,
-        )
-        _verify_release_configuration(application, revision)
-        redis_application = read_json(
+        runtime_state = read_json(
             _dokploy_url(
-                dokploy_url, "application.one", applicationId=redis_application_id
+                dokploy_url,
+                "application.runtimeServiceState",
+                applicationId=application_id,
             ),
             api_key,
         )
-        _verify_redis_configuration(redis_application)
+        application, service, admitted_services = _verify_release_configuration(
+            runtime_state, revision, expected_image
+        )
+        redis_runtime_state = read_json(
+            _dokploy_url(
+                dokploy_url,
+                "application.runtimeServiceState",
+                applicationId=redis_application_id,
+            ),
+            api_key,
+        )
+        redis_application, _ = _verify_redis_configuration(redis_runtime_state)
         redis_tasks = read_json(
             _dokploy_url(
                 dokploy_url,
@@ -323,12 +629,8 @@ def verify_rollout(
             stable_rounds = 0
             sleep(5)
             continue
-        replicas = int(application["replicas"])
-        if not 1 <= replicas <= MAX_REPLICAS:
-            raise ValueError(
-                f"configured replicas must be between 1 and {MAX_REPLICAS}"
-            )
-        stop_grace_ns = int(application.get("stopGracePeriodSwarm") or 0)
+        replicas = int(service["replicas"])
+        stop_grace_ns = int(service.get("stopGracePeriod") or 0)
         if stop_grace_ns < REQUIRED_STOP_GRACE_NS:
             raise ValueError(
                 "configured Swarm stop grace must outlive the supervised process drain"
@@ -360,7 +662,7 @@ def verify_rollout(
             continue
 
         def inspect_task(task_id: str) -> tuple[str, frozenset[str]]:
-            instance, addresses, labels = inspect_task_runtime(task_id, network)
+            instance, addresses, labels = inspect_task_runtime(task_id, network_id)
             if not isinstance(labels, dict) or any(
                 labels.get(key) != value for key, value in expected_labels.items()
             ):
@@ -375,16 +677,11 @@ def verify_rollout(
         authoritative_addresses = frozenset(
             address for _, addresses in inspected_tasks for address in addresses
         )
-
-        if ingress_stats_url is not None:
-            admitted_backends = frozenset(ingress_backends(ingress_stats_url))
-            if len(admitted_backends) != len(authoritative_addresses):
-                candidate = None
-                stable_rounds = 0
-                sleep(5)
-                continue
-        else:
-            admitted_backends = authoritative_addresses
+        if any(admitted != authoritative_addresses for admitted in admitted_services):
+            candidate = None
+            stable_rounds = 0
+            sleep(5)
+            continue
 
         responses = probe_health(health_url, max(4, replicas * 4))
         matches = [_is_exact_health(health, revision) for health in responses]
@@ -407,7 +704,8 @@ def verify_rollout(
             verify_monitor_evidence(
                 monitor_evidence_path,
                 authoritative_instances,
-                admitted_backends,
+                actual_running_tasks,
+                authoritative_addresses,
             )
             print(
                 json.dumps(
@@ -416,7 +714,7 @@ def verify_rollout(
                         "tasks": sorted(actual_running_tasks),
                         "instances": sorted(authoritative_instances),
                         "taskAddresses": sorted(authoritative_addresses),
-                        "admittedBackends": sorted(admitted_backends),
+                        "admittedTaskAddresses": sorted(authoritative_addresses),
                     },
                     separators=(",", ":"),
                 )
@@ -430,6 +728,20 @@ def verify_rollout(
 
 def main(arguments: list[str] | None = None) -> None:
     arguments = sys.argv[1:] if arguments is None else arguments
+    if arguments == ["monitor"]:
+        monitor_public_health(
+            health_url=os.environ.get(
+                "HEALTH_URL", "https://crawl4ai.haiku.host/health"
+            ),
+            expected_replicas=int(os.environ.get("EXPECTED_REPLICAS", "3")),
+            evidence_path=Path(os.environ["ROLLOUT_MONITOR_PATH"]),
+            armed_path=Path(os.environ["ROLLOUT_MONITOR_ARMED_PATH"]),
+            stop_path=Path(os.environ["ROLLOUT_MONITOR_STOP_PATH"]),
+            dokploy_url=os.environ["DOKPLOY_URL"],
+            api_key=os.environ["DOKPLOY_API_KEY"],
+            application_id=os.environ["APPLICATION_ID"],
+        )
+        return
     if arguments:
         raise ValueError(f"Unsupported verifier arguments: {arguments}")
     verify_rollout(
@@ -444,9 +756,7 @@ def main(arguments: list[str] | None = None) -> None:
             if os.environ.get("ROLLOUT_MONITOR_PATH")
             else None
         ),
-        ingress_stats_url=ingress_task_stats_url(
-            os.environ["INGRESS_APPLICATION_APP_NAME"]
-        ),
+        expected_image=f'{os.environ["IMAGE"]}@{os.environ["IMAGE_DIGEST"]}',
     )
 
 
