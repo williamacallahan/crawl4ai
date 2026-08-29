@@ -357,13 +357,12 @@ def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
         + '{"Network":{"ID":"network"},"Addresses":["10.0.1.11/24"]}]\t'
         + '"registry.example/crawl4ai@sha256:target"\n'
     )
-    monkeypatch.setattr(
-        rollout_verifier.subprocess,
-        "run",
-        lambda *_args, **_kwargs: rollout_verifier.subprocess.CompletedProcess(
-            [], 0, output, ""
-        ),
-    )
+    def run(command, **_kwargs):
+        template = command[command.index("--format") + 1]
+        assert "{{if .Status.ContainerStatus}}" in template
+        return rollout_verifier.subprocess.CompletedProcess(command, 0, output, "")
+
+    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
 
     instance, addresses, labels, image = ORIGINAL_INSPECT_TASK_RUNTIME(
         "task", "network"
@@ -437,8 +436,51 @@ def test_swarm_tasks_does_not_mask_non_race_inspect_failures(monkeypatch, stderr
 
     monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
 
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError) as failure:
         rollout_verifier._swarm_tasks("crawl4ai", set())
+
+    assert isinstance(failure.value.__cause__, subprocess.CalledProcessError)
+    assert stderr.strip() in str(failure.value)
+
+
+def test_swarm_tasks_reads_a_task_that_has_no_container_yet(monkeypatch):
+    tasks = '{"ID":"pending12345","DesiredState":"Running"}\n'
+    inspected = (
+        '"pending12345"\t1\t""\t"2026-08-29T00:00:01Z"\t"2026-08-29T00:00:02Z"\n'
+    )
+
+    def run(command, **_kwargs):
+        if command[1:3] == ["service", "ps"]:
+            return subprocess.CompletedProcess(command, 0, tasks, "")
+        # Docker exits 1 on an unguarded read of a key Swarm omits until the
+        # container exists, so the guard is what keeps this task inspectable.
+        template = command[command.index("--format") + 1]
+        assert "{{if .Status.ContainerStatus}}" in template
+        return subprocess.CompletedProcess(command, 0, inspected, "")
+
+    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
+
+    result = rollout_verifier._swarm_tasks("crawl4ai", set())
+
+    assert result[0]["ContainerID"] == ""
+    assert result[0]["Slot"] == 1
+
+
+def test_swarm_tasks_ignores_blank_inspect_output_lines(monkeypatch):
+    tasks = '{"ID":"vanished1234","DesiredState":"Running"}\n'
+
+    def run(command, **_kwargs):
+        if command[1:3] == ["service", "ps"]:
+            return subprocess.CompletedProcess(command, 0, tasks, "")
+        return subprocess.CompletedProcess(
+            command, 1, "\n", "error: no such object: vanished1234\n"
+        )
+
+    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
+
+    result = rollout_verifier._swarm_tasks("crawl4ai", set())
+
+    assert result[0]["ContainerID"] == ""
 
 
 def test_native_route_requires_only_vip_services_and_the_no_reuse_transport(
@@ -973,6 +1015,92 @@ def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_pat
             for entry in (
                 sample(["old-instance"], [predecessor]),
                 sample(["old-instance"], [predecessor, candidate_starting]),
+                sample(["new-instance"], [candidate_running, predecessor_draining]),
+                sample(["new-instance"], [candidate_running, predecessor_exited]),
+            )
+        )
+        + "\n"
+    )
+
+    verify_monitor_evidence(
+        Path(evidence),
+        frozenset({"new-instance"}),
+        frozenset({"new-task"}),
+        "target",
+        frozenset({"https://crawl.example/health"}),
+    )
+
+
+def test_monitor_ignores_tasks_without_a_container_when_correlating(tmp_path):
+    def task(task_id, container_id, desired, current, **overrides):
+        return {
+            "ID": task_id,
+            "ContainerID": container_id,
+            "DesiredState": desired,
+            "CurrentState": current,
+            "Slot": 1,
+            "StatusTimestamp": overrides.get(
+                "status_timestamp", "2026-08-29T00:00:00Z"
+            ),
+            "UpdatedAt": overrides.get("updated_at", "2026-08-29T00:00:00Z"),
+        }
+
+    def sample(instances, tasks):
+        return {
+            "ok": True,
+            "health": [
+                {
+                    "ok": True,
+                    "url": "https://crawl.example/health",
+                    "instance": instance,
+                    "revision": "target",
+                }
+                for instance in instances
+            ],
+            "tasks": tasks,
+        }
+
+    predecessor = task("old-task", "old-instance", "Running", "Running 1m")
+    # Swarm creates the candidate before its container exists; the monitor now
+    # records that task instead of aborting, so it must not shadow the predecessor.
+    candidate_pending = task(
+        "new-task",
+        "",
+        "Running",
+        "Preparing 1s",
+        status_timestamp="2026-08-29T00:00:01Z",
+        updated_at="2026-08-29T00:00:01Z",
+    )
+    candidate_running = task(
+        "new-task",
+        "new-instance",
+        "Running",
+        "Running 1s",
+        status_timestamp="2026-08-29T00:00:02Z",
+        updated_at="2026-08-29T00:00:02Z",
+    )
+    predecessor_draining = task(
+        "old-task",
+        "old-instance",
+        "Shutdown",
+        "Running 1m",
+        updated_at="2026-08-29T00:00:03Z",
+    )
+    predecessor_exited = task(
+        "old-task",
+        "old-instance",
+        "Shutdown",
+        "Complete 1s",
+        status_timestamp="2026-08-29T00:00:04Z",
+        updated_at="2026-08-29T00:00:03Z",
+    )
+    evidence = tmp_path / "rollout.jsonl"
+    evidence.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                sample(["old-instance"], [predecessor, candidate_pending]),
+                sample(["old-instance"], [predecessor, candidate_pending]),
                 sample(["new-instance"], [candidate_running, predecessor_draining]),
                 sample(["new-instance"], [candidate_running, predecessor_exited]),
             )

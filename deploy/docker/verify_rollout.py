@@ -75,6 +75,14 @@ ROLLOUT_MONITOR_NS = ROLLOUT_DELAY_NS
 STOP_GRACE_NS = 390_000_000_000
 ROLLOUT_PROOF_TIMEOUT_SECONDS = 4_000
 MONITOR_INTERVAL_SECONDS = 0.5
+# A task that has not reached its container yet (new/pending/assigned/accepted/
+# preparing) carries no Status.ContainerStatus, and Go template evaluation of a
+# missing key exits 1 with "template parsing error". Every rolling update creates
+# such a task, so the field must be read defensively.
+TASK_CONTAINER_ID_FORMAT = (
+    "{{if .Status.ContainerStatus}}{{json .Status.ContainerStatus.ContainerID}}"
+    '{{else}}""{{end}}'
+)
 
 
 def _observability_labels(revision: str) -> dict[str, str]:
@@ -973,8 +981,8 @@ def _swarm_tasks(app_name: str, tracked_task_ids: set[str]) -> list[dict[str, An
                 "inspect",
                 "--format",
                 "{{json .ID}}\t{{json .Slot}}\t"
-                "{{json .Status.ContainerStatus.ContainerID}}\t"
-                "{{json .Status.Timestamp}}\t{{json .Meta.UpdatedAt}}",
+                + TASK_CONTAINER_ID_FORMAT
+                + "\t{{json .Status.Timestamp}}\t{{json .Meta.UpdatedAt}}",
                 *task_ids,
             ],
             capture_output=True,
@@ -995,10 +1003,18 @@ def _swarm_tasks(app_name: str, tracked_task_ids: set[str]) -> list[dict[str, An
             or len(missing_task_ids) != len(error_lines)
             or not missing_task_ids <= set(task_ids)
         ):
-            inspected.check_returncode()
+            try:
+                inspected.check_returncode()
+            except subprocess.CalledProcessError as error:
+                raise RuntimeError(
+                    f"docker inspect failed for {task_ids}: "
+                    f"{inspected.stderr.strip()}"
+                ) from error
         containers = {}
         for task_id, slot, container_id, status_timestamp, updated_at in (
-            line.split("\t", 4) for line in inspected.stdout.splitlines()
+            line.split("\t", 4)
+            for line in inspected.stdout.splitlines()
+            if line
         ):
             container = json.loads(container_id)
             containers[json.loads(task_id)[:12]] = (
@@ -1112,10 +1128,13 @@ def verify_monitor_evidence(
     if not baseline_instances.isdisjoint(final_instances):
         raise RuntimeError("public monitor did not prove full predecessor withdrawal")
 
+    # A task without a container has not started and cannot be a predecessor
+    # whose withdrawal this proof correlates.
     first_tasks_by_slot = {
         task.get("Slot"): _task_id(task)
         for task in samples[0]["tasks"]
         if str(task.get("DesiredState", "")).lower() == "running"
+        and task.get("ContainerID")
     }
     first_tasks = set(first_tasks_by_slot.values())
     if first_tasks & final_tasks:
@@ -1246,9 +1265,9 @@ def _inspect_task_runtime(
             "inspect",
             task_id,
             "--format",
-            "{{json .Status.ContainerStatus.ContainerID}}\t"
-            "{{json .Spec.ContainerSpec.Labels}}\t{{json .NetworksAttachments}}\t"
-            "{{json .Spec.ContainerSpec.Image}}",
+            TASK_CONTAINER_ID_FORMAT
+            + "\t{{json .Spec.ContainerSpec.Labels}}\t"
+            + "{{json .NetworksAttachments}}\t{{json .Spec.ContainerSpec.Image}}",
         ],
         check=True,
         capture_output=True,
