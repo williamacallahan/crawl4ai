@@ -598,6 +598,15 @@ async def test_health_reports_unavailable_effective_redis_without_details(
     assert "topology detail" not in response.text
 
 
+def test_swarm_drain_keeps_established_vip_connections_ready():
+    entrypoint = (DOCKER_DIR / "entrypoint.sh").read_text()
+    drain = entrypoint.split("begin_drain()", maxsplit=1)[1]
+    assert "CRAWL4AI_DRAIN_PATH" not in entrypoint
+    assert drain.index('sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"') < drain.index(
+        'kill -TERM "${SUPERVISORD_PID}"'
+    )
+
+
 def test_ui_tokens_are_ephemeral_and_cdn_assets_are_version_pinned():
     playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
     monitor = (DOCKER_DIR / "static" / "monitor" / "index.html").read_text()

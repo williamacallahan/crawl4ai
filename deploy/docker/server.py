@@ -441,9 +441,6 @@ async def add_security_headers(request: Request, call_next):
 # transports and the metrics endpoint, for HTTP and WebSocket alike. Only the
 # health/token endpoints and the exact UI redirects are public.
 HEALTH_PATH = config["observability"]["health_check"]["endpoint"]
-DRAIN_PATH = pathlib.Path(
-    os.environ.get("CRAWL4AI_DRAIN_PATH", "/tmp/crawl4ai-draining")
-)
 
 
 # ── request body-size limit (DoS) ─────────────────────────────────────
@@ -967,7 +964,7 @@ async def health():
         "instance": os.environ.get("HOSTNAME", ""),
         "components": {"api": "unavailable"},
     }
-    if DRAIN_PATH.exists() or not getattr(app.state, "readiness_checks_active", False):
+    if not getattr(app.state, "readiness_checks_active", False):
         return JSONResponse(payload, status_code=503)
     try:
         await asyncio.wait_for(redis.ping(), timeout=2.0)

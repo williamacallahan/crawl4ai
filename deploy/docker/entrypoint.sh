@@ -63,15 +63,13 @@ else
 fi
 export GUNICORN_BIND
 
-DRAIN_PATH="${CRAWL4AI_DRAIN_PATH:-/tmp/crawl4ai-draining}"
-rm -f "${DRAIN_PATH}"
 supervisord -c supervisord.conf --pidfile /tmp/supervisord.pid &
 SUPERVISORD_PID=$!
 
 begin_drain() {
     trap '' TERM INT
-    touch "${DRAIN_PATH}"
-    # Swarm removes this task from the service VIP before sending SIGTERM.
+    # Swarm withdraws the task before SIGTERM. Keep established VIP connections
+    # ready through the gossip delay instead of poisoning them with a 503.
     sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"
     kill -TERM "${SUPERVISORD_PID}" 2>/dev/null || true
     wait "${SUPERVISORD_PID}" || exit $?
