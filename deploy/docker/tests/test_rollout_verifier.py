@@ -51,6 +51,10 @@ def _application(**overrides):
         "replicas": 1,
         "appName": "crawl4ai",
         "dockerImage": "registry.example/crawl4ai@sha256:target",
+        "cpuReservation": rollout_verifier.CRAWL_CPU_RESERVATION,
+        "cpuLimit": rollout_verifier.CRAWL_CPU_LIMIT,
+        "memoryReservation": rollout_verifier.CRAWL_MEMORY_RESERVATION,
+        "memoryLimit": rollout_verifier.CRAWL_MEMORY_LIMIT,
         "labelsSwarm": rollout_verifier._observability_labels("target"),
         "env": (
             f"LLM_PROVIDER={rollout_verifier.LLM_PROVIDER}\n"
@@ -297,16 +301,17 @@ def test_native_route_rejects_one_router_service_without_transport(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("node_count", [3, 4])
-def test_rollout_preflight_requires_four_capacity_admitted_nodes(
-    monkeypatch, node_count
+@pytest.mark.parametrize("eligible", [frozenset({"haiku-4"}), None])
+def test_rollout_preflight_requires_the_exact_capacity_admitted_pool(
+    monkeypatch, eligible
 ):
     monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
+    nodes = eligible or rollout_verifier.CRAWL_ELIGIBLE_NODES
     monkeypatch.setattr(
         rollout_verifier.subprocess,
         "run",
         lambda *_args, **_kwargs: rollout_verifier.subprocess.CompletedProcess(
-            [], 0, "".join(f"node-{index} Active\n" for index in range(node_count)), ""
+            [], 0, "".join(f"{node} Active\n" for node in sorted(nodes)), ""
         ),
     )
     monkeypatch.setattr(
@@ -324,9 +329,23 @@ def test_rollout_preflight_requires_four_capacity_admitted_nodes(
                     "Healthcheck": {"Test": rollout_verifier.CRAWL_HEALTHCHECK},
                     "StopGracePeriod": rollout_verifier.STOP_GRACE_NS,
                 },
-                "Placement": {"MaxReplicas": 1},
+                "Placement": {
+                    "Constraints": [rollout_verifier.CRAWL_NODE_CONSTRAINT],
+                    "MaxReplicas": 1,
+                },
+                "Resources": {
+                    "Reservations": {
+                        "NanoCPUs": int(rollout_verifier.CRAWL_CPU_RESERVATION),
+                        "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_RESERVATION),
+                    },
+                    "Limits": {
+                        "NanoCPUs": int(rollout_verifier.CRAWL_CPU_LIMIT),
+                        "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_LIMIT),
+                    },
+                },
             },
             "Mode": {"Replicated": {"Replicas": 3}},
+            "EndpointSpec": {"Mode": "vip"},
             "UpdateConfig": {
                 "Order": "start-first",
                 "Parallelism": 1,
@@ -346,8 +365,8 @@ def test_rollout_preflight_requires_four_capacity_admitted_nodes(
         },
     )
 
-    if node_count < 4:
-        with pytest.raises(RuntimeError, match="four resource-admitted"):
+    if eligible is not None:
+        with pytest.raises(RuntimeError, match="admitted haiku-4/5/9/18"):
             verify_rollout_preflight(
                 dokploy_url="https://dokploy.example",
                 api_key="secret",

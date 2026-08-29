@@ -33,6 +33,11 @@ CRAWL_HEALTHCHECK_MIN_RETRIES = 3
 CRAWL_HEALTHCHECK_MIN_INTERVAL_NS = 5_000_000_000
 CRAWL_MAX_REPLICAS_PER_NODE = 1
 CRAWL_NODE_CONSTRAINT = "node.labels.crawl4ai-eligible==true"
+CRAWL_ELIGIBLE_NODES = frozenset({"haiku-4", "haiku-5", "haiku-9", "haiku-18"})
+CRAWL_CPU_RESERVATION = "500000000"
+CRAWL_CPU_LIMIT = "2000000000"
+CRAWL_MEMORY_RESERVATION = "1073741824"
+CRAWL_MEMORY_LIMIT = "4294967296"
 CRAWL_ENDPOINT_SPEC = {"Mode": "vip", "Ports": []}
 ROLLOUT_DELAY_NS = 150_000_000_000
 ROLLOUT_MONITOR_NS = 150_000_000_000
@@ -88,6 +93,14 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
         raise ValueError("Crawl4AI placement must keep one replica per node")
     if placement.get("Constraints") != [CRAWL_NODE_CONSTRAINT]:
         raise ValueError("Crawl4AI placement must use capacity-admitted nodes")
+    for field, expected in (
+        ("cpuReservation", CRAWL_CPU_RESERVATION),
+        ("cpuLimit", CRAWL_CPU_LIMIT),
+        ("memoryReservation", CRAWL_MEMORY_RESERVATION),
+        ("memoryLimit", CRAWL_MEMORY_LIMIT),
+    ):
+        if application.get(field) != expected:
+            raise ValueError(f"Crawl4AI {field} does not match the admitted envelope")
     if application.get("endpointSpecSwarm") != CRAWL_ENDPOINT_SPEC:
         raise ValueError("Crawl4AI must use the native Swarm VIP endpoint mode")
     if application.get("swarmVipConnectionReuse") is not False:
@@ -157,7 +170,10 @@ def _verify_redis_configuration(application: Any) -> None:
 
 
 def _verify_current_rollout_source(application: Any) -> None:
-    if not isinstance(application, dict) or not application.get("dockerImage"):
+    if (
+        not isinstance(application, dict)
+        or "@sha256:" not in str(application.get("dockerImage", ""))
+    ):
         raise ValueError("current Crawl4AI artifact is not configured")
     if application.get("replicas") != CRAWL_REPLICAS:
         raise ValueError("current Crawl4AI service must have three replicas")
@@ -165,8 +181,22 @@ def _verify_current_rollout_source(application: Any) -> None:
     if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
         raise ValueError("current Crawl4AI service lacks the admission healthcheck")
     placement = application.get("placementSwarm")
-    if not isinstance(placement, dict) or placement.get("MaxReplicas") != 1:
+    if (
+        not isinstance(placement, dict)
+        or placement.get("MaxReplicas") != 1
+        or placement.get("Constraints") != [CRAWL_NODE_CONSTRAINT]
+    ):
         raise ValueError("current Crawl4AI service lacks one-task-per-node placement")
+    if application.get("endpointSpecSwarm") != CRAWL_ENDPOINT_SPEC:
+        raise ValueError("current Crawl4AI service does not use the native VIP")
+    for field, expected in (
+        ("cpuReservation", CRAWL_CPU_RESERVATION),
+        ("cpuLimit", CRAWL_CPU_LIMIT),
+        ("memoryReservation", CRAWL_MEMORY_RESERVATION),
+        ("memoryLimit", CRAWL_MEMORY_LIMIT),
+    ):
+        if application.get(field) != expected:
+            raise ValueError(f"current Crawl4AI {field} is not admission-safe")
     for field, failure_action in (
         ("updateConfigSwarm", "rollback"),
         ("rollbackConfigSwarm", "pause"),
@@ -208,13 +238,29 @@ def _verify_current_service_spec(
     if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
         raise ValueError("current Docker service lacks the admission healthcheck")
     placement = task.get("Placement")
-    if not isinstance(placement, dict) or placement.get("MaxReplicas") != 1:
+    if (
+        not isinstance(placement, dict)
+        or placement.get("MaxReplicas") != 1
+        or placement.get("Constraints") != [CRAWL_NODE_CONSTRAINT]
+    ):
         raise ValueError("current Docker service lacks one-task-per-node placement")
+    resources = task.get("Resources")
+    if not isinstance(resources, dict) or resources.get("Reservations") != {
+        "NanoCPUs": int(CRAWL_CPU_RESERVATION),
+        "MemoryBytes": int(CRAWL_MEMORY_RESERVATION),
+    } or resources.get("Limits") != {
+        "NanoCPUs": int(CRAWL_CPU_LIMIT),
+        "MemoryBytes": int(CRAWL_MEMORY_LIMIT),
+    }:
+        raise ValueError("current Docker service resources differ from admission")
     if int(container.get("StopGracePeriod") or 0) < REQUIRED_STOP_GRACE_NS:
         raise ValueError("current Docker service stop grace is not drain-safe")
     mode = spec.get("Mode")
     if not isinstance(mode, dict) or mode.get("Replicated", {}).get("Replicas") != CRAWL_REPLICAS:
         raise ValueError("current Docker service does not have three replicas")
+    endpoint = spec.get("EndpointSpec")
+    if not isinstance(endpoint, dict) or endpoint.get("Mode") != "vip":
+        raise ValueError("current Docker service does not use the native VIP")
     for field, failure_action in (
         ("UpdateConfig", "rollback"),
         ("RollbackConfig", "pause"),
@@ -245,16 +291,18 @@ def verify_rollout_preflight(
             "--filter",
             "status=ready",
             "--format",
-            "{{.ID}} {{.Availability}}",
+            "{{.Hostname}} {{.Availability}}",
         ],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-    eligible = [line for line in nodes if line.endswith(" Active")]
-    if len(eligible) < CRAWL_REPLICAS + 1:
+    eligible = {
+        line.removesuffix(" Active") for line in nodes if line.endswith(" Active")
+    }
+    if eligible != CRAWL_ELIGIBLE_NODES:
         raise RuntimeError(
-            "start-first requires four resource-admitted crawl4ai-eligible nodes"
+            "crawl4ai-eligible must match the admitted haiku-4/5/9/18 pool"
         )
     application = _curl_json(
         _dokploy_url(

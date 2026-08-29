@@ -23,7 +23,13 @@
       "Bash(./test-final-integration.sh:*)",
       "Bash(mv:*)",
       "Bash(ssh *)",
-      "Bash(command -v docker)"
+      "Bash(command -v docker)",
+      "Bash(env AVENTURE_AGENT_CHASSIS=claude-code AVENTURE_AGENT_MODEL=\"qwen3.8-27b\" aventure-cli media upload --media-type NEWS --media-id 1000009 --file \"https://assets.bwbx.io/images/users/iqjWHBFdfxIU/icBHWxhuaPv8/v1/1200x800.jpg\" --source-type newsArticle --source-detail \"https://www.bloomberg.com/news/articles/2026-08-28/nvidia-backed-lambda-inks-1-billion-private-debt-for-chip-deal\" --execute --data)",
+      "Bash(sips -g pixelWidth -g pixelHeight kakao-new-2h2.png kakao-old-e2k.webp)",
+      "Bash(sips -s format png kakao-favicon.ico --out kakao-favicon-64.png)",
+      "Bash(sips -g pixelWidth -g pixelHeight kakao-favicon-64.png)",
+      "Bash(sips -g pixelWidth -g pixelHeight vfo.png xp3.png)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__:__TRACKED_VAR__/deploy/docker .venv/bin/python -m pytest deploy/docker/tests/test_readiness_routing.py -q)"
     ]
   },
   "enableAllProjectMcpServers": false

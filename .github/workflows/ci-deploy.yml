@@ -242,7 +242,7 @@ jobs:
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.update" \
             -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health"],"Interval":10000000000,"Timeout":5000000000,"StartPeriod":120000000000,"Retries":5},"placementSwarm":{"Constraints":["node.labels.crawl4ai-eligible==true"],"MaxReplicas":1},"endpointSpecSwarm":{"Mode":"vip","Ports":[]},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"cpuReservation":"500000000","cpuLimit":"2000000000","memoryReservation":"1073741824","memoryLimit":"4294967296","labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health"],"Interval":10000000000,"Timeout":5000000000,"StartPeriod":120000000000,"Retries":5},"placementSwarm":{"Constraints":["node.labels.crawl4ai-eligible==true"],"MaxReplicas":1},"endpointSpecSwarm":{"Mode":"vip","Ports":[]},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
 
           export BASELINE_FORCE_UPDATE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ForceUpdate}}')"
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
@@ -265,7 +265,10 @@ jobs:
               -X POST "$DOKPLOY_URL/api/application.deploy" \
               -H 'content-type: application/json' \
               --data "$(printf '{"applicationId":"%s"}' "$REDIS_APPLICATION_ID")" >/dev/null
-            for _ in {1..60}; do
+            # Dokploy applied the one observed convergence redeploy ~5m36s
+            # after the POST (23:43:58 -> 23:49:34 on 2026-08-28), so a 300s
+            # poll expires before a healthy apply lands. Give it 600s.
+            for _ in {1..120}; do
               running="$(docker service ps "$REDIS_APPLICATION_APP_NAME" --filter desired-state=running --format '{{.CurrentState}}' | grep -c '^Running' || true)"
               if redis_args | grep -q 'appendfsync","everysec' && [ "$running" = "1" ]; then
                 break
