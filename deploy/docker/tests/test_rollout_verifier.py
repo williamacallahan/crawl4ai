@@ -60,7 +60,7 @@ def _task_runtime(monkeypatch):
     monkeypatch.setattr(
         rollout_verifier,
         "_service_update_state",
-        lambda _app_name: "rollback_completed",
+        lambda _app_name: "completed",
     )
     monkeypatch.setattr(
         rollout_verifier,
@@ -352,6 +352,62 @@ def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
     assert image == "registry.example/crawl4ai@sha256:target"
 
 
+def test_swarm_tasks_keeps_survivor_metadata_when_one_task_disappears(monkeypatch):
+    tasks = (
+        '{"ID":"survivor123","DesiredState":"Running"}\n'
+        '{"ID":"vanished1234","DesiredState":"Running"}\n'
+    )
+    inspected = (
+        '"survivor123"\t1\t"container123456"\t'
+        '"2026-08-29T00:00:01Z"\t"2026-08-29T00:00:02Z"\n'
+    )
+
+    def run(command, **_kwargs):
+        if command[1:3] == ["service", "ps"]:
+            return subprocess.CompletedProcess(command, 0, tasks, "")
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            inspected,
+            "Error: No such object: vanished1234\n",
+        )
+
+    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
+
+    result = rollout_verifier._swarm_tasks("crawl4ai", set())
+
+    assert result[0]["ContainerID"] == "container123"
+    assert result[0]["Slot"] == 1
+    assert result[1]["ContainerID"] == ""
+    assert result[1]["Slot"] is None
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "",
+        "Error response from daemon: permission denied\n",
+        "Error: No such object: different-task\n",
+        (
+            "Error: No such object: vanished1234\n"
+            "Error response from daemon: permission denied\n"
+        ),
+    ],
+)
+def test_swarm_tasks_does_not_mask_non_race_inspect_failures(monkeypatch, stderr):
+    tasks = '{"ID":"vanished1234","DesiredState":"Running"}\n'
+
+    def run(command, **_kwargs):
+        if command[1:3] == ["service", "ps"]:
+            return subprocess.CompletedProcess(command, 0, tasks, "")
+        return subprocess.CompletedProcess(command, 1, "", stderr)
+
+    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        rollout_verifier._swarm_tasks("crawl4ai", set())
+
+
 def test_native_route_requires_only_vip_services_and_the_no_reuse_transport(
     monkeypatch,
 ):
@@ -465,7 +521,12 @@ def test_native_route_rejects_one_router_service_without_transport(monkeypatch):
         )
 
 
-def test_rollback_verifier_requires_tasks_public_health_and_metadata():
+def test_rollback_verifier_requires_tasks_public_health_and_metadata(monkeypatch):
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_service_update_state",
+        lambda _app_name: "rollback_completed",
+    )
     read_json = _fake_read(
         {
             "application.one": {"replicas": 1, "appName": "crawl4ai"},
@@ -975,6 +1036,81 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_wi
         sleep=lambda _seconds: None,
     )
     assert set(probed_urls) == set(health_urls)
+
+
+def test_verifier_waits_for_swarm_completion_before_inspecting_runtime_labels(
+    monkeypatch,
+):
+    states = iter(["updating", "completed", "completed"])
+    inspected_states = []
+    current_state = None
+
+    def update_state(_app_name):
+        nonlocal current_state
+        current_state = next(states)
+        return current_state
+
+    def inspect_task(_task_id, _network_id):
+        inspected_states.append(current_state)
+        return (
+            "a" * 12,
+            frozenset({"10.0.1.11"}),
+            rollout_verifier._observability_labels("target"),
+            TARGET_IMAGE,
+        )
+
+    monkeypatch.setattr(rollout_verifier, "_service_update_state", update_state)
+    read_json = _fake_read(
+        {
+            "deployment.all": [{"status": "done"}],
+            "application.one": {"replicas": 1, "appName": "crawl4ai"},
+            "docker.getServiceContainersByAppName": [_running_task("task-a", "a")],
+        }
+    )
+
+    verify_rollout(
+        dokploy_url="https://dokploy.example",
+        api_key="secret",
+        application_id="app",
+        redis_application_id="redis",
+        revision="target",
+        expected_image=TARGET_IMAGE,
+        baseline_image=TARGET_IMAGE,
+        health_urls=HEALTH_URLS,
+        read_json=read_json,
+        probe_health=lambda _url, count: [_health("a" * 12)] * count,
+        sleep=lambda _seconds: None,
+        inspect_task_runtime=inspect_task,
+    )
+
+    assert inspected_states == ["completed", "completed"]
+
+
+@pytest.mark.parametrize("state", ["paused", "rollback_paused", "rollback_completed"])
+def test_verifier_rejects_terminal_swarm_update_state(monkeypatch, state):
+    monkeypatch.setattr(
+        rollout_verifier, "_service_update_state", lambda _app_name: state
+    )
+    read_json = _fake_read(
+        {
+            "deployment.all": [{"status": "done"}],
+            "application.one": {"replicas": 1, "appName": "crawl4ai"},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match=state):
+        verify_rollout(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            redis_application_id="redis",
+            revision="target",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
+            read_json=read_json,
+            sleep=lambda _seconds: None,
+        )
 
 
 @pytest.mark.parametrize(

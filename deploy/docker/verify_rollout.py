@@ -801,10 +801,21 @@ def _swarm_tasks(app_name: str, tracked_task_ids: set[str]) -> list[dict[str, An
                 "{{json .Status.Timestamp}}\t{{json .Meta.UpdatedAt}}",
                 *task_ids,
             ],
-            check=True,
             capture_output=True,
             text=True,
         )
+        error_lines = inspected.stderr.splitlines()
+        missing_task_ids = {
+            match.group(1)
+            for line in error_lines
+            if (match := re.fullmatch(r"Error: No such object: (\S+)", line))
+        }
+        if inspected.returncode and (
+            not error_lines
+            or len(missing_task_ids) != len(error_lines)
+            or not missing_task_ids <= set(task_ids)
+        ):
+            inspected.check_returncode()
         containers = {}
         for task_id, slot, container_id, status_timestamp, updated_at in (
             line.split("\t", 4) for line in inspected.stdout.splitlines()
@@ -1175,6 +1186,17 @@ def verify_rollout(
             api_key,
         )
         _verify_release_configuration(application, revision, expected_image)
+        app_name = application["appName"]
+        update_state = _service_update_state(app_name)
+        if update_state != "completed":
+            if update_state in {"paused", "rollback_paused", "rollback_completed"}:
+                raise RuntimeError(
+                    f"Swarm update stopped before final convergence: {update_state}"
+                )
+            candidate = None
+            stable_rounds = 0
+            sleep(5)
+            continue
         redis_application = read_json(
             _dokploy_url(
                 dokploy_url, "application.one", applicationId=redis_application_id
@@ -1214,7 +1236,6 @@ def verify_rollout(
             raise ValueError(
                 f"configured replicas must be between 1 and {MAX_REPLICAS}"
             )
-        app_name = application["appName"]
         tasks = read_json(
             _dokploy_url(
                 dokploy_url, "docker.getServiceContainersByAppName", appName=app_name
