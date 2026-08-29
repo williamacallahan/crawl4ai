@@ -28,8 +28,7 @@
       "Bash(sips -g pixelWidth -g pixelHeight kakao-new-2h2.png kakao-old-e2k.webp)",
       "Bash(sips -s format png kakao-favicon.ico --out kakao-favicon-64.png)",
       "Bash(sips -g pixelWidth -g pixelHeight kakao-favicon-64.png)",
-      "Bash(sips -g pixelWidth -g pixelHeight vfo.png xp3.png)",
-      "Bash(PYTHONPATH=__TRACKED_VAR__:__TRACKED_VAR__/deploy/docker .venv/bin/python -m pytest deploy/docker/tests/test_readiness_routing.py -q)"
+      "Bash(sips -g pixelWidth -g pixelHeight vfo.png xp3.png)"
     ]
   },
   "enableAllProjectMcpServers": false

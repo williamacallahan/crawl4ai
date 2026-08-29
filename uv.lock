@@ -568,6 +568,9 @@ transformer = [
 ]
 
 [package.dev-dependencies]
+deploy = [
+    { name = "pyyaml" },
+]
 dev = [
     { name = "crawl4ai" },
 ]
@@ -656,6 +659,7 @@ requires-dist = [
 provides-extras = ["pdf", "torch", "transformer", "cosine", "sync", "all"]
 
 [package.metadata.requires-dev]
+deploy = [{ name = "pyyaml", specifier = "==6.0.2" }]
 dev = [{ name = "crawl4ai", editable = "." }]
 server = [
     { name = "anyio", specifier = "==4.9.0" },

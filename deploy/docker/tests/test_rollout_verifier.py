@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
+import os
+import signal
+import subprocess
+import sys
+import time
 import urllib.parse
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,7 +18,7 @@ import verify_rollout as rollout_verifier
 from verify_rollout import (
     MAX_RESPONSE_BYTES,
     REQUIRED_STOP_GRACE_NS,
-    _curl_json,
+    _request_json,
     _has_task_error,
     verify_monitor_evidence,
     verify_native_route,
@@ -21,11 +27,22 @@ from verify_rollout import (
 )
 
 ORIGINAL_INSPECT_TASK_RUNTIME = rollout_verifier._inspect_task_runtime
+TARGET_IMAGE = "registry.example/crawl4ai@sha256:target"
+HEALTH_URLS = ("https://crawl.example/health",)
+DOCKER_DIR = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(autouse=True)
 def _task_runtime(monkeypatch):
     monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 1)
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_crawl_node_inventory",
+        lambda: {
+            node: ("Ready", "Active") for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
+        },
+    )
+
     def inspect(task_id, _network_id):
         instance = ("b" if "b" in task_id else "a") * 12
         address = "10.0.1.12" if instance.startswith("b") else "10.0.1.11"
@@ -38,12 +55,70 @@ def _task_runtime(monkeypatch):
 
     monkeypatch.setattr(rollout_verifier, "_inspect_task_runtime", inspect)
     monkeypatch.setattr(rollout_verifier, "_dokploy_network_id", lambda: "network")
+    monkeypatch.setattr(rollout_verifier, "verify_native_route", lambda **_kwargs: None)
+    monkeypatch.setattr(rollout_verifier, "_post_json", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_service_update_state",
+        lambda _app_name: "rollback_completed",
+    )
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_service_spec",
+        lambda app_name: (
+            _redis_service_spec()
+            if app_name == "crawl4ai-redis"
+            else _crawl_service_spec(rollout_verifier.CRAWL_REPLICAS)
+        ),
+    )
 
 
 def test_release_requires_exactly_three_replicas(monkeypatch):
     monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
     with pytest.raises(ValueError, match="exactly three"):
-        rollout_verifier._verify_release_configuration(_application(replicas=2), "target")
+        rollout_verifier._verify_release_configuration(
+            _application(replicas=2), "target", TARGET_IMAGE
+        )
+
+
+@pytest.mark.parametrize("field", ["updateConfigSwarm", "stopGracePeriodSwarm"])
+def test_current_rollout_source_rejects_timing_drift(field):
+    application = _application()
+    if field == "updateConfigSwarm":
+        application[field] = {
+            **application[field],
+            "Delay": rollout_verifier.ROLLOUT_DELAY_NS - 1,
+        }
+    else:
+        application[field] = rollout_verifier.STOP_GRACE_NS - 1
+    with pytest.raises(ValueError):
+        rollout_verifier._verify_current_rollout_source(application)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda spec: spec["TaskTemplate"]["ContainerSpec"]["Healthcheck"].update(
+            StartPeriod=1
+        ),
+        lambda spec: spec["EndpointSpec"].update(
+            Ports=[{"TargetPort": 11235, "PublishedPort": 11235}]
+        ),
+    ],
+)
+def test_rendered_crawl_service_rejects_healthcheck_or_published_port_drift(mutation):
+    spec = copy.deepcopy(_crawl_service_spec())
+    mutation(spec)
+
+    with pytest.raises(ValueError):
+        rollout_verifier._verify_current_service_spec(spec, TARGET_IMAGE)
+
+
+def test_rendered_redis_service_rejects_command_drift():
+    spec = copy.deepcopy(_redis_service_spec())
+    spec["TaskTemplate"]["ContainerSpec"]["Command"][6] = "always"
+    with pytest.raises(ValueError, match="appendfsync everysec"):
+        rollout_verifier._verify_redis_service_spec(spec)
 
 
 def _application(**overrides):
@@ -68,12 +143,7 @@ def _application(**overrides):
                 "mountPath": rollout_verifier.REDIS_MOUNT_PATH,
             }
         ],
-        "healthCheckSwarm": {
-            "Test": rollout_verifier.CRAWL_HEALTHCHECK,
-            "Interval": 10_000_000_000,
-            "Timeout": 5_000_000_000,
-            "Retries": 5,
-        },
+        "healthCheckSwarm": rollout_verifier.CRAWL_HEALTHCHECK_POLICY,
         "command": "redis-server --dir /data --appendonly yes --appendfsync everysec --loglevel notice",
         "placementSwarm": {
             "Constraints": [rollout_verifier.CRAWL_NODE_CONSTRAINT],
@@ -108,8 +178,85 @@ def _running_task(task_id: str, node: str, seconds: int = 1) -> dict:
         "containerId": task_id,
         "state": "running",
         "currentState": f"Running {seconds}s",
-        "node": node,
+        "node": {"a": "haiku-4", "b": "haiku-5"}.get(node, node),
         "error": "",
+    }
+
+
+def _crawl_service_spec(replicas: int = 1) -> dict:
+    return {
+        "TaskTemplate": {
+            "ContainerSpec": {
+                "Image": TARGET_IMAGE,
+                "Healthcheck": rollout_verifier.CRAWL_HEALTHCHECK_POLICY,
+                "StopGracePeriod": rollout_verifier.STOP_GRACE_NS,
+            },
+            "Placement": {
+                "Constraints": [rollout_verifier.CRAWL_NODE_CONSTRAINT],
+                "MaxReplicas": 1,
+            },
+            "Resources": {
+                "Reservations": {
+                    "NanoCPUs": int(rollout_verifier.CRAWL_CPU_RESERVATION),
+                    "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_RESERVATION),
+                },
+                "Limits": {
+                    "NanoCPUs": int(rollout_verifier.CRAWL_CPU_LIMIT),
+                    "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_LIMIT),
+                },
+            },
+        },
+        "Mode": {"Replicated": {"Replicas": replicas}},
+        "EndpointSpec": rollout_verifier.CRAWL_ENDPOINT_SPEC,
+        "UpdateConfig": {
+            "Order": "start-first",
+            "Parallelism": 1,
+            "FailureAction": "rollback",
+            "MaxFailureRatio": 0,
+            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
+            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+        },
+        "RollbackConfig": {
+            "Order": "start-first",
+            "Parallelism": 1,
+            "FailureAction": "pause",
+            "MaxFailureRatio": 0,
+            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
+            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+        },
+    }
+
+
+def _redis_service_spec() -> dict:
+    return {
+        "TaskTemplate": {
+            "ContainerSpec": {
+                "Image": rollout_verifier.REDIS_IMAGE,
+                "Command": rollout_verifier.REDIS_COMMAND,
+                "Healthcheck": rollout_verifier.REDIS_HEALTHCHECK_POLICY,
+                "Mounts": [
+                    {
+                        "Type": "volume",
+                        "Source": rollout_verifier.REDIS_VOLUME,
+                        "Target": rollout_verifier.REDIS_MOUNT_PATH,
+                    }
+                ],
+            },
+            "Placement": {
+                "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
+                "MaxReplicas": 1,
+            },
+            "Resources": {
+                "Reservations": {
+                    "NanoCPUs": int(rollout_verifier.REDIS_CPU_RESERVATION),
+                    "MemoryBytes": int(rollout_verifier.REDIS_MEMORY_RESERVATION),
+                },
+                "Limits": {
+                    "NanoCPUs": int(rollout_verifier.REDIS_CPU_LIMIT),
+                    "MemoryBytes": int(rollout_verifier.REDIS_MEMORY_LIMIT),
+                },
+            },
+        }
     }
 
 
@@ -138,11 +285,21 @@ def _fake_read(handlers):
             supplied = result
             result = _application(**result)
             if "applicationId=redis" in url:
-                result["appName"] = "crawl4ai-redis"
-                if "healthCheckSwarm" not in supplied:
-                    result["healthCheckSwarm"] = {
-                        "Test": rollout_verifier.REDIS_HEALTHCHECK
+                result.update(
+                    {
+                        "appName": "crawl4ai-redis",
+                        "dockerImage": rollout_verifier.REDIS_IMAGE,
+                        "replicas": 1,
+                        "cpuReservation": rollout_verifier.REDIS_CPU_RESERVATION,
+                        "cpuLimit": rollout_verifier.REDIS_CPU_LIMIT,
+                        "memoryReservation": rollout_verifier.REDIS_MEMORY_RESERVATION,
+                        "memoryLimit": rollout_verifier.REDIS_MEMORY_LIMIT,
                     }
+                )
+                if "healthCheckSwarm" not in supplied:
+                    result["healthCheckSwarm"] = (
+                        rollout_verifier.REDIS_HEALTHCHECK_POLICY
+                    )
                 if "placementSwarm" not in supplied:
                     result["placementSwarm"] = {
                         "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
@@ -169,7 +326,9 @@ def test_task_error_ignores_only_empty_dokploy_error_boilerplate(error, expected
 
 def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
     output = (
-        '"' + "a" * 64 + '"\t'
+        '"'
+        + "a" * 64
+        + '"\t'
         + '{"otel.service.version":"target"}\t'
         + '[{"Network":{"ID":"other"},"Addresses":["10.9.0.2/24"]},'
         + '{"Network":{"ID":"network"},"Addresses":["10.0.1.11/24"]}]\t'
@@ -200,8 +359,10 @@ def test_native_route_requires_only_vip_services_and_the_no_reuse_transport(
   routers:
     crawl4ai-yq1svi-router-1:
       service: crawl4ai-yq1svi-service-1
+      rule: Host(`crawl4ai.haiku.host`)
     crawl4ai-yq1svi-router-2:
       service: crawl4ai-yq1svi-service-2
+      rule: Host(`crawl4ai.popos-sf0.com`)
   services:
     crawl4ai-yq1svi-service-1:
       loadBalancer:
@@ -217,7 +378,7 @@ def test_native_route_requires_only_vip_services_and_the_no_reuse_transport(
     crawl4ai-yq1svi-swarm-vip:
       maxIdleConnsPerHost: -1
 """
-    monkeypatch.setattr(rollout_verifier, "_curl_json", lambda *_args: route)
+    monkeypatch.setattr(rollout_verifier, "_request_json", lambda *_args: route)
 
     verify_native_route(
         dokploy_url="https://dokploy.example",
@@ -240,6 +401,7 @@ def test_native_route_rejects_backend_or_transport_drift(monkeypatch, replacemen
   routers:
     crawl4ai-yq1svi-router-1:
       service: crawl4ai-yq1svi-service-1
+      rule: Host(`crawl4ai.haiku.host`)
   services:
     crawl4ai-yq1svi-service-1:
       loadBalancer:
@@ -258,7 +420,7 @@ def test_native_route_rejects_backend_or_transport_drift(monkeypatch, replacemen
         )
     else:
         route = route.replace("maxIdleConnsPerHost: -1", replacement)
-    monkeypatch.setattr(rollout_verifier, "_curl_json", lambda *_args: route)
+    monkeypatch.setattr(rollout_verifier, "_request_json", lambda *_args: route)
 
     with pytest.raises(ValueError):
         verify_native_route(
@@ -274,8 +436,10 @@ def test_native_route_rejects_one_router_service_without_transport(monkeypatch):
   routers:
     crawl4ai-yq1svi-router-1:
       service: crawl4ai-yq1svi-service-1
+      rule: Host(`crawl4ai.haiku.host`)
     crawl4ai-yq1svi-router-2:
       service: crawl4ai-yq1svi-service-2
+      rule: Host(`crawl4ai.popos-sf0.com`)
   services:
     crawl4ai-yq1svi-service-1:
       loadBalancer:
@@ -290,7 +454,7 @@ def test_native_route_rejects_one_router_service_without_transport(monkeypatch):
     crawl4ai-yq1svi-swarm-vip:
       maxIdleConnsPerHost: -1
 """
-    monkeypatch.setattr(rollout_verifier, "_curl_json", lambda *_args: route)
+    monkeypatch.setattr(rollout_verifier, "_request_json", lambda *_args: route)
 
     with pytest.raises(ValueError, match="does not use"):
         verify_native_route(
@@ -301,83 +465,128 @@ def test_native_route_rejects_one_router_service_without_transport(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("eligible", [frozenset({"haiku-4"}), None])
-def test_rollout_preflight_requires_the_exact_capacity_admitted_pool(
-    monkeypatch, eligible
-):
-    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
-    nodes = eligible or rollout_verifier.CRAWL_ELIGIBLE_NODES
-    monkeypatch.setattr(
-        rollout_verifier.subprocess,
-        "run",
-        lambda *_args, **_kwargs: rollout_verifier.subprocess.CompletedProcess(
-            [], 0, "".join(f"{node} Active\n" for node in sorted(nodes)), ""
-        ),
-    )
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_curl_json",
-        lambda *_args: _application(replicas=3),
-    )
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_service_spec",
-        lambda _app_name: {
-            "TaskTemplate": {
-                "ContainerSpec": {
-                    "Image": "registry.example/crawl4ai@sha256:target",
-                    "Healthcheck": {"Test": rollout_verifier.CRAWL_HEALTHCHECK},
-                    "StopGracePeriod": rollout_verifier.STOP_GRACE_NS,
-                },
-                "Placement": {
-                    "Constraints": [rollout_verifier.CRAWL_NODE_CONSTRAINT],
-                    "MaxReplicas": 1,
-                },
-                "Resources": {
-                    "Reservations": {
-                        "NanoCPUs": int(rollout_verifier.CRAWL_CPU_RESERVATION),
-                        "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_RESERVATION),
-                    },
-                    "Limits": {
-                        "NanoCPUs": int(rollout_verifier.CRAWL_CPU_LIMIT),
-                        "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_LIMIT),
-                    },
-                },
-            },
-            "Mode": {"Replicated": {"Replicas": 3}},
-            "EndpointSpec": {"Mode": "vip"},
-            "UpdateConfig": {
-                "Order": "start-first",
-                "Parallelism": 1,
-                "FailureAction": "rollback",
-                "MaxFailureRatio": 0,
-                "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
-                "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
-            },
-            "RollbackConfig": {
-                "Order": "start-first",
-                "Parallelism": 1,
-                "FailureAction": "pause",
-                "MaxFailureRatio": 0,
-                "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
-                "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
-            },
-        },
+def test_rollback_verifier_requires_tasks_public_health_and_metadata():
+    read_json = _fake_read(
+        {
+            "application.one": {"replicas": 1, "appName": "crawl4ai"},
+            "docker.getServiceContainersByAppName": [
+                _running_task("task-a", "haiku-4", 5)
+            ],
+        }
     )
 
-    if eligible is not None:
-        with pytest.raises(RuntimeError, match="admitted haiku-4/5/9/18"):
+    rollout_verifier._wait_for_verified_rollback(
+        app_name="crawl4ai",
+        baseline_image=TARGET_IMAGE,
+        dokploy_url="https://dokploy.example",
+        api_key="secret",
+        application_id="app",
+        health_urls=HEALTH_URLS,
+        read_json=read_json,
+        probe_health=lambda _url, count: [_health("a" * 12)] * count,
+        inspect_task_runtime=rollout_verifier._inspect_task_runtime,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("inventory", "message"),
+    [
+        ({"haiku-4": ("Ready", "Active")}, "admitted haiku-4/5/9/18"),
+        (
+            {
+                **{
+                    node: ("Ready", "Active")
+                    for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
+                },
+                "haiku-0": ("Down", "Drain"),
+            },
+            "admitted haiku-4/5/9/18",
+        ),
+        (
+            {
+                node: (("Down", "Drain") if node == "haiku-9" else ("Ready", "Active"))
+                for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
+            },
+            "Ready and Active",
+        ),
+        (None, None),
+    ],
+)
+def test_rollout_preflight_requires_the_exact_capacity_admitted_pool(
+    monkeypatch, inventory, message
+):
+    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_crawl_node_inventory",
+        lambda: inventory
+        or {
+            node: ("Ready", "Active") for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
+        },
+    )
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_request_json",
+        _fake_read({"application.one": {"replicas": 3}}),
+    )
+
+    if inventory is not None:
+        with pytest.raises(RuntimeError, match=message):
             verify_rollout_preflight(
                 dokploy_url="https://dokploy.example",
                 api_key="secret",
                 application_id="app",
+                redis_application_id="redis",
             )
     else:
         verify_rollout_preflight(
             dokploy_url="https://dokploy.example",
             api_key="secret",
             application_id="app",
+            redis_application_id="redis",
         )
+
+
+@pytest.mark.parametrize(
+    "tasks",
+    [
+        [_running_task("task-a", "haiku-0", 5)],
+        [
+            _running_task("task-a", "haiku-4", 5),
+            _running_task("task-b", "haiku-4", 5),
+            _running_task("task-c", "haiku-5", 5),
+        ],
+    ],
+)
+def test_verifier_rejects_tasks_outside_or_duplicated_within_admitted_pool(
+    monkeypatch, tasks
+):
+    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", len(tasks))
+    read_json = _fake_read(
+        {
+            "deployment.all": [{"status": "done"}],
+            "application.one": {"replicas": len(tasks), "appName": "crawl4ai"},
+            "docker.getServiceContainersByAppName": tasks,
+        }
+    )
+
+    with pytest.raises(ValueError, match="distinct admitted nodes"):
+        verify_rollout(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            redis_application_id="redis",
+            revision="target",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
+            read_json=read_json,
+            sleep=lambda _seconds: None,
+        )
+
+
 def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_path):
     def task(
         task_id,
@@ -402,7 +611,13 @@ def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_pat
         return {
             "ok": True,
             "health": [
-                {"ok": True, "instance": instance} for instance in instances
+                {
+                    "ok": True,
+                    "url": "https://crawl.example/health",
+                    "instance": instance,
+                    "revision": "target",
+                }
+                for instance in instances
             ],
             "tasks": tasks,
         }
@@ -450,16 +665,111 @@ def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_pat
                 sample(["new-instance"], [candidate_running, predecessor_exited]),
             )
         )
+        + "\n"
     )
 
     verify_monitor_evidence(
         Path(evidence),
         frozenset({"new-instance"}),
         frozenset({"new-task"}),
+        "target",
+        frozenset({"https://crawl.example/health"}),
     )
 
 
-def test_curl_json_rejects_streamed_responses_over_64_kib():
+def test_monitor_requires_each_public_domain_to_observe_the_final_task(tmp_path):
+    primary = "https://crawl.example/health"
+    secondary = "https://crawl-legacy.example/health"
+    evidence = tmp_path / "rollout.jsonl"
+    evidence.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "health": [
+                    {
+                        "ok": True,
+                        "url": primary,
+                        "instance": "new-instance",
+                        "revision": "target",
+                    }
+                ],
+                "tasks": [],
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(RuntimeError, match=secondary):
+        verify_monitor_evidence(
+            evidence,
+            frozenset({"new-instance"}),
+            frozenset({"new-task"}),
+            "target",
+            frozenset({primary, secondary}),
+        )
+
+
+def test_entrypoint_marks_drain_before_terminating_supervisord(tmp_path):
+    events = tmp_path / "events"
+    child_pid = tmp_path / "child.pid"
+    drain_path = tmp_path / "draining"
+    supervisord = tmp_path / "supervisord"
+    supervisord.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, signal\n"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+        "def stop(*_args):\n"
+        f"    drain = pathlib.Path({str(drain_path)!r}).exists()\n"
+        "    event = 'term-after-drain' if drain else 'term-before-drain'\n"
+        f"    pathlib.Path({str(events)!r}).write_text(event)\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "signal.signal(signal.SIGINT, stop)\n"
+        "while True:\n"
+        "    signal.pause()\n"
+    )
+    supervisord.chmod(0o755)
+    (tmp_path / "config.yml").write_text("security:\n  jwt_enabled: false\n")
+    environment = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{Path(sys.executable).parent}:{os.environ['PATH']}",
+        "REDIS_HOST": "external-redis",
+        "CRAWL4AI_API_TOKEN": "test-token",
+        "CRAWL4AI_DRAIN_PATH": str(drain_path),
+        "CRAWL4AI_DRAIN_DELAY_SECONDS": "0.2",
+    }
+    process = subprocess.Popen(
+        ["bash", str(DOCKER_DIR / "entrypoint.sh")], cwd=tmp_path, env=environment
+    )
+    try:
+        for _ in range(50):
+            if child_pid.exists():
+                break
+            time.sleep(0.02)
+        assert child_pid.exists()
+
+        process.send_signal(signal.SIGTERM)
+        for _ in range(50):
+            if drain_path.exists():
+                break
+            time.sleep(0.01)
+        assert drain_path.exists()
+        assert process.poll() is None
+        os.kill(int(child_pid.read_text()), 0)
+        process.send_signal(signal.SIGTERM)
+        assert process.poll() is None
+
+        assert process.wait(timeout=5) == 0
+        assert events.read_text() == "term-after-drain"
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(child_pid.read_text()), 0)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+
+
+def test_request_json_rejects_streamed_responses_over_64_kib():
     class OversizedHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -474,7 +784,7 @@ def test_curl_json_rejects_streamed_responses_over_64_kib():
     thread.start()
     try:
         with pytest.raises(ValueError, match="exceeds 64 KiB"):
-            _curl_json(f"http://127.0.0.1:{server.server_port}/")
+            _request_json(f"http://127.0.0.1:{server.server_port}/")
     finally:
         server.shutdown()
         thread.join()
@@ -526,19 +836,33 @@ def test_curl_json_rejects_streamed_responses_over_64_kib():
                     "Retries": 1,
                 }
             },
-            "tolerate transient blips",
+            "exact admission healthcheck",
         ),
         (
-            {"updateConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
+            {
+                "updateConfigSwarm": {
+                    "Order": "stop-first",
+                    "Parallelism": 1,
+                    "MaxFailureRatio": 0,
+                }
+            },
             "updateConfigSwarm must use start-first",
         ),
         (
-            {"rollbackConfigSwarm": {"Order": "stop-first", "Parallelism": 1, "MaxFailureRatio": 0}},
+            {
+                "rollbackConfigSwarm": {
+                    "Order": "stop-first",
+                    "Parallelism": 1,
+                    "MaxFailureRatio": 0,
+                }
+            },
             "rollbackConfigSwarm must use start-first",
         ),
     ],
 )
-def test_verifier_rejects_invalid_release_observability_configuration(overrides, message):
+def test_verifier_rejects_invalid_release_observability_configuration(
+    overrides, message
+):
     read_json = _fake_read(
         {
             "deployment.all": [{"status": "done"}],
@@ -553,7 +877,9 @@ def test_verifier_rejects_invalid_release_observability_configuration(overrides,
             application_id="app",
             redis_application_id="redis",
             revision="target",
-            health_url="https://crawl.example/health",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
             read_json=read_json,
         )
 
@@ -562,9 +888,14 @@ def test_verifier_rejects_invalid_release_observability_configuration(overrides,
     ("overrides", "message"),
     [
         ({"mounts": []}, "crawl4ai-redis-data"),
-        ({"healthCheckSwarm": {"Test": ["CMD-SHELL", "redis-cli ping"]}}, "healthcheck"),
         (
-            {"command": "redis-server --dir /data --appendonly yes --appendfsync always"},
+            {"healthCheckSwarm": {"Test": ["CMD-SHELL", "redis-cli ping"]}},
+            "healthcheck",
+        ),
+        (
+            {
+                "command": "redis-server --dir /data --appendonly yes --appendfsync always"
+            },
             "appendfsync everysec",
         ),
         ({"placementSwarm": {"Constraints": [], "MaxReplicas": 1}}, "haiku-18"),
@@ -597,13 +928,20 @@ def test_verifier_rejects_invalid_external_redis_configuration(overrides, messag
             application_id="app",
             redis_application_id="redis",
             revision="target",
-            health_url="https://crawl.example/health",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
             read_json=read_json,
         )
 
 
 def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_with_runtime_labels():
     container_id = "a" * 64
+    health_urls = (
+        "https://crawl.example/health",
+        "https://crawl-legacy.example/health",
+    )
+    probed_urls = []
     task_snapshots = iter(
         [
             [_running_task("task-a", "a")],
@@ -619,17 +957,24 @@ def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_wi
         }
     )
 
+    def probe_health(url, count):
+        probed_urls.append(url)
+        return [_health(container_id[:12])] * count
+
     verify_rollout(
         dokploy_url="https://dokploy.example",
         api_key="secret",
         application_id="app",
         redis_application_id="redis",
         revision="target",
-        health_url="https://crawl.example/health",
+        expected_image=TARGET_IMAGE,
+        baseline_image=TARGET_IMAGE,
+        health_urls=health_urls,
         read_json=read_json,
-        probe_health=lambda _url, count: [_health(container_id[:12])] * count,
+        probe_health=probe_health,
         sleep=lambda _seconds: None,
     )
+    assert set(probed_urls) == set(health_urls)
 
 
 @pytest.mark.parametrize(
@@ -698,7 +1043,9 @@ def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_dr
             application_id="app",
             redis_application_id="redis",
             revision="target",
-            health_url="https://crawl.example/health",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
             read_json=read_json,
             probe_health=lambda _url, count: [next(health_snapshots)] * count,
             sleep=lambda _seconds: None,
@@ -722,7 +1069,9 @@ def test_verifier_rejects_replica_counts_other_than_three():
             application_id="app",
             redis_application_id="redis",
             revision="target",
-            health_url="https://crawl.example/health",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
             read_json=read_json,
             sleep=lambda _seconds: None,
         )
@@ -747,7 +1096,9 @@ def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
             application_id="app",
             redis_application_id="redis",
             revision="target",
-            health_url="https://crawl.example/health",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
             read_json=read_json,
             sleep=lambda _seconds: None,
         )
@@ -781,7 +1132,9 @@ def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
             application_id="app",
             redis_application_id="redis",
             revision="target",
-            health_url="https://crawl.example/health",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
             read_json=read_json,
             probe_health=lambda _url, count: [_health("a" * 12)] * count,
             sleep=lambda _seconds: None,
@@ -823,7 +1176,9 @@ def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
             application_id="app",
             redis_application_id="redis",
             revision="target",
-            health_url="https://crawl.example/health",
+            expected_image=TARGET_IMAGE,
+            baseline_image=TARGET_IMAGE,
+            health_urls=HEALTH_URLS,
             read_json=read_json,
             probe_health=lambda _url, count: [_health("a" * 12), _health("b" * 12)]
             * (count // 2),

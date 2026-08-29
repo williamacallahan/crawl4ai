@@ -27,7 +27,6 @@ env:
   APPLICATION_ID: YTAj7y39GXOkUtoHpYYXw
   APPLICATION_APP_NAME: crawl4ai-yq1svi
   REDIS_APPLICATION_ID: D5WPQqgJYaonrZ6Pth2Cy
-  REDIS_APPLICATION_APP_NAME: crawl4ai-redis-8xt08u
 
 jobs:
   test:
@@ -40,12 +39,12 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.9.18"
 
       - name: Build test env
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          uv sync --locked --no-dev --group server --group test
+        run: uv sync --locked --no-dev --group server --group test
 
       - name: Unit gate
         run: |
@@ -188,6 +187,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.9.18"
+
+      - name: Build deploy env
+        run: uv sync --locked --only-group deploy
+
       - name: Deploy through the native Swarm VIP
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
@@ -202,7 +209,7 @@ jobs:
           MONITOR_PID=""
           start_monitor() {
             rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
-            python3 deploy/docker/verify_rollout.py monitor &
+            .venv/bin/python deploy/docker/verify_rollout.py monitor &
             MONITOR_PID=$!
             trap finish_monitor EXIT
             for _ in {1..30}; do
@@ -221,63 +228,33 @@ jobs:
             return "$monitor_status"
           }
           start_monitor
-          python3 deploy/docker/verify_rollout.py preflight
+          .venv/bin/python deploy/docker/verify_rollout.py preflight
+          .venv/bin/python deploy/docker/verify_rollout.py route
 
-          # Redis persistence: fsync-per-write blocked the single Redis thread on
-          # disk stalls and 503'd every replica's /health at once (2026-08-28 task
-          # kills). CI owns the record so verify_rollout's everysec invariant and
-          # the deployed configuration cannot drift apart; the running service
-          # picks the command up on its next redeploy.
+          export BASELINE_IMAGE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')"
+          release_payload="$(.venv/bin/python deploy/docker/verify_rollout.py policy)"
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.update" \
             -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","command":"redis-server --dir /data --appendonly yes --appendfsync everysec --loglevel notice"}' "$REDIS_APPLICATION_ID")" >/dev/null
-
-          printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
-            -X POST "$DOKPLOY_URL/api/application.update" \
-            -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","swarmVipConnectionReuse":false}' "$APPLICATION_ID")" >/dev/null
-          python3 deploy/docker/verify_rollout.py route
-
-          printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
-            -X POST "$DOKPLOY_URL/api/application.update" \
-            -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"cpuReservation":"500000000","cpuLimit":"2000000000","memoryReservation":"1073741824","memoryLimit":"4294967296","labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health"],"Interval":10000000000,"Timeout":5000000000,"StartPeriod":120000000000,"Retries":5},"placementSwarm":{"Constraints":["node.labels.crawl4ai-eligible==true"],"MaxReplicas":1},"endpointSpecSwarm":{"Mode":"vip","Ports":[]},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
+            --data "$release_payload" >/dev/null
 
           export BASELINE_FORCE_UPDATE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ForceUpdate}}')"
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H 'content-type: application/json' \
             --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
-          python3 deploy/docker/verify_rollout.py
-          finish_monitor
-          trap - EXIT
-
-          # Converge the running Redis onto the CI-owned command. This runs
-          # after the rollout gate so the app's blip-tolerant healthcheck is
-          # already live and the brief Redis restart cannot kill crawl tasks.
-          redis_args() {
-            docker service inspect "$REDIS_APPLICATION_APP_NAME" \
-              --format '{{json .Spec.TaskTemplate.ContainerSpec.Command}} {{json .Spec.TaskTemplate.ContainerSpec.Args}}'
-          }
-          if ! redis_args | grep -q 'appendfsync","everysec'; then
-            printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
-              -X POST "$DOKPLOY_URL/api/application.deploy" \
-              -H 'content-type: application/json' \
-              --data "$(printf '{"applicationId":"%s"}' "$REDIS_APPLICATION_ID")" >/dev/null
-            # Dokploy applied the one observed convergence redeploy ~5m36s
-            # after the POST (23:43:58 -> 23:49:34 on 2026-08-28), so a 300s
-            # poll expires before a healthy apply lands. Give it 600s.
-            for _ in {1..120}; do
-              running="$(docker service ps "$REDIS_APPLICATION_APP_NAME" --filter desired-state=running --format '{{.CurrentState}}' | grep -c '^Running' || true)"
-              if redis_args | grep -q 'appendfsync","everysec' && [ "$running" = "1" ]; then
-                break
-              fi
-              sleep 5
-            done
-            redis_args | grep -q 'appendfsync","everysec'
-            python3 deploy/docker/verify_rollout.py
+          if ! .venv/bin/python deploy/docker/verify_rollout.py; then
+            .venv/bin/python deploy/docker/verify_rollout.py rollback
+            finish_monitor
+            trap - EXIT
+            exit 1
           fi
+          if ! finish_monitor; then
+            .venv/bin/python deploy/docker/verify_rollout.py rollback
+            trap - EXIT
+            exit 1
+          fi
+          trap - EXIT
           echo "deploy verified for ${IMAGE}:${GITHUB_SHA} with $(wc -l < "$ROLLOUT_MONITOR_PATH") successful public probes"
 
       - name: Preserve rollout evidence
