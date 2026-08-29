@@ -27,6 +27,7 @@ from verify_rollout import (
 )
 
 ORIGINAL_INSPECT_TASK_RUNTIME = rollout_verifier._inspect_task_runtime
+ORIGINAL_POST_JSON = rollout_verifier._post_json
 TARGET_IMAGE = "registry.example/crawl4ai@sha256:target"
 HEALTH_URLS = ("https://crawl.example/health",)
 DOCKER_DIR = Path(__file__).resolve().parents[1]
@@ -299,6 +300,10 @@ def _fake_read(handlers):
             raise AssertionError(f"unexpected operation: {operation}")
         handler = handlers[operation]
         result = handler(url) if callable(handler) else handler
+        if operation == "deployment.all" and isinstance(result, list):
+            result = [
+                {"deploymentId": "deployment", **deployment} for deployment in result
+            ]
         if operation == "application.one" and isinstance(result, dict):
             supplied = result
             result = _application(**result)
@@ -370,7 +375,16 @@ def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
     assert image == "registry.example/crawl4ai@sha256:target"
 
 
-def test_swarm_tasks_keeps_survivor_metadata_when_one_task_disappears(monkeypatch):
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Error: No such object: vanished1234\n",
+        "error: no such object: vanished1234\n",
+    ],
+)
+def test_swarm_tasks_keeps_survivor_metadata_when_one_task_disappears(
+    monkeypatch, stderr
+):
     tasks = (
         '{"ID":"survivor123","DesiredState":"Running"}\n'
         '{"ID":"vanished1234","DesiredState":"Running"}\n'
@@ -387,7 +401,7 @@ def test_swarm_tasks_keeps_survivor_metadata_when_one_task_disappears(monkeypatc
             command,
             1,
             inspected,
-            "Error: No such object: vanished1234\n",
+            stderr,
         )
 
     monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
@@ -569,6 +583,165 @@ def test_rollback_verifier_requires_tasks_public_health_and_metadata(monkeypatch
     )
 
 
+@pytest.mark.parametrize("failed_read", ["state", "spec"])
+def test_rollback_verifier_retries_transient_service_inspect(monkeypatch, failed_read):
+    reads = {"state": 0, "spec": 0}
+
+    def service_update_state(_app_name):
+        reads["state"] += 1
+        if failed_read == "state" and reads["state"] == 1:
+            raise subprocess.CalledProcessError(1, ["docker", "service", "inspect"])
+        return "rollback_completed"
+
+    def service_spec(_app_name):
+        reads["spec"] += 1
+        if failed_read == "spec" and reads["spec"] == 1:
+            raise subprocess.CalledProcessError(1, ["docker", "service", "inspect"])
+        return _crawl_service_spec()
+
+    monkeypatch.setattr(rollout_verifier, "_service_update_state", service_update_state)
+    monkeypatch.setattr(rollout_verifier, "_service_spec", service_spec)
+    sleeps = []
+
+    rollout_verifier._wait_for_verified_rollback(
+        app_name="crawl4ai",
+        baseline_image=TARGET_IMAGE,
+        dokploy_url="https://dokploy.example",
+        api_key="secret",
+        application_id="app",
+        health_urls=HEALTH_URLS,
+        read_json=_fake_read(
+            {
+                "application.one": {"replicas": 1, "appName": "crawl4ai"},
+                "docker.getServiceContainersByAppName": [
+                    _running_task("task-a", "haiku-4", 5)
+                ],
+            }
+        ),
+        probe_health=lambda _url, count: [_health("a" * 12)] * count,
+        inspect_task_runtime=rollout_verifier._inspect_task_runtime,
+        sleep=sleeps.append,
+        monotonic=iter([0, 0, 1]).__next__,
+    )
+
+    assert reads[failed_read] == 2
+    assert sleeps == [5]
+
+
+def test_rollback_entry_retries_initial_service_inspect(monkeypatch):
+    reads = iter(
+        [
+            subprocess.CalledProcessError(1, ["docker", "service", "inspect"]),
+            _crawl_service_spec(),
+        ]
+    )
+
+    def service_spec(_app_name):
+        result = next(reads)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    waited = []
+    sleeps = []
+    monkeypatch.setattr(rollout_verifier, "_service_spec", service_spec)
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_wait_for_verified_rollback",
+        lambda **kwargs: waited.append(kwargs["baseline_image"]),
+    )
+    monkeypatch.setattr(rollout_verifier.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        rollout_verifier.time,
+        "monotonic",
+        iter([0, 0, 1]).__next__,
+    )
+    for key, value in {
+        "APPLICATION_APP_NAME": "crawl4ai",
+        "BASELINE_IMAGE": TARGET_IMAGE,
+        "DEPLOYMENT_ID": "deployment",
+        "IMAGE": "registry.example/crawl4ai",
+        "IMAGE_DIGEST": "sha256:target",
+        "GITHUB_SHA": "target",
+        "DOKPLOY_URL": "https://dokploy.example",
+        "DOKPLOY_API_KEY": "secret",
+        "APPLICATION_ID": "app",
+        "HEALTH_URLS": HEALTH_URLS[0],
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    rollout_verifier.main(["rollback"])
+
+    assert sleeps == [5]
+    assert waited == [TARGET_IMAGE]
+
+
+def test_post_json_normalizes_process_timeout(monkeypatch):
+    monkeypatch.setattr(
+        rollout_verifier.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["curl"], 20)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP request failed"):
+        ORIGINAL_POST_JSON("https://dokploy.example", "secret", {})
+
+
+def test_submit_reconciles_timeout_to_the_exact_queue_and_deployment(monkeypatch):
+    application_reads = iter(
+        [
+            _application(),
+            _application(
+                dockerImage="registry.example/crawl4ai@sha256:candidate",
+                labelsSwarm=rollout_verifier._observability_labels("candidate"),
+            ),
+        ]
+    )
+    deployment_reads = iter(
+        [
+            [],
+            [
+                {
+                    "deploymentId": "application-app-submission",
+                    "title": "crawl4ai-submission",
+                }
+            ],
+        ]
+    )
+
+    def read_json(url, _api_key):
+        if "application.one" in url:
+            return next(application_reads)
+        if "deployment.all" in url:
+            return next(deployment_reads)
+        return [{"id": "application-app-submission"}]
+
+    def post_json(url, _api_key, _payload):
+        if url.endswith("application.deploy"):
+            raise RuntimeError("timeout")
+
+    monkeypatch.setattr(rollout_verifier, "_post_json", post_json)
+    clock = iter([0, 0, 0, 0])
+
+    deployment_id = rollout_verifier.submit_application_deploy(
+        dokploy_url="https://dokploy.example",
+        api_key="secret",
+        application_id="app",
+        baseline_image=TARGET_IMAGE,
+        candidate_image="registry.example/crawl4ai@sha256:candidate",
+        candidate_revision="candidate",
+        submission_id="submission",
+        submission_title="crawl4ai-submission",
+        read_json=read_json,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: next(clock, 0),
+    )
+
+    assert deployment_id == "application-app-submission"
+
+
 @pytest.mark.parametrize(
     ("inventory", "message"),
     [
@@ -645,7 +818,10 @@ def test_verifier_rejects_tasks_outside_or_duplicated_within_admitted_pool(
     monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", len(tasks))
     read_json = _fake_read(
         {
-            "deployment.all": [{"status": "done"}],
+            "deployment.all": [
+                {"deploymentId": "other", "status": "error"},
+                {"status": "done"},
+            ],
             "application.one": {"replicas": len(tasks), "appName": "crawl4ai"},
             "docker.getServiceContainersByAppName": tasks,
         }

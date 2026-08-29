@@ -105,7 +105,7 @@ def _uses_native_rollback(application: dict[str, Any]) -> bool:
 
 def _verify_release_configuration(
     application: Any, revision: str, expected_image: str
-) -> None:
+) -> str:
     if not isinstance(application, dict):
         raise ValueError("application configuration response is invalid")
     if application.get("labelsSwarm") != _observability_labels(revision):
@@ -331,6 +331,21 @@ def _service_update_state(app_name: str) -> str:
     return result.stdout.strip()
 
 
+def _service_spec_with_retry(
+    app_name: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    deadline = monotonic() + ROLLOUT_PROOF_TIMEOUT_SECONDS
+    while monotonic() < deadline:
+        try:
+            return _service_spec(app_name)
+        except subprocess.CalledProcessError:
+            sleep(5)
+    raise TimeoutError("Docker service could not be inspected")
+
+
 def _wait_for_verified_rollback(
     *,
     app_name: str,
@@ -339,6 +354,8 @@ def _wait_for_verified_rollback(
     api_key: str,
     application_id: str,
     health_urls: tuple[str, ...],
+    candidate_image: str | None = None,
+    candidate_labels: dict[str, str] | None = None,
     read_json: Callable[[str, str | None], Any],
     probe_health: Callable[[str, int], list[Any]],
     inspect_task_runtime: Callable[
@@ -346,13 +363,22 @@ def _wait_for_verified_rollback(
     ],
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
-) -> None:
+) -> str:
     deadline = monotonic() + ROLLOUT_PROOF_TIMEOUT_SECONDS
     while monotonic() < deadline:
-        state = _service_update_state(app_name)
+        try:
+            state = _service_update_state(app_name)
+        except subprocess.CalledProcessError:
+            sleep(5)
+            continue
         if state in {"completed", "rollback_completed"}:
             try:
-                _verify_current_service_spec(_service_spec(app_name), baseline_image)
+                service_spec = _service_spec(app_name)
+            except subprocess.CalledProcessError:
+                sleep(5)
+                continue
+            try:
+                _verify_current_service_spec(service_spec, baseline_image)
             except ValueError:
                 sleep(5)
                 continue
@@ -429,14 +455,22 @@ def _wait_for_verified_rollback(
                 application_id=application_id,
                 app_name=app_name,
             )
+            restore_payload = {
+                "applicationId": application_id,
+                "dockerImage": baseline_image,
+                "labelsSwarm": _observability_labels(revision),
+            }
+            if candidate_image and candidate_labels:
+                restore_payload.update(
+                    {
+                        "expectedDockerImage": candidate_image,
+                        "expectedLabelsSwarm": candidate_labels,
+                    }
+                )
             _post_json(
                 f"{dokploy_url.rstrip('/')}/api/application.update",
                 api_key,
-                {
-                    "applicationId": application_id,
-                    "dockerImage": baseline_image,
-                    "labelsSwarm": _observability_labels(revision),
-                },
+                restore_payload,
             )
             restored_application = read_json(
                 _dokploy_url(
@@ -636,38 +670,166 @@ def _request_json(url: str, api_key: str | None = None) -> Any:
 
 def _post_json(url: str, api_key: str, payload: dict[str, Any]) -> Any:
     escaped = api_key.replace("\\", "\\\\").replace('"', '\\"')
-    response = subprocess.run(
-        [
-            "curl",
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "15",
-            "--max-filesize",
-            str(MAX_RESPONSE_BYTES),
-            "--request",
-            "POST",
-            "--header",
-            "content-type: application/json",
-            "--data",
-            json.dumps(payload, separators=(",", ":")),
-            "--config",
-            "-",
-            url,
-        ],
-        input=f'header = "x-api-key: {escaped}"\n'.encode(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=20,
-    )
+    try:
+        response = subprocess.run(
+            [
+                "curl",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "15",
+                "--max-filesize",
+                str(MAX_RESPONSE_BYTES),
+                "--request",
+                "POST",
+                "--header",
+                "content-type: application/json",
+                "--data",
+                json.dumps(payload, separators=(",", ":")),
+                "--config",
+                "-",
+                url,
+            ],
+            input=f'header = "x-api-key: {escaped}"\n'.encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("HTTP request failed") from error
     if response.returncode == 63:
         raise ValueError("HTTP response exceeds 64 KiB")
     if response.returncode != 0:
         raise RuntimeError("HTTP request failed")
     return json.loads(response.stdout) if response.stdout else None
+
+
+def _request_json_with_retry(
+    url: str,
+    api_key: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Any:
+    deadline = monotonic() + ROLLOUT_PROOF_TIMEOUT_SECONDS
+    while monotonic() < deadline:
+        try:
+            return _request_json(url, api_key)
+        except RuntimeError:
+            sleep(5)
+    raise TimeoutError("Dokploy API request did not recover")
+
+
+def submit_application_deploy(
+    *,
+    dokploy_url: str,
+    api_key: str,
+    application_id: str,
+    baseline_image: str,
+    candidate_image: str,
+    candidate_revision: str,
+    submission_id: str,
+    submission_title: str,
+    read_json: Callable[[str, str | None], Any] = _request_json,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    application_url = _dokploy_url(
+        dokploy_url, "application.one", applicationId=application_id
+    )
+    baseline = read_json(application_url, api_key)
+    if not isinstance(baseline, dict) or baseline.get("dockerImage") != baseline_image:
+        raise RuntimeError("Dokploy baseline metadata does not match the service")
+    baseline_labels = baseline.get("labelsSwarm")
+    if not isinstance(baseline_labels, dict):
+        raise RuntimeError("Dokploy baseline observability metadata is invalid")
+    candidate_labels = _observability_labels(candidate_revision)
+    update_url = f"{dokploy_url.rstrip('/')}/api/application.update"
+
+    def wait_for_metadata(image: str, labels: dict[str, str]) -> None:
+        deadline = monotonic() + 60
+        while monotonic() < deadline:
+            try:
+                application = read_json(application_url, api_key)
+                if (
+                    isinstance(application, dict)
+                    and application.get("dockerImage") == image
+                    and application.get("labelsSwarm") == labels
+                ):
+                    return
+            except (RuntimeError, ValueError):
+                pass
+            sleep(2)
+        raise TimeoutError("Dokploy application metadata did not converge")
+
+    def restore_baseline() -> None:
+        deadline = monotonic() + 60
+        while monotonic() < deadline:
+            current = read_json(application_url, api_key)
+            if not isinstance(current, dict):
+                raise RuntimeError("Dokploy application metadata is invalid")
+            if (
+                current.get("dockerImage") == baseline_image
+                and current.get("labelsSwarm") == baseline_labels
+            ):
+                return
+            if (
+                current.get("dockerImage") != candidate_image
+                or current.get("labelsSwarm") != candidate_labels
+            ):
+                raise RuntimeError("Dokploy application metadata changed concurrently")
+            try:
+                _post_json(
+                    update_url,
+                    api_key,
+                    {
+                        "applicationId": application_id,
+                        "expectedDockerImage": candidate_image,
+                        "expectedLabelsSwarm": candidate_labels,
+                        "dockerImage": baseline_image,
+                        "labelsSwarm": baseline_labels,
+                    },
+                )
+            except (RuntimeError, ValueError):
+                pass
+            sleep(2)
+        raise TimeoutError("Dokploy baseline metadata did not converge")
+
+    try:
+        _post_json(
+            update_url,
+            api_key,
+            {
+                "applicationId": application_id,
+                "dockerImage": candidate_image,
+                "labelsSwarm": candidate_labels,
+            },
+        )
+    except (RuntimeError, ValueError):
+        pass
+    try:
+        wait_for_metadata(candidate_image, candidate_labels)
+    except TimeoutError:
+        restore_baseline()
+        raise
+
+    deployment_id = f"application-{application_id}-{submission_id}"
+    deployment_url = f"{dokploy_url.rstrip('/')}/api/application.deploy"
+    payload = {
+        "applicationId": application_id,
+        "title": submission_title,
+        "idempotencyKey": submission_id,
+        "expectedDockerImage": candidate_image,
+        "expectedLabelsSwarm": candidate_labels,
+    }
+    try:
+        _post_json(deployment_url, api_key, payload)
+    except (RuntimeError, ValueError):
+        pass
+    return deployment_id
 
 
 def _probe_health(
@@ -820,7 +982,11 @@ def _swarm_tasks(app_name: str, tracked_task_ids: set[str]) -> list[dict[str, An
         missing_task_ids = {
             match.group(1)
             for line in error_lines
-            if (match := re.fullmatch(r"Error: No such object: (\S+)", line))
+            if (
+                match := re.fullmatch(
+                    r"(?:Error: No such object|error: no such object): (\S+)", line
+                )
+            )
         }
         if inspected.returncode and (
             not error_lines
@@ -1139,6 +1305,7 @@ def verify_rollout(
     revision: str,
     expected_image: str,
     baseline_image: str,
+    deployment_id: str = "deployment",
     health_urls: tuple[str, ...],
     read_json: Callable[[str, str | None], Any] = _request_json,
     probe_health: Callable[[str, int], list[Any]] | None = None,
@@ -1175,11 +1342,19 @@ def verify_rollout(
             _dokploy_url(dokploy_url, "deployment.all", applicationId=application_id),
             api_key,
         )
-        status = deployments[0]["status"] if deployments else "none"
+        deployment = next(
+            (
+                deployment
+                for deployment in deployments
+                if deployment.get("deploymentId") == deployment_id
+            ),
+            None,
+        )
+        status = deployment["status"] if deployment else "none"
         if status == "done":
             break
-        if status == "error":
-            raise RuntimeError("Dokploy reported a failed deployment")
+        if status in {"error", "cancelled"}:
+            raise RuntimeError(f"Dokploy reported a {status} deployment")
         sleep(15)
     else:
         raise TimeoutError(
@@ -1392,44 +1567,107 @@ def main(arguments: list[str] | None = None) -> None:
             app_name=os.environ["APPLICATION_APP_NAME"],
         )
         return
-    if arguments == ["policy"]:
+    if arguments == ["submit"]:
         print(
-            json.dumps(
-                {
-                    "applicationId": os.environ["APPLICATION_ID"],
-                    "dockerImage": f"{os.environ['IMAGE']}@{os.environ['IMAGE_DIGEST']}",
-                    "labelsSwarm": _observability_labels(os.environ["GITHUB_SHA"]),
-                },
-                separators=(",", ":"),
+            submit_application_deploy(
+                dokploy_url=os.environ["DOKPLOY_URL"],
+                api_key=os.environ["DOKPLOY_API_KEY"],
+                application_id=os.environ["APPLICATION_ID"],
+                baseline_image=os.environ["BASELINE_IMAGE"],
+                candidate_image=f"{os.environ['IMAGE']}@{os.environ['IMAGE_DIGEST']}",
+                candidate_revision=os.environ["GITHUB_SHA"],
+                submission_id=os.environ["SUBMISSION_ID"],
+                submission_title=os.environ["SUBMISSION_TITLE"],
             )
         )
         return
     if arguments == ["rollback"]:
         app_name = os.environ["APPLICATION_APP_NAME"]
         baseline_image = os.environ["BASELINE_IMAGE"]
-        current_image = (
-            _service_spec(app_name)
-            .get("TaskTemplate", {})
-            .get("ContainerSpec", {})
-            .get("Image")
+        current_spec = _service_spec_with_retry(
+            app_name, sleep=time.sleep, monotonic=time.monotonic
         )
+        container = current_spec.get("TaskTemplate", {}).get("ContainerSpec", {})
+        current_image = container.get("Image")
         if current_image != baseline_image:
-            deployments = _request_json(
+            candidate_image = f"{os.environ['IMAGE']}@{os.environ['IMAGE_DIGEST']}"
+
+            def owns_candidate(spec: dict[str, Any]) -> bool:
+                candidate_container = spec.get("TaskTemplate", {}).get(
+                    "ContainerSpec", {}
+                )
+                labels = (
+                    candidate_container.get("Labels")
+                    if isinstance(candidate_container, dict)
+                    else None
+                )
+                return (
+                    candidate_container.get("Image") == candidate_image
+                    and isinstance(labels, dict)
+                    and labels.get("dokploy.deployment.id")
+                    == os.environ["DEPLOYMENT_ID"]
+                    and all(
+                        labels.get(key) == value
+                        for key, value in _observability_labels(
+                            os.environ["GITHUB_SHA"]
+                        ).items()
+                    )
+                )
+
+            if not owns_candidate(current_spec):
+                raise RuntimeError("live service no longer matches this deployment")
+            deployments = _request_json_with_retry(
                 _dokploy_url(
                     os.environ["DOKPLOY_URL"],
                     "deployment.all",
                     applicationId=os.environ["APPLICATION_ID"],
                 ),
                 os.environ["DOKPLOY_API_KEY"],
+                sleep=time.sleep,
+                monotonic=time.monotonic,
             )
-            rollback_id = deployments[0].get("rollbackId") if deployments else None
+            deployment = next(
+                (
+                    deployment
+                    for deployment in deployments
+                    if deployment.get("deploymentId") == os.environ["DEPLOYMENT_ID"]
+                ),
+                None,
+            )
+            rollback_id = deployment.get("rollbackId") if deployment else None
             if not rollback_id:
                 raise RuntimeError("Dokploy deployment has no rollback record")
-            _post_json(
-                f"{os.environ['DOKPLOY_URL'].rstrip('/')}/api/rollback.rollback",
-                os.environ["DOKPLOY_API_KEY"],
-                {"rollbackId": rollback_id},
-            )
+            rollback_deadline = time.monotonic() + 60
+            while True:
+                try:
+                    _post_json(
+                        f"{os.environ['DOKPLOY_URL'].rstrip('/')}/api/rollback.rollback",
+                        os.environ["DOKPLOY_API_KEY"],
+                        {"rollbackId": rollback_id},
+                    )
+                    break
+                except (RuntimeError, ValueError):
+                    time.sleep(5)
+                    observed = _service_spec_with_retry(
+                        app_name, sleep=time.sleep, monotonic=time.monotonic
+                    )
+                    observed_image = (
+                        observed.get("TaskTemplate", {})
+                        .get("ContainerSpec", {})
+                        .get("Image")
+                    )
+                    if observed_image == baseline_image:
+                        break
+                    if not owns_candidate(observed):
+                        raise RuntimeError(
+                            "live service no longer matches this deployment"
+                        )
+                    if _service_update_state(app_name) != "completed":
+                        break
+                    if time.monotonic() >= rollback_deadline:
+                        raise TimeoutError(
+                            "Dokploy rollback submission did not recover"
+                        )
         _wait_for_verified_rollback(
             app_name=app_name,
             baseline_image=baseline_image,
@@ -1437,6 +1675,8 @@ def main(arguments: list[str] | None = None) -> None:
             api_key=os.environ["DOKPLOY_API_KEY"],
             application_id=os.environ["APPLICATION_ID"],
             health_urls=tuple(os.environ["HEALTH_URLS"].split(",")),
+            candidate_image=f"{os.environ['IMAGE']}@{os.environ['IMAGE_DIGEST']}",
+            candidate_labels=_observability_labels(os.environ["GITHUB_SHA"]),
             read_json=_request_json,
             probe_health=lambda url, count: _probe_health(url, count, _request_json),
             inspect_task_runtime=_inspect_task_runtime,
@@ -1463,6 +1703,7 @@ def main(arguments: list[str] | None = None) -> None:
         revision=os.environ["GITHUB_SHA"],
         expected_image=f"{os.environ['IMAGE']}@{os.environ['IMAGE_DIGEST']}",
         baseline_image=os.environ["BASELINE_IMAGE"],
+        deployment_id=os.environ["DEPLOYMENT_ID"],
         health_urls=tuple(
             os.environ.get("HEALTH_URLS", "https://crawl4ai.haiku.host/health").split(
                 ","

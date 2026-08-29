@@ -227,22 +227,29 @@ jobs:
             MONITOR_PID=""
             return "$monitor_status"
           }
+          recover_on_exit() {
+            failure_status=$?
+            trap - EXIT
+            if [ "$failure_status" -ne 0 ] && [ -n "${DEPLOYMENT_ID:-}" ]; then
+              .venv/bin/python deploy/docker/verify_rollout.py rollback || true
+            fi
+            finish_monitor || true
+            exit "$failure_status"
+          }
           start_monitor
           .venv/bin/python deploy/docker/verify_rollout.py preflight
           .venv/bin/python deploy/docker/verify_rollout.py route
 
-          export BASELINE_IMAGE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')"
-          release_payload="$(.venv/bin/python deploy/docker/verify_rollout.py policy)"
-          printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
-            -X POST "$DOKPLOY_URL/api/application.update" \
-            -H 'content-type: application/json' \
-            --data "$release_payload" >/dev/null
-
-          export BASELINE_FORCE_UPDATE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ForceUpdate}}')"
-          printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
-            -X POST "$DOKPLOY_URL/api/application.deploy" \
-            -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
+          BASELINE_IMAGE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')"
+          export BASELINE_IMAGE
+          BASELINE_FORCE_UPDATE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ForceUpdate}}')"
+          export BASELINE_FORCE_UPDATE
+          export SUBMISSION_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
+          export SUBMISSION_TITLE="crawl4ai-${SUBMISSION_ID}"
+          export DEPLOYMENT_ID="application-${APPLICATION_ID}-${SUBMISSION_ID}"
+          trap recover_on_exit EXIT
+          submitted_deployment_id="$(.venv/bin/python deploy/docker/verify_rollout.py submit)"
+          test "$submitted_deployment_id" = "$DEPLOYMENT_ID"
           if ! .venv/bin/python deploy/docker/verify_rollout.py; then
             .venv/bin/python deploy/docker/verify_rollout.py rollback
             finish_monitor
