@@ -804,6 +804,8 @@ def submit_application_deploy(
             api_key,
             {
                 "applicationId": application_id,
+                "expectedDockerImage": baseline_image,
+                "expectedLabelsSwarm": baseline_labels,
                 "dockerImage": candidate_image,
                 "labelsSwarm": candidate_labels,
             },

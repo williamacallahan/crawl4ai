@@ -743,6 +743,62 @@ def test_submit_reconciles_timeout_to_the_exact_queue_and_deployment(monkeypatch
     assert deployment_id == "application-app-submission"
 
 
+def test_submit_preserves_concurrent_metadata_when_candidate_cas_fails(monkeypatch):
+    application = _application()
+    baseline_labels = application["labelsSwarm"]
+    concurrent_labels = rollout_verifier._observability_labels("concurrent")
+    requests = []
+
+    def read_json(_url, _api_key):
+        return copy.deepcopy(application)
+
+    def post_json(url, _api_key, payload):
+        requests.append((url, payload))
+        if not url.endswith("application.update"):
+            return
+        application["labelsSwarm"] = concurrent_labels
+        if "expectedDockerImage" in payload and (
+            payload["expectedDockerImage"] != application["dockerImage"]
+            or payload["expectedLabelsSwarm"] != application["labelsSwarm"]
+        ):
+            raise ValueError("compare-and-swap failed")
+        application["dockerImage"] = payload["dockerImage"]
+        application["labelsSwarm"] = payload["labelsSwarm"]
+
+    monkeypatch.setattr(rollout_verifier, "_post_json", post_json)
+    clock = iter([0, 0, 60, 0, 0])
+
+    with pytest.raises(RuntimeError, match="metadata changed concurrently"):
+        rollout_verifier.submit_application_deploy(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            baseline_image=TARGET_IMAGE,
+            candidate_image="registry.example/crawl4ai@sha256:candidate",
+            candidate_revision="candidate",
+            submission_id="submission",
+            submission_title="crawl4ai-submission",
+            read_json=read_json,
+            sleep=lambda _seconds: None,
+            monotonic=clock.__next__,
+        )
+
+    assert application["dockerImage"] == TARGET_IMAGE
+    assert application["labelsSwarm"] == concurrent_labels
+    assert requests == [
+        (
+            "https://dokploy.example/api/application.update",
+            {
+                "applicationId": "app",
+                "expectedDockerImage": TARGET_IMAGE,
+                "expectedLabelsSwarm": baseline_labels,
+                "dockerImage": "registry.example/crawl4ai@sha256:candidate",
+                "labelsSwarm": rollout_verifier._observability_labels("candidate"),
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("inventory", "message"),
     [
