@@ -236,15 +236,15 @@ jobs:
             MONITOR_PID=""
             return "$monitor_status"
           }
-          if python3 deploy/docker/readiness_routing.py verify; then
-            start_monitor
-          fi
-
-          # The ingress shares haiku-0's singleton Traefik failure domain and is
-          # immutable after bootstrap. In-place replacement would move the
-          # RUNNING-before-ready race to this VIP, so source drift fails the
-          # exact-image proof below and requires a separately monitored cutover.
-          if ! docker service inspect "$INGRESS_APPLICATION_APP_NAME" >/dev/null 2>&1; then
+          # The ingress shares haiku-0's singleton Traefik failure domain.
+          # Source drift performs its monitored cutover HERE, before the
+          # zero-tolerance public monitor is armed: replacing the single-replica
+          # ingress (stop-first) interrupts public traffic for a few seconds,
+          # which must never count against the crawler rollout. The
+          # readiness_routing.py ingress proof below polls the Dokploy
+          # deployment to done and holds the exact-image invariant.
+          LIVE_INGRESS_IMAGE="$(docker service inspect "$INGRESS_APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null | cut -d@ -f1 || true)"
+          if [ "$LIVE_INGRESS_IMAGE" != "${INGRESS_IMAGE}:${INGRESS_TAG}" ]; then
             printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
               -X POST "$DOKPLOY_URL/api/application.update" \
               -H 'content-type: application/json' \
