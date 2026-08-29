@@ -19,6 +19,11 @@ def application(image=BASELINE, revision="baseline"):
         "sourceType": "docker",
         "dockerImage": image,
         "labelsSwarm": rollout._labels(revision),
+        "env": (
+            f"LLM_PROVIDER={rollout.LLM_PROVIDER}\n"
+            f"LLM_BASE_URL={rollout.LLM_BASE_URL}\n"
+            "LLM_API_KEY=secret"
+        ),
         "replicas": 3,
         "healthCheckSwarm": copy.deepcopy(rollout.HEALTHCHECK),
         "placementSwarm": {
@@ -56,6 +61,11 @@ def service_spec(image=BASELINE, revision="baseline"):
             "ContainerSpec": {
                 "Image": image,
                 "Labels": rollout._labels(revision),
+                "Env": [
+                    f"LLM_PROVIDER={rollout.LLM_PROVIDER}",
+                    f"LLM_BASE_URL={rollout.LLM_BASE_URL}",
+                    "LLM_API_KEY=secret",
+                ],
                 "Healthcheck": copy.deepcopy(rollout.HEALTHCHECK),
                 "StopGracePeriod": rollout.STOP_GRACE_NS,
             },
@@ -95,12 +105,20 @@ def health(instance="container123", revision=REVISION):
     }
 
 
-def route(custom=False, wrong_url=False):
-    transport = {"serversTransport": "custom"} if custom else {}
+def route(
+    custom_definition=False,
+    custom_reference=False,
+    wrong_url=False,
+    wrong_router=False,
+):
+    transport = {"serversTransport": "custom"} if custom_reference else {}
     config = {
         "http": {
             "routers": {
-                "one": {"rule": "Host(`crawl4ai.haiku.host`)", "service": "one"},
+                "one": {
+                    "rule": "Host(`crawl4ai.haiku.host`)",
+                    "service": "missing@internal" if wrong_router else "one",
+                },
                 "two": {
                     "rule": "Host(`crawl4ai.popos-sf0.com`)",
                     "service": "two",
@@ -125,7 +143,7 @@ def route(custom=False, wrong_url=False):
             },
         }
     }
-    if custom:
+    if custom_definition:
         config["http"]["serversTransports"] = {"custom": {}}
     return yaml_dump(config)
 
@@ -141,25 +159,84 @@ def test_policy_accepts_only_stock_docker_image_configuration():
     for field, value in (
         ("sourceType", "github"),
         ("replicas", 2),
+        ("healthCheckSwarm", {}),
+        ("placementSwarm", {}),
+        ("endpointSpecSwarm", {}),
+        ("updateConfigSwarm", {}),
+        ("rollbackConfigSwarm", {}),
         ("stopGracePeriodSwarm", 1),
+        ("stopGracePeriodSwarm", rollout.STOP_GRACE_NS + 1),
+        ("cpuReservation", "1"),
+        ("cpuLimit", "1"),
+        ("memoryReservation", "1"),
+        ("memoryLimit", "1"),
     ):
         changed = application()
         changed[field] = value
         with pytest.raises(ValueError):
             rollout._policy(changed)
 
+    changed = application()
+    changed["env"] = changed["env"].replace(
+        rollout.LLM_BASE_URL, "https://attacker.invalid/v1"
+    )
+    with pytest.raises(ValueError, match="LLM_BASE_URL"):
+        rollout._policy(changed)
 
-def test_running_spec_requires_exact_artifact_and_native_policy():
+    changed = application()
+    changed["env"] += f"\nLLM_BASE_URL={rollout.LLM_BASE_URL}"
+    with pytest.raises(ValueError, match="duplicate LLM_BASE_URL"):
+        rollout._policy(changed)
+
+
+def test_running_spec_rejects_artifact_drift():
     rollout._running_spec(service_spec(), BASELINE, rollout._labels("baseline"))
     changed = service_spec()
     changed["TaskTemplate"]["ContainerSpec"]["Image"] = CANDIDATE
     with pytest.raises(ValueError, match="artifact"):
         rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
 
+    changed = service_spec()
+    changed["TaskTemplate"]["ContainerSpec"]["Env"][1] = (
+        "LLM_BASE_URL=https://attacker.invalid/v1"
+    )
+    with pytest.raises(ValueError, match="LLM_BASE_URL"):
+        rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
 
-@pytest.mark.parametrize(("custom", "wrong"), [(True, False), (False, True)])
-def test_route_rejects_custom_transport_and_non_vip_target(monkeypatch, custom, wrong):
-    monkeypatch.setattr(rollout, "_request_json", lambda *_args: route(custom, wrong))
+    changed = service_spec()
+    changed["TaskTemplate"]["ContainerSpec"]["Env"].append(
+        f"LLM_BASE_URL={rollout.LLM_BASE_URL}"
+    )
+    with pytest.raises(ValueError, match="duplicate LLM_BASE_URL"):
+        rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
+
+    changed = service_spec()
+    changed["TaskTemplate"]["ContainerSpec"]["StopGracePeriod"] = (
+        rollout.STOP_GRACE_NS + 1
+    )
+    with pytest.raises(ValueError, match="stop grace"):
+        rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
+
+
+@pytest.mark.parametrize(
+    ("custom_definition", "custom_reference", "wrong_url", "wrong_router"),
+    [
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, False, True, False),
+        (False, False, False, True),
+    ],
+)
+def test_route_rejects_non_stock_routing(
+    monkeypatch, custom_definition, custom_reference, wrong_url, wrong_router
+):
+    monkeypatch.setattr(
+        rollout,
+        "_request_json",
+        lambda *_args: route(
+            custom_definition, custom_reference, wrong_url, wrong_router
+        ),
+    )
     with pytest.raises(ValueError):
         rollout.verify_route("https://dokploy", "key", "app", "crawl4ai")
 
@@ -194,7 +271,7 @@ def test_wait_deployment_accepts_one_exact_new_row(monkeypatch):
                 "description": "description",
                 "status": "done",
             },
-            {"deploymentId": "old"},
+            {"deploymentId": "old", "status": "done"},
         ],
     )
     result = rollout._wait_deployment(
@@ -213,6 +290,27 @@ def test_wait_deployment_fails_closed_on_foreign_row(monkeypatch):
         rollout._wait_deployment(
             "https://dokploy", "key", "app", set(), "title", "description"
         )
+
+
+def test_task_runtime_parses_container_identity_and_overlay(monkeypatch):
+    output = (
+        '"container123456789"\t'
+        + json.dumps(rollout._labels(REVISION))
+        + '\t"registry.example/crawl4ai@sha256:candidate"\t'
+        + '[{"Network":{"ID":"network"},"Addresses":["10.0.1.23/24"]}]\n'
+    )
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, output, ""),
+    )
+    runtime = rollout._task_runtime("task", "network")
+    assert runtime == {
+        "container": "container123",
+        "labels": rollout._labels(REVISION),
+        "image": CANDIDATE,
+        "addresses": {"10.0.1.23"},
+    }
 
 
 def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
@@ -255,11 +353,11 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
     monkeypatch.setattr(rollout.subprocess, "run", run)
     monkeypatch.setattr(
         rollout,
-        "_task_transition",
+        "_task_state",
         lambda task: (
-            ("2026-08-29T00:00:01Z", "", "running", "running")
+            ("running", "running")
             if task.startswith("task")
-            else ("", "2026-08-29T00:00:02Z", "shutdown", "shutdown")
+            else ("shutdown", "shutdown")
         ),
     )
     monkeypatch.setattr(
@@ -280,6 +378,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
 def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     state = application()
     posts = []
+    deployments = [{"deploymentId": "old", "status": "done"}]
 
     def post(url, _key, payload):
         posts.append((url, payload))
@@ -296,7 +395,11 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     monkeypatch.setenv("GITHUB_RUN_ID", "1")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
     monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
-    monkeypatch.setattr(rollout, "_deployments", lambda *_args: [{"deploymentId": "old"}])
+    monkeypatch.setattr(
+        rollout,
+        "_deployments",
+        lambda *_args: copy.deepcopy(deployments),
+    )
     monkeypatch.setattr(rollout, "_post_json", post)
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
@@ -324,6 +427,21 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     ]
     assert "idempotencyKey" not in posts[1][1]
     assert "expectedDockerImage" not in posts[0][1]
+
+    state = application()
+    posts.clear()
+    deployments[:] = [{"deploymentId": "running", "status": "running"}]
+    with pytest.raises(RuntimeError, match="nonterminal Dokploy deployment"):
+        rollout.deploy()
+    assert not posts
+
+    state = application()
+    posts.clear()
+    deployments[:] = [{"deploymentId": "old", "status": "done"}]
+    update_states = iter(["completed", "rollback_paused", "completed", "completed"])
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: next(update_states))
+    with pytest.raises(RuntimeError, match="rollback_paused"):
+        rollout.deploy()
 
 
 @pytest.mark.parametrize("fail_on", [1, 2])
@@ -375,7 +493,30 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path):
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
     monkeypatch.setenv("GITHUB_SHA", REVISION)
     rollout.evidence()
-    rows[0]["ok"] = False
+    rows[0]["revision"] = "baseline"
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
-    with pytest.raises(RuntimeError, match="failure"):
+    with pytest.raises(RuntimeError, match="each public domain"):
         rollout.evidence()
+
+
+def test_monitor_arms_only_after_both_domains_are_ready(monkeypatch, tmp_path):
+    evidence_path = tmp_path / "evidence.jsonl"
+    armed_path = tmp_path / "armed"
+    stop_path = tmp_path / "stop"
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(evidence_path))
+    monkeypatch.setenv("ROLLOUT_MONITOR_ARMED_PATH", str(armed_path))
+    monkeypatch.setenv("ROLLOUT_MONITOR_STOP_PATH", str(stop_path))
+    calls = []
+
+    def ready(url, *_args):
+        assert not armed_path.exists()
+        calls.append(url)
+        if len(calls) == len(rollout.HEALTH_URLS):
+            stop_path.touch()
+        return health()
+
+    monkeypatch.setattr(rollout, "_request_json", ready)
+    monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+    rollout.monitor()
+    assert armed_path.exists()
+    assert len(evidence_path.read_text().splitlines()) == len(rollout.HEALTH_URLS)

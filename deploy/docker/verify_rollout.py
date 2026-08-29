@@ -16,6 +16,8 @@ import yaml
 
 REPLICAS = 3
 ELIGIBLE_NODES = frozenset({"haiku-4", "haiku-5", "haiku-9", "haiku-18"})
+LLM_PROVIDER = "openai/qwen3.8-27b"
+LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 HEALTH_URLS = (
     "https://crawl4ai.haiku.host/health",
     "https://crawl4ai.popos-sf0.com/health",
@@ -43,6 +45,47 @@ def _labels(revision: str) -> dict[str, str]:
         "otel.service.name": "crawl4ai",
         "otel.deployment.environment.name": "production",
         "otel.service.version": revision,
+    }
+
+
+def _environment_values(environment: Any) -> dict[str, str]:
+    if isinstance(environment, str):
+        lines = environment.splitlines()
+    elif isinstance(environment, list) and all(
+        isinstance(line, str) for line in environment
+    ):
+        lines = environment
+    else:
+        raise ValueError("Crawl4AI environment is not configured")
+    values = {}
+    protected = {"LLM_PROVIDER", "LLM_BASE_URL", "LLM_API_KEY"}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            if key in protected and key in values:
+                raise ValueError(f"duplicate {key}")
+            values[key] = value
+    return values
+
+
+def _verify_llm_environment(environment: Any) -> None:
+    values = _environment_values(environment)
+    if values.get("LLM_PROVIDER") != LLM_PROVIDER:
+        raise ValueError("LLM_PROVIDER drifted")
+    if values.get("LLM_BASE_URL") != LLM_BASE_URL:
+        raise ValueError("LLM_BASE_URL drifted")
+    if not values.get("LLM_API_KEY", "").strip():
+        raise ValueError("LLM_API_KEY is empty")
+
+
+def _rollout_policy(failure_action: str) -> dict[str, Any]:
+    return {
+        "Parallelism": 1,
+        "Delay": DELAY_NS,
+        "FailureAction": failure_action,
+        "Monitor": DELAY_NS,
+        "MaxFailureRatio": 0,
+        "Order": "start-first",
     }
 
 
@@ -132,13 +175,18 @@ def _task_runtime(task_id: str, network_id: str) -> dict[str, Any]:
         if attachment.get("Network", {}).get("ID") == network_id
         for address in attachment.get("Addresses", [])
     }
+    return {
+        "container": json.loads(container)[:12],
+        "labels": json.loads(labels) or {},
+        "image": json.loads(image),
+        "addresses": addresses,
+    }
 
 
-def _task_transition(task_id: str) -> tuple[str, str, str, str]:
+def _task_state(task_id: str) -> tuple[str, str]:
     result = subprocess.run(
         [
             "docker", "inspect", task_id, "--format",
-            "{{json .Status.Timestamp}}\t{{json .Meta.UpdatedAt}}\t"
             "{{json .DesiredState}}\t{{json .Status.State}}",
         ],
         check=True,
@@ -146,13 +194,7 @@ def _task_transition(task_id: str) -> tuple[str, str, str, str]:
         text=True,
     )
     values = [json.loads(value) for value in result.stdout.rstrip("\n").split("\t")]
-    return values[0], values[1], values[2], values[3]
-    return {
-        "container": json.loads(container)[:12],
-        "labels": json.loads(labels) or {},
-        "image": json.loads(image),
-        "addresses": addresses,
-    }
+    return values[0], values[1]
 
 
 def _eligible_nodes() -> frozenset[str]:
@@ -183,6 +225,7 @@ def _eligible_nodes() -> frozenset[str]:
 def _policy(application: dict[str, Any]) -> None:
     if application.get("sourceType") != "docker":
         raise ValueError("Crawl4AI must remain a stock Dokploy Docker-image app")
+    _verify_llm_environment(application.get("env"))
     if application.get("replicas") != REPLICAS:
         raise ValueError("Crawl4AI must keep three replicas")
     if application.get("healthCheckSwarm") != HEALTHCHECK:
@@ -192,13 +235,9 @@ def _policy(application: dict[str, Any]) -> None:
     if application.get("endpointSpecSwarm") != {"Mode": "vip", "Ports": []}:
         raise ValueError("Crawl4AI must use the native Swarm VIP")
     for field, action in (("updateConfigSwarm", "rollback"), ("rollbackConfigSwarm", "pause")):
-        expected = {
-            "Parallelism": 1, "Delay": DELAY_NS, "FailureAction": action,
-            "Monitor": DELAY_NS, "MaxFailureRatio": 0, "Order": "start-first",
-        }
-        if application.get(field) != expected:
+        if application.get(field) != _rollout_policy(action):
             raise ValueError(f"{field} drifted")
-    if int(application.get("stopGracePeriodSwarm") or 0) < STOP_GRACE_NS:
+    if int(application.get("stopGracePeriodSwarm") or 0) != STOP_GRACE_NS:
         raise ValueError("Crawl4AI stop grace drifted")
     for field, expected in (
         ("cpuReservation", "500000000"), ("cpuLimit", "2000000000"),
@@ -213,22 +252,19 @@ def _running_spec(spec: dict[str, Any], image: str, labels: dict[str, str]) -> N
     container = task.get("ContainerSpec") or {}
     if container.get("Image") != image or container.get("Labels") != labels:
         raise ValueError("running artifact or labels differ from Dokploy")
+    _verify_llm_environment(container.get("Env"))
     if container.get("Healthcheck") != HEALTHCHECK:
         raise ValueError("running healthcheck drifted")
     if task.get("Placement") != {"Constraints": [NODE_CONSTRAINT], "MaxReplicas": 1}:
         raise ValueError("running placement drifted")
     if task.get("Resources") != RESOURCES:
         raise ValueError("running resources drifted")
-    if container.get("StopGracePeriod", 0) < STOP_GRACE_NS:
+    if container.get("StopGracePeriod", 0) != STOP_GRACE_NS:
         raise ValueError("running stop grace drifted")
     if spec.get("Mode") != {"Replicated": {"Replicas": REPLICAS}}:
         raise ValueError("running replica count drifted")
     for field, action in (("UpdateConfig", "rollback"), ("RollbackConfig", "pause")):
-        expected = {
-            "Parallelism": 1, "Delay": DELAY_NS, "FailureAction": action,
-            "Monitor": DELAY_NS, "MaxFailureRatio": 0, "Order": "start-first",
-        }
-        if spec.get(field) != expected:
+        if spec.get(field) != _rollout_policy(action):
             raise ValueError(f"running {field} drifted")
     endpoint = spec.get("EndpointSpec") or {}
     if endpoint.get("Mode") != "vip" or endpoint.get("Ports") not in (None, []):
@@ -253,10 +289,17 @@ def verify_route(base: str, api_key: str, application_id: str, app_name: str) ->
             raise ValueError("Dokploy route does not target the native Swarm VIP")
         if load_balancer.get("serversTransport"):
             raise ValueError("Dokploy route uses a custom transport")
-    rules = {router.get("rule") for router in routers.values()}
-    if not services or any(
-        not any(f"`{host}`" in str(rule) for rule in rules)
-        for host in (urllib.parse.urlparse(url).hostname for url in HEALTH_URLS)
+    hosts = tuple(urllib.parse.urlparse(url).hostname for url in HEALTH_URLS)
+    for router in routers.values():
+        rule = str(router.get("rule"))
+        if (
+            not any(f"`{host}`" in rule for host in hosts)
+            or router.get("service") not in services
+        ):
+            raise ValueError("Dokploy router is not bound to a native VIP service")
+    if not services or not routers or any(
+        not any(f"`{host}`" in str(router.get("rule")) for router in routers.values())
+        for host in hosts
     ):
         raise ValueError("Dokploy does not own both Crawl4AI domains")
 
@@ -354,18 +397,15 @@ def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
         )
         if predecessor is None:
             raise RuntimeError("Crawl4AI task has no predecessor withdrawal evidence")
-        admitted_at, _, desired, state = _task_transition(str(candidate["ID"])[:12])
-        _, withdrawn_at, predecessor_desired, predecessor_state = _task_transition(
-            str(predecessor["ID"])[:12]
-        )
+        desired, state = _task_state(str(candidate["ID"])[:12])
+        predecessor_desired, predecessor_state = _task_state(str(predecessor["ID"])[:12])
         if (
             desired != "running"
             or state != "running"
             or predecessor_desired != "shutdown"
             or predecessor_state not in {"shutdown", "complete"}
-            or admitted_at > withdrawn_at
         ):
-            raise RuntimeError("Swarm did not withdraw the predecessor after admission")
+            raise RuntimeError("Swarm task history contradicts the start-first rollout")
     network = subprocess.run(
         ["docker", "network", "inspect", "dokploy-network", "--format", "{{.ID}}"],
         check=True,
@@ -420,15 +460,20 @@ def deploy() -> None:
     for url in HEALTH_URLS:
         if not _exact_health(_request_json(f"{url}?baseline={uuid.uuid4()}"), baseline_revision):
             raise RuntimeError("public Crawl4AI baseline is not ready")
-    prior_ids = {
-        str(row.get("deploymentId"))
-        for row in _deployments(base, api_key, application_id)
-    }
+    prior_deployments = _deployments(base, api_key, application_id)
+    if any(
+        row.get("status") not in {"done", "error", "cancelled"}
+        for row in prior_deployments
+    ):
+        raise RuntimeError("Crawl4AI already has a nonterminal Dokploy deployment")
+    prior_ids = {str(row.get("deploymentId")) for row in prior_deployments}
     title = f"crawl4ai-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{revision}"
     description = f"candidate={candidate};baseline={baseline}"
     current = _application(base, api_key, application_id)
+    _policy(current)
     if current.get("dockerImage") != baseline or current.get("labelsSwarm") != baseline_labels:
         raise RuntimeError("baseline metadata changed before submission")
+    verify_route(base, api_key, application_id, app_name)
     _post_json(
         f"{base.rstrip('/')}/api/application.update",
         api_key,
@@ -439,8 +484,10 @@ def deploy() -> None:
         },
     )
     updated = _application(base, api_key, application_id)
+    _policy(updated)
     if updated.get("dockerImage") != candidate or updated.get("labelsSwarm") != _labels(revision):
         raise RuntimeError("candidate metadata did not converge; no deploy was submitted")
+    verify_route(base, api_key, application_id, app_name)
     _post_json(
         f"{base.rstrip('/')}/api/application.deploy",
         api_key,
@@ -448,8 +495,10 @@ def deploy() -> None:
     )
     deployment = _wait_deployment(base, api_key, application_id, prior_ids, title, description)
     deadline = time.monotonic() + TIMEOUT_SECONDS
-    while _update_state(app_name) != "completed":
+    while True:
         state = _update_state(app_name)
+        if state == "completed":
+            break
         if state in {"paused", "rollback_paused", "rollback_completed"}:
             raise RuntimeError(f"Swarm update ended in {state}; manual reconciliation required")
         if time.monotonic() >= deadline:
@@ -483,8 +532,8 @@ def monitor() -> None:
     armed = Path(os.environ["ROLLOUT_MONITOR_ARMED_PATH"])
     stop = Path(os.environ["ROLLOUT_MONITOR_STOP_PATH"])
     evidence.parent.mkdir(parents=True, exist_ok=True)
-    armed.touch()
     failures = 0
+    first_round = True
     with evidence.open("a") as output:
         while not stop.exists():
             for url in HEALTH_URLS:
@@ -507,6 +556,11 @@ def monitor() -> None:
                 failures += not sample["ok"]
                 output.write(json.dumps(sample, separators=(",", ":")) + "\n")
                 output.flush()
+            if first_round:
+                if failures:
+                    raise RuntimeError("public rollout baseline is not ready")
+                armed.touch()
+                first_round = False
             time.sleep(0.5)
     if failures:
         raise RuntimeError(f"public rollout monitor recorded {failures} failures")

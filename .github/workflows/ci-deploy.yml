@@ -198,7 +198,6 @@ jobs:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
           IMAGE_DIGEST: ${{ needs.merge.outputs.image_digest }}
-          HEALTH_URLS: https://crawl4ai.haiku.host/health,https://crawl4ai.popos-sf0.com/health
         run: |
           set -euo pipefail
           export ROLLOUT_MONITOR_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.jsonl"
