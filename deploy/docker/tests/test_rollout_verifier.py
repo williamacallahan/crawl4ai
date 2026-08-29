@@ -81,6 +81,21 @@ def test_release_requires_exactly_three_replicas(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rollbackActive": False},
+        {"rollbackRegistryId": None},
+        {"rollbackRegistryId": "other-registry"},
+    ],
+)
+def test_release_requires_native_rollback(overrides):
+    with pytest.raises(ValueError, match="native rollback"):
+        rollout_verifier._verify_release_configuration(
+            _application(**overrides), "target", TARGET_IMAGE
+        )
+
+
 @pytest.mark.parametrize("field", ["updateConfigSwarm", "stopGracePeriodSwarm"])
 def test_current_rollout_source_rejects_timing_drift(field):
     application = _application()
@@ -126,6 +141,9 @@ def _application(**overrides):
         "replicas": 1,
         "appName": "crawl4ai",
         "dockerImage": "registry.example/crawl4ai@sha256:target",
+        "registryId": "registry",
+        "rollbackActive": True,
+        "rollbackRegistryId": "registry",
         "cpuReservation": rollout_verifier.CRAWL_CPU_RESERVATION,
         "cpuLimit": rollout_verifier.CRAWL_CPU_LIMIT,
         "memoryReservation": rollout_verifier.CRAWL_MEMORY_RESERVATION,

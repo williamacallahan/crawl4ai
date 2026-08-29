@@ -95,6 +95,14 @@ def _environment_values(environment: str) -> dict[str, str]:
     return values
 
 
+def _uses_native_rollback(application: dict[str, Any]) -> bool:
+    return (
+        application.get("rollbackActive") is True
+        and bool(application.get("registryId"))
+        and application.get("rollbackRegistryId") == application.get("registryId")
+    )
+
+
 def _verify_release_configuration(
     application: Any, revision: str, expected_image: str
 ) -> None:
@@ -106,6 +114,8 @@ def _verify_release_configuration(
         raise ValueError("Crawl4AI must keep exactly three replicas")
     if application.get("dockerImage") != expected_image:
         raise ValueError("Crawl4AI image does not match the immutable release")
+    if not _uses_native_rollback(application):
+        raise ValueError("Crawl4AI must use its Nexus registry for native rollback")
     environment = application.get("env")
     if not isinstance(environment, str):
         raise ValueError("LLM environment is not configured")
@@ -249,6 +259,8 @@ def _verify_current_rollout_source(application: Any) -> None:
         raise ValueError("current Crawl4AI artifact is not configured")
     if application.get("replicas") != CRAWL_REPLICAS:
         raise ValueError("current Crawl4AI service must have three replicas")
+    if not _uses_native_rollback(application):
+        raise ValueError("current Crawl4AI service lacks native rollback")
     if application.get("healthCheckSwarm") != CRAWL_HEALTHCHECK_POLICY:
         raise ValueError(
             "current Crawl4AI service lacks the exact admission healthcheck"
