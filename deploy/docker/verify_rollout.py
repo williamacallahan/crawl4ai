@@ -978,7 +978,7 @@ def _swarm_tasks(app_name: str, tracked_task_ids: set[str]) -> list[dict[str, An
             capture_output=True,
             text=True,
         )
-        error_lines = inspected.stderr.splitlines()
+        error_lines = [line for line in inspected.stderr.splitlines() if line.strip()]
         missing_task_ids = {
             match.group(1)
             for line in error_lines

@@ -380,6 +380,7 @@ def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
     [
         "Error: No such object: vanished1234\n",
         "error: no such object: vanished1234\n",
+        "\nerror: no such object: vanished1234\n",
     ],
 )
 def test_swarm_tasks_keeps_survivor_metadata_when_one_task_disappears(
