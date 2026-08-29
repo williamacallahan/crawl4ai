@@ -314,6 +314,37 @@ def test_rollout_preflight_requires_four_capacity_admitted_nodes(
         "_curl_json",
         lambda *_args: _application(replicas=3),
     )
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_service_spec",
+        lambda _app_name: {
+            "TaskTemplate": {
+                "ContainerSpec": {
+                    "Image": "registry.example/crawl4ai@sha256:target",
+                    "Healthcheck": {"Test": rollout_verifier.CRAWL_HEALTHCHECK},
+                },
+                "Placement": {"MaxReplicas": 1},
+                "StopGracePeriod": rollout_verifier.STOP_GRACE_NS,
+            },
+            "Mode": {"Replicated": {"Replicas": 3}},
+            "UpdateConfig": {
+                "Order": "start-first",
+                "Parallelism": 1,
+                "FailureAction": "rollback",
+                "MaxFailureRatio": 0,
+                "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
+                "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            },
+            "RollbackConfig": {
+                "Order": "start-first",
+                "Parallelism": 1,
+                "FailureAction": "pause",
+                "MaxFailureRatio": 0,
+                "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
+                "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            },
+        },
+    )
 
     if node_count < 4:
         with pytest.raises(RuntimeError, match="four resource-admitted"):

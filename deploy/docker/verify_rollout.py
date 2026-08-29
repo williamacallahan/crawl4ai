@@ -184,6 +184,54 @@ def _verify_current_rollout_source(application: Any) -> None:
         raise ValueError("current Crawl4AI stop grace is not drain-safe")
 
 
+def _service_spec(app_name: str) -> dict[str, Any]:
+    result = subprocess.run(
+        ["docker", "service", "inspect", app_name, "--format", "{{json .Spec}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    spec = json.loads(result.stdout)
+    if not isinstance(spec, dict):
+        raise ValueError("current Crawl4AI service spec is invalid")
+    return spec
+
+
+def _verify_current_service_spec(
+    spec: dict[str, Any], application: dict[str, Any]
+) -> None:
+    task = spec.get("TaskTemplate")
+    container = task.get("ContainerSpec") if isinstance(task, dict) else None
+    if not isinstance(container, dict) or container.get("Image") != application["dockerImage"]:
+        raise ValueError("current Docker service artifact differs from Dokploy")
+    healthcheck = container.get("Healthcheck")
+    if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
+        raise ValueError("current Docker service lacks the admission healthcheck")
+    placement = task.get("Placement")
+    if not isinstance(placement, dict) or placement.get("MaxReplicas") != 1:
+        raise ValueError("current Docker service lacks one-task-per-node placement")
+    if int(task.get("StopGracePeriod") or 0) < REQUIRED_STOP_GRACE_NS:
+        raise ValueError("current Docker service stop grace is not drain-safe")
+    mode = spec.get("Mode")
+    if not isinstance(mode, dict) or mode.get("Replicated", {}).get("Replicas") != CRAWL_REPLICAS:
+        raise ValueError("current Docker service does not have three replicas")
+    for field, failure_action in (
+        ("UpdateConfig", "rollback"),
+        ("RollbackConfig", "pause"),
+    ):
+        config = spec.get(field)
+        if (
+            not isinstance(config, dict)
+            or config.get("Order") != "start-first"
+            or config.get("Parallelism") != 1
+            or config.get("FailureAction") != failure_action
+            or config.get("MaxFailureRatio") != 0
+            or int(config.get("Delay") or 0) < ROLLOUT_DELAY_NS
+            or int(config.get("Monitor") or 0) < ROLLOUT_MONITOR_NS
+        ):
+            raise ValueError(f"current Docker {field} is not a safe rollback source")
+
+
 def verify_rollout_preflight(
     *, dokploy_url: str, api_key: str, application_id: str
 ) -> None:
@@ -217,6 +265,7 @@ def verify_rollout_preflight(
         api_key,
     )
     _verify_current_rollout_source(application)
+    _verify_current_service_spec(_service_spec(application["appName"]), application)
 
 
 def _required_stop_grace_ns() -> int:
