@@ -294,14 +294,20 @@ jobs:
               -X POST "$DOKPLOY_URL/api/application.deploy" \
               -H 'content-type: application/json' \
               --data "$(printf '{"applicationId":"%s"}' "$REDIS_APPLICATION_ID")" >/dev/null
-            for _ in {1..60}; do
+            # Dokploy applied the one observed convergence redeploy ~5m36s
+            # after the POST (23:43:58 -> 23:49:34 on 2026-08-28), so a 300s
+            # poll expires before a healthy apply lands. Give it 600s.
+            for _ in {1..120}; do
               running="$(docker service ps "$REDIS_APPLICATION_APP_NAME" --filter desired-state=running --format '{{.CurrentState}}' | grep -c '^Running' || true)"
               if redis_args | grep -q 'appendfsync","everysec' && [ "$running" = "1" ]; then
                 break
               fi
               sleep 5
             done
-            redis_args | grep -q 'appendfsync","everysec'
+            if ! redis_args | grep -q 'appendfsync","everysec'; then
+              echo "::error::Redis service command did not converge to appendfsync everysec within 600s; rendered command/args: $(redis_args)"
+              exit 1
+            fi
             python3 deploy/docker/readiness_routing.py verify
           fi
           echo "deploy verified for ${IMAGE}:${GITHUB_SHA} with $(wc -l < "$ROLLOUT_MONITOR_PATH") successful public probes"

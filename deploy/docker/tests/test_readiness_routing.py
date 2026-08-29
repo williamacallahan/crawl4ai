@@ -82,18 +82,29 @@ def test_monitor_records_ingress_and_public_failure_after_arming(monkeypatch, tm
     samples = iter(
         [
             {"ok": True, "status": 200, "instance": "old", "revision": "old"},
-            {"ok": False, "error": "TimeoutError"},
+            {"ok": True, "status": 200, "instance": "old", "revision": "old"},
         ]
     )
-    monkeypatch.setattr(readiness_routing, "_public_health_sample", lambda _url: next(samples))
-    monkeypatch.setattr(
-        readiness_routing, "ingress_backends", lambda _url: ["10.0.1.11"]
+    backends = iter(
+        [
+            ["10.0.1.11"],
+            ValueError("HAProxy has no admitted Crawl4AI backends"),
+        ]
     )
+
+    def next_backends(_url):
+        result = next(backends)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(readiness_routing, "_public_health_sample", lambda _url: next(samples))
+    monkeypatch.setattr(readiness_routing, "ingress_backends", next_backends)
     monkeypatch.setattr(readiness_routing.time, "sleep", lambda _seconds: None)
     evidence = tmp_path / "monitor.jsonl"
     armed = tmp_path / "armed"
 
-    with pytest.raises(RuntimeError, match="failed request"):
+    with pytest.raises(RuntimeError, match="failed request.*no admitted Crawl4AI backends"):
         readiness_routing.monitor_public_health(
             health_url="https://crawl.example/health",
             stats_url="http://crawl4ai-ingress:8404/stats;csv",
@@ -104,14 +115,27 @@ def test_monitor_records_ingress_and_public_failure_after_arming(monkeypatch, tm
         )
 
     assert armed.exists()
-    assert [json.loads(line)["ok"] for line in evidence.read_text().splitlines()] == [
-        True,
-        False,
-    ]
+    written = [json.loads(line) for line in evidence.read_text().splitlines()]
+    assert [sample["ok"] for sample in written] == [True, False]
+    assert written[1]["ingressError"] == "ValueError"
+    assert "no admitted" in written[1]["ingressErrorDetail"]
     with pytest.raises(RuntimeError, match="did not remain successful"):
         readiness_routing.verify_monitor_evidence(
             evidence, frozenset({"replacement"}), frozenset({"10.0.1.11"})
         )
+
+
+def test_public_health_sample_records_error_detail(monkeypatch):
+    def raise_timeout(*_args, **_kwargs):
+        raise TimeoutError("timed out reading https://crawl.example/health")
+
+    monkeypatch.setattr(readiness_routing.urllib.request, "urlopen", raise_timeout)
+
+    sample = readiness_routing._public_health_sample("https://crawl.example/health")
+
+    assert sample["ok"] is False
+    assert sample["error"] == "TimeoutError"
+    assert "timed out" in sample["errorDetail"]
 
 
 def test_monitor_evidence_proves_predecessor_withdrawal_and_final_admission(tmp_path):
@@ -324,7 +348,7 @@ def test_haproxy_discovers_and_admits_only_healthy_swarm_tasks():
     assert "http-check expect status 200" in config
     assert re.search(
         r"default-server check inter 500ms fastinter 250ms downinter 250ms "
-        r"fall 1 rise 1 .* init-addr none init-state fully-down",
+        r"fall 2 rise 1 .* init-addr none init-state fully-down",
         config,
     )
 
@@ -371,13 +395,20 @@ def test_pid1_withdrawal_delay_outlives_haproxy_health_withdrawal():
     config = (INGRESS_DIR / "haproxy.cfg").read_text()
     entrypoint = (DOCKER_DIR / "entrypoint.sh").read_text()
 
-    interval_ms = int(re.search(r"\binter (\d+)ms", config).group(1))
-    timeout_ms = int(re.search(r"timeout check (\d+)ms", config).group(1))
+    server_line = re.search(r"default-server .+", config).group(0)
+    interval_ms = int(re.search(r"\binter (\d+)ms", server_line).group(1))
+    fastinter_ms = int(re.search(r"fastinter (\d+)ms", server_line).group(1))
+    fall = int(re.search(r"\bfall (\d+)", server_line).group(1))
+    timeout_value, timeout_unit = re.search(
+        r"timeout check (\d+)(m?s)", config
+    ).groups()
+    timeout_ms = int(timeout_value) * (1 if timeout_unit == "ms" else 1000)
     delay_seconds = int(
         re.search(r"CRAWL4AI_DRAIN_DELAY_SECONDS:-([0-9]+)", entrypoint).group(1)
     )
 
-    assert delay_seconds * 1000 > interval_ms + timeout_ms
+    withdrawal_ms = interval_ms + (fall - 1) * fastinter_ms + fall * timeout_ms
+    assert delay_seconds * 1000 > withdrawal_ms
 
 
 @pytest.mark.asyncio

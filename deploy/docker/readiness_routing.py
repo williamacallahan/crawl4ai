@@ -158,6 +158,7 @@ def _public_health_sample(url: str) -> dict[str, Any]:
             "timestamp": time.time(),
             "latencySeconds": time.monotonic() - started,
             "error": type(error).__name__,
+            "errorDetail": str(error)[:160],
         }
 
 
@@ -199,12 +200,19 @@ def monitor_public_health(
             try:
                 sample["backends"] = ingress_backends(stats_url)
             except Exception as error:
-                sample.update(ok=False, ingressError=type(error).__name__)
+                sample.update(
+                    ok=False,
+                    ingressError=type(error).__name__,
+                    ingressErrorDetail=str(error)[:160],
+                )
             evidence.write(json.dumps(sample, separators=(",", ":")) + "\n")
             evidence.flush()
             os.fsync(evidence.fileno())
             if not sample["ok"]:
-                raise RuntimeError("public health monitor observed a failed request")
+                raise RuntimeError(
+                    "public health monitor observed a failed request: "
+                    + json.dumps(sample, separators=(",", ":"))
+                )
             baseline_instances.add(sample["instance"])
             if len(baseline_instances) >= expected_replicas and not armed_path.exists():
                 armed_path.touch()
