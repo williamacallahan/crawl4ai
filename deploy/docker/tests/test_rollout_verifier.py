@@ -17,6 +17,7 @@ from verify_rollout import (
     verify_monitor_evidence,
     verify_native_route,
     verify_rollout,
+    verify_rollout_preflight,
 )
 
 ORIGINAL_INSPECT_TASK_RUNTIME = rollout_verifier._inspect_task_runtime
@@ -71,7 +72,7 @@ def _application(**overrides):
         },
         "command": "redis-server --dir /data --appendonly yes --appendfsync everysec --loglevel notice",
         "placementSwarm": {
-            "Constraints": [],
+            "Constraints": [rollout_verifier.CRAWL_NODE_CONSTRAINT],
             "MaxReplicas": rollout_verifier.CRAWL_MAX_REPLICAS_PER_NODE,
         },
         "endpointSpecSwarm": rollout_verifier.CRAWL_ENDPOINT_SPEC,
@@ -264,14 +265,87 @@ def test_native_route_rejects_backend_or_transport_drift(monkeypatch, replacemen
         )
 
 
+def test_native_route_rejects_one_router_service_without_transport(monkeypatch):
+    route = """http:
+  routers:
+    crawl4ai-yq1svi-router-1:
+      service: crawl4ai-yq1svi-service-1
+    crawl4ai-yq1svi-router-2:
+      service: crawl4ai-yq1svi-service-2
+  services:
+    crawl4ai-yq1svi-service-1:
+      loadBalancer:
+        servers:
+          - url: http://crawl4ai-yq1svi:11235
+        serversTransport: crawl4ai-yq1svi-swarm-vip
+    crawl4ai-yq1svi-service-2:
+      loadBalancer:
+        servers:
+          - url: http://crawl4ai-yq1svi:11235
+  serversTransports:
+    crawl4ai-yq1svi-swarm-vip:
+      maxIdleConnsPerHost: -1
+"""
+    monkeypatch.setattr(rollout_verifier, "_curl_json", lambda *_args: route)
+
+    with pytest.raises(ValueError, match="does not use"):
+        verify_native_route(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            app_name="crawl4ai-yq1svi",
+        )
+
+
+@pytest.mark.parametrize("node_count", [3, 4])
+def test_rollout_preflight_requires_four_capacity_admitted_nodes(
+    monkeypatch, node_count
+):
+    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
+    monkeypatch.setattr(
+        rollout_verifier.subprocess,
+        "run",
+        lambda *_args, **_kwargs: rollout_verifier.subprocess.CompletedProcess(
+            [], 0, "".join(f"node-{index} Active\n" for index in range(node_count)), ""
+        ),
+    )
+    monkeypatch.setattr(
+        rollout_verifier,
+        "_curl_json",
+        lambda *_args: _application(replicas=3),
+    )
+
+    if node_count < 4:
+        with pytest.raises(RuntimeError, match="four resource-admitted"):
+            verify_rollout_preflight(
+                dokploy_url="https://dokploy.example",
+                api_key="secret",
+                application_id="app",
+            )
+    else:
+        verify_rollout_preflight(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+        )
 def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_path):
-    def task(task_id, container_id, desired, current, slot=1):
+    def task(
+        task_id,
+        container_id,
+        desired,
+        current,
+        slot=1,
+        status_timestamp="2026-08-29T00:00:00Z",
+        updated_at="2026-08-29T00:00:00Z",
+    ):
         return {
             "ID": task_id,
             "ContainerID": container_id,
             "DesiredState": desired,
             "CurrentState": current,
             "Slot": slot,
+            "StatusTimestamp": status_timestamp,
+            "UpdatedAt": updated_at,
         }
 
     def sample(instances, tasks):
@@ -284,10 +358,37 @@ def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_pat
         }
 
     predecessor = task("old-task", "old-instance", "Running", "Running 1m")
-    candidate_starting = task("new-task", "new-instance", "Running", "Starting 1s")
-    candidate_running = task("new-task", "new-instance", "Running", "Running 1s")
-    predecessor_draining = task("old-task", "old-instance", "Shutdown", "Running 1m")
-    predecessor_exited = task("old-task", "old-instance", "Shutdown", "Complete 1s")
+    candidate_starting = task(
+        "new-task",
+        "new-instance",
+        "Running",
+        "Starting 1s",
+        status_timestamp="2026-08-29T00:00:01Z",
+        updated_at="2026-08-29T00:00:01Z",
+    )
+    candidate_running = task(
+        "new-task",
+        "new-instance",
+        "Running",
+        "Running 1s",
+        status_timestamp="2026-08-29T00:00:02Z",
+        updated_at="2026-08-29T00:00:02Z",
+    )
+    predecessor_draining = task(
+        "old-task",
+        "old-instance",
+        "Shutdown",
+        "Running 1m",
+        updated_at="2026-08-29T00:00:03Z",
+    )
+    predecessor_exited = task(
+        "old-task",
+        "old-instance",
+        "Shutdown",
+        "Complete 1s",
+        status_timestamp="2026-08-29T00:00:04Z",
+        updated_at="2026-08-29T00:00:03Z",
+    )
     evidence = tmp_path / "rollout.jsonl"
     evidence.write_text(
         "\n".join(

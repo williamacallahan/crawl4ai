@@ -221,6 +221,7 @@ jobs:
             return "$monitor_status"
           }
           start_monitor
+          python3 deploy/docker/verify_rollout.py preflight
 
           # Redis persistence: fsync-per-write blocked the single Redis thread on
           # disk stalls and 503'd every replica's /health at once (2026-08-28 task
@@ -235,10 +236,15 @@ jobs:
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.update" \
             -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health"],"Interval":10000000000,"Timeout":5000000000,"StartPeriod":120000000000,"Retries":5},"placementSwarm":{"MaxReplicas":1},"endpointSpecSwarm":{"Mode":"vip","Ports":[]},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000,"swarmVipConnectionReuse":false}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
-
+            --data "$(printf '{"applicationId":"%s","swarmVipConnectionReuse":false}' "$APPLICATION_ID")" >/dev/null
           python3 deploy/docker/verify_rollout.py route
 
+          printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
+            -X POST "$DOKPLOY_URL/api/application.update" \
+            -H 'content-type: application/json' \
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health"],"Interval":10000000000,"Timeout":5000000000,"StartPeriod":120000000000,"Retries":5},"placementSwarm":{"Constraints":["node.labels.crawl4ai-eligible==true"],"MaxReplicas":1},"endpointSpecSwarm":{"Mode":"vip","Ports":[]},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
+
+          export BASELINE_FORCE_UPDATE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ForceUpdate}}')"
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H 'content-type: application/json' \

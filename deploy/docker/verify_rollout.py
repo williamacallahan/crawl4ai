@@ -13,8 +13,11 @@ import time
 import urllib.parse
 import uuid
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 MAX_RESPONSE_BYTES = 65_536
 MAX_REPLICAS = 16
@@ -29,6 +32,7 @@ CRAWL_HEALTHCHECK = ["CMD", "curl", "-f", "http://localhost:11235/health"]
 CRAWL_HEALTHCHECK_MIN_RETRIES = 3
 CRAWL_HEALTHCHECK_MIN_INTERVAL_NS = 5_000_000_000
 CRAWL_MAX_REPLICAS_PER_NODE = 1
+CRAWL_NODE_CONSTRAINT = "node.labels.crawl4ai-eligible==true"
 CRAWL_ENDPOINT_SPEC = {"Mode": "vip", "Ports": []}
 ROLLOUT_DELAY_NS = 150_000_000_000
 ROLLOUT_MONITOR_NS = 150_000_000_000
@@ -82,6 +86,8 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
         or placement.get("MaxReplicas") != CRAWL_MAX_REPLICAS_PER_NODE
     ):
         raise ValueError("Crawl4AI placement must keep one replica per node")
+    if placement.get("Constraints") != [CRAWL_NODE_CONSTRAINT]:
+        raise ValueError("Crawl4AI placement must use capacity-admitted nodes")
     if application.get("endpointSpecSwarm") != CRAWL_ENDPOINT_SPEC:
         raise ValueError("Crawl4AI must use the native Swarm VIP endpoint mode")
     if application.get("swarmVipConnectionReuse") is not False:
@@ -148,6 +154,69 @@ def _verify_redis_configuration(application: Any) -> None:
         raise ValueError("external Redis must be placed on haiku-18")
     if placement.get("MaxReplicas") != 1:
         raise ValueError("external Redis MaxReplicas must be 1")
+
+
+def _verify_current_rollout_source(application: Any) -> None:
+    if not isinstance(application, dict) or not application.get("dockerImage"):
+        raise ValueError("current Crawl4AI artifact is not configured")
+    if application.get("replicas") != CRAWL_REPLICAS:
+        raise ValueError("current Crawl4AI service must have three replicas")
+    healthcheck = application.get("healthCheckSwarm")
+    if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
+        raise ValueError("current Crawl4AI service lacks the admission healthcheck")
+    placement = application.get("placementSwarm")
+    if not isinstance(placement, dict) or placement.get("MaxReplicas") != 1:
+        raise ValueError("current Crawl4AI service lacks one-task-per-node placement")
+    for field, failure_action in (
+        ("updateConfigSwarm", "rollback"),
+        ("rollbackConfigSwarm", "pause"),
+    ):
+        config = application.get(field)
+        if (
+            not isinstance(config, dict)
+            or config.get("Order") != "start-first"
+            or config.get("Parallelism") != 1
+            or config.get("MaxFailureRatio") != 0
+            or config.get("FailureAction") != failure_action
+        ):
+            raise ValueError(f"current {field} is not a safe rollback source")
+    if int(application.get("stopGracePeriodSwarm") or 0) < REQUIRED_STOP_GRACE_NS:
+        raise ValueError("current Crawl4AI stop grace is not drain-safe")
+
+
+def verify_rollout_preflight(
+    *, dokploy_url: str, api_key: str, application_id: str
+) -> None:
+    nodes = subprocess.run(
+        [
+            "docker",
+            "node",
+            "ls",
+            "--filter",
+            "node.label=crawl4ai-eligible=true",
+            "--filter",
+            "status=ready",
+            "--format",
+            "{{.ID}} {{.Availability}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    eligible = [line for line in nodes if line.endswith(" Active")]
+    if len(eligible) < CRAWL_REPLICAS + 1:
+        raise RuntimeError(
+            "start-first requires four resource-admitted crawl4ai-eligible nodes"
+        )
+    application = _curl_json(
+        _dokploy_url(
+            dokploy_url,
+            "application.one",
+            applicationId=application_id,
+        ),
+        api_key,
+    )
+    _verify_current_rollout_source(application)
 
 
 def _required_stop_grace_ns() -> int:
@@ -232,30 +301,36 @@ def verify_native_route(
     )
     if not isinstance(route, str):
         raise ValueError("Dokploy Traefik configuration response is invalid")
+    config = yaml.safe_load(route)
+    if not isinstance(config, dict) or not isinstance(config.get("http"), dict):
+        raise ValueError("Dokploy Traefik configuration is malformed")
+    http = config["http"]
+    routers = http.get("routers")
+    services = http.get("services")
+    transports = http.get("serversTransports")
+    if not all(isinstance(value, dict) for value in (routers, services, transports)):
+        raise ValueError("Dokploy route is missing routers, services, or transports")
     expected_url = f"http://{app_name}:11235"
-    configured_urls = re.findall(r"\burl:\s*([^\s]+)", route)
-    if not configured_urls or set(configured_urls) != {expected_url}:
-        raise ValueError("Dokploy route does not target only the Crawl4AI Swarm VIP")
-    service_names = set(
-        re.findall(
-            rf"(?m)^\s{{4}}({re.escape(app_name)}-service-[0-9]+):\s*$",
-            route,
-        )
-    )
-    router_targets = set(re.findall(r"(?m)^\s{6}service:\s*([^\s]+)\s*$", route))
-    if not router_targets or not router_targets <= service_names:
-        raise ValueError("Every Dokploy router must target an application VIP service")
     transport_name = f"{app_name}-swarm-vip"
-    service_transports = re.findall(r"\bserversTransport:\s*([^\s]+)", route)
-    if not service_transports or set(service_transports) != {transport_name}:
-        raise ValueError(
-            "Every Dokploy service must use the application Swarm VIP transport"
-        )
-    if not re.search(
-        rf"(?m)^\s{{4}}{re.escape(transport_name)}:\s*$[\s\S]*?^\s{{6}}maxIdleConnsPerHost:\s*-1\s*$",
-        route,
-    ):
+    if transports.get(transport_name, {}).get("maxIdleConnsPerHost") != -1:
         raise ValueError("Dokploy Swarm VIP transport must disable idle connection reuse")
+    if not routers:
+        raise ValueError("Dokploy route has no routers")
+    for router in routers.values():
+        if not isinstance(router, dict) or not isinstance(router.get("service"), str):
+            raise ValueError("Dokploy router has no service target")
+        service = services.get(router["service"])
+        load_balancer = service.get("loadBalancer") if isinstance(service, dict) else None
+        servers = load_balancer.get("servers") if isinstance(load_balancer, dict) else None
+        urls = {
+            server.get("url")
+            for server in servers or []
+            if isinstance(server, dict)
+        }
+        if urls != {expected_url}:
+            raise ValueError("Dokploy router does not target the Crawl4AI Swarm VIP")
+        if load_balancer.get("serversTransport") != transport_name:
+            raise ValueError("Dokploy router does not use the Swarm VIP transport")
 def _public_health_sample(url: str) -> dict[str, Any]:
     started = time.monotonic()
     try:
@@ -318,7 +393,8 @@ def _swarm_tasks(
                 "inspect",
                 "--format",
                 "{{json .ID}}\t{{json .Slot}}\t"
-                "{{json .Status.ContainerStatus.ContainerID}}",
+                "{{json .Status.ContainerStatus.ContainerID}}\t"
+                "{{json .Status.Timestamp}}\t{{json .Meta.UpdatedAt}}",
                 *task_ids,
             ],
             check=True,
@@ -326,18 +402,24 @@ def _swarm_tasks(
             text=True,
         )
         containers = {}
-        for task_id, slot, container_id in (
-            line.split("\t", 2) for line in inspected.stdout.splitlines()
+        for task_id, slot, container_id, status_timestamp, updated_at in (
+            line.split("\t", 4) for line in inspected.stdout.splitlines()
         ):
             container = json.loads(container_id)
             containers[json.loads(task_id)[:12]] = (
                 json.loads(slot),
                 container[:12] if container else "",
+                json.loads(status_timestamp),
+                json.loads(updated_at),
             )
         for task in tasks:
-            slot, container = containers.get(_task_id(task), (None, ""))
+            slot, container, status_timestamp, updated_at = containers.get(
+                _task_id(task), (None, "", None, None)
+            )
             task["Slot"] = slot
             task["ContainerID"] = container
+            task["StatusTimestamp"] = status_timestamp
+            task["UpdatedAt"] = updated_at
     return tasks
 
 
@@ -390,6 +472,10 @@ def monitor_public_health(
 
 def _task_id(task: dict[str, Any]) -> str:
     return str(task.get("ID", task.get("Id", "")))[:12]
+
+
+def _timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def verify_monitor_evidence(
@@ -450,23 +536,27 @@ def verify_monitor_evidence(
         if not predecessor:
             raise RuntimeError("monitor did not correlate a candidate with its predecessor")
         candidate_running = next(
-            index
+            (index, task)
             for index, task in observed
             if str(task.get("CurrentState", "")).startswith("Running ")
         )
         predecessor_shutdown = next(
             (
-                index
+                (index, task)
                 for index, sample in enumerate(samples)
-                if any(
-                    _task_id(task) == predecessor
-                    and str(task.get("DesiredState", "")).lower() == "shutdown"
-                    for task in sample["tasks"]
-                )
+                for task in sample["tasks"]
+                if _task_id(task) == predecessor
+                and str(task.get("DesiredState", "")).lower() == "shutdown"
             ),
             None,
         )
-        if predecessor_shutdown is None or candidate_running > predecessor_shutdown:
+        if predecessor_shutdown is None:
+            raise RuntimeError("monitor did not observe predecessor shutdown")
+        candidate_running_at = candidate_running[1].get("StatusTimestamp")
+        predecessor_shutdown_at = predecessor_shutdown[1].get("UpdatedAt")
+        if not candidate_running_at or not predecessor_shutdown_at:
+            raise RuntimeError("monitor task timestamps are incomplete")
+        if _timestamp(candidate_running_at) >= _timestamp(predecessor_shutdown_at):
             raise RuntimeError("monitor did not prove per-slot admission before shutdown")
 
     predecessor_instances = {
@@ -500,8 +590,15 @@ def verify_monitor_evidence(
             ),
             None,
         )
-        if withdrawal is None or exit_index is None or withdrawal > exit_index:
+        if withdrawal is None or exit_index is None or withdrawal >= exit_index:
             raise RuntimeError("monitor did not observe predecessor withdrawal before exit")
+        withdrawn_task = next(
+            task
+            for task in samples[withdrawal]["tasks"]
+            if task.get("ContainerID") == predecessor
+        )
+        if not str(withdrawn_task.get("CurrentState", "")).startswith("Running "):
+            raise RuntimeError("monitor did not observe a withdrawn predecessor still running")
         served_while_draining = {
             probe.get("instance")
             for sample in samples[withdrawal : exit_index + 1]
@@ -566,6 +663,23 @@ def _dokploy_network_id() -> str:
     return network
 
 
+def _service_force_update(app_name: str) -> int:
+    result = subprocess.run(
+        [
+            "docker",
+            "service",
+            "inspect",
+            app_name,
+            "--format",
+            "{{.Spec.TaskTemplate.ForceUpdate}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(result.stdout.strip())
+
+
 def verify_rollout(
     *,
     dokploy_url: str,
@@ -578,6 +692,7 @@ def verify_rollout(
     probe_health: Callable[[str, int], list[Any]] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    baseline_force_update: int | None = None,
     monitor_evidence_path: Path | None = None,
     inspect_task_runtime: Callable[
         [str, str], tuple[str, frozenset[str], dict[str, str], str]
@@ -586,6 +701,12 @@ def verify_rollout(
 ) -> None:
     """Require a stable task set and matching public instances at one revision."""
     inspect_task_runtime = inspect_task_runtime or _inspect_task_runtime
+    if baseline_force_update is not None:
+        generation_deadline = monotonic() + 600
+        while _service_force_update(os.environ["APPLICATION_APP_NAME"]) <= baseline_force_update:
+            if monotonic() >= generation_deadline:
+                raise TimeoutError("Dokploy did not create a new service generation")
+            sleep(5)
     deployment_deadline = monotonic() + 600
     while monotonic() < deployment_deadline:
         deployments = read_json(
@@ -775,6 +896,13 @@ def main(arguments: list[str] | None = None) -> None:
             app_name=os.environ["APPLICATION_APP_NAME"],
         )
         return
+    if arguments == ["preflight"]:
+        verify_rollout_preflight(
+            dokploy_url=os.environ["DOKPLOY_URL"],
+            api_key=os.environ["DOKPLOY_API_KEY"],
+            application_id=os.environ["APPLICATION_ID"],
+        )
+        return
     if arguments:
         raise ValueError(f"Unsupported verifier arguments: {arguments}")
     verify_rollout(
@@ -787,6 +915,11 @@ def main(arguments: list[str] | None = None) -> None:
         monitor_evidence_path=(
             Path(os.environ["ROLLOUT_MONITOR_PATH"])
             if os.environ.get("ROLLOUT_MONITOR_PATH")
+            else None
+        ),
+        baseline_force_update=(
+            int(os.environ["BASELINE_FORCE_UPDATE"])
+            if os.environ.get("BASELINE_FORCE_UPDATE")
             else None
         ),
     )
