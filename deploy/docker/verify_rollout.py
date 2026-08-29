@@ -210,7 +210,7 @@ def _verify_current_service_spec(
     placement = task.get("Placement")
     if not isinstance(placement, dict) or placement.get("MaxReplicas") != 1:
         raise ValueError("current Docker service lacks one-task-per-node placement")
-    if int(task.get("StopGracePeriod") or 0) < REQUIRED_STOP_GRACE_NS:
+    if int(container.get("StopGracePeriod") or 0) < REQUIRED_STOP_GRACE_NS:
         raise ValueError("current Docker service stop grace is not drain-safe")
     mode = spec.get("Mode")
     if not isinstance(mode, dict) or mode.get("Replicated", {}).get("Replicas") != CRAWL_REPLICAS:

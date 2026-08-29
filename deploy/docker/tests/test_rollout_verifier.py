@@ -322,9 +322,9 @@ def test_rollout_preflight_requires_four_capacity_admitted_nodes(
                 "ContainerSpec": {
                     "Image": "registry.example/crawl4ai@sha256:target",
                     "Healthcheck": {"Test": rollout_verifier.CRAWL_HEALTHCHECK},
+                    "StopGracePeriod": rollout_verifier.STOP_GRACE_NS,
                 },
                 "Placement": {"MaxReplicas": 1},
-                "StopGracePeriod": rollout_verifier.STOP_GRACE_NS,
             },
             "Mode": {"Replicated": {"Replicas": 3}},
             "UpdateConfig": {
