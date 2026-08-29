@@ -1,285 +1,92 @@
-from __future__ import annotations
-
 import copy
 import json
-import os
-import signal
 import subprocess
-import sys
-import time
-import urllib.parse
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
 
 import pytest
 
-import verify_rollout as rollout_verifier
-from verify_rollout import (
-    MAX_RESPONSE_BYTES,
-    REQUIRED_STOP_GRACE_NS,
-    _request_json,
-    _has_task_error,
-    verify_monitor_evidence,
-    verify_native_route,
-    verify_rollout,
-    verify_rollout_preflight,
-)
+import verify_rollout as rollout
 
-ORIGINAL_INSPECT_TASK_RUNTIME = rollout_verifier._inspect_task_runtime
-ORIGINAL_POST_JSON = rollout_verifier._post_json
-TARGET_IMAGE = "registry.example/crawl4ai@sha256:target"
-HEALTH_URLS = ("https://crawl.example/health",)
-DOCKER_DIR = Path(__file__).resolve().parents[1]
+BASELINE = "registry.example/crawl4ai@sha256:baseline"
+CANDIDATE = "registry.example/crawl4ai@sha256:candidate"
+REVISION = "a" * 40
 
 
-@pytest.fixture(autouse=True)
-def _task_runtime(monkeypatch):
-    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 1)
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_crawl_node_inventory",
-        lambda: {
-            node: ("Ready", "Active") for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
-        },
-    )
-
-    def inspect(task_id, _network_id):
-        instance = ("b" if "b" in task_id else "a") * 12
-        address = "10.0.1.12" if instance.startswith("b") else "10.0.1.11"
-        return (
-            instance,
-            frozenset({address}),
-            rollout_verifier._observability_labels("target"),
-            "registry.example/crawl4ai@sha256:target",
-        )
-
-    monkeypatch.setattr(rollout_verifier, "_inspect_task_runtime", inspect)
-    monkeypatch.setattr(rollout_verifier, "_dokploy_network_id", lambda: "network")
-    monkeypatch.setattr(rollout_verifier, "verify_native_route", lambda **_kwargs: None)
-    monkeypatch.setattr(rollout_verifier, "_post_json", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_service_update_state",
-        lambda _app_name: "completed",
-    )
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_service_spec",
-        lambda app_name: (
-            _redis_service_spec()
-            if app_name == "crawl4ai-redis"
-            else _crawl_service_spec(rollout_verifier.CRAWL_REPLICAS)
-        ),
-    )
-
-
-def test_release_requires_exactly_three_replicas(monkeypatch):
-    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
-    with pytest.raises(ValueError, match="exactly three"):
-        rollout_verifier._verify_release_configuration(
-            _application(replicas=2), "target", TARGET_IMAGE
-        )
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"rollbackActive": False},
-        {"rollbackRegistryId": None},
-        {"rollbackRegistryId": "other-registry"},
-    ],
-)
-def test_release_requires_native_rollback(overrides):
-    with pytest.raises(ValueError, match="native rollback"):
-        rollout_verifier._verify_release_configuration(
-            _application(**overrides), "target", TARGET_IMAGE
-        )
-
-
-@pytest.mark.parametrize("field", ["updateConfigSwarm", "stopGracePeriodSwarm"])
-def test_current_rollout_source_rejects_timing_drift(field):
-    application = _application()
-    if field == "updateConfigSwarm":
-        application[field] = {
-            **application[field],
-            "Delay": rollout_verifier.ROLLOUT_DELAY_NS - 1,
-        }
-    else:
-        application[field] = rollout_verifier.STOP_GRACE_NS - 1
-    with pytest.raises(ValueError):
-        rollout_verifier._verify_current_rollout_source(application)
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda spec: spec["TaskTemplate"]["ContainerSpec"]["Healthcheck"].update(
-            StartPeriod=1
-        ),
-        lambda spec: spec["EndpointSpec"].update(
-            Ports=[{"TargetPort": 11235, "PublishedPort": 11235}]
-        ),
-    ],
-)
-def test_rendered_crawl_service_rejects_healthcheck_or_published_port_drift(mutation):
-    spec = copy.deepcopy(_crawl_service_spec())
-    mutation(spec)
-
-    with pytest.raises(ValueError):
-        rollout_verifier._verify_current_service_spec(spec, TARGET_IMAGE)
-
-
-def test_rendered_redis_service_rejects_command_drift():
-    spec = copy.deepcopy(_redis_service_spec())
-    spec["TaskTemplate"]["ContainerSpec"]["Command"][6] = "always"
-    with pytest.raises(ValueError, match="appendfsync everysec"):
-        rollout_verifier._verify_redis_service_spec(spec)
-
-
-def _application(**overrides):
-    application = {
-        "replicas": 1,
+def application(image=BASELINE, revision="baseline"):
+    return {
+        "applicationId": "app",
         "appName": "crawl4ai",
-        "dockerImage": "registry.example/crawl4ai@sha256:target",
-        "registryId": "registry",
-        "rollbackActive": True,
-        "rollbackRegistryId": "registry",
-        "cpuReservation": rollout_verifier.CRAWL_CPU_RESERVATION,
-        "cpuLimit": rollout_verifier.CRAWL_CPU_LIMIT,
-        "memoryReservation": rollout_verifier.CRAWL_MEMORY_RESERVATION,
-        "memoryLimit": rollout_verifier.CRAWL_MEMORY_LIMIT,
-        "labelsSwarm": rollout_verifier._observability_labels("target"),
-        "env": (
-            f"LLM_PROVIDER={rollout_verifier.LLM_PROVIDER}\n"
-            f"LLM_BASE_URL={rollout_verifier.LLM_BASE_URL}\n"
-            "LLM_API_KEY=nonempty"
-        ),
-        "mounts": [
-            {
-                "type": "volume",
-                "volumeName": rollout_verifier.REDIS_VOLUME,
-                "mountPath": rollout_verifier.REDIS_MOUNT_PATH,
-            }
-        ],
-        "healthCheckSwarm": rollout_verifier.CRAWL_HEALTHCHECK_POLICY,
-        "command": "redis-server --dir /data --appendonly yes --appendfsync everysec --loglevel notice",
+        "sourceType": "docker",
+        "dockerImage": image,
+        "labelsSwarm": rollout._labels(revision),
+        "replicas": 3,
+        "healthCheckSwarm": copy.deepcopy(rollout.HEALTHCHECK),
         "placementSwarm": {
-            "Constraints": [rollout_verifier.CRAWL_NODE_CONSTRAINT],
-            "MaxReplicas": rollout_verifier.CRAWL_MAX_REPLICAS_PER_NODE,
+            "Constraints": [rollout.NODE_CONSTRAINT],
+            "MaxReplicas": 1,
         },
-        "endpointSpecSwarm": rollout_verifier.CRAWL_ENDPOINT_SPEC,
-        "swarmVipConnectionReuse": False,
+        "endpointSpecSwarm": {"Mode": "vip", "Ports": []},
         "updateConfigSwarm": {
-            "Order": "start-first",
             "Parallelism": 1,
-            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
-            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            "Delay": rollout.DELAY_NS,
             "FailureAction": "rollback",
+            "Monitor": rollout.DELAY_NS,
             "MaxFailureRatio": 0,
+            "Order": "start-first",
         },
         "rollbackConfigSwarm": {
-            "Order": "start-first",
             "Parallelism": 1,
-            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
-            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            "Delay": rollout.DELAY_NS,
             "FailureAction": "pause",
+            "Monitor": rollout.DELAY_NS,
             "MaxFailureRatio": 0,
+            "Order": "start-first",
         },
-        "stopGracePeriodSwarm": rollout_verifier.STOP_GRACE_NS,
-    }
-    application.update(overrides)
-    return application
-
-
-def _running_task(task_id: str, node: str, seconds: int = 1) -> dict:
-    return {
-        "containerId": task_id,
-        "state": "running",
-        "currentState": f"Running {seconds}s",
-        "node": {"a": "haiku-4", "b": "haiku-5"}.get(node, node),
-        "error": "",
+        "stopGracePeriodSwarm": rollout.STOP_GRACE_NS,
+        "cpuReservation": "500000000",
+        "cpuLimit": "2000000000",
+        "memoryReservation": "1073741824",
+        "memoryLimit": "4294967296",
     }
 
 
-def _crawl_service_spec(replicas: int = 1) -> dict:
+def service_spec(image=BASELINE, revision="baseline"):
     return {
         "TaskTemplate": {
             "ContainerSpec": {
-                "Image": TARGET_IMAGE,
-                "Healthcheck": rollout_verifier.CRAWL_HEALTHCHECK_POLICY,
-                "StopGracePeriod": rollout_verifier.STOP_GRACE_NS,
+                "Image": image,
+                "Labels": rollout._labels(revision),
+                "Healthcheck": copy.deepcopy(rollout.HEALTHCHECK),
+                "StopGracePeriod": rollout.STOP_GRACE_NS,
             },
             "Placement": {
-                "Constraints": [rollout_verifier.CRAWL_NODE_CONSTRAINT],
+                "Constraints": [rollout.NODE_CONSTRAINT],
                 "MaxReplicas": 1,
             },
-            "Resources": {
-                "Reservations": {
-                    "NanoCPUs": int(rollout_verifier.CRAWL_CPU_RESERVATION),
-                    "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_RESERVATION),
-                },
-                "Limits": {
-                    "NanoCPUs": int(rollout_verifier.CRAWL_CPU_LIMIT),
-                    "MemoryBytes": int(rollout_verifier.CRAWL_MEMORY_LIMIT),
-                },
-            },
+            "Resources": copy.deepcopy(rollout.RESOURCES),
         },
-        "Mode": {"Replicated": {"Replicas": replicas}},
-        "EndpointSpec": rollout_verifier.CRAWL_ENDPOINT_SPEC,
+        "Mode": {"Replicated": {"Replicas": 3}},
         "UpdateConfig": {
-            "Order": "start-first",
             "Parallelism": 1,
+            "Delay": rollout.DELAY_NS,
             "FailureAction": "rollback",
+            "Monitor": rollout.DELAY_NS,
             "MaxFailureRatio": 0,
-            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
-            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            "Order": "start-first",
         },
         "RollbackConfig": {
-            "Order": "start-first",
             "Parallelism": 1,
+            "Delay": rollout.DELAY_NS,
             "FailureAction": "pause",
+            "Monitor": rollout.DELAY_NS,
             "MaxFailureRatio": 0,
-            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
-            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            "Order": "start-first",
         },
+        "EndpointSpec": {"Mode": "vip"},
     }
 
 
-def _redis_service_spec() -> dict:
-    return {
-        "TaskTemplate": {
-            "ContainerSpec": {
-                "Image": rollout_verifier.REDIS_IMAGE,
-                "Command": rollout_verifier.REDIS_COMMAND,
-                "Healthcheck": rollout_verifier.REDIS_HEALTHCHECK_POLICY,
-                "Mounts": [
-                    {
-                        "Type": "volume",
-                        "Source": rollout_verifier.REDIS_VOLUME,
-                        "Target": rollout_verifier.REDIS_MOUNT_PATH,
-                    }
-                ],
-            },
-            "Placement": {
-                "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
-                "MaxReplicas": 1,
-            },
-            "Resources": {
-                "Reservations": {
-                    "NanoCPUs": int(rollout_verifier.REDIS_CPU_RESERVATION),
-                    "MemoryBytes": int(rollout_verifier.REDIS_MEMORY_RESERVATION),
-                },
-                "Limits": {
-                    "NanoCPUs": int(rollout_verifier.REDIS_CPU_LIMIT),
-                    "MemoryBytes": int(rollout_verifier.REDIS_MEMORY_LIMIT),
-                },
-            },
-        }
-    }
-
-
-def _health(instance: str, revision: str = "target") -> dict:
+def health(instance="container123", revision=REVISION):
     return {
         "instance": instance,
         "revision": revision,
@@ -288,1416 +95,287 @@ def _health(instance: str, revision: str = "target") -> dict:
     }
 
 
-def _fake_read(handlers):
-    def read_json(url, _api_key):
-        operation = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
-        if (
-            operation == "docker.getServiceContainersByAppName"
-            and "appName=crawl4ai-redis" in url
-        ):
-            return [_running_task("redis-task", "haiku-18")]
-        if operation not in handlers:
-            raise AssertionError(f"unexpected operation: {operation}")
-        handler = handlers[operation]
-        result = handler(url) if callable(handler) else handler
-        if operation == "deployment.all" and isinstance(result, list):
-            result = [
-                {"deploymentId": "deployment", **deployment} for deployment in result
-            ]
-        if operation == "application.one" and isinstance(result, dict):
-            supplied = result
-            result = _application(**result)
-            if "applicationId=redis" in url:
-                result.update(
-                    {
-                        "appName": "crawl4ai-redis",
-                        "dockerImage": rollout_verifier.REDIS_IMAGE,
-                        "replicas": 1,
-                        "cpuReservation": rollout_verifier.REDIS_CPU_RESERVATION,
-                        "cpuLimit": rollout_verifier.REDIS_CPU_LIMIT,
-                        "memoryReservation": rollout_verifier.REDIS_MEMORY_RESERVATION,
-                        "memoryLimit": rollout_verifier.REDIS_MEMORY_LIMIT,
-                    }
-                )
-                if "healthCheckSwarm" not in supplied:
-                    result["healthCheckSwarm"] = (
-                        rollout_verifier.REDIS_HEALTHCHECK_POLICY
-                    )
-                if "placementSwarm" not in supplied:
-                    result["placementSwarm"] = {
-                        "Constraints": [rollout_verifier.REDIS_NODE_CONSTRAINT],
-                        "MaxReplicas": 1,
-                    }
-            result.setdefault("stopGracePeriodSwarm", REQUIRED_STOP_GRACE_NS)
-        return result
-
-    return read_json
-
-
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        ("", False),
-        ("Error:", False),
-        ("Error: task failed", True),
-        ("task failed", True),
-    ],
-)
-def test_task_error_ignores_only_empty_dokploy_error_boilerplate(error, expected):
-    assert _has_task_error({"error": error}) is expected
-
-
-def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
-    output = (
-        '"'
-        + "a" * 64
-        + '"\t'
-        + '{"otel.service.version":"target"}\t'
-        + '[{"Network":{"ID":"other"},"Addresses":["10.9.0.2/24"]},'
-        + '{"Network":{"ID":"network"},"Addresses":["10.0.1.11/24"]}]\t'
-        + '"registry.example/crawl4ai@sha256:target"\n'
-    )
-    def run(command, **_kwargs):
-        template = command[command.index("--format") + 1]
-        assert "{{if .Status.ContainerStatus}}" in template
-        return rollout_verifier.subprocess.CompletedProcess(command, 0, output, "")
-
-    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
-
-    instance, addresses, labels, image = ORIGINAL_INSPECT_TASK_RUNTIME(
-        "task", "network"
-    )
-
-    assert instance == "a" * 12
-    assert addresses == frozenset({"10.0.1.11"})
-    assert labels == {"otel.service.version": "target"}
-    assert image == "registry.example/crawl4ai@sha256:target"
-
-
-@pytest.mark.parametrize(
-    "stderr",
-    [
-        "Error: No such object: vanished1234\n",
-        "error: no such object: vanished1234\n",
-        "\nerror: no such object: vanished1234\n",
-    ],
-)
-def test_swarm_tasks_keeps_survivor_metadata_when_one_task_disappears(
-    monkeypatch, stderr
-):
-    tasks = (
-        '{"ID":"survivor123","DesiredState":"Running"}\n'
-        '{"ID":"vanished1234","DesiredState":"Running"}\n'
-    )
-    inspected = (
-        '"survivor123"\t1\t"container123456"\t'
-        '"2026-08-29T00:00:01Z"\t"2026-08-29T00:00:02Z"\n'
-    )
-
-    def run(command, **_kwargs):
-        if command[1:3] == ["service", "ps"]:
-            return subprocess.CompletedProcess(command, 0, tasks, "")
-        return subprocess.CompletedProcess(
-            command,
-            1,
-            inspected,
-            stderr,
-        )
-
-    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
-
-    result = rollout_verifier._swarm_tasks("crawl4ai", set())
-
-    assert result[0]["ContainerID"] == "container123"
-    assert result[0]["Slot"] == 1
-    assert result[1]["ContainerID"] == ""
-    assert result[1]["Slot"] is None
-
-
-@pytest.mark.parametrize(
-    "stderr",
-    [
-        "",
-        "Error response from daemon: permission denied\n",
-        "Error: No such object: different-task\n",
-        (
-            "Error: No such object: vanished1234\n"
-            "Error response from daemon: permission denied\n"
-        ),
-    ],
-)
-def test_swarm_tasks_does_not_mask_non_race_inspect_failures(monkeypatch, stderr):
-    tasks = '{"ID":"vanished1234","DesiredState":"Running"}\n'
-
-    def run(command, **_kwargs):
-        if command[1:3] == ["service", "ps"]:
-            return subprocess.CompletedProcess(command, 0, tasks, "")
-        return subprocess.CompletedProcess(command, 1, "", stderr)
-
-    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
-
-    with pytest.raises(RuntimeError) as failure:
-        rollout_verifier._swarm_tasks("crawl4ai", set())
-
-    assert isinstance(failure.value.__cause__, subprocess.CalledProcessError)
-    assert stderr.strip() in str(failure.value)
-
-
-def test_swarm_tasks_reads_a_task_that_has_no_container_yet(monkeypatch):
-    tasks = '{"ID":"pending12345","DesiredState":"Running"}\n'
-    inspected = (
-        '"pending12345"\t1\t""\t"2026-08-29T00:00:01Z"\t"2026-08-29T00:00:02Z"\n'
-    )
-
-    def run(command, **_kwargs):
-        if command[1:3] == ["service", "ps"]:
-            return subprocess.CompletedProcess(command, 0, tasks, "")
-        # Docker exits 1 on an unguarded read of a key Swarm omits until the
-        # container exists, so the guard is what keeps this task inspectable.
-        template = command[command.index("--format") + 1]
-        assert "{{if .Status.ContainerStatus}}" in template
-        return subprocess.CompletedProcess(command, 0, inspected, "")
-
-    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
-
-    result = rollout_verifier._swarm_tasks("crawl4ai", set())
-
-    assert result[0]["ContainerID"] == ""
-    assert result[0]["Slot"] == 1
-
-
-def test_swarm_tasks_ignores_blank_inspect_output_lines(monkeypatch):
-    tasks = '{"ID":"vanished1234","DesiredState":"Running"}\n'
-
-    def run(command, **_kwargs):
-        if command[1:3] == ["service", "ps"]:
-            return subprocess.CompletedProcess(command, 0, tasks, "")
-        return subprocess.CompletedProcess(
-            command, 1, "\n", "error: no such object: vanished1234\n"
-        )
-
-    monkeypatch.setattr(rollout_verifier.subprocess, "run", run)
-
-    result = rollout_verifier._swarm_tasks("crawl4ai", set())
-
-    assert result[0]["ContainerID"] == ""
-
-
-def test_native_route_requires_only_vip_services_and_the_no_reuse_transport(
-    monkeypatch,
-):
-    route = """http:
-  routers:
-    crawl4ai-yq1svi-router-1:
-      service: crawl4ai-yq1svi-service-1
-      rule: Host(`crawl4ai.haiku.host`)
-    crawl4ai-yq1svi-router-2:
-      service: crawl4ai-yq1svi-service-2
-      rule: Host(`crawl4ai.popos-sf0.com`)
-  services:
-    crawl4ai-yq1svi-service-1:
-      loadBalancer:
-        servers:
-          - url: http://crawl4ai-yq1svi:11235
-        serversTransport: crawl4ai-yq1svi-swarm-vip
-    crawl4ai-yq1svi-service-2:
-      loadBalancer:
-        servers:
-          - url: http://crawl4ai-yq1svi:11235
-        serversTransport: crawl4ai-yq1svi-swarm-vip
-  serversTransports:
-    crawl4ai-yq1svi-swarm-vip:
-      maxIdleConnsPerHost: -1
-"""
-    monkeypatch.setattr(rollout_verifier, "_request_json", lambda *_args: route)
-
-    verify_native_route(
-        dokploy_url="https://dokploy.example",
-        api_key="secret",
-        application_id="app",
-        app_name="crawl4ai-yq1svi",
-    )
-
-
-@pytest.mark.parametrize(
-    "replacement",
-    [
-        "http://legacy-ingress:11235",
-        "serversTransport: default",
-        "maxIdleConnsPerHost: 0",
-    ],
-)
-def test_native_route_rejects_backend_or_transport_drift(monkeypatch, replacement):
-    route = """http:
-  routers:
-    crawl4ai-yq1svi-router-1:
-      service: crawl4ai-yq1svi-service-1
-      rule: Host(`crawl4ai.haiku.host`)
-  services:
-    crawl4ai-yq1svi-service-1:
-      loadBalancer:
-        servers:
-          - url: http://crawl4ai-yq1svi:11235
-        serversTransport: crawl4ai-yq1svi-swarm-vip
-  serversTransports:
-    crawl4ai-yq1svi-swarm-vip:
-      maxIdleConnsPerHost: -1
-"""
-    if replacement.startswith("http"):
-        route = route.replace("http://crawl4ai-yq1svi:11235", replacement)
-    elif replacement.startswith("serversTransport"):
-        route = route.replace(
-            "serversTransport: crawl4ai-yq1svi-swarm-vip", replacement
-        )
-    else:
-        route = route.replace("maxIdleConnsPerHost: -1", replacement)
-    monkeypatch.setattr(rollout_verifier, "_request_json", lambda *_args: route)
-
-    with pytest.raises(ValueError):
-        verify_native_route(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            app_name="crawl4ai-yq1svi",
-        )
-
-
-def test_native_route_rejects_one_router_service_without_transport(monkeypatch):
-    route = """http:
-  routers:
-    crawl4ai-yq1svi-router-1:
-      service: crawl4ai-yq1svi-service-1
-      rule: Host(`crawl4ai.haiku.host`)
-    crawl4ai-yq1svi-router-2:
-      service: crawl4ai-yq1svi-service-2
-      rule: Host(`crawl4ai.popos-sf0.com`)
-  services:
-    crawl4ai-yq1svi-service-1:
-      loadBalancer:
-        servers:
-          - url: http://crawl4ai-yq1svi:11235
-        serversTransport: crawl4ai-yq1svi-swarm-vip
-    crawl4ai-yq1svi-service-2:
-      loadBalancer:
-        servers:
-          - url: http://crawl4ai-yq1svi:11235
-  serversTransports:
-    crawl4ai-yq1svi-swarm-vip:
-      maxIdleConnsPerHost: -1
-"""
-    monkeypatch.setattr(rollout_verifier, "_request_json", lambda *_args: route)
-
-    with pytest.raises(ValueError, match="does not use"):
-        verify_native_route(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            app_name="crawl4ai-yq1svi",
-        )
-
-
-def test_rollback_verifier_requires_tasks_public_health_and_metadata(monkeypatch):
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_service_update_state",
-        lambda _app_name: "rollback_completed",
-    )
-    read_json = _fake_read(
-        {
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
-            "docker.getServiceContainersByAppName": [
-                _running_task("task-a", "haiku-4", 5)
-            ],
-        }
-    )
-
-    rollout_verifier._wait_for_verified_rollback(
-        app_name="crawl4ai",
-        baseline_image=TARGET_IMAGE,
-        dokploy_url="https://dokploy.example",
-        api_key="secret",
-        application_id="app",
-        health_urls=HEALTH_URLS,
-        read_json=read_json,
-        probe_health=lambda _url, count: [_health("a" * 12)] * count,
-        inspect_task_runtime=rollout_verifier._inspect_task_runtime,
-        sleep=lambda _seconds: None,
-        monotonic=lambda: 0,
-    )
-
-
-@pytest.mark.parametrize("failed_read", ["state", "spec"])
-def test_rollback_verifier_retries_transient_service_inspect(monkeypatch, failed_read):
-    reads = {"state": 0, "spec": 0}
-
-    def service_update_state(_app_name):
-        reads["state"] += 1
-        if failed_read == "state" and reads["state"] == 1:
-            raise subprocess.CalledProcessError(1, ["docker", "service", "inspect"])
-        return "rollback_completed"
-
-    def service_spec(_app_name):
-        reads["spec"] += 1
-        if failed_read == "spec" and reads["spec"] == 1:
-            raise subprocess.CalledProcessError(1, ["docker", "service", "inspect"])
-        return _crawl_service_spec()
-
-    monkeypatch.setattr(rollout_verifier, "_service_update_state", service_update_state)
-    monkeypatch.setattr(rollout_verifier, "_service_spec", service_spec)
-    sleeps = []
-
-    rollout_verifier._wait_for_verified_rollback(
-        app_name="crawl4ai",
-        baseline_image=TARGET_IMAGE,
-        dokploy_url="https://dokploy.example",
-        api_key="secret",
-        application_id="app",
-        health_urls=HEALTH_URLS,
-        read_json=_fake_read(
-            {
-                "application.one": {"replicas": 1, "appName": "crawl4ai"},
-                "docker.getServiceContainersByAppName": [
-                    _running_task("task-a", "haiku-4", 5)
-                ],
-            }
-        ),
-        probe_health=lambda _url, count: [_health("a" * 12)] * count,
-        inspect_task_runtime=rollout_verifier._inspect_task_runtime,
-        sleep=sleeps.append,
-        monotonic=iter([0, 0, 1]).__next__,
-    )
-
-    assert reads[failed_read] == 2
-    assert sleeps == [5]
-
-
-def test_rollback_entry_retries_initial_service_inspect(monkeypatch):
-    reads = iter(
-        [
-            subprocess.CalledProcessError(1, ["docker", "service", "inspect"]),
-            _crawl_service_spec(),
-        ]
-    )
-
-    def service_spec(_app_name):
-        result = next(reads)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    waited = []
-    sleeps = []
-    monkeypatch.setattr(rollout_verifier, "_service_spec", service_spec)
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_wait_for_verified_rollback",
-        lambda **kwargs: waited.append(kwargs["baseline_image"]),
-    )
-    monkeypatch.setattr(rollout_verifier.time, "sleep", sleeps.append)
-    monkeypatch.setattr(
-        rollout_verifier.time,
-        "monotonic",
-        iter([0, 0, 1]).__next__,
-    )
-    for key, value in {
-        "APPLICATION_APP_NAME": "crawl4ai",
-        "BASELINE_IMAGE": TARGET_IMAGE,
-        "DEPLOYMENT_ID": "deployment",
-        "IMAGE": "registry.example/crawl4ai",
-        "IMAGE_DIGEST": "sha256:target",
-        "GITHUB_SHA": "target",
-        "DOKPLOY_URL": "https://dokploy.example",
-        "DOKPLOY_API_KEY": "secret",
-        "APPLICATION_ID": "app",
-        "HEALTH_URLS": HEALTH_URLS[0],
-    }.items():
-        monkeypatch.setenv(key, value)
-
-    rollout_verifier.main(["rollback"])
-
-    assert sleeps == [5]
-    assert waited == [TARGET_IMAGE]
-
-
-def test_post_json_normalizes_process_timeout(monkeypatch):
-    monkeypatch.setattr(
-        rollout_verifier.subprocess,
-        "run",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            subprocess.TimeoutExpired(["curl"], 20)
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="HTTP request failed"):
-        ORIGINAL_POST_JSON("https://dokploy.example", "secret", {})
-
-
-def test_submit_reconciles_timeout_to_the_exact_queue_and_deployment(monkeypatch):
-    application_reads = iter(
-        [
-            _application(),
-            _application(
-                dockerImage="registry.example/crawl4ai@sha256:candidate",
-                labelsSwarm=rollout_verifier._observability_labels("candidate"),
-            ),
-        ]
-    )
-    deployment_reads = iter(
-        [
-            [],
-            [
-                {
-                    "deploymentId": "application-app-submission",
-                    "title": "crawl4ai-submission",
-                }
-            ],
-        ]
-    )
-
-    def read_json(url, _api_key):
-        if "application.one" in url:
-            return next(application_reads)
-        if "deployment.all" in url:
-            return next(deployment_reads)
-        return [{"id": "application-app-submission"}]
-
-    def post_json(url, _api_key, _payload):
-        if url.endswith("application.deploy"):
-            raise RuntimeError("timeout")
-
-    monkeypatch.setattr(rollout_verifier, "_post_json", post_json)
-    clock = iter([0, 0, 0, 0])
-
-    deployment_id = rollout_verifier.submit_application_deploy(
-        dokploy_url="https://dokploy.example",
-        api_key="secret",
-        application_id="app",
-        baseline_image=TARGET_IMAGE,
-        candidate_image="registry.example/crawl4ai@sha256:candidate",
-        candidate_revision="candidate",
-        submission_id="submission",
-        submission_title="crawl4ai-submission",
-        read_json=read_json,
-        sleep=lambda _seconds: None,
-        monotonic=lambda: next(clock, 0),
-    )
-
-    assert deployment_id == "application-app-submission"
-
-
-def test_submit_preserves_concurrent_metadata_when_candidate_cas_fails(monkeypatch):
-    application = _application()
-    baseline_labels = application["labelsSwarm"]
-    concurrent_labels = rollout_verifier._observability_labels("concurrent")
-    requests = []
-
-    def read_json(_url, _api_key):
-        return copy.deepcopy(application)
-
-    def post_json(url, _api_key, payload):
-        requests.append((url, payload))
-        if not url.endswith("application.update"):
-            return
-        application["labelsSwarm"] = concurrent_labels
-        if "expectedDockerImage" in payload and (
-            payload["expectedDockerImage"] != application["dockerImage"]
-            or payload["expectedLabelsSwarm"] != application["labelsSwarm"]
-        ):
-            raise ValueError("compare-and-swap failed")
-        application["dockerImage"] = payload["dockerImage"]
-        application["labelsSwarm"] = payload["labelsSwarm"]
-
-    monkeypatch.setattr(rollout_verifier, "_post_json", post_json)
-    clock = iter([0, 0, 60, 0, 0])
-
-    with pytest.raises(RuntimeError, match="metadata changed concurrently"):
-        rollout_verifier.submit_application_deploy(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            baseline_image=TARGET_IMAGE,
-            candidate_image="registry.example/crawl4ai@sha256:candidate",
-            candidate_revision="candidate",
-            submission_id="submission",
-            submission_title="crawl4ai-submission",
-            read_json=read_json,
-            sleep=lambda _seconds: None,
-            monotonic=clock.__next__,
-        )
-
-    assert application["dockerImage"] == TARGET_IMAGE
-    assert application["labelsSwarm"] == concurrent_labels
-    assert requests == [
-        (
-            "https://dokploy.example/api/application.update",
-            {
-                "applicationId": "app",
-                "expectedDockerImage": TARGET_IMAGE,
-                "expectedLabelsSwarm": baseline_labels,
-                "dockerImage": "registry.example/crawl4ai@sha256:candidate",
-                "labelsSwarm": rollout_verifier._observability_labels("candidate"),
-            },
-        )
-    ]
-
-
-@pytest.mark.parametrize(
-    ("inventory", "message"),
-    [
-        ({"haiku-4": ("Ready", "Active")}, "admitted haiku-4/5/9/18"),
-        (
-            {
-                **{
-                    node: ("Ready", "Active")
-                    for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
+def route(custom=False, wrong_url=False):
+    transport = {"serversTransport": "custom"} if custom else {}
+    config = {
+        "http": {
+            "routers": {
+                "one": {"rule": "Host(`crawl4ai.haiku.host`)", "service": "one"},
+                "two": {
+                    "rule": "Host(`crawl4ai.popos-sf0.com`)",
+                    "service": "two",
                 },
-                "haiku-0": ("Down", "Drain"),
             },
-            "admitted haiku-4/5/9/18",
-        ),
-        (
-            {
-                node: (("Down", "Drain") if node == "haiku-9" else ("Ready", "Active"))
-                for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
-            },
-            "Ready and Active",
-        ),
-        (None, None),
-    ],
-)
-def test_rollout_preflight_requires_the_exact_capacity_admitted_pool(
-    monkeypatch, inventory, message
-):
-    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", 3)
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_crawl_node_inventory",
-        lambda: inventory
-        or {
-            node: ("Ready", "Active") for node in rollout_verifier.CRAWL_ELIGIBLE_NODES
-        },
-    )
-    monkeypatch.setattr(
-        rollout_verifier,
-        "_request_json",
-        _fake_read({"application.one": {"replicas": 3}}),
-    )
-
-    if inventory is not None:
-        with pytest.raises(RuntimeError, match=message):
-            verify_rollout_preflight(
-                dokploy_url="https://dokploy.example",
-                api_key="secret",
-                application_id="app",
-                redis_application_id="redis",
-            )
-    else:
-        verify_rollout_preflight(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-        )
-
-
-@pytest.mark.parametrize(
-    "tasks",
-    [
-        [_running_task("task-a", "haiku-0", 5)],
-        [
-            _running_task("task-a", "haiku-4", 5),
-            _running_task("task-b", "haiku-4", 5),
-            _running_task("task-c", "haiku-5", 5),
-        ],
-    ],
-)
-def test_verifier_rejects_tasks_outside_or_duplicated_within_admitted_pool(
-    monkeypatch, tasks
-):
-    monkeypatch.setattr(rollout_verifier, "CRAWL_REPLICAS", len(tasks))
-    read_json = _fake_read(
-        {
-            "deployment.all": [
-                {"deploymentId": "other", "status": "error"},
-                {"status": "done"},
-            ],
-            "application.one": {"replicas": len(tasks), "appName": "crawl4ai"},
-            "docker.getServiceContainersByAppName": tasks,
-        }
-    )
-
-    with pytest.raises(ValueError, match="distinct admitted nodes"):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-            sleep=lambda _seconds: None,
-        )
-
-
-def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_path):
-    def task(
-        task_id,
-        container_id,
-        desired,
-        current,
-        slot=1,
-        status_timestamp="2026-08-29T00:00:00Z",
-        updated_at="2026-08-29T00:00:00Z",
-    ):
-        return {
-            "ID": task_id,
-            "ContainerID": container_id,
-            "DesiredState": desired,
-            "CurrentState": current,
-            "Slot": slot,
-            "StatusTimestamp": status_timestamp,
-            "UpdatedAt": updated_at,
-        }
-
-    def sample(instances, tasks):
-        return {
-            "ok": True,
-            "health": [
-                {
-                    "ok": True,
-                    "url": "https://crawl.example/health",
-                    "instance": instance,
-                    "revision": "target",
-                }
-                for instance in instances
-            ],
-            "tasks": tasks,
-        }
-
-    predecessor = task("old-task", "old-instance", "Running", "Running 1m")
-    candidate_starting = task(
-        "new-task",
-        "new-instance",
-        "Running",
-        "Starting 1s",
-        status_timestamp="2026-08-29T00:00:01Z",
-        updated_at="2026-08-29T00:00:01Z",
-    )
-    candidate_running = task(
-        "new-task",
-        "new-instance",
-        "Running",
-        "Running 1s",
-        status_timestamp="2026-08-29T00:00:02Z",
-        updated_at="2026-08-29T00:00:02Z",
-    )
-    predecessor_draining = task(
-        "old-task",
-        "old-instance",
-        "Shutdown",
-        "Running 1m",
-        updated_at="2026-08-29T00:00:03Z",
-    )
-    predecessor_exited = task(
-        "old-task",
-        "old-instance",
-        "Shutdown",
-        "Complete 1s",
-        status_timestamp="2026-08-29T00:00:04Z",
-        updated_at="2026-08-29T00:00:03Z",
-    )
-    evidence = tmp_path / "rollout.jsonl"
-    evidence.write_text(
-        "\n".join(
-            json.dumps(entry)
-            for entry in (
-                sample(["old-instance"], [predecessor]),
-                sample(["old-instance"], [predecessor, candidate_starting]),
-                sample(["new-instance"], [candidate_running, predecessor_draining]),
-                sample(["new-instance"], [candidate_running, predecessor_exited]),
-            )
-        )
-        + "\n"
-    )
-
-    verify_monitor_evidence(
-        Path(evidence),
-        frozenset({"new-instance"}),
-        frozenset({"new-task"}),
-        "target",
-        frozenset({"https://crawl.example/health"}),
-    )
-
-
-def test_monitor_ignores_tasks_without_a_container_when_correlating(tmp_path):
-    def task(task_id, container_id, desired, current, **overrides):
-        return {
-            "ID": task_id,
-            "ContainerID": container_id,
-            "DesiredState": desired,
-            "CurrentState": current,
-            "Slot": 1,
-            "StatusTimestamp": overrides.get(
-                "status_timestamp", "2026-08-29T00:00:00Z"
-            ),
-            "UpdatedAt": overrides.get("updated_at", "2026-08-29T00:00:00Z"),
-        }
-
-    def sample(instances, tasks):
-        return {
-            "ok": True,
-            "health": [
-                {
-                    "ok": True,
-                    "url": "https://crawl.example/health",
-                    "instance": instance,
-                    "revision": "target",
-                }
-                for instance in instances
-            ],
-            "tasks": tasks,
-        }
-
-    predecessor = task("old-task", "old-instance", "Running", "Running 1m")
-    # Swarm creates the candidate before its container exists; the monitor now
-    # records that task instead of aborting, so it must not shadow the predecessor.
-    candidate_pending = task(
-        "new-task",
-        "",
-        "Running",
-        "Preparing 1s",
-        status_timestamp="2026-08-29T00:00:01Z",
-        updated_at="2026-08-29T00:00:01Z",
-    )
-    candidate_running = task(
-        "new-task",
-        "new-instance",
-        "Running",
-        "Running 1s",
-        status_timestamp="2026-08-29T00:00:02Z",
-        updated_at="2026-08-29T00:00:02Z",
-    )
-    predecessor_draining = task(
-        "old-task",
-        "old-instance",
-        "Shutdown",
-        "Running 1m",
-        updated_at="2026-08-29T00:00:03Z",
-    )
-    predecessor_exited = task(
-        "old-task",
-        "old-instance",
-        "Shutdown",
-        "Complete 1s",
-        status_timestamp="2026-08-29T00:00:04Z",
-        updated_at="2026-08-29T00:00:03Z",
-    )
-    evidence = tmp_path / "rollout.jsonl"
-    evidence.write_text(
-        "\n".join(
-            json.dumps(entry)
-            for entry in (
-                sample(["old-instance"], [predecessor, candidate_pending]),
-                sample(["old-instance"], [predecessor, candidate_pending]),
-                sample(["new-instance"], [candidate_running, predecessor_draining]),
-                sample(["new-instance"], [candidate_running, predecessor_exited]),
-            )
-        )
-        + "\n"
-    )
-
-    verify_monitor_evidence(
-        Path(evidence),
-        frozenset({"new-instance"}),
-        frozenset({"new-task"}),
-        "target",
-        frozenset({"https://crawl.example/health"}),
-    )
-
-
-def test_monitor_requires_each_public_domain_to_observe_the_final_task(tmp_path):
-    primary = "https://crawl.example/health"
-    secondary = "https://crawl-legacy.example/health"
-    evidence = tmp_path / "rollout.jsonl"
-    evidence.write_text(
-        json.dumps(
-            {
-                "ok": True,
-                "health": [
-                    {
-                        "ok": True,
-                        "url": primary,
-                        "instance": "new-instance",
-                        "revision": "target",
+            "services": {
+                key: {
+                    "loadBalancer": {
+                        "servers": [
+                            {
+                                "url": (
+                                    "http://wrong:11235"
+                                    if wrong_url
+                                    else "http://crawl4ai:11235"
+                                )
+                            }
+                        ],
+                        **transport,
                     }
-                ],
-                "tasks": [],
-            }
-        )
-        + "\n"
-    )
-
-    with pytest.raises(RuntimeError, match=secondary):
-        verify_monitor_evidence(
-            evidence,
-            frozenset({"new-instance"}),
-            frozenset({"new-task"}),
-            "target",
-            frozenset({primary, secondary}),
-        )
-
-
-def test_entrypoint_marks_drain_before_terminating_supervisord(tmp_path):
-    events = tmp_path / "events"
-    child_pid = tmp_path / "child.pid"
-    drain_path = tmp_path / "draining"
-    supervisord = tmp_path / "supervisord"
-    supervisord.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, pathlib, signal\n"
-        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
-        "def stop(*_args):\n"
-        f"    drain = pathlib.Path({str(drain_path)!r}).exists()\n"
-        "    event = 'term-after-drain' if drain else 'term-before-drain'\n"
-        f"    pathlib.Path({str(events)!r}).write_text(event)\n"
-        "    raise SystemExit(0)\n"
-        "signal.signal(signal.SIGTERM, stop)\n"
-        "signal.signal(signal.SIGINT, stop)\n"
-        "while True:\n"
-        "    signal.pause()\n"
-    )
-    supervisord.chmod(0o755)
-    (tmp_path / "config.yml").write_text("security:\n  jwt_enabled: false\n")
-    environment = {
-        **os.environ,
-        "PATH": f"{tmp_path}:{Path(sys.executable).parent}:{os.environ['PATH']}",
-        "REDIS_HOST": "external-redis",
-        "CRAWL4AI_API_TOKEN": "test-token",
-        "CRAWL4AI_DRAIN_PATH": str(drain_path),
-        "CRAWL4AI_DRAIN_DELAY_SECONDS": "0.2",
+                }
+                for key in ("one", "two")
+            },
+        }
     }
-    process = subprocess.Popen(
-        ["bash", str(DOCKER_DIR / "entrypoint.sh")], cwd=tmp_path, env=environment
-    )
-    try:
-        for _ in range(50):
-            if child_pid.exists():
-                break
-            time.sleep(0.02)
-        assert child_pid.exists()
-
-        process.send_signal(signal.SIGTERM)
-        for _ in range(50):
-            if drain_path.exists():
-                break
-            time.sleep(0.01)
-        assert drain_path.exists()
-        assert process.poll() is None
-        os.kill(int(child_pid.read_text()), 0)
-        process.send_signal(signal.SIGTERM)
-        assert process.poll() is None
-
-        assert process.wait(timeout=5) == 0
-        assert events.read_text() == "term-after-drain"
-        with pytest.raises(ProcessLookupError):
-            os.kill(int(child_pid.read_text()), 0)
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            process.wait(timeout=5)
+    if custom:
+        config["http"]["serversTransports"] = {"custom": {}}
+    return yaml_dump(config)
 
 
-def test_request_json_rejects_streamed_responses_over_64_kib():
-    class OversizedHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"x" * (MAX_RESPONSE_BYTES + 1))
+def yaml_dump(value):
+    import yaml
 
-        def log_message(self, format, *_args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), OversizedHandler)
-    thread = Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        with pytest.raises(ValueError, match="exceeds 64 KiB"):
-            _request_json(f"http://127.0.0.1:{server.server_port}/")
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
+    return yaml.safe_dump(value)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"labelsSwarm": {}}, "observability labels"),
-        (
-            {
-                "env": (
-                    "LLM_PROVIDER=openai/gpt-4o-mini\n"
-                    "LLM_BASE_URL=https://api.llm-gateway.iocloudhost.net/v1\n"
-                    "LLM_API_KEY=nonempty"
-                )
-            },
-            "LLM_PROVIDER",
-        ),
-        (
-            {
-                "env": (
-                    "LLM_PROVIDER=openai/qwen3.8-27b\n"
-                    "LLM_BASE_URL=https://wrong.example/v1\n"
-                    "LLM_API_KEY=nonempty"
-                )
-            },
-            "LLM_BASE_URL",
-        ),
-        (
-            {
-                "env": (
-                    "LLM_PROVIDER=openai/qwen3.8-27b\n"
-                    "LLM_BASE_URL=https://api.llm-gateway.iocloudhost.net/v1\n"
-                    "LLM_API_KEY="
-                )
-            },
-            "LLM_API_KEY must be nonempty",
-        ),
-        ({"placementSwarm": {"MaxReplicas": 2}}, "one replica per node"),
-        ({"healthCheckSwarm": {"Test": ["CMD", "true"]}}, "admission healthcheck"),
-        (
-            {
-                "healthCheckSwarm": {
-                    "Test": rollout_verifier.CRAWL_HEALTHCHECK,
-                    "Interval": 1_000_000_000,
-                    "Timeout": 1_000_000_000,
-                    "Retries": 1,
-                }
-            },
-            "exact admission healthcheck",
-        ),
-        (
-            {
-                "updateConfigSwarm": {
-                    "Order": "stop-first",
-                    "Parallelism": 1,
-                    "MaxFailureRatio": 0,
-                }
-            },
-            "updateConfigSwarm must use start-first",
-        ),
-        (
-            {
-                "rollbackConfigSwarm": {
-                    "Order": "stop-first",
-                    "Parallelism": 1,
-                    "MaxFailureRatio": 0,
-                }
-            },
-            "rollbackConfigSwarm must use start-first",
-        ),
-    ],
-)
-def test_verifier_rejects_invalid_release_observability_configuration(
-    overrides, message
-):
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": overrides,
-        }
-    )
-
-    with pytest.raises(ValueError, match=message):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-        )
+def test_policy_accepts_only_stock_docker_image_configuration():
+    rollout._policy(application())
+    for field, value in (
+        ("sourceType", "github"),
+        ("replicas", 2),
+        ("stopGracePeriodSwarm", 1),
+    ):
+        changed = application()
+        changed[field] = value
+        with pytest.raises(ValueError):
+            rollout._policy(changed)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"mounts": []}, "crawl4ai-redis-data"),
-        (
-            {"healthCheckSwarm": {"Test": ["CMD-SHELL", "redis-cli ping"]}},
-            "healthcheck",
-        ),
-        (
-            {
-                "command": "redis-server --dir /data --appendonly yes --appendfsync always"
-            },
-            "appendfsync everysec",
-        ),
-        ({"placementSwarm": {"Constraints": [], "MaxReplicas": 1}}, "haiku-18"),
-        (
-            {
-                "placementSwarm": {
-                    "Constraints": ["node.hostname==haiku-18"],
-                    "MaxReplicas": 2,
-                }
-            },
-            "MaxReplicas",
-        ),
-    ],
-)
-def test_verifier_rejects_invalid_external_redis_configuration(overrides, message):
-    def application_for_id(url):
-        return overrides if "applicationId=redis" in url else {}
-
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": application_for_id,
-        }
-    )
-
-    with pytest.raises(ValueError, match=message):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-        )
+def test_running_spec_requires_exact_artifact_and_native_policy():
+    rollout._running_spec(service_spec(), BASELINE, rollout._labels("baseline"))
+    changed = service_spec()
+    changed["TaskTemplate"]["ContainerSpec"]["Image"] = CANDIDATE
+    with pytest.raises(ValueError, match="artifact"):
+        rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
 
 
-def test_verifier_requires_two_identical_complete_task_and_instance_snapshots_with_runtime_labels():
-    container_id = "a" * 64
-    health_urls = (
-        "https://crawl.example/health",
-        "https://crawl-legacy.example/health",
-    )
-    probed_urls = []
-    task_snapshots = iter(
-        [
-            [_running_task("task-a", "a")],
-            [_running_task("task-a", "a", 6)],
-        ]
-    )
-
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
-            "docker.getServiceContainersByAppName": lambda _url: next(task_snapshots),
-        }
-    )
-
-    def probe_health(url, count):
-        probed_urls.append(url)
-        return [_health(container_id[:12])] * count
-
-    verify_rollout(
-        dokploy_url="https://dokploy.example",
-        api_key="secret",
-        application_id="app",
-        redis_application_id="redis",
-        revision="target",
-        expected_image=TARGET_IMAGE,
-        baseline_image=TARGET_IMAGE,
-        health_urls=health_urls,
-        read_json=read_json,
-        probe_health=probe_health,
-        sleep=lambda _seconds: None,
-    )
-    assert set(probed_urls) == set(health_urls)
+@pytest.mark.parametrize(("custom", "wrong"), [(True, False), (False, True)])
+def test_route_rejects_custom_transport_and_non_vip_target(monkeypatch, custom, wrong):
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: route(custom, wrong))
+    with pytest.raises(ValueError):
+        rollout.verify_route("https://dokploy", "key", "app", "crawl4ai")
 
 
-def test_verifier_waits_for_swarm_completion_before_inspecting_runtime_labels(
-    monkeypatch,
-):
-    states = iter(["updating", "completed", "completed"])
-    inspected_states = []
-    current_state = None
-
-    def update_state(_app_name):
-        nonlocal current_state
-        current_state = next(states)
-        return current_state
-
-    def inspect_task(_task_id, _network_id):
-        inspected_states.append(current_state)
-        return (
-            "a" * 12,
-            frozenset({"10.0.1.11"}),
-            rollout_verifier._observability_labels("target"),
-            TARGET_IMAGE,
-        )
-
-    monkeypatch.setattr(rollout_verifier, "_service_update_state", update_state)
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
-            "docker.getServiceContainersByAppName": [_running_task("task-a", "a")],
-        }
-    )
-
-    verify_rollout(
-        dokploy_url="https://dokploy.example",
-        api_key="secret",
-        application_id="app",
-        redis_application_id="redis",
-        revision="target",
-        expected_image=TARGET_IMAGE,
-        baseline_image=TARGET_IMAGE,
-        health_urls=HEALTH_URLS,
-        read_json=read_json,
-        probe_health=lambda _url, count: [_health("a" * 12)] * count,
-        sleep=lambda _seconds: None,
-        inspect_task_runtime=inspect_task,
-    )
-
-    assert inspected_states == ["completed", "completed"]
+def test_route_accepts_stock_dokploy_file(monkeypatch):
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: route())
+    rollout.verify_route("https://dokploy", "key", "app", "crawl4ai")
 
 
-@pytest.mark.parametrize("state", ["paused", "rollback_paused", "rollback_completed"])
-def test_verifier_rejects_terminal_swarm_update_state(monkeypatch, state):
+def test_post_keeps_api_key_out_of_argv(monkeypatch):
+    observed = {}
+
+    def run(command, **kwargs):
+        observed["command"] = command
+        observed["input"] = kwargs["input"]
+        return subprocess.CompletedProcess(command, 0, "{}", "")
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    rollout._post_json("https://dokploy/api/application.update", "secret", {"x": 1})
+    assert "secret" not in " ".join(observed["command"])
+    assert 'header = "x-api-key: secret"' in observed["input"]
+
+
+def test_wait_deployment_accepts_one_exact_new_row(monkeypatch):
     monkeypatch.setattr(
-        rollout_verifier, "_service_update_state", lambda _app_name: state
-    )
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
-        }
-    )
-
-    with pytest.raises(RuntimeError, match=state):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-            sleep=lambda _seconds: None,
-        )
-
-
-@pytest.mark.parametrize(
-    "second_tasks,second_health,second_labels,error_type,error_message",
-    [
-        (
-            [_running_task("task-b", "b")],
-            _health("b" * 12),
-            None,
-            TimeoutError,
-            "did not stabilize",
-        ),
-        (
-            [_running_task("task-a", "a", 6)],
-            _health("a" * 12, "rolled-back"),
-            None,
-            TimeoutError,
-            "did not stabilize",
-        ),
-        (
-            [_running_task("task-a", "a", 6)],
-            _health("a" * 12),
-            rollout_verifier._observability_labels("wrong"),
-            ValueError,
-            "observability labels",
-        ),
-    ],
-)
-def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_drift(
-    second_tasks, second_health, second_labels, error_type, error_message
-):
-    clock = iter([0, 0, 0, 1, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
-    task_snapshots = iter(
-        [
-            [_running_task("task-a", "a")],
-            second_tasks,
-        ]
-    )
-    health_snapshots = iter([_health("a" * 12), second_health])
-    config_labels = iter([None, second_labels])
-
-    def inspect_task(task_id, _network_id):
-        container_id = ("a" if task_id == "task-a" else "b") * 64
-        labels = next(config_labels)
-        return (
-            container_id[:12],
-            frozenset({"10.0.1.11" if task_id == "task-a" else "10.0.1.12"}),
-            rollout_verifier._observability_labels("target")
-            if labels is None
-            else labels,
-            "registry.example/crawl4ai@sha256:target",
-        )
-
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
-            "docker.getServiceContainersByAppName": lambda _url: next(task_snapshots),
-        }
-    )
-
-    with pytest.raises(error_type, match=error_message):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-            probe_health=lambda _url, count: [next(health_snapshots)] * count,
-            sleep=lambda _seconds: None,
-            monotonic=lambda: next(clock),
-            inspect_task_runtime=inspect_task,
-        )
-
-
-def test_verifier_rejects_replica_counts_other_than_three():
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 17, "appName": "crawl4ai"},
-        }
-    )
-
-    with pytest.raises(ValueError, match="exactly three"):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-            sleep=lambda _seconds: None,
-        )
-
-
-def test_verifier_rejects_stop_grace_shorter_than_the_process_drain():
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {
-                "replicas": 1,
-                "appName": "crawl4ai",
-                "stopGracePeriodSwarm": REQUIRED_STOP_GRACE_NS - 1,
+        rollout,
+        "_deployments",
+        lambda *_args: [
+            {
+                "deploymentId": "new",
+                "title": "title",
+                "description": "description",
+                "status": "done",
             },
-        }
+            {"deploymentId": "old"},
+        ],
     )
+    result = rollout._wait_deployment(
+        "https://dokploy", "key", "app", {"old"}, "title", "description"
+    )
+    assert result["deploymentId"] == "new"
 
-    with pytest.raises(ValueError, match="must outlive"):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-            sleep=lambda _seconds: None,
+
+def test_wait_deployment_fails_closed_on_foreign_row(monkeypatch):
+    monkeypatch.setattr(
+        rollout,
+        "_deployments",
+        lambda *_args: [{"deploymentId": "foreign", "title": "other"}],
+    )
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        rollout._wait_deployment(
+            "https://dokploy", "key", "app", set(), "title", "description"
         )
 
 
-def test_verifier_rejects_shutdown_desired_tasks_that_are_still_running():
-    clock = iter([0, 0, 0, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
-    tasks = [
-        _running_task("task-current", "a", 5),
+def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
+    rows = [
         {
-            "containerId": "task-stale",
-            "state": "shutdown",
-            "currentState": "Running 1s",
-            "node": "b",
-            "error": "",
-        },
+            "ID": f"task{index}",
+            "Name": f"crawl4ai.{index}",
+            "Node": node,
+            "DesiredState": "Running",
+            "CurrentState": "Running 1m",
+        }
+        for index, node in enumerate(("haiku-4", "haiku-5", "haiku-9"), 1)
     ]
-
-    read_json = _fake_read(
+    rows += [
         {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
-            "docker.getServiceContainersByAppName": tasks,
+            "ID": f"old{index}",
+            "Name": f"crawl4ai.{index}",
+            "Node": node,
+            "DesiredState": "Shutdown",
+            "CurrentState": "Shutdown 1m",
         }
-    )
-
-    with pytest.raises(TimeoutError, match="did not stabilize"):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-            probe_health=lambda _url, count: [_health("a" * 12)] * count,
-            sleep=lambda _seconds: None,
-            monotonic=lambda: next(clock),
-        )
-
-
-def test_verifier_rejects_desired_running_tasks_that_are_still_pending():
-    clock = iter([0, 0, 0, 1, rollout_verifier.ROLLOUT_PROOF_TIMEOUT_SECONDS + 1])
-    tasks = [
-        _running_task("task-a", "a", 5),
-        _running_task("task-b", "b", 5),
-        {
-            "containerId": "task-pending",
-            "state": "running",
-            "currentState": "Pending 1s",
-            "node": "",
-            "error": "",
-        },
+        for index, node in enumerate(("haiku-5", "haiku-9", "haiku-18"), 1)
     ]
-
-    def unexpected_inspection(_task, _network):
-        raise AssertionError(
-            "impossible task sets must short-circuit before inspection"
-        )
-
-    read_json = _fake_read(
-        {
-            "deployment.all": [{"status": "done"}],
-            "application.one": {"replicas": 1, "appName": "crawl4ai"},
-            "docker.getServiceContainersByAppName": tasks,
+    runtimes = {
+        f"task{index}": {
+            "container": f"container{index}",
+            "labels": rollout._labels(REVISION),
+            "image": CANDIDATE,
+            "addresses": {f"10.0.1.{index}"},
         }
-    )
+        for index in range(1, 4)
+    }
+    def run(command, **_kwargs):
+        if command[1:3] == ["service", "ps"]:
+            return subprocess.CompletedProcess(
+                command, 0, "\n".join(json.dumps(row) for row in rows), ""
+            )
+        return subprocess.CompletedProcess(command, 0, "network\n", "")
 
-    with pytest.raises(TimeoutError, match="did not stabilize"):
-        verify_rollout(
-            dokploy_url="https://dokploy.example",
-            api_key="secret",
-            application_id="app",
-            redis_application_id="redis",
-            revision="target",
-            expected_image=TARGET_IMAGE,
-            baseline_image=TARGET_IMAGE,
-            health_urls=HEALTH_URLS,
-            read_json=read_json,
-            probe_health=lambda _url, count: [_health("a" * 12), _health("b" * 12)]
-            * (count // 2),
-            sleep=lambda _seconds: None,
-            monotonic=lambda: next(clock),
-            inspect_task_runtime=unexpected_inspection,
-        )
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    monkeypatch.setattr(
+        rollout,
+        "_task_transition",
+        lambda task: (
+            ("2026-08-29T00:00:01Z", "", "running", "running")
+            if task.startswith("task")
+            else ("", "2026-08-29T00:00:02Z", "shutdown", "shutdown")
+        ),
+    )
+    monkeypatch.setattr(
+        rollout, "_task_runtime", lambda task, _network: runtimes[task]
+    )
+    monkeypatch.setattr(
+        rollout,
+        "_request_json",
+        lambda url, *_args: health(
+            next(runtime["container"] for runtime in runtimes.values() if next(iter(runtime["addresses"])) in url)
+        ),
+    )
+    proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION)
+    assert proof["nodes"] == ["haiku-4", "haiku-5", "haiku-9"]
+    assert len(proof["instances"]) == 3
+
+
+def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
+    state = application()
+    posts = []
+
+    def post(url, _key, payload):
+        posts.append((url, payload))
+        if url.endswith("application.update"):
+            state["dockerImage"] = payload["dockerImage"]
+            state["labelsSwarm"] = payload["labelsSwarm"]
+
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    monkeypatch.setenv("IMAGE", "registry.example/crawl4ai")
+    monkeypatch.setenv("IMAGE_DIGEST", "sha256:candidate")
+    monkeypatch.setenv("GITHUB_SHA", REVISION)
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(rollout, "_deployments", lambda *_args: [{"deploymentId": "old"}])
+    monkeypatch.setattr(rollout, "_post_json", post)
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(state["dockerImage"], state["labelsSwarm"]["otel.service.version"]))
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(
+        rollout,
+        "_wait_deployment",
+        lambda *_args: {"deploymentId": "new", "status": "done"},
+    )
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: {"tasks": ["1", "2", "3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["a", "b", "c"]},
+    )
+    monkeypatch.setattr(
+        rollout,
+        "_request_json",
+        lambda url, *_args: health(revision="baseline" if "baseline=" in url else REVISION),
+    )
+    rollout.deploy()
+    assert [url.rsplit("/", 1)[-1] for url, _ in posts] == [
+        "application.update",
+        "application.deploy",
+    ]
+    assert "idempotencyKey" not in posts[1][1]
+    assert "expectedDockerImage" not in posts[0][1]
+
+
+@pytest.mark.parametrize("fail_on", [1, 2])
+def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    monkeypatch.setenv("IMAGE", "registry.example/crawl4ai")
+    monkeypatch.setenv("IMAGE_DIGEST", "sha256:candidate")
+    monkeypatch.setenv("GITHUB_SHA", REVISION)
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    state = application()
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(rollout, "_deployments", lambda *_args: [])
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: {})
+    monkeypatch.setattr(
+        rollout,
+        "_request_json",
+        lambda _url, *_args: health(revision="baseline"),
+    )
+    calls = []
+
+    def fail(url, _key, payload):
+        calls.append(url)
+        if url.endswith("application.update"):
+            state["dockerImage"] = payload["dockerImage"]
+            state["labelsSwarm"] = payload["labelsSwarm"]
+        if len(calls) == fail_on:
+            raise RuntimeError("HTTP request failed; state is ambiguous")
+
+    monkeypatch.setattr(rollout, "_post_json", fail)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        rollout.deploy()
+    assert len(calls) == fail_on
+
+
+def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path):
+    path = tmp_path / "evidence.jsonl"
+    rows = [
+        {"ok": True, "url": url, "revision": REVISION, "instance": "one"}
+        for url in rollout.HEALTH_URLS
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
+    monkeypatch.setenv("GITHUB_SHA", REVISION)
+    rollout.evidence()
+    rows[0]["ok"] = False
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    with pytest.raises(RuntimeError, match="failure"):
+        rollout.evidence()

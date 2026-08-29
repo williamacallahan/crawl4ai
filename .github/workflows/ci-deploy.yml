@@ -25,8 +25,6 @@ permissions:
 env:
   IMAGE: docker.iocloudhost.net/crawl4ai
   APPLICATION_ID: YTAj7y39GXOkUtoHpYYXw
-  APPLICATION_APP_NAME: crawl4ai-yq1svi
-  REDIS_APPLICATION_ID: D5WPQqgJYaonrZ6Pth2Cy
 
 jobs:
   test:
@@ -206,63 +204,22 @@ jobs:
           export ROLLOUT_MONITOR_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.jsonl"
           export ROLLOUT_MONITOR_ARMED_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.armed"
           export ROLLOUT_MONITOR_STOP_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.stop"
-          MONITOR_PID=""
-          start_monitor() {
-            rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
-            .venv/bin/python deploy/docker/verify_rollout.py monitor &
-            MONITOR_PID=$!
-            trap finish_monitor EXIT
-            for _ in {1..30}; do
-              test -f "$ROLLOUT_MONITOR_ARMED_PATH" && break
-              kill -0 "$MONITOR_PID"
-              sleep 1
-            done
-            test -f "$ROLLOUT_MONITOR_ARMED_PATH"
-          }
-          finish_monitor() {
-            test -n "$MONITOR_PID" || return 0
-            touch "$ROLLOUT_MONITOR_STOP_PATH"
-            monitor_status=0
-            wait "$MONITOR_PID" || monitor_status=$?
-            MONITOR_PID=""
-            return "$monitor_status"
-          }
-          recover_on_exit() {
-            failure_status=$?
-            trap - EXIT
-            if [ "$failure_status" -ne 0 ] && [ -n "${DEPLOYMENT_ID:-}" ]; then
-              .venv/bin/python deploy/docker/verify_rollout.py rollback || true
-            fi
-            finish_monitor || true
-            exit "$failure_status"
-          }
-          start_monitor
-          .venv/bin/python deploy/docker/verify_rollout.py preflight
-          .venv/bin/python deploy/docker/verify_rollout.py route
+          rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
+          .venv/bin/python deploy/docker/verify_rollout.py monitor &
+          monitor_pid=$!
+          trap 'touch "$ROLLOUT_MONITOR_STOP_PATH"; wait "$monitor_pid" || true' EXIT
+          for _ in {1..30}; do
+            test -f "$ROLLOUT_MONITOR_ARMED_PATH" && break
+            kill -0 "$monitor_pid"
+            sleep 1
+          done
+          test -f "$ROLLOUT_MONITOR_ARMED_PATH"
 
-          BASELINE_IMAGE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')"
-          export BASELINE_IMAGE
-          BASELINE_FORCE_UPDATE="$(docker service inspect "$APPLICATION_APP_NAME" --format '{{.Spec.TaskTemplate.ForceUpdate}}')"
-          export BASELINE_FORCE_UPDATE
-          export SUBMISSION_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
-          export SUBMISSION_TITLE="crawl4ai-${SUBMISSION_ID}"
-          export DEPLOYMENT_ID="application-${APPLICATION_ID}-${SUBMISSION_ID}"
-          trap recover_on_exit EXIT
-          submitted_deployment_id="$(.venv/bin/python deploy/docker/verify_rollout.py submit)"
-          test "$submitted_deployment_id" = "$DEPLOYMENT_ID"
-          if ! .venv/bin/python deploy/docker/verify_rollout.py; then
-            .venv/bin/python deploy/docker/verify_rollout.py rollback
-            finish_monitor
-            trap - EXIT
-            exit 1
-          fi
-          if ! finish_monitor; then
-            .venv/bin/python deploy/docker/verify_rollout.py rollback
-            trap - EXIT
-            exit 1
-          fi
+          .venv/bin/python deploy/docker/verify_rollout.py deploy
+          touch "$ROLLOUT_MONITOR_STOP_PATH"
+          wait "$monitor_pid"
           trap - EXIT
-          echo "deploy verified for ${IMAGE}:${GITHUB_SHA} with $(wc -l < "$ROLLOUT_MONITOR_PATH") successful public probes"
+          .venv/bin/python deploy/docker/verify_rollout.py evidence
 
       - name: Preserve rollout evidence
         if: always()
