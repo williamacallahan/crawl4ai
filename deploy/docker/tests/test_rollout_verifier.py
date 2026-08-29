@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import urllib.parse
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
@@ -12,6 +14,8 @@ from verify_rollout import (
     REQUIRED_STOP_GRACE_NS,
     _curl_json,
     _has_task_error,
+    verify_monitor_evidence,
+    verify_native_route,
     verify_rollout,
 )
 
@@ -28,6 +32,7 @@ def _task_runtime(monkeypatch):
             instance,
             frozenset({address}),
             rollout_verifier._observability_labels("target"),
+            "registry.example/crawl4ai@sha256:target",
         )
 
     monkeypatch.setattr(rollout_verifier, "_inspect_task_runtime", inspect)
@@ -44,6 +49,7 @@ def _application(**overrides):
     application = {
         "replicas": 1,
         "appName": "crawl4ai",
+        "dockerImage": "registry.example/crawl4ai@sha256:target",
         "labelsSwarm": rollout_verifier._observability_labels("target"),
         "env": (
             f"LLM_PROVIDER={rollout_verifier.LLM_PROVIDER}\n"
@@ -68,8 +74,25 @@ def _application(**overrides):
             "Constraints": [],
             "MaxReplicas": rollout_verifier.CRAWL_MAX_REPLICAS_PER_NODE,
         },
-        "updateConfigSwarm": {"Order": "start-first", "Parallelism": 1, "MaxFailureRatio": 0},
-        "rollbackConfigSwarm": {"Order": "start-first", "Parallelism": 1, "MaxFailureRatio": 0},
+        "endpointSpecSwarm": rollout_verifier.CRAWL_ENDPOINT_SPEC,
+        "swarmVipConnectionReuse": False,
+        "updateConfigSwarm": {
+            "Order": "start-first",
+            "Parallelism": 1,
+            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
+            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            "FailureAction": "rollback",
+            "MaxFailureRatio": 0,
+        },
+        "rollbackConfigSwarm": {
+            "Order": "start-first",
+            "Parallelism": 1,
+            "Delay": rollout_verifier.ROLLOUT_DELAY_NS,
+            "Monitor": rollout_verifier.ROLLOUT_MONITOR_NS,
+            "FailureAction": "pause",
+            "MaxFailureRatio": 0,
+        },
+        "stopGracePeriodSwarm": rollout_verifier.STOP_GRACE_NS,
     }
     application.update(overrides)
     return application
@@ -144,7 +167,8 @@ def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
         '"' + "a" * 64 + '"\t'
         + '{"otel.service.version":"target"}\t'
         + '[{"Network":{"ID":"other"},"Addresses":["10.9.0.2/24"]},'
-        + '{"Network":{"ID":"network"},"Addresses":["10.0.1.11/24"]}]\n'
+        + '{"Network":{"ID":"network"},"Addresses":["10.0.1.11/24"]}]\t'
+        + '"registry.example/crawl4ai@sha256:target"\n'
     )
     monkeypatch.setattr(
         rollout_verifier.subprocess,
@@ -154,13 +178,134 @@ def test_task_runtime_reads_only_the_dokploy_overlay(monkeypatch):
         ),
     )
 
-    instance, addresses, labels = ORIGINAL_INSPECT_TASK_RUNTIME(
+    instance, addresses, labels, image = ORIGINAL_INSPECT_TASK_RUNTIME(
         "task", "network"
     )
 
     assert instance == "a" * 12
     assert addresses == frozenset({"10.0.1.11"})
     assert labels == {"otel.service.version": "target"}
+    assert image == "registry.example/crawl4ai@sha256:target"
+
+
+def test_native_route_requires_only_vip_services_and_the_no_reuse_transport(
+    monkeypatch,
+):
+    route = """http:
+  routers:
+    crawl4ai-yq1svi-router-1:
+      service: crawl4ai-yq1svi-service-1
+    crawl4ai-yq1svi-router-2:
+      service: crawl4ai-yq1svi-service-2
+  services:
+    crawl4ai-yq1svi-service-1:
+      loadBalancer:
+        servers:
+          - url: http://crawl4ai-yq1svi:11235
+        serversTransport: crawl4ai-yq1svi-swarm-vip
+    crawl4ai-yq1svi-service-2:
+      loadBalancer:
+        servers:
+          - url: http://crawl4ai-yq1svi:11235
+        serversTransport: crawl4ai-yq1svi-swarm-vip
+  serversTransports:
+    crawl4ai-yq1svi-swarm-vip:
+      maxIdleConnsPerHost: -1
+"""
+    monkeypatch.setattr(rollout_verifier, "_curl_json", lambda *_args: route)
+
+    verify_native_route(
+        dokploy_url="https://dokploy.example",
+        api_key="secret",
+        application_id="app",
+        app_name="crawl4ai-yq1svi",
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "http://legacy-ingress:11235",
+        "serversTransport: default",
+        "maxIdleConnsPerHost: 0",
+    ],
+)
+def test_native_route_rejects_backend_or_transport_drift(monkeypatch, replacement):
+    route = """http:
+  routers:
+    crawl4ai-yq1svi-router-1:
+      service: crawl4ai-yq1svi-service-1
+  services:
+    crawl4ai-yq1svi-service-1:
+      loadBalancer:
+        servers:
+          - url: http://crawl4ai-yq1svi:11235
+        serversTransport: crawl4ai-yq1svi-swarm-vip
+  serversTransports:
+    crawl4ai-yq1svi-swarm-vip:
+      maxIdleConnsPerHost: -1
+"""
+    if replacement.startswith("http"):
+        route = route.replace("http://crawl4ai-yq1svi:11235", replacement)
+    elif replacement.startswith("serversTransport"):
+        route = route.replace(
+            "serversTransport: crawl4ai-yq1svi-swarm-vip", replacement
+        )
+    else:
+        route = route.replace("maxIdleConnsPerHost: -1", replacement)
+    monkeypatch.setattr(rollout_verifier, "_curl_json", lambda *_args: route)
+
+    with pytest.raises(ValueError):
+        verify_native_route(
+            dokploy_url="https://dokploy.example",
+            api_key="secret",
+            application_id="app",
+            app_name="crawl4ai-yq1svi",
+        )
+
+
+def test_monitor_proves_admission_and_predecessor_withdrawal_before_exit(tmp_path):
+    def task(task_id, container_id, desired, current, slot=1):
+        return {
+            "ID": task_id,
+            "ContainerID": container_id,
+            "DesiredState": desired,
+            "CurrentState": current,
+            "Slot": slot,
+        }
+
+    def sample(instances, tasks):
+        return {
+            "ok": True,
+            "health": [
+                {"ok": True, "instance": instance} for instance in instances
+            ],
+            "tasks": tasks,
+        }
+
+    predecessor = task("old-task", "old-instance", "Running", "Running 1m")
+    candidate_starting = task("new-task", "new-instance", "Running", "Starting 1s")
+    candidate_running = task("new-task", "new-instance", "Running", "Running 1s")
+    predecessor_draining = task("old-task", "old-instance", "Shutdown", "Running 1m")
+    predecessor_exited = task("old-task", "old-instance", "Shutdown", "Complete 1s")
+    evidence = tmp_path / "rollout.jsonl"
+    evidence.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                sample(["old-instance"], [predecessor]),
+                sample(["old-instance"], [predecessor, candidate_starting]),
+                sample(["new-instance"], [candidate_running, predecessor_draining]),
+                sample(["new-instance"], [candidate_running, predecessor_exited]),
+            )
+        )
+    )
+
+    verify_monitor_evidence(
+        Path(evidence),
+        frozenset({"new-instance"}),
+        frozenset({"new-task"}),
+    )
 
 
 def test_curl_json_rejects_streamed_responses_over_64_kib():
@@ -384,6 +529,7 @@ def test_verifier_rejects_membership_churn_revision_rollback_or_runtime_label_dr
             rollout_verifier._observability_labels("target")
             if labels is None
             else labels,
+            "registry.example/crawl4ai@sha256:target",
         )
 
     read_json = _fake_read(

@@ -24,11 +24,8 @@ permissions:
 
 env:
   IMAGE: docker.iocloudhost.net/crawl4ai
-  INGRESS_IMAGE: docker.iocloudhost.net/crawl4ai-ingress
   APPLICATION_ID: YTAj7y39GXOkUtoHpYYXw
   APPLICATION_APP_NAME: crawl4ai-yq1svi
-  INGRESS_APPLICATION_ID: QeMB9toEaBOtOszdinFuk
-  INGRESS_APPLICATION_APP_NAME: app-override-1080p-application-wo4lq5
   REDIS_APPLICATION_ID: D5WPQqgJYaonrZ6Pth2Cy
   REDIS_APPLICATION_APP_NAME: crawl4ai-redis-8xt08u
 
@@ -64,7 +61,6 @@ jobs:
             deploy/docker/tests/test_crawl_job_queue.py \
             deploy/docker/tests/test_crawl_job_queue_redis.py \
             deploy/docker/tests/test_crawl_job_contract.py \
-            deploy/docker/tests/test_readiness_routing.py \
             deploy/docker/tests/test_rollout_verifier.py \
             deploy/docker/tests/test_runtime_ui_repairs.py \
             deploy/docker/tests/test_security_headers_xss.py \
@@ -112,8 +108,6 @@ jobs:
           reclaim_build_disk() {
             docker images --filter=reference="${IMAGE}:*" --format '{{.Repository}}:{{.Tag}}' \
               | xargs -r docker rmi || true
-            docker images --filter=reference="${INGRESS_IMAGE}:*" --format '{{.Repository}}:{{.Tag}}' \
-              | xargs -r docker rmi || true
             docker builder prune -af --filter until=10m || true
             df -h /
           }
@@ -137,13 +131,6 @@ jobs:
             -t "${IMAGE}:${GIT_SHA}-${ARCH}" .
           # Docker owns layer-transfer retries; surface its terminal failure.
           docker push "${IMAGE}:${GIT_SHA}-${ARCH}"
-          INGRESS_TAG="config-$(sha256sum deploy/ingress/Dockerfile deploy/ingress/haproxy.cfg | sha256sum | cut -c1-16)"
-          if ! docker manifest inspect "${INGRESS_IMAGE}:${INGRESS_TAG}-${ARCH}" >/dev/null 2>&1; then
-            docker build --provenance=false --sbom=false \
-              -f deploy/ingress/Dockerfile \
-              -t "${INGRESS_IMAGE}:${INGRESS_TAG}-${ARCH}" .
-            docker push "${INGRESS_IMAGE}:${INGRESS_TAG}-${ARCH}"
-          fi
 
       # The runners are long-lived and shared; without this the Nexus credential
       # stays in ~/.docker/config.json for whatever job lands here next.
@@ -154,6 +141,8 @@ jobs:
   merge:
     needs: build
     runs-on: [self-hosted, Linux, X64, williamacallahan]
+    outputs:
+      image_digest: ${{ steps.manifest.outputs.image_digest }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -166,6 +155,7 @@ jobs:
         run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
 
       - name: Publish multi-arch manifest
+        id: manifest
         env:
           GIT_SHA: ${{ github.sha }}
         run: |
@@ -173,12 +163,9 @@ jobs:
           docker manifest create "${IMAGE}:${GIT_SHA}" \
             "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"
           docker manifest push "${IMAGE}:${GIT_SHA}"
-          INGRESS_TAG="config-$(sha256sum deploy/ingress/Dockerfile deploy/ingress/haproxy.cfg | sha256sum | cut -c1-16)"
-          if ! docker manifest inspect "${INGRESS_IMAGE}:${INGRESS_TAG}" >/dev/null 2>&1; then
-            docker manifest create "${INGRESS_IMAGE}:${INGRESS_TAG}" \
-              "${INGRESS_IMAGE}:${INGRESS_TAG}-amd64" "${INGRESS_IMAGE}:${INGRESS_TAG}-arm64"
-            docker manifest push "${INGRESS_IMAGE}:${INGRESS_TAG}"
-          fi
+          image_digest=$(docker buildx imagetools inspect "${IMAGE}:${GIT_SHA}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          test "${image_digest#sha256:}" != "$image_digest"
+          echo "image_digest=$image_digest" >> "$GITHUB_OUTPUT"
 
       # A single-arch list would schedule fine and then sit Pending forever on
       # the arm64 swarm node, so fail loudly here instead.
@@ -188,9 +175,6 @@ jobs:
         run: |
           docker manifest inspect "${IMAGE}:${GIT_SHA}" \
             | python3 -c 'import json,sys; a={m["platform"]["architecture"] for m in json.load(sys.stdin)["manifests"]}; print("published:",a); sys.exit(0 if {"amd64","arm64"} <= a else 1)'
-          INGRESS_TAG="config-$(sha256sum deploy/ingress/Dockerfile deploy/ingress/haproxy.cfg | sha256sum | cut -c1-16)"
-          docker manifest inspect "${INGRESS_IMAGE}:${INGRESS_TAG}" \
-            | python3 -c 'import json,sys; a={m["platform"]["architecture"] for m in json.load(sys.stdin)["manifests"]}; print("ingress published:",a); sys.exit(0 if {"amd64","arm64"} <= a else 1)'
 
       - name: Drop registry credentials
         if: always()
@@ -204,21 +188,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Deploy through readiness-aware task routing
+      - name: Deploy through the native Swarm VIP
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          IMAGE_DIGEST: ${{ needs.merge.outputs.image_digest }}
+          HEALTH_URLS: https://crawl4ai.haiku.host/health,https://crawl4ai.popos-sf0.com/health
         run: |
           set -euo pipefail
-          INGRESS_TAG="config-$(sha256sum deploy/ingress/Dockerfile deploy/ingress/haproxy.cfg | sha256sum | cut -c1-16)"
-          export INGRESS_TAG
           export ROLLOUT_MONITOR_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.jsonl"
           export ROLLOUT_MONITOR_ARMED_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.armed"
           export ROLLOUT_MONITOR_STOP_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.stop"
           MONITOR_PID=""
           start_monitor() {
             rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
-            python3 deploy/docker/readiness_routing.py monitor &
+            python3 deploy/docker/verify_rollout.py monitor &
             MONITOR_PID=$!
             trap finish_monitor EXIT
             for _ in {1..30}; do
@@ -236,27 +220,7 @@ jobs:
             MONITOR_PID=""
             return "$monitor_status"
           }
-          if python3 deploy/docker/readiness_routing.py verify; then
-            start_monitor
-          fi
-
-          # The ingress shares haiku-0's singleton Traefik failure domain and is
-          # immutable after bootstrap. In-place replacement would move the
-          # RUNNING-before-ready race to this VIP, so source drift fails the
-          # exact-image proof below and requires a separately monitored cutover.
-          if ! docker service inspect "$INGRESS_APPLICATION_APP_NAME" >/dev/null 2>&1; then
-            printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
-              -X POST "$DOKPLOY_URL/api/application.update" \
-              -H 'content-type: application/json' \
-              --data "$(printf '{"applicationId":"%s","sourceType":"docker","dockerImage":"%s:%s","registryId":"svxwBOnKPT8f476w2I77n","replicas":1,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai-ingress","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","haproxy","-c","-f","/usr/local/etc/haproxy/haproxy.cfg"],"Interval":1000000000,"Timeout":1000000000,"StartPeriod":5000000000,"Retries":3},"placementSwarm":{"Constraints":["node.hostname==haiku-0"],"MaxReplicas":1},"updateConfigSwarm":{"Parallelism":1,"Delay":0,"FailureAction":"rollback","Monitor":30000000000,"MaxFailureRatio":0,"Order":"stop-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":0,"FailureAction":"pause","Monitor":30000000000,"MaxFailureRatio":0,"Order":"stop-first"}}' "$INGRESS_APPLICATION_ID" "$INGRESS_IMAGE" "$INGRESS_TAG" "$INGRESS_TAG")" >/dev/null
-            printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
-              -X POST "$DOKPLOY_URL/api/application.deploy" \
-              -H 'content-type: application/json' \
-              --data "$(printf '{"applicationId":"%s"}' "$INGRESS_APPLICATION_ID")" >/dev/null
-          fi
-          python3 deploy/docker/readiness_routing.py ingress
-          test -n "$MONITOR_PID" || start_monitor
-          python3 deploy/docker/readiness_routing.py
+          start_monitor
 
           # Redis persistence: fsync-per-write blocked the single Redis thread on
           # disk stalls and 503'd every replica's /health at once (2026-08-28 task
@@ -271,14 +235,15 @@ jobs:
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.update" \
             -H 'content-type: application/json' \
-            --data "$(printf '{"applicationId":"%s","dockerImage":"%s:%s","replicas":3,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health"],"Interval":10000000000,"Timeout":5000000000,"StartPeriod":120000000000,"Retries":5},"placementSwarm":{"MaxReplicas":1},"updateConfigSwarm":{"Parallelism":1,"Delay":0,"FailureAction":"rollback","Monitor":210000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":0,"FailureAction":"pause","Monitor":210000000000,"MaxFailureRatio":0,"Order":"start-first"}}' "$APPLICATION_ID" "$IMAGE" "$GITHUB_SHA" "$GITHUB_SHA")" >/dev/null
+            --data "$(printf '{"applicationId":"%s","dockerImage":"%s@%s","replicas":3,"labelsSwarm":{"otel.logs.enabled":"true","otel.service.name":"crawl4ai","otel.deployment.environment.name":"production","otel.service.version":"%s"},"healthCheckSwarm":{"Test":["CMD","curl","-f","http://localhost:11235/health"],"Interval":10000000000,"Timeout":5000000000,"StartPeriod":120000000000,"Retries":5},"placementSwarm":{"MaxReplicas":1},"endpointSpecSwarm":{"Mode":"vip","Ports":[]},"updateConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"rollback","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"rollbackConfigSwarm":{"Parallelism":1,"Delay":150000000000,"FailureAction":"pause","Monitor":150000000000,"MaxFailureRatio":0,"Order":"start-first"},"stopGracePeriodSwarm":390000000000,"swarmVipConnectionReuse":false}' "$APPLICATION_ID" "$IMAGE" "$IMAGE_DIGEST" "$GITHUB_SHA")" >/dev/null
+
+          python3 deploy/docker/verify_rollout.py route
+
           printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" | curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 65536 --config - \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H 'content-type: application/json' \
             --data "$(printf '{"applicationId":"%s"}' "$APPLICATION_ID")" >/dev/null
           python3 deploy/docker/verify_rollout.py
-          python3 deploy/docker/readiness_routing.py ingress
-          python3 deploy/docker/readiness_routing.py verify
           finish_monitor
           trap - EXIT
 
@@ -302,7 +267,7 @@ jobs:
               sleep 5
             done
             redis_args | grep -q 'appendfsync","everysec'
-            python3 deploy/docker/readiness_routing.py verify
+            python3 deploy/docker/verify_rollout.py
           fi
           echo "deploy verified for ${IMAGE}:${GITHUB_SHA} with $(wc -l < "$ROLLOUT_MONITOR_PATH") successful public probes"
 

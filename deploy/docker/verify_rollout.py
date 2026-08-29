@@ -1,4 +1,4 @@
-"""Fail closed until Dokploy and every public replica serve one exact revision."""
+"""Prove one immutable Crawl4AI release through Dokploy's native Swarm VIP."""
 
 from __future__ import annotations
 
@@ -16,13 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from readiness_routing import (
-    MAX_RESPONSE_BYTES,
-    ingress_backends,
-    ingress_task_stats_url,
-    verify_monitor_evidence,
-)
-
+MAX_RESPONSE_BYTES = 65_536
 MAX_REPLICAS = 16
 CRAWL_REPLICAS = 3
 LLM_PROVIDER = "openai/qwen3.8-27b"
@@ -35,7 +29,12 @@ CRAWL_HEALTHCHECK = ["CMD", "curl", "-f", "http://localhost:11235/health"]
 CRAWL_HEALTHCHECK_MIN_RETRIES = 3
 CRAWL_HEALTHCHECK_MIN_INTERVAL_NS = 5_000_000_000
 CRAWL_MAX_REPLICAS_PER_NODE = 1
+CRAWL_ENDPOINT_SPEC = {"Mode": "vip", "Ports": []}
+ROLLOUT_DELAY_NS = 150_000_000_000
+ROLLOUT_MONITOR_NS = 150_000_000_000
+STOP_GRACE_NS = 390_000_000_000
 ROLLOUT_PROOF_TIMEOUT_SECONDS = 900
+MONITOR_INTERVAL_SECONDS = 0.5
 
 
 def _observability_labels(revision: str) -> dict[str, str]:
@@ -63,6 +62,10 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
         raise ValueError("observability labels do not match the release")
     if application.get("replicas") != CRAWL_REPLICAS:
         raise ValueError("Crawl4AI must keep exactly three replicas")
+    image = os.environ.get("IMAGE")
+    digest = os.environ.get("IMAGE_DIGEST")
+    if image and digest and application.get("dockerImage") != f"{image}@{digest}":
+        raise ValueError("Crawl4AI image does not match the immutable release")
     environment = application.get("env")
     if not isinstance(environment, str):
         raise ValueError("LLM environment is not configured")
@@ -74,8 +77,15 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
     if not values.get("LLM_API_KEY", "").strip():
         raise ValueError("LLM_API_KEY must be nonempty")
     placement = application.get("placementSwarm")
-    if not isinstance(placement, dict) or placement.get("MaxReplicas") != CRAWL_MAX_REPLICAS_PER_NODE:
+    if (
+        not isinstance(placement, dict)
+        or placement.get("MaxReplicas") != CRAWL_MAX_REPLICAS_PER_NODE
+    ):
         raise ValueError("Crawl4AI placement must keep one replica per node")
+    if application.get("endpointSpecSwarm") != CRAWL_ENDPOINT_SPEC:
+        raise ValueError("Crawl4AI must use the native Swarm VIP endpoint mode")
+    if application.get("swarmVipConnectionReuse") is not False:
+        raise ValueError("Crawl4AI must disable Traefik-to-VIP connection reuse")
     healthcheck = application.get("healthCheckSwarm")
     if not isinstance(healthcheck, dict) or healthcheck.get("Test") != CRAWL_HEALTHCHECK:
         raise ValueError("Crawl4AI must use the routing admission healthcheck")
@@ -88,12 +98,26 @@ def _verify_release_configuration(application: Any, revision: str) -> None:
         raise ValueError(
             "Crawl4AI healthcheck must tolerate transient blips (Retries>=3, Interval>=5s)"
         )
-    for field in ("updateConfigSwarm", "rollbackConfigSwarm"):
+    for field, failure_action in (
+        ("updateConfigSwarm", "rollback"),
+        ("rollbackConfigSwarm", "pause"),
+    ):
         config = application.get(field)
         if not isinstance(config, dict) or config.get("Order") != "start-first":
             raise ValueError(f"{field} must use start-first order")
         if config.get("Parallelism") != 1 or config.get("MaxFailureRatio") != 0:
             raise ValueError(f"{field} must replace one task at a time and fail closed")
+        if config.get("FailureAction") != failure_action:
+            raise ValueError(f"{field} has the wrong failure action")
+        if (
+            config.get("Delay") != ROLLOUT_DELAY_NS
+            or config.get("Monitor") != ROLLOUT_MONITOR_NS
+        ):
+            raise ValueError(
+                f"{field} must keep the qualified rollout delay and monitor"
+            )
+    if int(application.get("stopGracePeriodSwarm") or 0) < STOP_GRACE_NS:
+        raise ValueError("Crawl4AI stop grace must outlive the complete drain window")
 
 
 def _verify_redis_configuration(application: Any) -> None:
@@ -195,6 +219,298 @@ def _dokploy_url(base_url: str, operation: str, **params: str) -> str:
     return f"{base_url.rstrip('/')}/api/{operation}?{urllib.parse.urlencode(params)}"
 
 
+def verify_native_route(
+    *, dokploy_url: str, api_key: str, application_id: str, app_name: str
+) -> None:
+    route = _curl_json(
+        _dokploy_url(
+            dokploy_url,
+            "application.readTraefikConfig",
+            applicationId=application_id,
+        ),
+        api_key,
+    )
+    if not isinstance(route, str):
+        raise ValueError("Dokploy Traefik configuration response is invalid")
+    expected_url = f"http://{app_name}:11235"
+    configured_urls = re.findall(r"\burl:\s*([^\s]+)", route)
+    if not configured_urls or set(configured_urls) != {expected_url}:
+        raise ValueError("Dokploy route does not target only the Crawl4AI Swarm VIP")
+    service_names = set(
+        re.findall(
+            rf"(?m)^\s{{4}}({re.escape(app_name)}-service-[0-9]+):\s*$",
+            route,
+        )
+    )
+    router_targets = set(re.findall(r"(?m)^\s{6}service:\s*([^\s]+)\s*$", route))
+    if not router_targets or not router_targets <= service_names:
+        raise ValueError("Every Dokploy router must target an application VIP service")
+    transport_name = f"{app_name}-swarm-vip"
+    service_transports = re.findall(r"\bserversTransport:\s*([^\s]+)", route)
+    if not service_transports or set(service_transports) != {transport_name}:
+        raise ValueError(
+            "Every Dokploy service must use the application Swarm VIP transport"
+        )
+    if not re.search(
+        rf"(?m)^\s{{4}}{re.escape(transport_name)}:\s*$[\s\S]*?^\s{{6}}maxIdleConnsPerHost:\s*-1\s*$",
+        route,
+    ):
+        raise ValueError("Dokploy Swarm VIP transport must disable idle connection reuse")
+def _public_health_sample(url: str) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        health = _curl_json(f"{url}?rollout={uuid.uuid4()}")
+        if not _is_exact_health_shape(health):
+            raise ValueError("public health response is malformed")
+        return {
+            "ok": True,
+            "timestamp": time.time(),
+            "latencySeconds": time.monotonic() - started,
+            "instance": health["instance"],
+            "revision": health["revision"],
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "timestamp": time.time(),
+            "latencySeconds": time.monotonic() - started,
+            "error": type(error).__name__,
+        }
+
+
+def _is_exact_health_shape(health: Any) -> bool:
+    return (
+        isinstance(health, dict)
+        and bool(health.get("instance"))
+        and bool(health.get("revision"))
+        and health.get("status") == "ok"
+    )
+
+
+def _swarm_tasks(
+    app_name: str, tracked_task_ids: set[str]
+) -> list[dict[str, str]]:
+    result = subprocess.run(
+        [
+            "docker",
+            "service",
+            "ps",
+            "--no-trunc",
+            "--format",
+            "{{json .}}",
+            app_name,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tasks = [json.loads(line) for line in result.stdout.splitlines() if line]
+    task_ids = [
+        _task_id(task)
+        for task in tasks
+        if _task_id(task) in tracked_task_ids
+        or str(task.get("DesiredState", "")).lower() == "running"
+    ]
+    if task_ids:
+        inspected = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .ID}}\t{{json .Slot}}\t"
+                "{{json .Status.ContainerStatus.ContainerID}}",
+                *task_ids,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        containers = {}
+        for task_id, slot, container_id in (
+            line.split("\t", 2) for line in inspected.stdout.splitlines()
+        ):
+            container = json.loads(container_id)
+            containers[json.loads(task_id)[:12]] = (
+                json.loads(slot),
+                container[:12] if container else "",
+            )
+        for task in tasks:
+            slot, container = containers.get(_task_id(task), (None, ""))
+            task["Slot"] = slot
+            task["ContainerID"] = container
+    return tasks
+
+
+def monitor_public_health(
+    *,
+    health_urls: tuple[str, ...],
+    app_name: str,
+    expected_replicas: int,
+    evidence_path: Path,
+    armed_path: Path,
+    stop_path: Path,
+) -> None:
+    baseline_instances: set[str] = set()
+    tracked_task_ids: set[str] = set()
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    with evidence_path.open("w") as evidence, concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(health_urls) * 6
+    ) as executor:
+        while not stop_path.exists():
+            tasks = _swarm_tasks(app_name, tracked_task_ids)
+            tracked_task_ids.update(
+                _task_id(task)
+                for task in tasks
+                if str(task.get("DesiredState", "")).lower() == "running"
+            )
+            health = list(
+                executor.map(
+                    _public_health_sample,
+                    health_urls * 6,
+                )
+            )
+            sample = {
+                "ok": all(probe["ok"] for probe in health),
+                "timestamp": time.time(),
+                "health": health,
+                "tasks": [
+                    task for task in tasks if _task_id(task) in tracked_task_ids
+                ],
+            }
+            evidence.write(json.dumps(sample, separators=(",", ":")) + "\n")
+            evidence.flush()
+            os.fsync(evidence.fileno())
+            if not sample["ok"]:
+                raise RuntimeError("public health monitor observed a failed request")
+            baseline_instances.update(probe["instance"] for probe in health)
+            if len(baseline_instances) >= expected_replicas and not armed_path.exists():
+                armed_path.touch()
+            time.sleep(MONITOR_INTERVAL_SECONDS)
+
+
+def _task_id(task: dict[str, Any]) -> str:
+    return str(task.get("ID", task.get("Id", "")))[:12]
+
+
+def verify_monitor_evidence(
+    evidence_path: Path | None,
+    final_instances: frozenset[str],
+    final_tasks: frozenset[str],
+) -> None:
+    if evidence_path is None:
+        return
+    samples = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    if not samples or any(not sample.get("ok") for sample in samples):
+        raise RuntimeError("public health monitor did not remain successful")
+    observed_instances = {
+        probe.get("instance")
+        for sample in samples
+        for probe in sample["health"]
+    }
+    if not final_instances <= observed_instances:
+        raise RuntimeError("public monitor did not observe every replacement task")
+    baseline_instances: set[str] = set()
+    for sample in samples:
+        baseline_instances.update(
+            probe["instance"] for probe in sample["health"]
+        )
+        if len(baseline_instances) == len(final_instances):
+            break
+    if len(baseline_instances) != len(final_instances):
+        raise RuntimeError("public monitor did not capture the complete predecessor set")
+    if not baseline_instances.isdisjoint(final_instances):
+        raise RuntimeError("public monitor did not prove full predecessor withdrawal")
+
+    first_tasks_by_slot = {
+        task.get("Slot"): _task_id(task)
+        for task in samples[0]["tasks"]
+        if str(task.get("DesiredState", "")).lower() == "running"
+    }
+    first_tasks = set(first_tasks_by_slot.values())
+    if first_tasks & final_tasks:
+        raise RuntimeError("Swarm task identities did not fully roll over")
+    for task_id in final_tasks:
+        observed = [
+            (index, task)
+            for index, sample in enumerate(samples)
+            for task in sample["tasks"]
+            if _task_id(task) == task_id
+        ]
+        lifecycle = {
+            str(task.get("CurrentState", "")).split(" ", 1)[0].lower()
+            for _, task in observed
+        }
+        slots = {task.get("Slot") for _, task in observed}
+        if "starting" not in lifecycle or "running" not in lifecycle:
+            raise RuntimeError("monitor did not prove candidate STARTING-to-RUNNING admission")
+        if len(slots) != 1:
+            raise RuntimeError("monitor did not prove one stable slot for a candidate")
+        slot = slots.pop()
+        predecessor = first_tasks_by_slot.get(slot)
+        if not predecessor:
+            raise RuntimeError("monitor did not correlate a candidate with its predecessor")
+        candidate_running = next(
+            index
+            for index, task in observed
+            if str(task.get("CurrentState", "")).startswith("Running ")
+        )
+        predecessor_shutdown = next(
+            (
+                index
+                for index, sample in enumerate(samples)
+                if any(
+                    _task_id(task) == predecessor
+                    and str(task.get("DesiredState", "")).lower() == "shutdown"
+                    for task in sample["tasks"]
+                )
+            ),
+            None,
+        )
+        if predecessor_shutdown is None or candidate_running > predecessor_shutdown:
+            raise RuntimeError("monitor did not prove per-slot admission before shutdown")
+
+    predecessor_instances = {
+        task.get("ContainerID")
+        for task in samples[0]["tasks"]
+        if _task_id(task) in first_tasks
+    }
+    for predecessor in predecessor_instances:
+        withdrawal = next(
+            (
+                index
+                for index, sample in enumerate(samples)
+                if any(
+                    task.get("ContainerID") == predecessor
+                    and str(task.get("DesiredState", "")).lower() == "shutdown"
+                    for task in sample["tasks"]
+                )
+            ),
+            None,
+        )
+        exit_index = next(
+            (
+                index
+                for index, sample in enumerate(samples)
+                if any(
+                    task.get("ContainerID") == predecessor
+                    and str(task.get("CurrentState", "")).split(" ", 1)[0].lower()
+                    in {"complete", "failed", "shutdown"}
+                    for task in sample["tasks"]
+                )
+            ),
+            None,
+        )
+        if withdrawal is None or exit_index is None or withdrawal > exit_index:
+            raise RuntimeError("monitor did not observe predecessor withdrawal before exit")
+        served_while_draining = {
+            probe.get("instance")
+            for sample in samples[withdrawal : exit_index + 1]
+            for probe in sample["health"]
+        }
+        if predecessor in served_while_draining:
+            raise RuntimeError("public routing still selected a withdrawn predecessor")
+
+
 def _is_exact_health(health: Any, revision: str) -> bool:
     return (
         isinstance(health, dict)
@@ -213,7 +529,7 @@ def _has_task_error(task: dict[str, Any]) -> bool:
 
 def _inspect_task_runtime(
     task_id: str, network_id: str
-) -> tuple[str, frozenset[str], dict[str, str]]:
+) -> tuple[str, frozenset[str], dict[str, str], str]:
     result = subprocess.run(
         [
             "docker",
@@ -221,20 +537,21 @@ def _inspect_task_runtime(
             task_id,
             "--format",
             "{{json .Status.ContainerStatus.ContainerID}}\t"
-            "{{json .Spec.ContainerSpec.Labels}}\t{{json .NetworksAttachments}}",
+            "{{json .Spec.ContainerSpec.Labels}}\t{{json .NetworksAttachments}}\t"
+            "{{json .Spec.ContainerSpec.Image}}",
         ],
         check=True,
         capture_output=True,
         text=True,
     )
-    container, labels, attachments = result.stdout.rstrip("\n").split("\t", 2)
+    container, labels, attachments, image = result.stdout.rstrip("\n").split("\t", 3)
     addresses = frozenset(
         address.split("/", 1)[0]
         for attachment in json.loads(attachments) or []
         if attachment.get("Network", {}).get("ID") == network_id
         for address in attachment.get("Addresses", [])
     )
-    return json.loads(container)[:12], addresses, json.loads(labels) or {}
+    return json.loads(container)[:12], addresses, json.loads(labels) or {}, json.loads(image)
 
 
 def _dokploy_network_id() -> str:
@@ -262,9 +579,8 @@ def verify_rollout(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     monitor_evidence_path: Path | None = None,
-    ingress_stats_url: str | None = None,
     inspect_task_runtime: Callable[
-        [str, str], tuple[str, frozenset[str], dict[str, str]]
+        [str, str], tuple[str, frozenset[str], dict[str, str], str]
     ]
     | None = None,
 ) -> None:
@@ -376,13 +692,15 @@ def verify_rollout(
             continue
 
         def inspect_task(task_id: str) -> tuple[str, frozenset[str]]:
-            instance, addresses, labels = inspect_task_runtime(task_id, network)
+            instance, addresses, labels, image = inspect_task_runtime(task_id, network)
             if not isinstance(labels, dict) or any(
                 labels.get(key) != value for key, value in expected_labels.items()
             ):
                 raise ValueError("container observability labels do not match release")
             if not addresses:
                 raise ValueError("Crawl4AI task has no overlay address")
+            if image != application["dockerImage"]:
+                raise ValueError("running task image does not match the immutable release")
             return instance, addresses
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=replicas) as executor:
@@ -391,16 +709,6 @@ def verify_rollout(
         authoritative_addresses = frozenset(
             address for _, addresses in inspected_tasks for address in addresses
         )
-
-        if ingress_stats_url is not None:
-            admitted_backends = frozenset(ingress_backends(ingress_stats_url))
-            if len(admitted_backends) != len(authoritative_addresses):
-                candidate = None
-                stable_rounds = 0
-                sleep(5)
-                continue
-        else:
-            admitted_backends = authoritative_addresses
 
         responses = probe_health(health_url, max(4, replicas * 4))
         matches = [_is_exact_health(health, revision) for health in responses]
@@ -423,7 +731,7 @@ def verify_rollout(
             verify_monitor_evidence(
                 monitor_evidence_path,
                 authoritative_instances,
-                admitted_backends,
+                frozenset(task[:12] for task in actual_running_tasks),
             )
             print(
                 json.dumps(
@@ -431,8 +739,7 @@ def verify_rollout(
                         "revision": revision,
                         "tasks": sorted(actual_running_tasks),
                         "instances": sorted(authoritative_instances),
-                        "taskAddresses": sorted(authoritative_addresses),
-                        "admittedBackends": sorted(admitted_backends),
+                        "vipTaskAddresses": sorted(authoritative_addresses),
                     },
                     separators=(",", ":"),
                 )
@@ -446,6 +753,28 @@ def verify_rollout(
 
 def main(arguments: list[str] | None = None) -> None:
     arguments = sys.argv[1:] if arguments is None else arguments
+    if arguments == ["monitor"]:
+        monitor_public_health(
+            health_urls=tuple(
+                os.environ.get(
+                    "HEALTH_URLS", "https://crawl4ai.haiku.host/health"
+                ).split(",")
+            ),
+            app_name=os.environ["APPLICATION_APP_NAME"],
+            expected_replicas=CRAWL_REPLICAS,
+            evidence_path=Path(os.environ["ROLLOUT_MONITOR_PATH"]),
+            armed_path=Path(os.environ["ROLLOUT_MONITOR_ARMED_PATH"]),
+            stop_path=Path(os.environ["ROLLOUT_MONITOR_STOP_PATH"]),
+        )
+        return
+    if arguments == ["route"]:
+        verify_native_route(
+            dokploy_url=os.environ["DOKPLOY_URL"],
+            api_key=os.environ["DOKPLOY_API_KEY"],
+            application_id=os.environ["APPLICATION_ID"],
+            app_name=os.environ["APPLICATION_APP_NAME"],
+        )
+        return
     if arguments:
         raise ValueError(f"Unsupported verifier arguments: {arguments}")
     verify_rollout(
@@ -459,9 +788,6 @@ def main(arguments: list[str] | None = None) -> None:
             Path(os.environ["ROLLOUT_MONITOR_PATH"])
             if os.environ.get("ROLLOUT_MONITOR_PATH")
             else None
-        ),
-        ingress_stats_url=ingress_task_stats_url(
-            os.environ["INGRESS_APPLICATION_APP_NAME"]
         ),
     )
 
