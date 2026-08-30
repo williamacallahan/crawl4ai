@@ -26,10 +26,7 @@ def application(image=BASELINE, revision="baseline"):
         ),
         "replicas": 3,
         "healthCheckSwarm": copy.deepcopy(rollout.HEALTHCHECK),
-        "placementSwarm": {
-            "Constraints": [rollout.NODE_CONSTRAINT],
-            "MaxReplicas": 1,
-        },
+        "placementSwarm": copy.deepcopy(rollout.PLACEMENT),
         "endpointSpecSwarm": {"Mode": "vip", "Ports": []},
         "updateConfigSwarm": {
             "Parallelism": 1,
@@ -69,10 +66,7 @@ def service_spec(image=BASELINE, revision="baseline"):
                 "Healthcheck": copy.deepcopy(rollout.HEALTHCHECK),
                 "StopGracePeriod": rollout.STOP_GRACE_NS,
             },
-            "Placement": {
-                "Constraints": [rollout.NODE_CONSTRAINT],
-                "MaxReplicas": 1,
-            },
+            "Placement": copy.deepcopy(rollout.PLACEMENT),
             "Resources": copy.deepcopy(rollout.RESOURCES),
         },
         "Mode": {"Replicated": {"Replicas": 3}},
@@ -525,7 +519,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
             next(runtime["container"] for runtime in runtimes.values() if next(iter(runtime["addresses"])) in url)
         ),
     )
-    proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION)
+    proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES)
     assert proof["nodes"] == ["haiku-4", "haiku-5", "haiku-9"]
     assert len(proof["instances"]) == 3
 
@@ -542,6 +536,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
         if url.endswith("application.update"):
             state["dockerImage"] = payload["dockerImage"]
             state["labelsSwarm"] = payload["labelsSwarm"]
+            state["placementSwarm"] = payload["placementSwarm"]
 
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
     monkeypatch.setenv("DOKPLOY_API_KEY", "key")
@@ -586,6 +581,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
         "application.deploy",
     ]
     assert "idempotencyKey" not in posts[1][1]
+    assert posts[0][1]["placementSwarm"] == rollout.PLACEMENT
     assert "expectedDockerImage" not in posts[0][1]
 
     state = application()
@@ -637,6 +633,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
         if url.endswith("application.update"):
             state["dockerImage"] = payload["dockerImage"]
             state["labelsSwarm"] = payload["labelsSwarm"]
+            state["placementSwarm"] = payload["placementSwarm"]
         if len(calls) == fail_on:
             raise RuntimeError("HTTP request failed; state is ambiguous")
 
@@ -683,3 +680,236 @@ def test_monitor_arms_only_after_both_domains_are_ready(monkeypatch, tmp_path):
     rollout.monitor()
     assert armed_path.exists()
     assert len(evidence_path.read_text().splitlines()) == len(rollout.HEALTH_URLS)
+
+
+def _node_commands(nodes):
+    """Stub docker node ls/inspect for a fleet of (hostname, labeled, state, availability)."""
+    def run(cmd, **_kwargs):
+        if cmd[1] == "node" and cmd[2] == "ls":
+            return subprocess.CompletedProcess(cmd, 0, "".join(f"id{i}\n" for i in range(len(nodes))), "")
+        lines = []
+        for hostname, labeled, state, availability in nodes:
+            labels = {"crawl4ai-eligible": "true"} if labeled else {}
+            lines.append("\t".join([
+                json.dumps(hostname), json.dumps(labels),
+                json.dumps(state), json.dumps(availability),
+            ]))
+        return subprocess.CompletedProcess(cmd, 0, "".join(line + "\n" for line in lines), "")
+    return run
+
+
+def test_eligible_nodes_excludes_a_down_member_without_failing(monkeypatch):
+    # A down node is a capacity event: it leaves the result, not raises.
+    monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
+        ("haiku-0", False, "ready", "active"),
+        ("haiku-4", True, "down", "active"),
+        ("haiku-5", True, "ready", "active"),
+        ("haiku-9", True, "ready", "active"),
+        ("haiku-18", True, "ready", "active"),
+    ]))
+    assert rollout._eligible_nodes() == frozenset({"haiku-5", "haiku-9", "haiku-18"})
+
+
+def test_eligible_nodes_flags_membership_drift_even_when_ready(monkeypatch):
+    monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
+        ("haiku-4", True, "ready", "active"),
+        ("haiku-5", True, "ready", "active"),
+        ("haiku-9", True, "ready", "active"),
+    ]))
+    with pytest.raises(RuntimeError, match="inventory drifted"):
+        rollout._eligible_nodes()
+
+
+def test_policy_accepts_legacy_capped_placement_during_transition():
+    app = application()
+    app["placementSwarm"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    rollout._policy(app)
+
+
+def test_policy_rejects_foreign_placement():
+    app = application()
+    app["placementSwarm"] = {"Constraints": [rollout.NODE_CONSTRAINT], "MaxReplicas": 2}
+    with pytest.raises(ValueError, match="placement drifted"):
+        rollout._policy(app)
+
+
+def test_running_spec_accepts_legacy_capped_placement():
+    spec = service_spec()
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    rollout._running_spec(spec, BASELINE, rollout._labels("baseline"))
+
+
+def test_running_spec_strict_mode_rejects_legacy_placement():
+    # The post-deploy readback must prove the cap is actually gone from the
+    # rendered service — legacy tolerance is for the pre-write baseline only.
+    spec = service_spec()
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    with pytest.raises(ValueError, match="placement drifted"):
+        rollout._running_spec(
+            spec, BASELINE, rollout._labels("baseline"), placements=(rollout.PLACEMENT,)
+        )
+
+
+def _healed_baseline_rows():
+    # haiku-4 died holding slot 1; Swarm healed the replica onto haiku-18,
+    # and the ghost task on the dead node can never confirm its shutdown.
+    rows = [
+        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-18",
+         "DesiredState": "Running", "CurrentState": "Running 1m"},
+        {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-4",
+         "DesiredState": "Shutdown", "CurrentState": "Running 12 hours ago"},
+        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-5",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-9",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-9",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-5",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+    ]
+    runtimes = {
+        f"task{index}": {
+            "container": f"container{index}",
+            "labels": rollout._labels("baseline"),
+            "image": BASELINE,
+            "addresses": {f"10.0.1.{index}"},
+        }
+        for index in range(1, 4)
+    }
+    return rows, runtimes
+
+
+def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
+    def run(command, **_kwargs):
+        if command[1:3] == ["service", "ps"]:
+            return subprocess.CompletedProcess(
+                command, 0, "\n".join(json.dumps(row) for row in rows), ""
+            )
+        return subprocess.CompletedProcess(command, 0, "network\n", "")
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    monkeypatch.setattr(
+        rollout,
+        "_task_state",
+        lambda task: (
+            ("running", "running") if task.startswith("task")
+            else ("shutdown", "running") if task.startswith("ghost")
+            else ("shutdown", "rejected") if task.startswith("reject")
+            else ("shutdown", "shutdown")
+        ),
+    )
+    monkeypatch.setattr(rollout, "_task_runtime", lambda task, _network: runtimes[task])
+    monkeypatch.setattr(
+        rollout,
+        "_request_json",
+        lambda url, *_args: health(
+            next(r["container"] for r in runtimes.values() if next(iter(r["addresses"])) in url),
+            revision=revision,
+        ),
+    )
+
+
+def test_baseline_tolerates_a_ghost_predecessor_on_a_down_node(monkeypatch):
+    rows, runtimes = _healed_baseline_rows()
+    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+    assert sorted(proof["nodes"]) == ["haiku-18", "haiku-5", "haiku-9"]
+    # The same state must still fail a converged proof: the ghost's shutdown
+    # was never confirmed, so this deploy's own withdrawals stay strict.
+    with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready)
+
+
+def test_baseline_tolerates_healed_colocation_but_converged_does_not(monkeypatch):
+    rows, runtimes = _healed_baseline_rows()
+    for row in rows:
+        if row["ID"] == "task1":
+            row["Node"] = "haiku-5"  # healed replica doubled up
+    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+    assert sorted(proof["nodes"]) == ["haiku-5", "haiku-9"]
+    with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready)
+
+
+def _deploy_env(monkeypatch):
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    monkeypatch.setenv("IMAGE", "registry.example/crawl4ai")
+    monkeypatch.setenv("IMAGE_DIGEST", "sha256:candidate")
+    monkeypatch.setenv("GITHUB_SHA", REVISION)
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+
+
+def test_deploy_requires_ready_capacity_not_full_fleet(monkeypatch):
+    _deploy_env(monkeypatch)
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application())
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+
+    # Three ready of four labeled nodes is enough capacity: the gate passes
+    # and evaluation reaches the baseline task census.
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"}))
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: (_ for _ in ()).throw(SystemExit("capacity gate passed")),
+    )
+    with pytest.raises(SystemExit, match="capacity gate passed"):
+        rollout.deploy()
+
+    # Two ready nodes cannot place three replicas: fail before the census.
+    monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: pytest.fail("census must not run"))
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-9", "haiku-18"}))
+    with pytest.raises(RuntimeError, match="not enough Ready eligible nodes"):
+        rollout.deploy()
+
+
+def test_deploy_rejects_a_reintroduced_cap_once_the_record_converged(monkeypatch):
+    # Record already migrated to the capless shape; a capped LIVE spec is
+    # drift, not transition residue.
+    _deploy_env(monkeypatch)
+    spec = service_spec()
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application())
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: spec)
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    with pytest.raises(ValueError, match="running placement drifted"):
+        rollout.deploy()
+
+
+def test_deploy_tolerates_legacy_live_spec_only_while_record_is_legacy(monkeypatch):
+    _deploy_env(monkeypatch)
+    state = application()
+    state["placementSwarm"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    spec = service_spec()
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: spec)
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(
+        rollout, "_verify_redis", lambda: (_ for _ in ()).throw(SystemExit("baseline spec accepted"))
+    )
+    with pytest.raises(SystemExit, match="baseline spec accepted"):
+        rollout.deploy()
+
+
+def test_baseline_keeps_unassigned_attempts_strict(monkeypatch):
+    # A rejected scheduling attempt has no node; it is not a stranded ghost
+    # and must not excuse the withdrawal proof.
+    rows, runtimes = _healed_baseline_rows()
+    rows.insert(1, {"ID": "reject1", "Name": "crawl4ai.1", "Node": "",
+                    "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"})
+    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)

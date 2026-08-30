@@ -31,6 +31,16 @@ HEALTHCHECK = {
     "Retries": 5,
 }
 NODE_CONSTRAINT = "node.labels.crawl4ai-eligible==true"
+# A down eligible node is a capacity event, not a rollout failure. Placement
+# carries no MaxReplicas cap: the hard cap turned any single down node into a
+# rollout deadlock — start-first had no legal overlap slot, for the update and
+# for its automatic rollback alike (2026-08-30, haiku-4). The scheduler's
+# default same-service spread keeps replicas apart when capacity allows, and
+# _verify_tasks fail-closes on the end state if they ever land together.
+PLACEMENT = {"Constraints": [NODE_CONSTRAINT]}
+# ponytail: legacy capped placement accepted while records/services converge;
+# delete _LEGACY_PLACEMENT after the first green deploy on this shape.
+_LEGACY_PLACEMENT = {"Constraints": [NODE_CONSTRAINT], "MaxReplicas": 1}
 RESOURCES = {
     "Reservations": {"NanoCPUs": 500_000_000, "MemoryBytes": 1_073_741_824},
     "Limits": {"NanoCPUs": 2_000_000_000, "MemoryBytes": 4_294_967_296},
@@ -226,6 +236,13 @@ def _task_state(task_id: str) -> tuple[str, str]:
 
 
 def _eligible_nodes() -> frozenset[str]:
+    """Ready/Active nodes carrying the eligibility label.
+
+    A labeled node that is down or drained is excluded from the result but is
+    not an error: node loss is a capacity event and must not read as rollout
+    failure. Label membership drifting from the contract is an error
+    regardless of node state.
+    """
     listed = subprocess.run(
         ["docker", "node", "ls", "--format", "{{.ID}}"],
         check=True, capture_output=True, text=True,
@@ -240,14 +257,17 @@ def _eligible_nodes() -> frozenset[str]:
         ],
         check=True, capture_output=True, text=True,
     )
-    eligible = set()
+    labeled = set()
+    ready = set()
     for line in inspected.stdout.splitlines():
         hostname, labels, state, availability = line.split("\t", 3)
         if (json.loads(labels) or {}).get("crawl4ai-eligible") == "true":
-            if (json.loads(state), json.loads(availability)) != ("ready", "active"):
-                raise RuntimeError("a Crawl4AI node is not Ready/Active")
-            eligible.add(json.loads(hostname))
-    return frozenset(eligible)
+            labeled.add(json.loads(hostname))
+            if (json.loads(state), json.loads(availability)) == ("ready", "active"):
+                ready.add(json.loads(hostname))
+    if frozenset(labeled) != ELIGIBLE_NODES:
+        raise RuntimeError("Crawl4AI eligible-node inventory drifted")
+    return frozenset(ready)
 
 
 def _drain_budget_ns(environment: Any) -> int:
@@ -319,7 +339,7 @@ def _policy(application: dict[str, Any]) -> None:
         raise ValueError("Crawl4AI must keep three replicas")
     if application.get("healthCheckSwarm") != HEALTHCHECK:
         raise ValueError("Crawl4AI admission healthcheck drifted")
-    if application.get("placementSwarm") != {"Constraints": [NODE_CONSTRAINT], "MaxReplicas": 1}:
+    if application.get("placementSwarm") not in (PLACEMENT, _LEGACY_PLACEMENT):
         raise ValueError("Crawl4AI placement drifted")
     if application.get("endpointSpecSwarm") != {"Mode": "vip", "Ports": []}:
         raise ValueError("Crawl4AI must use the native Swarm VIP")
@@ -340,7 +360,12 @@ def _policy(application: dict[str, Any]) -> None:
             raise ValueError(f"Crawl4AI {field} drifted")
 
 
-def _running_spec(spec: dict[str, Any], image: str, labels: dict[str, str]) -> None:
+def _running_spec(
+    spec: dict[str, Any],
+    image: str,
+    labels: dict[str, str],
+    placements: tuple[dict[str, Any], ...] = (PLACEMENT, _LEGACY_PLACEMENT),
+) -> None:
     task = spec.get("TaskTemplate") or {}
     container = task.get("ContainerSpec") or {}
     if container.get("Image") != image or container.get("Labels") != labels:
@@ -348,7 +373,7 @@ def _running_spec(spec: dict[str, Any], image: str, labels: dict[str, str]) -> N
     _verify_llm_environment(container.get("Env"))
     if container.get("Healthcheck") != HEALTHCHECK:
         raise ValueError("running healthcheck drifted")
-    if task.get("Placement") != {"Constraints": [NODE_CONSTRAINT], "MaxReplicas": 1}:
+    if task.get("Placement") not in placements:
         raise ValueError("running placement drifted")
     if task.get("Resources") != RESOURCES:
         raise ValueError("running resources drifted")
@@ -467,7 +492,9 @@ def _service_tasks(app_name: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in listed.stdout.splitlines() if line]
 
 
-def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
+def _verify_tasks(
+    app_name: str, image: str, revision: str, ready: frozenset[str], converged: bool = True
+) -> dict[str, Any]:
     rows = _service_tasks(app_name)
     current = [
         row for row in rows
@@ -479,7 +506,12 @@ def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
     ):
         raise RuntimeError("Crawl4AI tasks did not converge")
     nodes = {row.get("Node") for row in current}
-    if len(nodes) != REPLICAS or not nodes <= ELIGIBLE_NODES:
+    if not nodes <= ELIGIBLE_NODES:
+        raise RuntimeError("Crawl4AI tasks are not on eligible nodes")
+    # Distinct placement is this deploy's converged obligation. The baseline is
+    # not held to it: a node death heals replicas onto the surviving nodes, and
+    # refusing to deploy from that state would leave co-location permanent.
+    if converged and len(nodes) != REPLICAS:
         raise RuntimeError("Crawl4AI tasks are not on distinct eligible nodes")
     by_slot: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -493,11 +525,20 @@ def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
         if predecessor is None:
             raise RuntimeError("Crawl4AI task has no predecessor withdrawal evidence")
         desired, state = _task_state(str(candidate["ID"])[:12])
+        if desired != "running" or state != "running":
+            raise RuntimeError("Swarm task history contradicts the start-first rollout")
+        stranded = predecessor.get("Node") in ELIGIBLE_NODES - ready
+        if not converged and stranded:
+            # A predecessor stranded on a down eligible node can never confirm
+            # its own shutdown; its desired state already records the
+            # withdrawal. Only that exact case is excused: an unassigned or
+            # rejected attempt (no node) or a task on a foreign node is not
+            # withdrawal evidence and stays strict. The deploy's own
+            # withdrawals happen on ready nodes and stay fully confirmed.
+            continue
         predecessor_desired, predecessor_state = _task_state(str(predecessor["ID"])[:12])
         if (
-            desired != "running"
-            or state != "running"
-            or predecessor_desired != "shutdown"
+            predecessor_desired != "shutdown"
             or predecessor_state not in {"shutdown", "complete"}
         ):
             raise RuntimeError("Swarm task history contradicts the start-first rollout")
@@ -529,6 +570,14 @@ def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
     }
 
 
+def _record_converged(app: dict[str, Any], candidate: str, revision: str) -> bool:
+    return (
+        app.get("dockerImage") == candidate
+        and app.get("labelsSwarm") == _labels(revision)
+        and app.get("placementSwarm") == PLACEMENT
+    )
+
+
 def deploy() -> None:
     base = os.environ["DOKPLOY_URL"]
     api_key = os.environ["DOKPLOY_API_KEY"]
@@ -547,12 +596,25 @@ def deploy() -> None:
     app_name = str(application["appName"])
     if _update_state(app_name) != "completed":
         raise RuntimeError("Crawl4AI already has a nonterminal Swarm update")
-    _running_spec(_service_spec(app_name), baseline, baseline_labels)
-    if _eligible_nodes() != ELIGIBLE_NODES:
-        raise RuntimeError("Crawl4AI eligible-node inventory drifted")
+    # The live service may keep the legacy cap only while the Dokploy record
+    # still carries it; once the record has converged, a capped live spec is
+    # reintroduced drift, not transition residue.
+    baseline_placements = (
+        (PLACEMENT, _LEGACY_PLACEMENT)
+        if application.get("placementSwarm") == _LEGACY_PLACEMENT
+        else (PLACEMENT,)
+    )
+    _running_spec(
+        _service_spec(app_name), baseline, baseline_labels, placements=baseline_placements
+    )
     _verify_redis()
     verify_route(base, api_key, application_id, app_name)
-    _verify_tasks(app_name, baseline, baseline_revision)
+    # Captured adjacent to its use: this snapshot decides which unconfirmable
+    # predecessors the baseline may excuse.
+    ready = _eligible_nodes()
+    if len(ready) < REPLICAS:
+        raise RuntimeError("not enough Ready eligible nodes to place every replica")
+    _verify_tasks(app_name, baseline, baseline_revision, ready, False)
     for url in HEALTH_URLS:
         if not _exact_health(_request_json(f"{url}?baseline={uuid.uuid4()}"), baseline_revision):
             raise RuntimeError("public Crawl4AI baseline is not ready")
@@ -577,11 +639,12 @@ def deploy() -> None:
             "applicationId": application_id,
             "dockerImage": candidate,
             "labelsSwarm": _labels(revision),
+            "placementSwarm": PLACEMENT,
         },
     )
     updated = _application(base, api_key, application_id)
     _policy(updated)
-    if updated.get("dockerImage") != candidate or updated.get("labelsSwarm") != _labels(revision):
+    if not _record_converged(updated, candidate, revision):
         raise RuntimeError("candidate metadata did not converge; no deploy was submitted")
     verify_route(base, api_key, application_id, app_name)
     _post_json(
@@ -602,12 +665,15 @@ def deploy() -> None:
         time.sleep(5)
     final = _application(base, api_key, application_id)
     _policy(final)
-    if final.get("dockerImage") != candidate or final.get("labelsSwarm") != _labels(revision):
+    if not _record_converged(final, candidate, revision):
         raise RuntimeError("foreign application metadata replaced the candidate")
-    _running_spec(_service_spec(app_name), candidate, _labels(revision))
-    if _eligible_nodes() != ELIGIBLE_NODES:
-        raise RuntimeError("Crawl4AI eligible-node inventory drifted")
-    task_proof = _verify_tasks(app_name, candidate, revision)
+    _running_spec(
+        _service_spec(app_name), candidate, _labels(revision), placements=(PLACEMENT,)
+    )
+    ready = _eligible_nodes()
+    if len(ready) < REPLICAS:
+        raise RuntimeError("not enough Ready eligible nodes to place every replica")
+    task_proof = _verify_tasks(app_name, candidate, revision, ready)
     verify_route(base, api_key, application_id, app_name)
     for url in HEALTH_URLS:
         if not all(
