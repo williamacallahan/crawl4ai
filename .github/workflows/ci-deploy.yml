@@ -103,7 +103,12 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           reclaim_build_disk() {
-            docker images --filter=reference="${IMAGE}:*" --format '{{.Repository}}:{{.Tag}}' \
+            # Emit IDs, not repo:tag. Each build leaves the previous run's image
+            # named but untagged; the reference filter still matches it, so the
+            # tag form pipes "<repo>:<none>" into docker rmi, which rejects it as
+            # an invalid reference and leaves ~4.9GB behind every run. The arm64
+            # runner's 51G root filesystem fills after a handful of builds.
+            docker images --filter=reference="${IMAGE}:*" --format '{{.ID}}' \
               | xargs -r docker rmi || true
             docker builder prune -af --filter until=10m || true
             df -h /
