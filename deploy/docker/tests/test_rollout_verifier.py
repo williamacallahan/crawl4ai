@@ -154,6 +154,137 @@ def yaml_dump(value):
     return yaml.safe_dump(value)
 
 
+def redis_spec():
+    return {
+        "TaskTemplate": {
+            "ContainerSpec": {
+                "Image": "redis@sha256:redis",
+                "Command": list(rollout.REDIS_COMMAND),
+                "Mounts": copy.deepcopy(rollout.REDIS_MOUNTS),
+                "Healthcheck": {
+                    "Test": list(rollout.REDIS_HEALTHCHECK_TEST),
+                    **copy.deepcopy(rollout.REDIS_HEALTHCHECK_FLOORS),
+                },
+            },
+            "Placement": {
+                "Constraints": [f"node.hostname=={rollout.REDIS_NODE}"],
+                "MaxReplicas": 1,
+            },
+        },
+        "Mode": {"Replicated": {"Replicas": 1}},
+    }
+
+
+def redis_tasks(state="Running 19 hours ago", node=None):
+    return [
+        {
+            "ID": "redis1",
+            "Name": "crawl4ai-redis.1",
+            "Node": node or rollout.REDIS_NODE,
+            "DesiredState": "Running",
+            "CurrentState": state,
+        },
+        {
+            "ID": "redis0",
+            "Name": "crawl4ai-redis.1",
+            "Node": rollout.REDIS_NODE,
+            "DesiredState": "Shutdown",
+            "CurrentState": "Shutdown 30 hours ago",
+        },
+    ]
+
+
+def test_redis_pins_encode_the_2026_08_28_incident_invariants():
+    """The drift check is only as good as what it pins, so pin the two values
+    the incident was about rather than trusting the comparison alone."""
+    assert "everysec" in rollout.REDIS_COMMAND and "always" not in rollout.REDIS_COMMAND
+    assert rollout.REDIS_COMMAND[rollout.REDIS_COMMAND.index("--appendfsync") + 1] == "everysec"
+    assert rollout.REDIS_COMMAND[rollout.REDIS_COMMAND.index("--appendonly") + 1] == "yes"
+    assert rollout.REDIS_MOUNTS == [
+        {"Type": "volume", "Source": "crawl4ai-redis-data", "Target": "/data"}
+    ]
+    assert rollout.REDIS_HEALTHCHECK_FLOORS["Retries"] >= 3
+    assert rollout.REDIS_HEALTHCHECK_FLOORS["Interval"] >= 5_000_000_000
+
+
+def test_redis_proof_rejects_durability_drift(monkeypatch):
+    def check(spec=None, tasks=None):
+        monkeypatch.setattr(rollout, "_service_spec", lambda _n: copy.deepcopy(spec or redis_spec()))
+        monkeypatch.setattr(rollout, "_service_tasks", lambda _n: copy.deepcopy(tasks or redis_tasks()))
+        rollout._verify_redis()
+
+    check()
+
+    # appendfsync=always was half of the 2026-08-28 fleet kill.
+    drifted = redis_spec()
+    command = drifted["TaskTemplate"]["ContainerSpec"]["Command"]
+    command[command.index("everysec")] = "always"
+    with pytest.raises(ValueError, match="command"):
+        check(spec=drifted)
+
+    drifted = redis_spec()
+    drifted["TaskTemplate"]["ContainerSpec"]["Mounts"] = []
+    with pytest.raises(ValueError, match="volume"):
+        check(spec=drifted)
+
+    drifted = redis_spec()
+    drifted["TaskTemplate"]["ContainerSpec"]["Healthcheck"] = {}
+    with pytest.raises(ValueError, match="healthcheck probe"):
+        check(spec=drifted)
+
+    drifted = redis_spec()
+    drifted["TaskTemplate"]["ContainerSpec"]["Healthcheck"]["Retries"] = 1
+    with pytest.raises(ValueError, match="Retries fell below"):
+        check(spec=drifted)
+
+    # Raising a floor is a safety improvement, not drift: the 2026-08-28 kill
+    # came from a healthcheck that was too tight.
+    relaxed = redis_spec()
+    relaxed["TaskTemplate"]["ContainerSpec"]["Healthcheck"]["Retries"] = 5
+    relaxed["TaskTemplate"]["ContainerSpec"]["Healthcheck"]["StartPeriod"] = 60_000_000_000
+    check(spec=relaxed)
+
+    drifted = redis_spec()
+    drifted["TaskTemplate"]["Placement"]["Constraints"] = ["node.hostname==haiku-4"]
+    with pytest.raises(ValueError, match="placement"):
+        check(spec=drifted)
+
+    drifted = redis_spec()
+    drifted["Mode"] = {"Replicated": {"Replicas": 2}}
+    with pytest.raises(ValueError, match="single-replica"):
+        check(spec=drifted)
+
+    with pytest.raises(RuntimeError, match="did not converge"):
+        check(tasks=redis_tasks(state="Preparing 2 seconds ago"))
+
+    with pytest.raises(RuntimeError, match="did not converge"):
+        check(tasks=redis_tasks(node="haiku-4"))
+
+    second = dict(redis_tasks()[0], ID="redis2", Name="crawl4ai-redis.2")
+    with pytest.raises(RuntimeError, match="did not converge"):
+        check(tasks=redis_tasks() + [second])
+
+
+def test_stop_grace_covers_the_shipped_container_drain_budget(monkeypatch):
+    """STOP_GRACE_NS was a bare literal; supervisord's stop wait and the
+    entrypoint's drain delay could grow past it with nothing to notice."""
+    shipped = application()
+    assert rollout._drain_budget_ns(shipped["env"]) < rollout.STOP_GRACE_NS
+    rollout._policy(shipped)
+
+    # A drain delay raised in the Dokploy console must be what is measured,
+    # not the fallback literal in entrypoint.sh.
+    raised = application()
+    raised["env"] += "\nCRAWL4AI_DRAIN_DELAY_SECONDS=600"
+    assert rollout._drain_budget_ns(raised["env"]) > rollout.STOP_GRACE_NS
+    with pytest.raises(ValueError, match="drain budget"):
+        rollout._policy(raised)
+
+    monkeypatch.setattr(rollout, "_drain_budget_ns", lambda _env: rollout.STOP_GRACE_NS)
+    with pytest.raises(ValueError, match="drain budget"):
+        rollout._policy(application())
+
+
 def test_policy_accepts_only_stock_docker_image_configuration():
     rollout._policy(application())
     for field, value in (
@@ -402,10 +533,12 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
 def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     state = application()
     posts = []
+    events = []
     deployments = [{"deploymentId": "old", "status": "done"}]
 
     def post(url, _key, payload):
         posts.append((url, payload))
+        events.append(url.rsplit("/", 1)[-1])
         if url.endswith("application.update"):
             state["dockerImage"] = payload["dockerImage"]
             state["labelsSwarm"] = payload["labelsSwarm"]
@@ -428,6 +561,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(state["dockerImage"], state["labelsSwarm"]["otel.service.version"]))
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: events.append("verify_redis"))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
         rollout,
@@ -445,6 +579,8 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
         lambda url, *_args: health(revision="baseline" if "baseline=" in url else REVISION),
     )
     rollout.deploy()
+    # The Redis proof must precede the first write, not merely happen.
+    assert events == ["verify_redis", "application.update", "application.deploy"]
     assert [url.rsplit("/", 1)[-1] for url, _ in posts] == [
         "application.update",
         "application.deploy",
@@ -454,6 +590,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
 
     state = application()
     posts.clear()
+    events.clear()
     deployments[:] = [{"deploymentId": "running", "status": "running"}]
     with pytest.raises(RuntimeError, match="nonterminal Dokploy deployment"):
         rollout.deploy()
@@ -461,6 +598,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
 
     state = application()
     posts.clear()
+    events.clear()
     deployments[:] = [{"deploymentId": "old", "status": "done"}]
     update_states = iter(["completed", "rollback_paused", "completed", "completed"])
     monkeypatch.setattr(rollout, "_update_state", lambda _name: next(update_states))
@@ -483,6 +621,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     monkeypatch.setattr(rollout, "_deployments", lambda *_args: [])
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: {})

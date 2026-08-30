@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,6 +38,33 @@ RESOURCES = {
 DELAY_NS = 400_000_000_000
 STOP_GRACE_NS = 390_000_000_000
 TIMEOUT_SECONDS = 4_000
+# Crawl4AI's durable job queue and task state live in this one external Redis.
+# Nothing in the deploy path proved its wiring, so a lost volume, an unpinned
+# or duplicated replica, or a reintroduced appendfsync=always would first
+# surface as a production incident. The appName is immutable in Dokploy.
+REDIS_SERVICE = "crawl4ai-redis-8xt08u"
+REDIS_NODE = "haiku-18"
+# everysec, never always: appendfsync=always was half of the 2026-08-28 fleet
+# kill, stalling every crawl behind Redis. Pinned so a console edit cannot
+# reintroduce it silently.
+REDIS_COMMAND = [
+    "redis-server",
+    "--dir", "/data",
+    "--appendonly", "yes",
+    "--appendfsync", "everysec",
+    "--loglevel", "notice",
+]
+REDIS_MOUNTS = [{"Type": "volume", "Source": "crawl4ai-redis-data", "Target": "/data"}]
+REDIS_HEALTHCHECK_TEST = ["CMD", "redis-cli", "ping"]
+# Floors, not equalities. The 2026-08-28 kill came from a healthcheck that was
+# too tight, so raising Retries or StartPeriod is a safety improvement and must
+# not read as drift. Only the probe itself is bidirectional.
+REDIS_HEALTHCHECK_FLOORS = {
+    "Interval": 5_000_000_000,
+    "Timeout": 1_000_000_000,
+    "StartPeriod": 10_000_000_000,
+    "Retries": 3,
+}
 
 
 def _labels(revision: str) -> dict[str, str]:
@@ -222,6 +250,67 @@ def _eligible_nodes() -> frozenset[str]:
     return frozenset(eligible)
 
 
+def _drain_budget_ns(environment: Any) -> int:
+    """What PID 1 needs to shut down cleanly, read from the sources that own it.
+
+    Swarm SIGKILLs a task the moment StopGracePeriod expires, so a stop grace
+    shorter than supervisord's stop wait plus the entrypoint's pre-termination
+    delay truncates the drain. Nothing tied STOP_GRACE_NS to either number.
+
+    The delay is read from the deployed environment when it sets one: the
+    literal in entrypoint.sh is only the fallback, and reading it alone would
+    miss a value raised in the Dokploy console.
+    """
+    here = Path(__file__).resolve().parent
+    # The slowest program in the group bounds supervisord's own shutdown.
+    stop_waits = re.findall(
+        r"^stopwaitsecs=(\d+)\s*$", (here / "supervisord.conf").read_text(), re.MULTILINE
+    )
+    fallback = re.search(
+        r"CRAWL4AI_DRAIN_DELAY_SECONDS:-(\d+)", (here / "entrypoint.sh").read_text()
+    )
+    if not stop_waits or not fallback:
+        raise ValueError("container drain budget is no longer readable from its own sources")
+    deployed = _environment_values(environment).get("CRAWL4AI_DRAIN_DELAY_SECONDS", "").strip()
+    drain = int(deployed) if deployed.isdigit() else int(fallback.group(1))
+    return (max(int(value) for value in stop_waits) + drain) * 1_000_000_000
+
+
+def _verify_redis() -> None:
+    """Prove the external Redis is still durable, pinned and single before
+    rolling anything that depends on it."""
+    spec = _service_spec(REDIS_SERVICE)
+    task = spec.get("TaskTemplate") or {}
+    container = task.get("ContainerSpec") or {}
+    if container.get("Command") != REDIS_COMMAND:
+        raise ValueError("Crawl4AI Redis command drifted")
+    if container.get("Mounts") != REDIS_MOUNTS:
+        raise ValueError("Crawl4AI Redis durable volume drifted")
+    healthcheck = container.get("Healthcheck") or {}
+    if healthcheck.get("Test") != REDIS_HEALTHCHECK_TEST:
+        raise ValueError("Crawl4AI Redis healthcheck probe drifted")
+    for field, floor in REDIS_HEALTHCHECK_FLOORS.items():
+        if int(healthcheck.get(field) or 0) < floor:
+            raise ValueError(f"Crawl4AI Redis healthcheck {field} fell below its floor")
+    if task.get("Placement") != {
+        "Constraints": [f"node.hostname=={REDIS_NODE}"],
+        "MaxReplicas": 1,
+    }:
+        raise ValueError("Crawl4AI Redis placement drifted")
+    if spec.get("Mode") != {"Replicated": {"Replicas": 1}}:
+        raise ValueError("Crawl4AI Redis must stay single-replica")
+    running = [
+        row for row in _service_tasks(REDIS_SERVICE)
+        if str(row.get("DesiredState", "")).lower() == "running"
+    ]
+    if (
+        len(running) != 1
+        or not str(running[0].get("CurrentState", "")).startswith("Running ")
+        or running[0].get("Node") != REDIS_NODE
+    ):
+        raise RuntimeError("Crawl4AI Redis task did not converge on its pinned node")
+
+
 def _policy(application: dict[str, Any]) -> None:
     if application.get("sourceType") != "docker":
         raise ValueError("Crawl4AI must remain a stock Dokploy Docker-image app")
@@ -237,6 +326,10 @@ def _policy(application: dict[str, Any]) -> None:
     for field, action in (("updateConfigSwarm", "rollback"), ("rollbackConfigSwarm", "pause")):
         if application.get(field) != _rollout_policy(action):
             raise ValueError(f"{field} drifted")
+    # Strictly greater: a grace equal to the budget leaves no room for the
+    # SIGTERM itself to be delivered and observed.
+    if STOP_GRACE_NS <= _drain_budget_ns(application.get("env")):
+        raise ValueError("Crawl4AI stop grace no longer covers the container drain budget")
     if int(application.get("stopGracePeriodSwarm") or 0) != STOP_GRACE_NS:
         raise ValueError("Crawl4AI stop grace drifted")
     for field, expected in (
@@ -364,18 +457,20 @@ def _exact_health(health: Any, revision: str | None = None) -> bool:
     )
 
 
-def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
+def _service_tasks(app_name: str) -> list[dict[str, Any]]:
     listed = subprocess.run(
         ["docker", "service", "ps", "--no-trunc", "--format", "{{json .}}", app_name],
         check=True,
         capture_output=True,
         text=True,
     )
+    return [json.loads(line) for line in listed.stdout.splitlines() if line]
+
+
+def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
+    rows = _service_tasks(app_name)
     current = [
-        row
-        for line in listed.stdout.splitlines()
-        if line
-        for row in (json.loads(line),)
+        row for row in rows
         if str(row.get("DesiredState", "")).lower() == "running"
     ]
     if len(current) != REPLICAS or any(
@@ -387,7 +482,7 @@ def _verify_tasks(app_name: str, image: str, revision: str) -> dict[str, Any]:
     if len(nodes) != REPLICAS or not nodes <= ELIGIBLE_NODES:
         raise RuntimeError("Crawl4AI tasks are not on distinct eligible nodes")
     by_slot: dict[str, list[dict[str, Any]]] = {}
-    for row in [json.loads(line) for line in listed.stdout.splitlines() if line]:
+    for row in rows:
         by_slot.setdefault(str(row.get("Name")), []).append(row)
     for candidate in current:
         history = by_slot[str(candidate.get("Name"))]
@@ -455,6 +550,7 @@ def deploy() -> None:
     _running_spec(_service_spec(app_name), baseline, baseline_labels)
     if _eligible_nodes() != ELIGIBLE_NODES:
         raise RuntimeError("Crawl4AI eligible-node inventory drifted")
+    _verify_redis()
     verify_route(base, api_key, application_id, app_name)
     _verify_tasks(app_name, baseline, baseline_revision)
     for url in HEALTH_URLS:
