@@ -29,10 +29,36 @@ class FakeResult:
         return {"url": self.url, "success": True, "fit_html": None, "pdf": None}
 
 
+# The library's catch-all shape (crawl4ai/utils.py get_error_context): container
+# path, source snippet and raw exception text.
+INTERNAL_ERROR_MESSAGE = (
+    "Unexpected error in _crawl_web at line 806 in _crawl_web "
+    "(/app/crawl4ai/async_crawler_strategy.py):\n"
+    "Error: boom\n\nCode context:\n 805 | raise\n"
+)
+
+
+class FailingResult:
+    url = "https://example.com/blocked"
+
+    def __init__(self, error_message):
+        self.error_message = error_message
+
+    def model_dump(self):
+        return {
+            "url": self.url,
+            "success": False,
+            "error_message": self.error_message,
+            "fit_html": None,
+            "pdf": None,
+        }
+
+
 class FakeCrawler:
-    def __init__(self, mode="success"):
+    def __init__(self, mode="success", failure_message=INTERNAL_ERROR_MESSAGE):
         self.crawler_strategy = FakeStrategy()
         self.mode = mode
+        self.failure_message = failure_message
         self.started = False
         self.closed = False
         self.run_started = asyncio.Event()
@@ -52,6 +78,10 @@ class FakeCrawler:
             await self.continue_run.wait()
         if self.mode == "slow":
             await asyncio.sleep(0.05)
+        if self.mode == "internal_error":
+            raise RuntimeError(self.failure_message)
+        if self.mode == "crawl_failure":
+            return FailingResult(self.failure_message)
         return FakeResult()
 
     async def arun_many(self, *_args, **_kwargs):
@@ -60,6 +90,11 @@ class FakeCrawler:
                 await asyncio.sleep(0.05)
             if self.mode == "error":
                 raise RuntimeError("crawl failed")
+            if self.mode == "internal_error":
+                raise RuntimeError(self.failure_message)
+            if self.mode == "crawl_failure":
+                yield FailingResult(self.failure_message)
+                return
             yield FakeResult()
 
         return results()
@@ -240,6 +275,118 @@ def test_stream_close_closes_dedicated_hook_crawler(monkeypatch):
     assert pooled.crawler_strategy.hooks == original
     assert dedicated.closed
     assert released == []
+
+
+def test_failed_result_error_message_is_sanitized_with_a_correlation_id(monkeypatch):
+    """A partial/total failure returns 200 with the result body, so the
+    library's catch-all error_message is the leak vector, not the 502 path."""
+    pooled = FakeCrawler(mode="crawl_failure")
+    install_fakes(monkeypatch, pooled)
+
+    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    message = response["results"][0]["error_message"]
+    assert message.startswith("Crawl failed (correlation_id=")
+    body = json.dumps(response)
+    assert "async_crawler_strategy.py" not in body
+    assert "Code context" not in body
+    assert "/app/" not in body
+
+
+def test_upstream_failure_reason_reaches_the_caller_unchanged(monkeypatch):
+    """Nothing is withheld, so no correlation id is minted."""
+    pooled = FakeCrawler(mode="crawl_failure", failure_message="Blocked by anti-bot protection")
+    install_fakes(monkeypatch, pooled)
+
+    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert response["results"][0]["error_message"] == "Blocked by anti-bot protection"
+
+
+def test_all_failed_crawl_reports_an_unsuccessful_aggregate(monkeypatch):
+    pooled = FakeCrawler(mode="crawl_failure")
+    install_fakes(monkeypatch, pooled)
+
+    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert response["success"] is False
+
+
+def test_aggregate_verdict_survives_a_caller_field_projection(monkeypatch):
+    """result_fields may omit "success"; the aggregate is read before projection
+    so /crawl's 502 rule and /crawl/job's terminal state stay correct."""
+    pooled = FakeCrawler()
+    install_fakes(monkeypatch, pooled)
+
+    response = run(
+        api.handle_crawl_request(
+            ["https://example.com"], {}, {}, crawl_config(), result_fields=["url"]
+        )
+    )
+
+    assert response["results"] == [{"url": "https://example.com"}]
+    assert response["success"] is True
+
+
+def test_projected_failure_keeps_its_unsuccessful_aggregate(monkeypatch):
+    pooled = FakeCrawler(mode="crawl_failure")
+    install_fakes(monkeypatch, pooled)
+
+    response = run(
+        api.handle_crawl_request(
+            ["https://example.com"], {}, {}, crawl_config(), result_fields=["url"]
+        )
+    )
+
+    assert response["results"] == [{"url": "https://example.com/blocked"}]
+    assert response["success"] is False
+
+
+def test_streamed_failure_record_is_sanitized(monkeypatch):
+    pooled = FakeCrawler(mode="crawl_failure")
+    install_fakes(monkeypatch, pooled)
+
+    async def exercise():
+        crawler, results, _hooks = await api.handle_stream_crawl_request(
+            ["https://example.com"], {}, {}, crawl_config()
+        )
+        output = api.stream_results(crawler, results)
+        record = json.loads((await anext(output)).decode())
+        await output.aclose()
+        return record
+
+    record = run(exercise())
+
+    assert record["success"] is False
+    assert record["error_message"].startswith("Crawl failed (correlation_id=")
+    assert "async_crawler_strategy.py" not in json.dumps(record)
+
+
+def test_crawl_failure_reported_to_the_monitor_is_sanitized(monkeypatch):
+    """/monitor/requests, /monitor/logs/errors and /monitor/ws return this text
+    to any data-scope principal, including other tenants'."""
+    import monitor as monitor_module
+
+    recorded = {}
+
+    class FakeMonitor:
+        async def track_request_start(self, *_args, **_kwargs):
+            return None
+
+        async def track_request_end(self, _request_id, **kwargs):
+            recorded.update(kwargs)
+
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: FakeMonitor())
+    pooled = FakeCrawler(mode="internal_error")
+    install_fakes(monkeypatch, pooled)
+
+    with pytest.raises(HTTPException) as error:
+        run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert error.value.status_code == 500
+    assert recorded["status_code"] == 500
+    assert recorded["error"].startswith("Crawl failed (correlation_id=")
+    assert "async_crawler_strategy.py" not in recorded["error"]
 
 
 def test_non_hook_request_keeps_pooled_lifecycle(monkeypatch):

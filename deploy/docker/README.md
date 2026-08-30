@@ -666,6 +666,13 @@ For long-running crawls or when you want to avoid keeping connections open, use 
 4. **Webhook Fired** → Server POSTs completion notification to your webhook URL
 5. **Fetch Results** → If data wasn't included in webhook, GET `/crawl/job/{task_id}`
 
+A job whose every URL failed terminates as `failed`, not `completed`, and is not
+retried — the attempt itself ran. Its per-URL results are still published, so the
+status response and a `webhook_data_in_payload` webhook carry both `error` and the
+results. Each result's `error_message` is the client-safe reason; when the
+underlying message had to be withheld it carries a `correlation_id` matching the
+full text in the server log.
+
 #### Quick Example
 
 ```bash

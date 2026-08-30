@@ -1,5 +1,7 @@
 import logging
 import os
+import re
+import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -212,7 +214,16 @@ def is_task_id(value: str) -> bool:
     """Check if the value matches task ID pattern."""
     return value.startswith("llm_") and "_" in value
 
+logger = logging.getLogger(__name__)
+
 _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", 'File "', ".py")
+# The markers above only recognize the library's get_error_context shape. Its
+# dispatcher reports a bare str(e) instead (crawl4ai/async_dispatcher.py:342,
+# :346), so a path-bearing OSError carries no marker at all. Match the
+# container filesystem directly, after removing the crawled URL — a URL
+# legitimately has path segments, whatever is left should not.
+_CONTAINER_PATH = re.compile(r"/(?:app|ms-playwright|home|root|usr|opt|srv|etc|var|tmp|proc)/")
+_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 
 
 def public_error_detail(error_message: Optional[str]) -> str:
@@ -226,7 +237,42 @@ def public_error_detail(error_message: Optional[str]) -> str:
     message = (error_message or "").strip()
     if not message or any(marker in message for marker in _INTERNAL_ERROR_MARKERS):
         return "Crawl failed"
+    if _CONTAINER_PATH.search(_URL.sub("", message)):
+        return "Crawl failed"
     return message[:500]
+
+
+def correlated_error(public: str, detail: object, context: str = "crawl failure") -> str:
+    """Stamp a client-safe message with the correlation id its full text is logged under.
+
+    Nothing is discarded: the caller gets a message that cannot leak internals
+    and an id an operator can grep the server log for. The logged text is
+    capped because this runs once per failed URL and a batch can be large.
+    """
+    cid = uuid.uuid4().hex[:12]
+    logger.error(
+        "%s [cid=%s]: %s",
+        context,
+        cid,
+        str(detail)[:2000],
+        exc_info=detail if isinstance(detail, BaseException) else False,
+    )
+    return f"{public} (correlation_id={cid})"
+
+
+def public_crawl_error(raw: Optional[str], url: Optional[str] = None) -> str:
+    """Client-safe form of a failed result's error_message.
+
+    Every crawl surface serializes CrawlResult verbatim, so this runs at each
+    serialization owner. A correlation id is minted only when something was
+    actually withheld: an upstream reason that passes through, one that is
+    merely capped, and an empty message all leave the log alone.
+    """
+    message = (raw or "").strip()
+    public = public_error_detail(raw)
+    if not message or public == message[:500]:
+        return public
+    return correlated_error(public, raw, f"crawl failure url={url or 'unknown'}")
 
 
 def datetime_handler(obj: any) -> Optional[str]:

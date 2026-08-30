@@ -82,6 +82,104 @@ class TestErrorSanitization:
         assert public_error_detail("  ") == "Crawl failed"
         assert public_error_detail('File "/app/server.py", line 1') == "Crawl failed"
 
+    def test_all_failed_crawl_returns_502_with_the_already_sanitized_reason(
+        self, stock_client, server_module, monkeypatch
+    ):
+        """/crawl reads the aggregate handle_crawl_request computed rather than
+        re-deriving it from projected per-result fields, and forwards the
+        error_message that owner already sanitized."""
+        from auth import create_access_token
+
+        async def all_urls_failed(**_kwargs):
+            return {
+                "success": False,
+                # A projected result: result_fields may omit "success", which
+                # is why the verdict is read from the aggregate above.
+                "results": [
+                    {
+                        "url": "https://example.com",
+                        "error_message": "Crawl failed (correlation_id=deadbeefcafe)",
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(server_module, "handle_crawl_request", all_urls_failed)
+        h = {"Authorization": f"Bearer {create_access_token({'sub': 'u@x.com'}, scope='data')}"}
+        r = stock_client.post("/crawl", json={"urls": ["https://example.com"]}, headers=h)
+
+        assert r.status_code == 502
+        assert r.json()["detail"] == (
+            "Crawl request failed: Crawl failed (correlation_id=deadbeefcafe)"
+        )
+
+    def test_public_error_detail_genericizes_container_paths_without_a_marker(self):
+        """crawl4ai/async_dispatcher.py reports a bare str(e), which carries
+        none of the get_error_context markers."""
+        from utils import public_error_detail
+
+        assert public_error_detail(
+            "[Errno 2] No such file or directory: '/ms-playwright/chromium-1148/chrome'"
+        ) == "Crawl failed"
+        assert public_error_detail(
+            "BrowserType.launch: Executable doesn't exist at /home/appuser/.cache/chrome"
+        ) == "Crawl failed"
+        # The crawled URL's own path segments must not trip it.
+        upstream = "Blocked by anti-bot protection at https://example.com/app/login"
+        assert public_error_detail(upstream) == upstream
+
+    def test_correlation_id_is_minted_only_when_something_was_withheld(self):
+        from utils import public_crawl_error
+
+        clean = "Blocked by anti-bot protection"
+        assert public_crawl_error(clean) == clean
+        # Merely capped at 500: the caller still sees the real reason.
+        assert public_crawl_error("x" * 2000) == "x" * 500
+        # Nothing to withhold.
+        assert public_crawl_error("   ") == "Crawl failed"
+        assert public_crawl_error(None) == "Crawl failed"
+        assert public_crawl_error("Traceback (most recent call last)").startswith(
+            "Crawl failed (correlation_id="
+        )
+
+    def test_execute_js_result_error_message_is_sanitized(
+        self, stock_client, server_module, monkeypatch
+    ):
+        from auth import create_access_token
+
+        class Result:
+            success = True
+            error_message = (
+                "Unexpected error in _crawl_web (/app/crawl4ai/async_crawler_strategy.py)"
+            )
+
+            def model_dump(self):
+                return {
+                    "url": "https://example.com",
+                    "success": True,
+                    "error_message": self.error_message,
+                }
+
+        class Crawler:
+            async def arun(self, **_kwargs):
+                return [Result()]
+
+        async def get_crawler(_config):
+            return Crawler()
+
+        monkeypatch.setattr(server_module, "EXECUTE_JS_ENABLED", True)
+        monkeypatch.setattr(server_module, "get_crawler", get_crawler)
+        monkeypatch.setattr(server_module, "validate_webhook_url", lambda _url: None)
+        h = {"Authorization": f"Bearer {create_access_token({'sub': 'u@x.com'}, scope='data')}"}
+        r = stock_client.post(
+            "/execute_js",
+            json={"url": "https://example.com", "scripts": ["return 1"]},
+            headers=h,
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["error_message"].startswith("Crawl failed (correlation_id=")
+        assert "async_crawler_strategy.py" not in r.text
+
     def test_5xx_is_generic_with_correlation_id(self, stock_client, server_module):
         from auth import create_access_token
         h = {"Authorization": f"Bearer {create_access_token({'sub': 'u@x.com'}, scope='admin')}"}

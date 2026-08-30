@@ -141,6 +141,13 @@ When a crawl job fails, a webhook is sent with error details.
 }
 ```
 
+A crawl job whose every URL failed also reports `status: "failed"`, with
+`error: "Every crawled URL failed"` — and, when `webhook_data_in_payload` is set,
+it still carries `data` with the per-URL results. Read both on a failure: the
+`error` is the summary, `data` holds each URL's own `error_message`. Those
+per-URL messages are client-safe; when the underlying text had to be withheld
+they carry a `correlation_id` that matches the full message in the server log.
+
 ### Example 5: Using Global Default Webhook
 
 If you set a `default_url` in config.yml, jobs without webhook_config will use it:
@@ -258,6 +265,9 @@ def handle_crawl_webhook():
     elif status == 'failed':
         error = payload.get('error', 'Unknown error')
         print(f"{task_type} job {task_id} failed: {error}")
+        # An all-URLs-failed crawl still ships its per-URL results.
+        for result in (payload.get('data') or {}).get('results', []):
+            print(f"  - {result.get('url')}: {result.get('error_message')}")
         # Handle failure...
 
     return jsonify({"status": "received"}), 200

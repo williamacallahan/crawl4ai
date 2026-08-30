@@ -21,7 +21,7 @@ from egress_proxy import start_pinning_proxy, stop_pinning_proxy
 from fastapi import HTTPException, status
 from redis import asyncio as aioredis
 from redis_config import RESILIENT_CLIENT_KWARGS, build_redis_url
-from utils import load_config, setup_logging
+from utils import correlated_error, load_config, setup_logging
 from webhook import WebhookDeliveryService
 
 logger = logging.getLogger(__name__)
@@ -186,7 +186,17 @@ class CrawlJobWorker:
         except asyncio.CancelledError:
             raise
         except (HTTPException, OSError, RuntimeError, TypeError, ValueError) as error:
-            error_message = str(error.detail if isinstance(error, HTTPException) else error)
+            # This worker is a separate process: the API's central 500 handler
+            # never sees these, so nothing else genericizes them before they
+            # reach the task hash /crawl/job/{id} returns and the webhook. A
+            # deliberate 4xx detail is already client-facing; a 5xx detail and
+            # a bare exception (which routinely names container paths) are not.
+            if isinstance(error, HTTPException) and error.status_code < 500:
+                error_message = str(error.detail)
+            else:
+                error_message = correlated_error(
+                    "Crawl job failed", error, f"crawl job={entry.task_id}"
+                )
             terminal_input = isinstance(error, HTTPException) and error.status_code in {
                 status.HTTP_400_BAD_REQUEST,
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -204,6 +214,14 @@ class CrawlJobWorker:
                 )
                 await self.queue.mark_retry(entry, payload, self.consumer, attempt, error_message)
             return
+
+        if result.get("success") is False:
+            # Every URL failed. The attempt itself ran, so this is terminal
+            # rather than retryable, but the per-URL diagnostics still ship:
+            # complete() writes result and error independently.
+            error_message = "Every crawled URL failed"
+            await self.queue.complete(entry, payload, attempt, result=result, error=error_message)
+            return "failed", result, error_message
 
         await self.queue.complete(entry, payload, attempt, result=result)
         return "completed", result, None

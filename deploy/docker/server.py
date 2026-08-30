@@ -78,6 +78,7 @@ from utils import (
     get_browser_extra_args,
     load_config,
     public_error_detail,
+    public_crawl_error,
     setup_logging,
     validate_url_destination,
     validate_webhook_url,
@@ -891,6 +892,8 @@ async def execute_js(
             # whose detail the central handler must genericize away.
             raise HTTPException(502, detail=public_error_detail(results[0].error_message))
         data = results[0].model_dump()
+        if data.get("error_message"):
+            data["error_message"] = public_crawl_error(data["error_message"], data.get("url"))
         return JSONResponse(data)
     except HTTPException:
         raise
@@ -1024,13 +1027,14 @@ async def crawl(
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
     )
-    # check if all of the results are not successful
-    if all(not result["success"] for result in results["results"]):
+    if not results["success"]:
         # Every URL failed upstream: surface the first reason as a gateway
-        # error instead of a genericized internal 500.
+        # error instead of a genericized internal 500. handle_crawl_request
+        # already sanitized each error_message, so it passes through as-is.
+        first = results["results"][0] if results["results"] else {}
         raise HTTPException(
             502,
-            f"Crawl request failed: {public_error_detail(results['results'][0]['error_message'])}",
+            f"Crawl request failed: {first.get('error_message') or 'Crawl failed'}",
         )
     return JSONResponse(results)
 

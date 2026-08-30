@@ -31,6 +31,8 @@ from utils import (
     get_redis_task_ttl,
     is_task_id,
     public_error_detail,
+    correlated_error,
+    public_crawl_error,
     should_cleanup_task,
     validate_llm_provider,
     validate_url_destination,
@@ -349,6 +351,15 @@ async def handle_llm_qa(
         if crawler:
             await release_crawler(crawler)
 
+class LlmExtractionRejected(RuntimeError):
+    """Provider-reported extraction errors.
+
+    Unlike everything else the catch-all below sees, this text comes from the
+    LLM response, not from the server, so it is already client-facing and must
+    reach the caller intact.
+    """
+
+
 async def process_llm_extraction(
     redis: aioredis.Redis,
     config: dict,
@@ -436,9 +447,10 @@ async def process_llm_extraction(
                 )
 
         if not result.success:
+            error_message = public_crawl_error(result.error_message, url)
             await hset_with_ttl(redis, f"task:{task_id}", {
                 "status": TaskStatus.FAILED,
-                "error": result.error_message
+                "error": error_message
             }, config)
 
             # Send webhook notification on failure
@@ -448,7 +460,7 @@ async def process_llm_extraction(
                 status="failed",
                 urls=[url],
                 webhook_config=webhook_config,
-                error=result.error_message
+                error=error_message
             )
             return
 
@@ -463,7 +475,7 @@ async def process_llm_extraction(
                 if isinstance(block, dict) and block.get("error")
             ]
             if extraction_errors:
-                raise RuntimeError("; ".join(extraction_errors))
+                raise LlmExtractionRejected("; ".join(extraction_errors))
 
         result_data = {"extracted_content": content}
 
@@ -483,10 +495,18 @@ async def process_llm_extraction(
         )
 
     except Exception as e:
-        logger.error(f"LLM extraction error: {str(e)}", exc_info=True)
+        # This runs as a background task, so the central 500 handler never sees
+        # it: str(e) would land verbatim in the task hash that /llm/job/{id}
+        # returns and in the caller-supplied webhook.
+        error_message = (
+            str(e)
+            if isinstance(e, LlmExtractionRejected)
+            else correlated_error("LLM extraction failed", e, f"llm extraction task={task_id}")
+        )
+        logger.error("LLM extraction error: %s", e, exc_info=True)
         await hset_with_ttl(redis, f"task:{task_id}", {
             "status": TaskStatus.FAILED,
-            "error": str(e)
+            "error": error_message
         }, config)
 
         # Send webhook notification on failure
@@ -496,7 +516,7 @@ async def process_llm_extraction(
             status="failed",
             urls=[url],
             webhook_config=webhook_config,
-            error=str(e)
+            error=error_message
         )
 
 async def handle_markdown_request(
@@ -804,9 +824,11 @@ def create_task_response(task: dict, task_id: str, base_url: str, collection: st
         }
     }
 
-    if task["status"] == TaskStatus.COMPLETED:
+    # A crawl job whose URLs all failed is terminal-failed but still carries
+    # its per-URL diagnostics, so result and error are not exclusive.
+    if task.get("result"):
         response["result"] = json.loads(task["result"])
-    elif task["status"] == TaskStatus.FAILED:
+    if task["status"] == TaskStatus.FAILED:
         response["error"] = task["error"]
 
     return response
@@ -882,6 +904,10 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
             try:
                 server_memory_mb = _get_memory_mb()
                 result_dict = result.model_dump()
+                if result_dict.get("error_message"):
+                    result_dict["error_message"] = public_crawl_error(
+                        result_dict["error_message"], result_dict.get("url")
+                    )
                 result_dict['server_memory_mb'] = server_memory_mb
                 if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
                     result_dict["fit_html"] = None
@@ -891,8 +917,11 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
                 data = json.dumps(result_dict, default=datetime_handler) + "\n"
                 yield data.encode('utf-8')
             except Exception as e:
-                logger.error(f"Serialization error: {e}")
-                error_response = {"error": str(e), "url": getattr(result, 'url', 'unknown')}
+                streamed_url = getattr(result, 'url', 'unknown')
+                error_response = {
+                    "error": correlated_error("Result serialization failed", e, f"stream url={streamed_url}"),
+                    "url": streamed_url,
+                }
                 yield (json.dumps(error_response) + "\n").encode('utf-8')
 
         yield json.dumps({"status": "completed"}).encode('utf-8')
@@ -1035,6 +1064,7 @@ async def handle_crawl_request(
 
         # Process results to handle PDF bytes
         processed_results = []
+        any_url_succeeded = False
         for result in results:
             try:
                 result_dict: Dict[str, Any]
@@ -1044,12 +1074,15 @@ async def handle_crawl_request(
                 elif isinstance(result, dict):
                     result_dict = dict(result)
                 else:
-                    # Handle unexpected result type
-                    logger.warning(f"Unexpected result type: {type(result)}")
+                    # Handle unexpected result type. Neither the class name nor
+                    # the object's repr (which carries its address) belongs in a
+                    # client body; both stay in the log behind the id below.
                     result_dict = {
-                        "url": str(result) if hasattr(result, '__str__') else "unknown",
+                        "url": "unknown",
                         "success": False,
-                        "error_message": f"Unexpected result type: {type(result).__name__}"
+                        "error_message": correlated_error(
+                            "Crawl failed", f"unexpected result type: {type(result)!r}"
+                        ),
                     }
                 
                 # if fit_html is not a string, set it to None to avoid serialization errors
@@ -1061,20 +1094,33 @@ async def handle_crawl_request(
                 if isinstance(pdf, bytes):
                     result_dict['pdf'] = b64encode(pdf).decode('utf-8')
 
+                # Sanitize before projection so a caller-requested
+                # error_message field carries the client-safe text.
+                if result_dict.get("error_message"):
+                    result_dict["error_message"] = public_crawl_error(
+                        result_dict["error_message"], result_dict.get("url")
+                    )
+                # Read the per-URL verdict before projection: result_fields may
+                # omit "success", and the caller-visible aggregate below must
+                # not depend on what the caller asked to see.
+                any_url_succeeded = any_url_succeeded or bool(result_dict.get("success"))
+
                 if result_fields:
                     result_dict = _project_crawl_result(result_dict, result_fields)
-                    
+
                 processed_results.append(result_dict)
             except Exception as e:
-                logger.error(f"Error processing result: {e}")
                 processed_results.append({
                     "url": "unknown",
                     "success": False,
-                    "error_message": str(e)
+                    "error_message": correlated_error("Crawl failed", f"result serialization failed: {e}"),
                 })
             
         response = {
-            "success": True,
+            # Whether the crawl produced anything usable. Callers that project
+            # result fields away still get an authoritative verdict here, and
+            # /crawl/job stores it as the job's terminal state.
+            "success": any_url_succeeded,
             "results": processed_results,
             "server_processing_time_s": end_time - start_time,
             "server_memory_delta_mb": mem_delta_mb,
@@ -1120,11 +1166,15 @@ async def handle_crawl_request(
     except Exception as e:
         logger.error(f"Crawl error: {str(e)}", exc_info=True)
 
+        # /monitor/requests, /monitor/logs/errors and /monitor/ws return this
+        # verbatim to any data-scope principal, so it cannot be str(e).
+        monitor_error = correlated_error("Crawl failed", e, f"crawl request={request_id}")
+
         # Track request error
         try:
             from monitor import get_monitor
             await get_monitor().track_request_end(
-                request_id, success=False, error=str(e), status_code=500
+                request_id, success=False, error=monitor_error, status_code=500
             )
         except Exception:
             pass

@@ -16,6 +16,7 @@ if DOCKER_DIR not in sys.path:
 import api  # noqa: E402
 import crawl_job_worker  # noqa: E402
 import job  # noqa: E402
+import llm_broker  # noqa: E402
 from crawl_job_queue import CrawlJobAttempt, CrawlJobEntry  # noqa: E402
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
 
@@ -111,6 +112,164 @@ def test_worker_terminalizes_deterministic_input_failure_without_retry():
         error="Cannot resolve URL host",
     )
     queue.mark_retry.assert_not_awaited()
+
+
+def test_worker_terminalizes_an_all_failed_crawl_and_keeps_its_results():
+    """A crawl whose every URL failed ran to the end, so it is terminal rather
+    than retryable, but the per-URL diagnostics must still reach the poller."""
+    queue = SimpleNamespace(
+        settings=SimpleNamespace(max_attempts=3),
+        complete=AsyncMock(),
+        mark_retry=AsyncMock(),
+    )
+    crawl_result = {
+        "success": False,
+        "results": [{"url": "https://example.com", "success": False, "error_message": "Crawl failed"}],
+    }
+
+    async def all_urls_fail(_payload):
+        return crawl_result
+
+    worker = CrawlJobWorker(queue, {}, "worker-a", crawl=all_urls_fail, webhook_service=object())
+    entry = CrawlJobEntry(stream_id="1-0", task_id="crawl_all_failed")
+    attempt = CrawlJobAttempt(number=1, fence_token="attempt-a", consumer="worker-a")
+
+    result = asyncio.run(worker._process_attempt(entry, {}, attempt=attempt))
+
+    assert result == ("failed", crawl_result, "Every crawled URL failed")
+    queue.complete.assert_awaited_once_with(
+        entry,
+        {},
+        attempt,
+        result=crawl_result,
+        error="Every crawled URL failed",
+    )
+    queue.mark_retry.assert_not_awaited()
+
+
+def test_worker_completes_when_any_url_succeeded():
+    queue = SimpleNamespace(
+        settings=SimpleNamespace(max_attempts=3),
+        complete=AsyncMock(),
+        mark_retry=AsyncMock(),
+    )
+    crawl_result = {
+        "success": True,
+        "results": [
+            {"url": "https://ok.example", "success": True},
+            {"url": "https://bad.example", "success": False, "error_message": "Crawl failed"},
+        ],
+    }
+
+    async def partial_success(_payload):
+        return crawl_result
+
+    worker = CrawlJobWorker(queue, {}, "worker-a", crawl=partial_success, webhook_service=object())
+    entry = CrawlJobEntry(stream_id="1-0", task_id="crawl_partial")
+    attempt = CrawlJobAttempt(number=1, fence_token="attempt-a", consumer="worker-a")
+
+    result = asyncio.run(worker._process_attempt(entry, {}, attempt=attempt))
+
+    assert result == ("completed", crawl_result, None)
+    queue.complete.assert_awaited_once_with(entry, {}, attempt, result=crawl_result)
+
+
+def test_task_status_of_a_failed_crawl_job_still_carries_its_results():
+    response = api.create_task_response(
+        {
+            "status": api.TaskStatus.FAILED,
+            "created_at": "2026-08-29T12:00:00",
+            "url": "https://example.com",
+            "result": json.dumps({"success": False, "results": [{"url": "https://example.com"}]}),
+            "error": "Every crawled URL failed",
+        },
+        "crawl_all_failed",
+        "https://crawl.example/",
+        "crawl/job",
+    )
+
+    assert response["error"] == "Every crawled URL failed"
+    assert response["result"]["results"] == [{"url": "https://example.com"}]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        HTTPException(
+            status_code=500,
+            detail=json.dumps(
+                {
+                    "error": (
+                        "Unexpected error in _crawl_web at line 806 in _crawl_web "
+                        "(/app/crawl4ai/async_crawler_strategy.py): boom"
+                    ),
+                    "server_memory_delta_mb": 1,
+                }
+            ),
+        ),
+        OSError(28, "No space left on device", "/app/crawl4ai/cache/x"),
+    ],
+    ids=["internal-500-detail", "bare-oserror"],
+)
+def test_worker_does_not_publish_internal_detail_to_the_job_client(failure):
+    """The worker is a separate process, so the API's central 500 handler never
+    genericizes what lands in the task hash /crawl/job/{id} returns."""
+    queue = SimpleNamespace(
+        settings=SimpleNamespace(max_attempts=1),
+        complete=AsyncMock(),
+        mark_retry=AsyncMock(),
+    )
+
+    async def blow_up(_payload):
+        raise failure
+
+    worker = CrawlJobWorker(queue, {}, "worker-a", crawl=blow_up, webhook_service=object())
+    entry = CrawlJobEntry(stream_id="1-0", task_id="crawl_leak")
+    attempt = CrawlJobAttempt(number=1, fence_token="attempt-a", consumer="worker-a")
+
+    status, _result, message = asyncio.run(worker._process_attempt(entry, {}, attempt=attempt))
+
+    assert status == "failed"
+    assert message.startswith("Crawl job failed (correlation_id=")
+    assert "/app/" not in message and "async_crawler_strategy" not in message
+    queue.complete.assert_awaited_once_with(entry, {}, attempt, error=message)
+
+
+def test_llm_job_failure_does_not_publish_internal_detail(monkeypatch):
+    """process_llm_extraction runs as a background task: its catch-all wrote
+    str(e) straight into the hash /llm/job/{id} returns and into the webhook."""
+    stored = {}
+    sent = {}
+
+    async def record_hset(_redis, key, mapping, _config):
+        stored[key] = mapping
+
+    class FakeWebhook:
+        def __init__(self, _config):
+            pass
+
+        async def notify_job_completion(self, **kwargs):
+            sent.update(kwargs)
+
+    def blow_up(*_args, **_kwargs):
+        raise OSError(2, "No such file or directory", "/app/crawl4ai/provider.json")
+
+    monkeypatch.setattr(api, "validate_llm_provider", lambda *_a, **_k: (True, None))
+    monkeypatch.setattr(llm_broker, "resolve_llm", blow_up)
+    monkeypatch.setattr(api, "hset_with_ttl", record_hset)
+    monkeypatch.setattr(api, "WebhookDeliveryService", FakeWebhook)
+
+    asyncio.run(
+        api.process_llm_extraction(
+            object(), {"llm": {}}, "llm_leak", "https://example.com", "extract"
+        )
+    )
+
+    message = stored["task:llm_leak"]["error"]
+    assert message.startswith("LLM extraction failed (correlation_id=")
+    assert "/app/" not in message
+    assert sent["error"] == message
+    assert sent["status"] == "failed"
 
 
 def test_worker_retries_request_timeout():
