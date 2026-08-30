@@ -313,6 +313,30 @@ def test_task_runtime_parses_container_identity_and_overlay(monkeypatch):
     }
 
 
+def test_task_runtime_guards_the_container_id_swarm_omits(monkeypatch):
+    # Swarm omits Status.ContainerStatus until a task reaches its container, and
+    # docker inspect exits 1 on an unguarded read of that missing key. That aborted
+    # three consecutive production rollouts (runs 33248150206, 33250958425,
+    # 33265831563) in which every health probe had succeeded.
+    output = (
+        '""\t'
+        + json.dumps(rollout._labels(REVISION))
+        + '\t"registry.example/crawl4ai@sha256:candidate"\t'
+        + "null\n"
+    )
+
+    def run(command, **_kwargs):
+        assert "{{if .Status.ContainerStatus}}" in command[command.index("--format") + 1]
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+
+    runtime = rollout._task_runtime("task", "network")
+
+    assert runtime["container"] == ""
+    assert runtime["addresses"] == set()
+
+
 def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
     rows = [
         {
