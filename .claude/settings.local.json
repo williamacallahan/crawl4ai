@@ -28,7 +28,9 @@
       "Bash(sips -g pixelWidth -g pixelHeight kakao-new-2h2.png kakao-old-e2k.webp)",
       "Bash(sips -s format png kakao-favicon.ico --out kakao-favicon-64.png)",
       "Bash(sips -g pixelWidth -g pixelHeight kakao-favicon-64.png)",
-      "Bash(sips -g pixelWidth -g pixelHeight vfo.png xp3.png)"
+      "Bash(sips -g pixelWidth -g pixelHeight vfo.png xp3.png)",
+      "Bash(ping -c 2 -W 3 haiku-4.tail5038c7.ts.net)",
+      "Bash(git add *)"
     ]
   },
   "enableAllProjectMcpServers": false
