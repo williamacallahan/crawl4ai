@@ -935,6 +935,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
             # Adjust viewport if needed
             if not self.browser_config.text_mode and config.adjust_viewport_to_content:
+                cdp = None
                 try:
                     dimensions = await self.get_page_dimensions(page)
                     page_height = dimensions["height"]
@@ -964,13 +965,18 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             "scale": scale,
                         },
                     )
-                    await cdp.detach()
                 except Exception as e:
                     self.logger.warning(
                         message="Failed to adjust viewport to content: {error}",
                         tag="VIEWPORT",
                         params={"error": str(e)},
                     )
+                finally:
+                    if cdp is not None:
+                        try:
+                            await cdp.detach()
+                        except Exception:
+                            pass
 
             # Handle full page scanning
             if config.scan_full_page:
@@ -1637,6 +1643,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         Returns:
             Optional[str]: The MHTML content as a string, or None if there was an error
         """
+        cdp_session = None
         try:
             # Ensure the page is fully loaded before capturing
             try:
@@ -1674,9 +1681,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # The result contains a 'data' field with the MHTML content
             mhtml_content = result.get("data")
             
-            # Detach the CDP session to clean up resources
-            await cdp_session.detach()
-            
             return mhtml_content
         except Exception as e:
             # Log the error but don't raise it - we'll just return None for the MHTML
@@ -1687,6 +1691,15 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     params={"error": str(e)},
                 )
             return None
+        finally:
+            # Detach the CDP session to clean up resources. This must run even
+            # when send() raises, otherwise the CDP session leaks (orphaned
+            # session accumulating on the page/context for long-running crawls).
+            if cdp_session is not None:
+                try:
+                    await cdp_session.detach()
+                except Exception:
+                    pass
 
     async def _capture_console_messages(
         self, page: Page, file_path: str
