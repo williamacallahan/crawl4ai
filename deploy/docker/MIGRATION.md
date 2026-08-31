@@ -148,9 +148,10 @@ To keep the previous behavior exactly, set the caps you don't want to `0`.
 
 ### Error responses are generic
 
-5xx responses return `{"error": "Internal server error", "correlation_id": "…"}`.
-Match the correlation id in the server logs for detail. Developer-facing 4xx
-messages are unchanged.
+500 responses return `{"error": "Internal server error", "correlation_id": "…"}`.
+Match the correlation id in the server logs for detail. Other 5xx responses
+carry their reason in `detail` (e.g. 502 for an upstream crawl failure).
+Developer-facing 4xx messages are unchanged.
 
 ---
 
