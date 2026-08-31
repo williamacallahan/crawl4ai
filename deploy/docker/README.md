@@ -100,7 +100,7 @@ EOL
       -p 11235:11235 \
       --name crawl4ai \
       --shm-size=1g \
-      unclecode/crawl4ai:0.8.6
+      unclecode/crawl4ai:0.9.2
     ```
 
 *   **With LLM support:**
@@ -111,7 +111,7 @@ EOL
       --name crawl4ai \
       --env-file .llm.env \
       --shm-size=1g \
-      unclecode/crawl4ai:0.8.6
+      unclecode/crawl4ai:0.9.2
     ```
 
 > The server will be available at `http://localhost:11235`. Visit `/playground` to access the interactive testing interface.
@@ -184,7 +184,7 @@ The `docker-compose.yml` file in the project root provides a simplified approach
     ```bash
     # Pulls and runs the release candidate from Docker Hub
     # Automatically selects the correct architecture
-    IMAGE=unclecode/crawl4ai:0.8.6 docker compose up -d
+    IMAGE=unclecode/crawl4ai:0.9.2 docker compose up -d
     ```
 
 *   **Build and Run Locally:**
