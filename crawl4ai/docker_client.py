@@ -1,13 +1,13 @@
-from typing import List, Optional, Union, AsyncGenerator, Dict, Any, Callable
+from typing import List, Optional, Union, AsyncGenerator, Dict, Any
 import httpx
 import json
+import warnings
 from urllib.parse import urljoin
 import asyncio
 
 from .async_configs import BrowserConfig, CrawlerRunConfig
 from .models import CrawlResult
 from .async_logger import AsyncLogger, LogLevel
-from .utils import hooks_to_string
 
 
 class Crawl4aiClientError(Exception):
@@ -76,10 +76,25 @@ class Crawl4aiDockerClient:
         urls: List[str],
         browser_config: Optional[BrowserConfig] = None,
         crawler_config: Optional[CrawlerRunConfig] = None,
-        hooks: Optional[Union[Dict[str, Callable], Dict[str, str]]] = None,
+        hooks: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         hooks_timeout: int = 30
     ) -> Dict[str, Any]:
-        """Prepare request data from configs."""
+        """Prepare request data from configs.
+
+        ``hooks`` is sent in the Docker server's declarative format:
+        ``{"hooks": [{"action": ..., "params": {...}}]}``. The server's
+        ``HookConfig`` schema (since 0.9.0) accepts only this declarative list;
+        the legacy ``code``/``timeout`` fields were removed (replaced by fixed
+        actions to prevent RCE). See ``deploy/docker/MIGRATION.md``.
+
+        Accepted shapes for ``hooks``:
+          * a declarative wrapper dict: ``{"hooks": [{"action": ..., "params": {...}}]}``
+          * a bare list of hook specs: ``[{"action": ..., "params": {...}}]``
+
+        Legacy code-based hooks (``Dict[str, Callable]`` or ``Dict[str, str]``)
+        are accepted for backward-compatibility but no longer sent: the server
+        would silently ignore them. A ``DeprecationWarning`` is emitted instead.
+        """
         if self._token:
             self._http_client.headers["Authorization"] = f"Bearer {self._token}"
 
@@ -91,20 +106,45 @@ class Crawl4aiDockerClient:
 
         # Handle hooks if provided
         if hooks:
-            # Check if hooks are already strings or need conversion
-            if any(callable(v) for v in hooks.values()):
-                # Convert function objects to strings
-                hooks_code = hooks_to_string(hooks)
-            else:
-                # Already in string format
-                hooks_code = hooks
-
-            request_data["hooks"] = {
-                "code": hooks_code,
-                "timeout": hooks_timeout
-            }
+            hooks_payload = self._build_hooks_payload(hooks)
+            if hooks_payload is not None:
+                request_data["hooks"] = hooks_payload
 
         return request_data
+
+    @staticmethod
+    def _build_hooks_payload(
+        hooks: Union[Dict[str, Any], List[Dict[str, Any]]]
+    ) -> Optional[Dict[str, Any]]:
+        """Translate the ``hooks`` argument into the server's declarative payload.
+
+        Returns ``{"hooks": [<HookSpec>, ...]}`` for declarative input, or
+        ``None`` when the input is the legacy code-based format (after emitting
+        a ``DeprecationWarning``), so the server is never sent a payload it
+        would silently drop.
+        """
+        # Declarative: a bare list of hook specs.
+        if isinstance(hooks, list):
+            return {"hooks": list(hooks)}
+
+        # Declarative: a wrapper dict already in the server's shape.
+        if isinstance(hooks, dict) and isinstance(hooks.get("hooks"), list):
+            return {"hooks": list(hooks["hooks"])}
+
+        # Legacy code-based format (Dict[str, Callable] | Dict[str, str]).
+        # The server removed exec()-based hooks in 0.9.0 for RCE prevention;
+        # sending {"code": ..., "timeout": ...} is silently ignored, yielding
+        # HookConfig(hooks=[]). Warn and drop it instead of failing silently.
+        warnings.warn(
+            "Code-based hooks are no longer supported by the Docker server "
+            "(removed in 0.9.0 for RCE prevention). Use declarative hooks "
+            "instead, e.g. {'hooks': [{'action': 'block_resources', 'params': "
+            "{'resource_types': ['image']}}]}. See deploy/docker/MIGRATION.md. "
+            "The legacy hooks were not sent.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return None
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> httpx.Response:
         """Make an HTTP request with error handling."""
@@ -128,7 +168,7 @@ class Crawl4aiDockerClient:
         urls: List[str],
         browser_config: Optional[BrowserConfig] = None,
         crawler_config: Optional[CrawlerRunConfig] = None,
-        hooks: Optional[Union[Dict[str, Callable], Dict[str, str]]] = None,
+        hooks: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         hooks_timeout: int = 30
     ) -> Union[CrawlResult, List[CrawlResult], AsyncGenerator[CrawlResult, None]]:
         """
@@ -138,22 +178,37 @@ class Crawl4aiDockerClient:
             urls: List of URLs to crawl
             browser_config: Browser configuration
             crawler_config: Crawler configuration
-            hooks: Optional hooks - can be either:
-                   - Dict[str, Callable]: Function objects that will be converted to strings
-                   - Dict[str, str]: Already stringified hook code
-            hooks_timeout: Timeout in seconds for each hook execution (1-120)
+            hooks: Optional declarative hooks, either:
+                   - A wrapper dict: ``{"hooks": [{"action": ..., "params": {...}}]}``
+                   - A bare list of hook specs: ``[{"action": ..., "params": {...}}]``
+
+                   Available actions are enumerated by the server's
+                   ``GET /hooks/info`` endpoint (e.g. ``block_resources``,
+                   ``add_cookies``, ``set_headers``, ``scroll_to_bottom``,
+                   ``wait_for_timeout``).
+
+                   Legacy code-based hooks (``Dict[str, Callable]`` or
+                   ``Dict[str, str]``) are no longer executed by the server
+                   (removed in 0.9.0 for RCE prevention); passing one emits a
+                   ``DeprecationWarning`` and the hooks are not sent. Use the
+                   in-process SDK (``AsyncWebCrawler``) for arbitrary hook
+                   code.
+            hooks_timeout: Timeout in seconds for the HTTP request to the
+                           server (not a per-hook execution timeout; that
+                           field was removed from the server schema in 0.9.0).
 
         Returns:
             Single CrawlResult, list of results, or async generator for streaming
 
-        Example with function hooks:
-            >>> async def my_hook(page, context, **kwargs):
-            ...     await page.set_viewport_size({"width": 1920, "height": 1080})
-            ...     return page
-            >>>
+        Example with declarative hooks:
             >>> result = await client.crawl(
             ...     ["https://example.com"],
-            ...     hooks={"on_page_context_created": my_hook}
+            ...     hooks={"hooks": [
+            ...         {"action": "block_resources",
+            ...          "params": {"resource_types": ["image", "font"]}},
+            ...         {"action": "scroll_to_bottom",
+            ...          "params": {"max_steps": 10, "delay_ms": 500}},
+            ...     ]}
             ... )
         """
         await self._check_server()
