@@ -6,8 +6,6 @@
 | `ManagedBrowser.__init__` | Stores config and logger, creates temp dir, preps internal state. |
 | `ManagedBrowser.start` | Spawns or connects to the Chromium process, returns its CDP endpoint plus the `subprocess.Popen` handle. |
 | `ManagedBrowser._initial_startup_check` | Pings the CDP endpoint once to be sure the browser is alive, raises if not. |
-| `ManagedBrowser._monitor_browser_process` | Async-loops on the subprocess, logs exits or crashes, restarts if policy allows. |
-| `ManagedBrowser._get_browser_path_WIP` | Old helper that maps OS + browser type to an executable path. |
 | `ManagedBrowser._get_browser_path` | Current helper, checks env vars, Playwright cache, and OS defaults for the real executable. |
 | `ManagedBrowser._get_browser_args` | Builds the final CLI arg list by merging user flags, stealth flags, and defaults. |
 | `ManagedBrowser.cleanup` | Terminates the browser, stops monitors, deletes the temp dir. |
