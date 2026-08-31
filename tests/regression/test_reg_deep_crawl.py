@@ -35,6 +35,27 @@ def _to_ip_url(local_server: str) -> str:
     return local_server.replace("localhost", "127.0.0.1")
 
 
+async def _crawl_max_pages(local_server: str, strategy, stream: bool):
+    """Crawl /deep/hub with the given strategy and return the list of results.
+
+    Shared helper for the max_pages boundary regression tests so every strategy
+    and mode is exercised through the same code path.
+    """
+    base = _to_ip_url(local_server)
+    hub_url = base + "/deep/hub"
+    config = CrawlerRunConfig(
+        deep_crawl_strategy=strategy, stream=stream, verbose=False
+    )
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        if stream:
+            results = []
+            async for r in await crawler.arun(url=hub_url, config=config):
+                results.append(r)
+        else:
+            results = list(await crawler.arun(url=hub_url, config=config))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # BFS Deep Crawl
 # ---------------------------------------------------------------------------
@@ -109,6 +130,61 @@ async def test_bfs_max_pages(local_server):
         assert len(result_list) <= 3, (
             f"Expected at most 3 results, got {len(result_list)}"
         )
+
+
+@pytest.mark.asyncio
+async def test_bfs_max_pages_exact_boundary(local_server):
+    """BFS batch mode must return exactly max_pages at a mid-level boundary.
+
+    Regression for the overshoot bug where the entire BFS level was processed
+    regardless of the limit (max_pages=5 used to yield 10 results).
+    """
+    strategy = BFSDeepCrawlStrategy(max_depth=3, max_pages=5)
+    results = await _crawl_max_pages(local_server, strategy, stream=False)
+    assert len(results) == 5, (
+        f"BFS batch max_pages=5: expected exactly 5, got {len(results)}. "
+        f"URLs: {[r.url for r in results]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bfs_max_pages_streaming_exact_boundary(local_server):
+    """BFS streaming mode must yield the boundary page (no undershoot).
+
+    Regression for the undershoot bug where the page that hit the limit was
+    dropped before being yielded (max_pages=4 used to yield 3 results).
+    """
+    strategy = BFSDeepCrawlStrategy(max_depth=3, max_pages=4)
+    results = await _crawl_max_pages(local_server, strategy, stream=True)
+    assert len(results) == 4, (
+        f"BFS stream max_pages=4: expected exactly 4, got {len(results)}. "
+        f"URLs: {[r.url for r in results]}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+@pytest.mark.parametrize("max_pages", [1, 4, 5, 8])
+async def test_bfs_max_pages_all_boundaries(local_server, max_pages, stream):
+    """BFS must return exactly max_pages across edge, level, and mid-level boundaries.
+
+    Covers the one-page edge case (1), a level-aligned boundary (4), a mid-level
+    boundary that previously overshot in batch mode (5), and a larger mid-level
+    value (8), in both batch and streaming modes.
+    """
+    strategy = BFSDeepCrawlStrategy(max_depth=3, max_pages=max_pages)
+    results = await _crawl_max_pages(local_server, strategy, stream=stream)
+    mode = "stream" if stream else "batch"
+    assert len(results) == max_pages, (
+        f"BFS {mode} max_pages={max_pages}: expected exactly {max_pages}, "
+        f"got {len(results)}. URLs: {[r.url for r in results]}"
+    )
+    # The start page must always be the first result.
+    assert "/deep/hub" in results[0].url
+    # Every result must carry depth metadata populated by the strategy.
+    for r in results:
+        assert r.metadata is not None, "Each result should have metadata"
+        assert "depth" in r.metadata, "Metadata should contain 'depth' key"
 
 
 @pytest.mark.asyncio
@@ -209,6 +285,24 @@ async def test_dfs_max_depth(local_server):
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+async def test_dfs_max_pages_exact_boundary(local_server, stream):
+    """DFS must return exactly max_pages in both batch and stream modes.
+
+    Regression for the DFS overshoot bug: the while-loop kept popping stack
+    URLs after the in-for-loop break because there was no top-of-loop
+    max_pages guard (max_pages=5 used to yield 6+ results).
+    """
+    strategy = DFSDeepCrawlStrategy(max_depth=3, max_pages=5)
+    results = await _crawl_max_pages(local_server, strategy, stream=stream)
+    mode = "stream" if stream else "batch"
+    assert len(results) == 5, (
+        f"DFS {mode} max_pages=5: expected exactly 5, got {len(results)}. "
+        f"URLs: {[r.url for r in results]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # BestFirst Deep Crawl
 # ---------------------------------------------------------------------------
@@ -228,6 +322,7 @@ async def test_bestfirst_basic(local_server):
         result_list = list(results)
         assert len(result_list) >= 1, "BestFirst should return at least the start page"
         assert result_list[0].success, "First result should be successful"
+
 
 
 # ---------------------------------------------------------------------------

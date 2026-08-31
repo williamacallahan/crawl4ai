@@ -267,6 +267,12 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                     # Increment pages crawled per URL for accurate state tracking
                     self._pages_crawled += 1
 
+                    # Stop once the boundary page has been appended so the crawl
+                    # does not overshoot the max_pages limit mid-level.
+                    if self._pages_crawled >= self.max_pages:
+                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                        break
+
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
 
@@ -329,6 +335,11 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             depths: Dict[str, int] = {start_url: 0}
 
         while current_level and not self._cancel_event.is_set():
+            # Check if we've already reached max_pages before starting a new level
+            if self._pages_crawled >= self.max_pages:
+                self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
+                break
+
             # Check external cancellation callback before processing this level
             if await self._check_cancellation():
                 self.logger.info("Crawl cancelled by user")
@@ -351,19 +362,18 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 parent_url = next((parent for (u, parent) in current_level if u == url), None)
                 result.metadata["parent_url"] = parent_url
                 
-                # Count only successful crawls
+                results_count += 1
+                yield result
+
+                # Only count successful crawls toward max_pages limit
                 if result.success:
                     self._pages_crawled += 1
-                    # Check if we've reached the limit during batch processing
+                    # Stop once the boundary page has been yielded so the crawl
+                    # does not overshoot the max_pages limit on the next level.
                     if self._pages_crawled >= self.max_pages:
                         self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
                         break  # Exit the generator
-                
-                results_count += 1
-                yield result
-                
-                # Only discover links from successful crawls
-                if result.success:
+
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
 
