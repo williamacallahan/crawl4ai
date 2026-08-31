@@ -127,6 +127,18 @@ def _rollout_policy(failure_action: str) -> dict[str, Any]:
     }
 
 
+class CurlError(RuntimeError):
+    """curl exited non-zero; curl_exit carries the code for triage.
+
+    22 means the service answered badly (--fail on a 4xx/5xx); 7/28/35/52/56
+    point at transport between the runner and the host, not the service.
+    """
+
+    def __init__(self, message: str, curl_exit: int):
+        super().__init__(message)
+        self.curl_exit = curl_exit
+
+
 def _request_json(url: str, api_key: str | None = None) -> Any:
     config = ""
     if api_key:
@@ -144,7 +156,14 @@ def _request_json(url: str, api_key: str | None = None) -> Any:
         timeout=20,
     )
     if response.returncode:
-        raise RuntimeError("HTTP request failed")
+        # Carry curl's own diagnosis: a bare "HTTP request failed" made the
+        # 2026-08-31 single-sample monitor failure unattributable (connection
+        # reset vs TLS vs 5xx), leaving the gate's verdict unactionable.
+        raise CurlError(
+            f"HTTP request failed: curl exit {response.returncode}: "
+            f"{(response.stderr or '').strip()[:200]}",
+            response.returncode,
+        )
     return json.loads(response.stdout) if response.stdout else None
 
 
@@ -165,7 +184,11 @@ def _post_json(url: str, api_key: str, payload: dict[str, Any]) -> Any:
         timeout=20,
     )
     if response.returncode:
-        raise RuntimeError("HTTP request failed; state is ambiguous")
+        raise CurlError(
+            "HTTP request failed; state is ambiguous: "
+            f"curl exit {response.returncode}: {(response.stderr or '').strip()[:200]}",
+            response.returncode,
+        )
     return json.loads(response.stdout) if response.stdout else None
 
 
@@ -713,7 +736,8 @@ def monitor() -> None:
                         "ok": False,
                         "url": url,
                         "timestamp": time.time(),
-                        "error": type(error).__name__,
+                        "error": f"{type(error).__name__}: {error}"[:300],
+                        "curl_exit": getattr(error, "curl_exit", None),
                     }
                 failures += not sample["ok"]
                 output.write(json.dumps(sample, separators=(",", ":")) + "\n")

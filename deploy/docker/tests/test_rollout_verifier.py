@@ -682,6 +682,50 @@ def test_monitor_arms_only_after_both_domains_are_ready(monkeypatch, tmp_path):
     assert len(evidence_path.read_text().splitlines()) == len(rollout.HEALTH_URLS)
 
 
+def test_request_json_failure_carries_curl_diagnosis(monkeypatch):
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(
+            cmd, 56, "", "curl: (56) Recv failure: Connection reset by peer"
+        ),
+    )
+    with pytest.raises(rollout.CurlError) as error:
+        rollout._request_json("https://example.test/health")
+    assert error.value.curl_exit == 56
+    assert "curl exit 56" in str(error.value)
+    assert "Connection reset" in str(error.value)
+
+
+def test_monitor_failure_sample_is_attributable(monkeypatch, tmp_path):
+    """A failed probe must record what failed — the 2026-08-31 run went red
+    on a single sample that said only {"error": "RuntimeError"}."""
+    evidence_path = tmp_path / "evidence.jsonl"
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(evidence_path))
+    monkeypatch.setenv("ROLLOUT_MONITOR_ARMED_PATH", str(tmp_path / "armed"))
+    monkeypatch.setenv("ROLLOUT_MONITOR_STOP_PATH", str(tmp_path / "stop"))
+    calls = []
+
+    def probe(url, *_args):
+        calls.append(url)
+        if len(calls) <= len(rollout.HEALTH_URLS):
+            if len(calls) == len(rollout.HEALTH_URLS):
+                pass  # first round healthy: arms the monitor
+            return health()
+        (tmp_path / "stop").touch()
+        raise rollout.CurlError("HTTP request failed: curl exit 56: reset", 56)
+
+    monkeypatch.setattr(rollout, "_request_json", probe)
+    monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError, match="recorded"):
+        rollout.monitor()
+    samples = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    failed = [s for s in samples if not s["ok"]]
+    assert failed
+    assert failed[0]["curl_exit"] == 56
+    assert failed[0]["error"].startswith("CurlError: HTTP request failed: curl exit 56")
+
+
 def _node_commands(nodes):
     """Stub docker node ls/inspect for a fleet of (hostname, labeled, state, availability)."""
     def run(cmd, **_kwargs):
