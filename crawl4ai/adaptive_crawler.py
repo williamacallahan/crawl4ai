@@ -1205,7 +1205,9 @@ class EmbeddingStrategy(CrawlStrategy):
         
     def get_quality_confidence(self, state: CrawlState) -> float:
         """Calculate quality-based confidence score for display"""
-        learning_score = state.metrics.get('learning_score', 0.0)
+        # calculate_confidence() stores the coverage score under 'coverage_score';
+        # read that key (not the legacy 'learning_score' key, which is never set).
+        coverage_score = state.metrics.get('coverage_score', 0.0)
         validation_score = state.metrics.get('validation_confidence', 0.0)
         
         # Get config values
@@ -1216,17 +1218,17 @@ class EmbeddingStrategy(CrawlStrategy):
         
         if self._validation_passed and validation_score > validation_min:
             # Validated systems get boosted scores
-            # Map 0.4-0.7 learning → quality_min-quality_max confidence
-            if learning_score < 0.4:
+            # Map 0.4-0.7 coverage → quality_min-quality_max confidence
+            if coverage_score < 0.4:
                 confidence = quality_min  # Minimum for validated systems
-            elif learning_score > 0.7:
+            elif coverage_score > 0.7:
                 confidence = quality_max  # Maximum realistic confidence
             else:
                 # Linear mapping in between
-                confidence = quality_min + (learning_score - 0.4) * scale_factor
+                confidence = quality_min + (coverage_score - 0.4) * scale_factor
         else:
             # Not validated = conservative mapping
-            confidence = learning_score * 0.8
+            confidence = coverage_score * 0.8
             
         return confidence
     
