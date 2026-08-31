@@ -756,7 +756,11 @@ class EmbeddingStrategy(CrawlStrategy):
             exponential_factor=llm_config_dict.get('backoff_exponential_factor', 2) if llm_config_dict else 2,
         )
         
-        variations = json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        if not content or not content.strip():
+            finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+            raise ValueError(f"LLM returned no content (finish_reason: {finish_reason})")
+        variations = json.loads(content)
         
         
         # # Mock data with more variations for split
