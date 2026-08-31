@@ -47,57 +47,6 @@ class RelevantContentFilter(ABC):
             verbose (bool): Enable verbose logging (default: False).
         """
         self.user_query = user_query
-        self.included_tags = {
-            # Primary structure
-            "article",
-            "main",
-            "section",
-            "div",
-            # List structures
-            "ul",
-            "ol",
-            "li",
-            "dl",
-            "dt",
-            "dd",
-            # Text content
-            "p",
-            "span",
-            "blockquote",
-            "pre",
-            "code",
-            # Headers
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            # Tables
-            "table",
-            "thead",
-            "tbody",
-            "tr",
-            "td",
-            "th",
-            # Other semantic elements
-            "figure",
-            "figcaption",
-            "details",
-            "summary",
-            # Text formatting
-            "em",
-            "strong",
-            "b",
-            "i",
-            "mark",
-            "small",
-            # Rich content
-            "time",
-            "address",
-            "cite",
-            "q",
-        }
         self.excluded_tags = {
             "nav",
             "footer",
@@ -109,7 +58,6 @@ class RelevantContentFilter(ABC):
             "iframe",
             "noscript",
         }
-        self.header_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
         self.negative_patterns = re.compile(
             r"nav|footer|header|sidebar|ads|comment|promo|advert|social|share", re.I
         )
@@ -269,53 +217,6 @@ class RelevantContentFilter(ABC):
             ]
 
         return chunks
-
-    def _deprecated_extract_text_chunks(
-        self, soup: BeautifulSoup
-    ) -> List[Tuple[int, str, Tag]]:
-        """Common method for extracting text chunks"""
-        _text_cache = {}
-
-        def fast_text(element: Tag) -> str:
-            elem_id = id(element)
-            if elem_id in _text_cache:
-                return _text_cache[elem_id]
-            texts = []
-            for content in element.contents:
-                if isinstance(content, str):
-                    text = content.strip()
-                    if text:
-                        texts.append(text)
-            result = " ".join(texts)
-            _text_cache[elem_id] = result
-            return result
-
-        candidates = []
-        index = 0
-
-        def dfs(element):
-            nonlocal index
-            if isinstance(element, Tag):
-                if element.name in self.included_tags:
-                    if not self.is_excluded(element):
-                        text = fast_text(element)
-                        word_count = len(text.split())
-
-                        # Headers pass through with adjusted minimum
-                        if element.name in self.header_tags:
-                            if word_count >= 3:  # Minimal sanity check for headers
-                                candidates.append((index, text, element))
-                                index += 1
-                        # Regular content uses standard minimum
-                        elif word_count >= self.min_word_count:
-                            candidates.append((index, text, element))
-                            index += 1
-
-                for child in element.children:
-                    dfs(child)
-
-        dfs(soup.body if soup.body else soup)
-        return candidates
 
     def is_excluded(self, tag: Tag) -> bool:
         """Common method for exclusion logic"""
