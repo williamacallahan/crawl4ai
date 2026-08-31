@@ -660,3 +660,85 @@ async def test_dedicated_release_finishes_cleanup_when_cancelled(monkeypatch):
     assert getattr(crawler, "_docker_pool_sig") is None
     assert crawler_pool.COLD_POOL == {}
     assert crawler_pool.ADMISSION_SEM._value == 1
+
+
+class LeakCheckMonitor:
+    """Mirrors the real monitor's active-entry bookkeeping (issue #2)."""
+
+    def __init__(self):
+        self.active_requests = {}
+        self.closed = []
+
+    async def track_request_start(self, request_id, *_args, **_kwargs):
+        self.active_requests[request_id] = {"id": request_id}
+
+    async def track_request_end(self, request_id, **kwargs):
+        if request_id in self.active_requests:
+            self.active_requests.pop(request_id)
+            self.closed.append(kwargs)
+
+
+def test_rejected_request_closes_its_monitor_entry(monkeypatch):
+    """A deliberate-status rejection (SSRF 400 pass-through) must not leave a
+    forever-'active' monitor entry (issue #2)."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler())
+
+    def blocked(_url):
+        raise HTTPException(
+            status_code=400, detail="URL blocked (SSRF protection): URL blocked"
+        )
+
+    monkeypatch.setattr(api, "validate_url_destination", blocked)
+    with pytest.raises(HTTPException) as error:
+        run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert error.value.status_code == 400
+    assert fake.active_requests == {}
+    assert fake.closed[-1]["status_code"] == 400
+    assert "URL blocked" in fake.closed[-1]["error"]
+
+
+def test_deadline_504_closes_its_monitor_entry(monkeypatch):
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler(mode="slow"))
+
+    with pytest.raises(HTTPException) as error:
+        run(
+            api.handle_crawl_request(
+                ["https://example.com"], {}, {}, crawl_config(wall_clock_s=0.01)
+            )
+        )
+
+    assert error.value.status_code == 504
+    assert fake.active_requests == {}
+    assert fake.closed[-1]["status_code"] == 504
+
+
+def test_late_500_records_type_name_never_its_detail(monkeypatch):
+    """A generic 500's detail embeds raw str(e); if one ever reaches the
+    finally with the entry still open, only the exception type may be
+    recorded — /monitor/* returns this text to any data-scope principal."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler())
+
+    def internal_500(_url):
+        raise HTTPException(status_code=500, detail="raw internals: /app/secret.py boom")
+
+    monkeypatch.setattr(api, "validate_url_destination", internal_500)
+    with pytest.raises(HTTPException):
+        run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert fake.active_requests == {}
+    assert fake.closed[-1]["status_code"] == 500
+    assert fake.closed[-1]["error"] == "request aborted: HTTPException"
+    assert "raw internals" not in fake.closed[-1]["error"]

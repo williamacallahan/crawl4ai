@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sys
 import time
 from base64 import b64encode
 from contextlib import asynccontextmanager, suppress
@@ -1144,14 +1145,8 @@ async def handle_crawl_request(
 
     except (UntrustedConfigError, HookValidationError) as e:
         # An untrusted request body tried to set a forbidden power-field,
-        # construct a disallowed type, or specify an invalid hook. Client error.
-        try:
-            from monitor import get_monitor
-            await get_monitor().track_request_end(
-                request_id, success=False, error=str(e), status_code=400
-            )
-        except Exception:
-            pass
+        # construct a disallowed type, or specify an invalid hook. Client
+        # error; the finally below records it on the monitor.
         raise HTTPException(status_code=400, detail=f"Rejected request: {e}")
 
     except asyncio.TimeoutError:
@@ -1193,6 +1188,43 @@ async def handle_crawl_request(
             })
         )
     finally:
+        # Every exit that skipped an explicit track_request_end — SSRF 400s,
+        # request-validation 400s, deadline 504s, client cancellation — would
+        # otherwise leave the monitor entry "active" forever (issue #2).
+        # Deliberate-status HTTPException details on those paths are already
+        # client-safe; anything else gets a type name only, because
+        # /monitor/* returns this text to any data-scope principal.
+        try:
+            from monitor import get_monitor
+            monitor = get_monitor()
+            # The still-active guard is load-bearing, not redundant with the
+            # one inside track_request_end: when a branch above already
+            # recorded (e.g. the correlated, sanitized 500), this block must
+            # never overwrite it with the in-flight exception's detail — the
+            # generic 500 HTTPException carries raw str(e).
+            if request_id in monitor.active_requests:
+                pending = sys.exc_info()[1]
+                if isinstance(pending, HTTPException) and pending.status_code != 500:
+                    # Deliberate-status details (400/502/503/504...) are
+                    # client-safe; the generic 500's detail embeds raw str(e).
+                    aborted_status = pending.status_code
+                    aborted_error = str(pending.detail)[:500]
+                else:
+                    aborted_status = 500
+                    aborted_error = (
+                        f"request aborted: {type(pending).__name__}"
+                        if pending else "request aborted"
+                    )
+                await monitor.track_request_end(
+                    request_id,
+                    success=False,
+                    error=aborted_error,
+                    status_code=aborted_status,
+                )
+        except BaseException:
+            # Monitor not critical — and nothing here may shadow the crawler
+            # disposal below, cancellation included.
+            pass
         await _dispose_crawler(crawler)
 
 async def handle_stream_crawl_request(
