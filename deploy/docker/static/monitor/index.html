@@ -56,13 +56,22 @@
         ::-webkit-scrollbar-thumb:hover {
             background: #4EFFFF;
         }
+
+        /* Narrow viewports: stack the fixed-column grids. The vendored Tailwind
+           build carries no responsive variants (no md:*, no grid-cols-1), so
+           this cannot be expressed in classes. */
+        @media (max-width: 767px) {
+            .responsive-grid {
+                grid-template-columns: minmax(0, 1fr);
+            }
+        }
     </style>
 </head>
 
 <body class="bg-dark text-light font-mono min-h-screen flex flex-col" style="font-feature-settings: 'calt' 0;">
     <!-- Header -->
-    <header class="border-b border-border px-4 py-2 flex items-center">
-        <h1 class="text-lg font-medium flex items-center space-x-4">
+    <header class="border-b border-border px-4 py-2 flex flex-wrap items-center gap-4">
+        <h1 class="text-lg font-medium flex flex-wrap items-center gap-4">
             <img src="/static/assets/logo.png" alt="Crawl4AI" class="h-8">
             <span class="text-secondary">Monitor</span>
             <a href="https://github.com/unclecode/crawl4ai" target="_blank" class="flex space-x-1">
@@ -70,9 +79,9 @@
             </a>
         </h1>
 
-        <div class="ml-auto flex items-center space-x-4">
+        <div class="ml-auto flex flex-wrap items-center gap-4">
             <!-- Token bar -->
-            <div class="flex items-center space-x-2">
+            <div class="flex flex-wrap items-center gap-2">
                 <input id="token-input" type="password" placeholder="API token"
                        autocomplete="off" autocapitalize="off" spellcheck="false"
                        class="bg-dark border border-border rounded px-2 py-1 text-xs w-48">
@@ -107,7 +116,7 @@
         <section class="bg-surface rounded-lg border border-border p-4">
             <h2 class="text-sm font-medium mb-3 text-primary">System Health</h2>
 
-            <div class="grid grid-cols-4 gap-4 mb-4">
+            <div class="grid grid-cols-4 gap-4 mb-4 responsive-grid">
                 <!-- CPU -->
                 <div>
                     <div class="flex justify-between text-xs mb-1">
@@ -151,7 +160,7 @@
 
             <!-- Pool Status -->
             <div class="border-t border-border pt-3">
-                <div class="grid grid-cols-3 gap-4 text-xs">
+                <div class="grid grid-cols-3 gap-4 text-xs responsive-grid">
                     <div>
                         <span class="text-secondary">🔥 Permanent:</span>
                         <span id="pool-perm" class="text-primary ml-2">INACTIVE (0MB)</span>
@@ -173,12 +182,12 @@
         </section>
 
         <!-- Live Activity Grid (2x2) -->
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-2 gap-4 responsive-grid">
             <!-- Requests Section -->
             <section class="bg-surface rounded-lg border border-border overflow-hidden flex flex-col" style="height: 350px;">
                 <div class="px-4 py-2 border-b border-border flex items-center justify-between">
                     <h3 class="text-sm font-medium text-primary">📝 Requests (<span id="active-count">0</span> active)</h3>
-                    <select id="filter-requests" class="bg-dark border border-border rounded px-2 py-1 text-xs">
+                    <select id="filter-requests" aria-label="Filter requests" class="bg-dark border border-border rounded px-2 py-1 text-xs">
                         <option value="all">All</option>
                         <option value="success">Success</option>
                         <option value="error">Errors</option>
@@ -246,7 +255,7 @@
         </div>
 
         <!-- Endpoint Analytics & Timeline (Side by side) -->
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-2 gap-4 responsive-grid">
             <!-- Endpoint Analytics -->
             <section class="bg-surface rounded-lg border border-border p-4">
                 <h2 class="text-sm font-medium mb-3 text-primary">Endpoint Analytics</h2>
@@ -272,7 +281,7 @@
             <section class="bg-surface rounded-lg border border-border p-4">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-medium text-primary">Resource Timeline (5min)</h2>
-                    <select id="timeline-metric" class="bg-dark border border-border rounded px-2 py-1 text-xs">
+                    <select id="timeline-metric" aria-label="Timeline metric" class="bg-dark border border-border rounded px-2 py-1 text-xs">
                         <option value="memory">Memory %</option>
                         <option value="requests">Requests/5s</option>
                         <option value="browsers">Browser Count</option>

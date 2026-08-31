@@ -662,12 +662,267 @@ def test_playground_controls_are_named_and_header_can_wrap():
     assert {"flex-wrap", "gap-4"} <= set(token_bar.parent["class"])
 
 
+class _StubMonitor:
+    async def get_health_summary(self):
+        return {}
+
+    async def get_browser_list(self):
+        return []
+
+    def get_active_requests(self):
+        return []
+
+    def get_completed_requests(self, limit=10):
+        return []
+
+    def get_timeline_data(self, metric, window):
+        return []
+
+    def get_janitor_log(self, limit=10):
+        return []
+
+    def get_errors_log(self, limit=10):
+        return []
+
+
+class _StubWebSocket:
+    def __init__(self, state):
+        from starlette.websockets import WebSocketState
+
+        self.application_state = state
+        self.sends = 0
+        self._connected = WebSocketState.CONNECTED
+
+    async def accept(self):
+        return None
+
+    async def send_json(self, data):
+        self.sends += 1
+        # Exactly what Starlette raises once the socket has been closed.
+        raise RuntimeError(
+            "Unexpected ASGI message 'websocket.send', after sending 'websocket.close'."
+        )
+
+
+@pytest.mark.asyncio
+async def test_monitor_websocket_stops_instead_of_looping_on_a_closed_socket(
+    monkeypatch,
+):
+    """A send on a closed socket raises RuntimeError, not WebSocketDisconnect.
+
+    The old handler retried every 2s, so one rollout logged the same traceback
+    for the whole 390s stop-grace window (observed 2026-08-31 on haiku-18).
+    """
+    import monitor_routes
+    from starlette.websockets import WebSocketState
+
+    monkeypatch.setattr(monitor_routes, "get_monitor", lambda: _StubMonitor())
+
+    closed = _StubWebSocket(WebSocketState.DISCONNECTED)
+    await asyncio.wait_for(monitor_routes.websocket_endpoint(closed), timeout=5)
+    assert closed.sends == 1
+
+    # A still-connected socket keeps the retry: the loop must not exit.
+    live = _StubWebSocket(WebSocketState.CONNECTED)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(monitor_routes.websocket_endpoint(live), timeout=0.5)
+    assert live.sends == 1
+
+
+def _extract_js_function(source: str, signature: str) -> str:
+    """Slice one brace-balanced function out of a single-file HTML page."""
+    start = source.index(signature)
+    depth = 0
+    for i in range(source.index("{", start), len(source)):
+        depth += 1 if source[i] == "{" else -1 if source[i] == "}" else 0
+        if depth == 0:
+            return source[start : i + 1]
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
+
+def test_playground_api_error_message_survives_every_fastapi_error_shape():
+    """Runs the real function; the other UI checks only read source text.
+
+    `detail` is whatever the server sent: a string, an array of {loc,msg}, an
+    array holding nulls or bare strings, or absent. Interpolating it printed
+    "[object Object]" (2026-08-31 dogfood ISSUE-005), and a naive rewrite throws
+    on a null entry or prints "undefined".
+    """
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+
+    node = shutil.which("node")
+    assert node, "node is required (the workflow's JS actions already need it)"
+
+    playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
+    fn = _extract_js_function(playground, "function apiErrorMessage(body)")
+
+    cases = {
+        "null": (None, "Request failed"),
+        "empty": ({}, "Request failed"),
+        "null entry": ({"detail": [None]}, "Request failed"),
+        "empty array": ({"detail": []}, "Request failed"),
+        "entry with no msg": ({"detail": [{"loc": ["body", "urls"]}]}, "Request failed"),
+        "string entries": ({"detail": ["Not authenticated"]}, "Not authenticated"),
+        "real 422": (
+            {"detail": [{"loc": ["body", "urls"], "msg": "List should have at least 1 item"}]},
+            "body.urls: List should have at least 1 item",
+        ),
+        "two entries": (
+            {"detail": [{"loc": ["body", "a"], "msg": "m1"}, {"loc": ["body", "b"], "msg": "m2"}]},
+            "body.a: m1; body.b: m2",
+        ),
+        "detail string": ({"detail": "Token invalid"}, "Token invalid"),
+        # 7017316 returns a correlation id instead of internal detail; losing it
+        # from the UI leaves an operator nothing to grep for.
+        "correlation id": (
+            {"error": "Internal server error", "correlation_id": "abc123"},
+            "Internal server error (correlation_id: abc123)",
+        ),
+    }
+
+    script = [fn, "const out = {};"]
+    for name, (body, _) in cases.items():
+        script.append(
+            f"try {{ out[{json.dumps(name)}] = apiErrorMessage({json.dumps(body)}); }}"
+            f" catch (e) {{ out[{json.dumps(name)}] = 'THREW ' + e.message; }}"
+        )
+    script.append("console.log(JSON.stringify(out));")
+
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as handle:
+        handle.write("\n".join(script))
+        path = handle.name
+    result = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+    actual = json.loads(result.stdout)
+    assert actual == {name: expected for name, (_, expected) in cases.items()}
+
+
+def test_response_pane_never_parses_crawled_markup_into_the_document():
+    """`innerHTML = textContent` re-parsed the crawl response as HTML.
+
+    2026-08-31 dogfood: a crawled page's <img>/<link> were inserted into the
+    Playground document and issued real requests from this origin, and
+    highlight.js warned "unescaped HTML" on every run.
+    """
+    playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
+    reset = playground.split("function forceHighlightElement", maxsplit=1)[1]
+    reset = reset.split("hljs.highlightElement", maxsplit=1)[0]
+    assert "element.textContent = text;" in reset
+    assert "element.innerHTML" not in reset
+    # One highlight per render. The deleted call sat after the if/else and so ran
+    # a second time on the block a branch had just highlighted, which is what
+    # produced the hljs warning. Match the shape (a highlight immediately after a
+    # closing brace at the branch's indent), not a call count, so hoisting the
+    # repeated querySelector stays allowed.
+    body = playground.split("async function runCrawl", maxsplit=1)[1]
+    body = body.split("async function runStressTest", maxsplit=1)[0]
+    assert not re.search(
+        r"\n {16}}\n+\s*forceHighlightElement\(", body
+    ), "runCrawl highlights the response block twice on a success path"
+
+
+def test_stress_test_fails_closed_and_averages_over_completed_chunks():
+    """2026-08-31 dogfood ISSUE-001/ISSUE-002.
+
+    Every chunk reported a tick on HTTP 401, and the average divided by the
+    last-finished chunk's index rather than the number of timed chunks.
+    """
+    playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
+    stress = playground.split("async function runStressTest", maxsplit=1)[1]
+
+    success, _, failure = stress.partition("} catch (error) {")
+
+    # Both request paths reject a non-2xx response instead of ticking it green,
+    # and neither may parse the body in a way that can throw first (a proxy 502
+    # answers with HTML, and that would hide the status).
+    assert stress.count("if (!response.ok)") == 2
+    assert stress.count("await response.json().catch(() => null)") == 2
+    assert "await response.json();" not in stress
+
+    # The average divides by the chunks actually timed, never by a chunk index.
+    assert "totalTime / succeededChunks" in stress
+    assert "totalTime / (index + 1)" not in stress
+
+    # Success and failure bookkeeping each live on their own side of the catch —
+    # a positive assertion, so deleting either one fails rather than passing.
+    assert "succeededChunks++" in success and "succeededChunks++" not in failure
+    assert "completed += batch.length;" in success
+    assert "completed += batch.length;" not in failure
+    assert "failedChunks++" in failure and "failedChunks++" not in success
+    assert "Stress test finished with ${failedChunks}" in stress
+
+    # Unknown memory reads the same in the per-chunk log and in the footer; the
+    # footer used to print a fabricated 0MB beside a log line saying n/a.
+    assert "Number.isFinite(memory) ? `${memory}MB` : 'n/a'" in stress
+    assert "Number.isFinite(peakMemory) ? `${peakMemory}MB` : 'n/a'" in stress
+    assert "let maxMem;" in stress  # never seeded with a real-looking 0
+
+
+def test_monitor_controls_are_named_and_layout_survives_a_mobile_viewport():
+    """2026-08-31 dogfood ISSUE-003/ISSUE-004: two critical axe `select-name`
+    violations, and a header group 334px wider than a 390px viewport."""
+    from bs4 import BeautifulSoup
+
+    monitor_text = (DOCKER_DIR / "static" / "monitor" / "index.html").read_text()
+    document = BeautifulSoup(monitor_text, "html.parser")
+
+    assert document.select_one("#filter-requests")["aria-label"] == "Filter requests"
+    assert document.select_one("#timeline-metric")["aria-label"] == "Timeline metric"
+
+    header = document.find("header")
+    assert {"flex-wrap", "gap-4"} <= set(header["class"])
+    assert {"flex-wrap", "gap-4"} <= set(header.find("h1")["class"])
+    controls = document.select_one("header > div.ml-auto")
+    assert {"flex-wrap", "gap-4"} <= set(controls["class"])
+
+    # The vendored Tailwind build ships no responsive variants, so the stacking
+    # has to come from the page's own media query. Assert the rule and the class
+    # it targets together — a rule keyed to some other selector would leave every
+    # grid multi-column at 390px while both halves "exist".
+    grids = document.select(".responsive-grid")
+    assert len(grids) == 4
+    assert all("grid" in grid["class"] for grid in grids)
+    rule = re.search(
+        r"@media \(max-width: 767px\) \{(.*?)\n {8}\}", monitor_text, re.DOTALL
+    )
+    assert rule, "no narrow-viewport media query"
+    assert ".responsive-grid" in rule.group(1)
+    assert "grid-template-columns: minmax(0, 1fr);" in rule.group(1)
+
+    # Any responsive utility the page uses must exist in the vendored build,
+    # which is generated per-page: a `md:` class that is not compiled is a silent
+    # no-op that reads like a working fix.
+    compiled_css = (
+        DOCKER_DIR / "static" / "assets" / "tailwind-3.4.17.min.css"
+    ).read_text()
+    used_variants = {
+        cls
+        for tag in document.find_all(class_=True)
+        for cls in tag["class"]
+        if ":" in cls
+    }
+    missing = {
+        cls for cls in used_variants if cls.replace(":", "\\:") not in compiled_css
+    }
+    assert not missing, f"classes absent from the vendored Tailwind build: {missing}"
+
+
 def test_ui_error_and_websocket_fallback_paths_are_explicit():
     playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
     monitor = (DOCKER_DIR / "static" / "monitor" / "index.html").read_text()
 
     assert "const errorData = await response.json().catch(() => ({}));" in playground
-    assert "errorData.detail || errorData.error || 'Request failed'" in playground
+    # FastAPI 422 sends `detail` as an array of objects; interpolating it printed
+    # "[object Object]" and dropped the only actionable text (2026-08-31 dogfood).
+    assert "throw new Error(apiErrorMessage(errorData));" in playground
+    assert "function apiErrorMessage(body" in playground
+    run_crawl = playground.split("async function runCrawl", maxsplit=1)[1]
+    run_crawl = run_crawl.split("async function runStressTest", maxsplit=1)[0]
+    assert ".detail || " not in run_crawl
     assert "Number.isFinite(memory) && Number.isFinite(peakMemory)" in playground
 
     assert "if (!token)" in monitor

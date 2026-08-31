@@ -6,6 +6,7 @@ from auth import require_admin
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from monitor import get_monitor
 from pydantic import BaseModel
+from starlette.websockets import WebSocketState
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/monitor", tags=["monitor"])
@@ -399,6 +400,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("WebSocket client disconnected")
                 break
             except Exception as e:
+                # A send on an already-closed socket raises RuntimeError, not
+                # WebSocketDisconnect, so the retry re-raised it every 2s and
+                # spammed a traceback for the whole stop-grace window on every
+                # rollout (observed 2026-08-31, haiku-18). A closed socket is
+                # terminal: stop instead of retrying.
+                if websocket.application_state is not WebSocketState.CONNECTED:
+                    logger.info("WebSocket closed during update: %s", e)
+                    break
                 logger.error(f"WebSocket error: {e}", exc_info=True)
                 await asyncio.sleep(2)  # Continue trying
 

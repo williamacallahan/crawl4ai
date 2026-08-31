@@ -389,8 +389,8 @@
             <div class="px-4 py-2 border-t border-border text-sm text-secondary">
                 <div class="flex justify-between">
                     <span>Completed: <span id="stress-completed">0</span>/<span id="stress-total">0</span></span>
-                    <span>Avg. Time: <span id="stress-avg-time">0</span>ms</span>
-                    <span>Peak Memory: <span id="stress-peak-mem">0</span>MB</span>
+                    <span>Avg. Time: <span id="stress-avg-time">0ms</span></span>
+                    <span>Peak Memory: <span id="stress-peak-mem">0MB</span></span>
                 </div>
             </div>
         </div>
@@ -412,6 +412,35 @@
                 opts.headers = { ...opts.headers, 'Authorization': 'Bearer ' + token };
             }
             return fetch(url, opts);
+        }
+
+        // FastAPI sends `detail` as a string for HTTPException and as an array of
+        // {loc, msg} objects for 422 validation errors. Interpolating the array
+        // rendered "[object Object]" and threw away the only actionable text.
+        // Entries are treated as untrusted: an array may hold nulls, plain
+        // strings, or objects with no `msg`, and none of those may throw or
+        // print "undefined" into the response pane.
+        function apiErrorMessage(body) {
+            const detail = body && body.detail;
+            const lines = (Array.isArray(detail) ? detail : []).map(entry => {
+                if (entry === null || typeof entry !== 'object') {
+                    return entry ? String(entry) : '';
+                }
+                if (!entry.msg) return '';
+                const where = Array.isArray(entry.loc) ? entry.loc.join('.') : entry.loc;
+                return where ? `${where}: ${entry.msg}` : String(entry.msg);
+            }).filter(Boolean);
+
+            let message;
+            if (lines.length) message = lines.join('; ');
+            else if (typeof detail === 'string' && detail) message = detail;
+            else if (detail && !Array.isArray(detail)) message = JSON.stringify(detail);
+            else message = (body && body.error) || 'Request failed';
+
+            // 7017316 replaced client-facing crawl detail with a correlation id so
+            // an operator can grep the log for it; keep it reachable from the UI.
+            const cid = body && body.correlation_id;
+            return cid ? `${message} (correlation_id: ${cid})` : message;
         }
 
         function applyToken() {
@@ -746,7 +775,7 @@
                     responseData = await response.json();
                     const time = Math.round(performance.now() - startTime);
                     if (!response.ok) {
-                        throw new Error(responseData.detail || responseData.error || 'Request failed');
+                        throw new Error(apiErrorMessage(responseData));
                     }
                     updateStatus('success', time);
                     document.querySelector('#response-content code').textContent = JSON.stringify(responseData, null, 2);
@@ -762,7 +791,7 @@
 
                     if (!response.ok) {
                         const errorData = await response.json().catch(() => ({}));
-                        throw new Error(errorData.detail || errorData.error || 'Request failed');
+                        throw new Error(apiErrorMessage(errorData));
                     }
 
                     const reader = response.body.getReader();
@@ -793,7 +822,7 @@
                     const time = Math.round(performance.now() - startTime);
 
                     if (!response.ok) {
-                        throw new Error(responseData.detail || responseData.error || 'Request failed');
+                        throw new Error(apiErrorMessage(responseData));
                     }
 
                     updateStatus(
@@ -808,8 +837,6 @@
                     forceHighlightElement(document.querySelector('#response-content code'));
                 }
 
-                forceHighlightElement(document.querySelector('#response-content code'));
-                
                 // For generateSnippets, handle the LLM case specially
                 if (endpoint === 'llm') {
                     const url = urls[0];
@@ -844,8 +871,8 @@
 
             document.getElementById('stress-completed').textContent = '0';
             document.getElementById('stress-total').textContent = total;
-            document.getElementById('stress-avg-time').textContent = '0';
-            document.getElementById('stress-peak-mem').textContent = '0';
+            document.getElementById('stress-avg-time').textContent = '0ms';
+            document.getElementById('stress-peak-mem').textContent = '0MB';
 
             const api = '/crawl'; // Always use /crawl - backend handles streaming internally
             const urls = Array.from({ length: total }, (_, i) => `https://httpbin.org/anything/stress-${i}-${Date.now()}`);
@@ -856,8 +883,10 @@
             }
 
             let completed = 0;
+            let succeededChunks = 0;
+            let failedChunks = 0;
             let totalTime = 0;
-            let peakMemory = 0;
+            let peakMemory;
 
             const processBatch = async (batch, index) => {
                 const payload = {
@@ -876,9 +905,15 @@
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(payload)
                         });
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}: ` +
+                                apiErrorMessage(await response.json().catch(() => null)));
+                        }
 
                         const reader = response.body.getReader();
-                        let maxMem = 0;
+                        // Stays undefined when the server reports no memory, so a
+                        // silent server is never rendered as a real "Peak 0MB".
+                        let maxMem;
                         while (true) {
                             const { value, done } = await reader.read();
                             if (done) break;
@@ -886,8 +921,8 @@
                             text.split('\n').forEach(line => {
                                 try {
                                     const obj = JSON.parse(line);
-                                    if (obj.server_memory_mb) {
-                                        maxMem = Math.max(maxMem, obj.server_memory_mb);
+                                    if (Number.isFinite(obj.server_memory_mb)) {
+                                        maxMem = Math.max(maxMem ?? 0, obj.server_memory_mb);
                                     }
                                 } catch { }
                             });
@@ -901,24 +936,48 @@
                             body: JSON.stringify(payload)
                         });
 
-                        const data = await response.json();
+                        // Same shape as the streaming branch: an upstream proxy can
+                        // answer a 502 with HTML, and response.json() would then throw
+                        // before the status this guard exists to report is read.
+                        const data = await response.json().catch(() => null);
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}: ${apiErrorMessage(data)}`);
+                        }
+                        if (!data) {
+                            throw new Error(`HTTP ${response.status}: response body was not JSON`);
+                        }
                         memory = data.server_peak_memory_mb;
                     }
 
                     time = Math.round(performance.now() - start);
-                    peakMemory = Math.max(peakMemory, memory || 0);
+                    if (Number.isFinite(memory)) {
+                        peakMemory = Math.max(peakMemory ?? 0, memory);
+                    }
                     totalTime += time;
+                    succeededChunks++;
+                    completed += batch.length;
 
-                    logEl.textContent += `[${index + 1}/${chunks.length}] ✔ ${time}ms | Peak ${memory}MB\n`;
+                    const peak = Number.isFinite(memory) ? `${memory}MB` : 'n/a';
+                    logEl.textContent += `[${index + 1}/${chunks.length}] ✔ ${time}ms | Peak ${peak}\n`;
                 } catch (error) {
                     time = Math.round(performance.now() - start);
+                    failedChunks++;
                     logEl.textContent += `[${index + 1}/${chunks.length}] ✖ ${time}ms | ${error.message}\n`;
                 }
 
-                completed += batch.length;
+                // `completed` counts URLs that actually succeeded, so the footer
+                // cannot read 2/2 while every request failed.
                 document.getElementById('stress-completed').textContent = completed;
-                document.getElementById('stress-peak-mem').textContent = peakMemory;
-                document.getElementById('stress-avg-time').textContent = Math.round(totalTime / (index + 1));
+                document.getElementById('stress-peak-mem').textContent =
+                    Number.isFinite(peakMemory) ? `${peakMemory}MB` : 'n/a';
+                // Divide by the chunks actually timed, and say n/a when none were.
+                // The old divisor was `index + 1` — the position of whichever chunk
+                // wrote last. Chunks finish out of order under concurrency, so when
+                // the last one to finish was not the highest-numbered one the
+                // divisor was too small and the average came out inflated, by up to
+                // N x when chunk 1 finished last (2026-08-31 dogfood ISSUE-002).
+                document.getElementById('stress-avg-time').textContent =
+                    succeededChunks ? `${Math.round(totalTime / succeededChunks)}ms` : 'n/a';
 
                 logEl.scrollTop = logEl.scrollHeight;
             };
@@ -940,7 +999,9 @@
                     }
 
                     if (active === 0 && index >= chunks.length) {
-                        logEl.textContent += '\n✅ Stress test completed\n';
+                        logEl.textContent += failedChunks
+                            ? `\n❌ Stress test finished with ${failedChunks}/${chunks.length} failed chunks\n`
+                            : `\n✅ Stress test completed (${succeededChunks}/${chunks.length} chunks)\n`;
                         resolve();
                     }
                 };
@@ -959,9 +1020,13 @@
             // Save current scroll position (important for large code blocks)
             const scrollTop = element.parentElement.scrollTop;
 
-            // Reset the element
+            // Reset the element. textContent, never innerHTML: the block holds a
+            // crawl response, so innerHTML parsed the crawled page's own markup
+            // into this document (proved 2026-08-31: <img>/<link> from a crawled
+            // page issued real requests from this origin, and highlight.js then
+            // warned "unescaped HTML" on every run).
             const text = element.textContent;
-            element.innerHTML = text;
+            element.textContent = text;
             element.removeAttribute('data-highlighted');
 
             // Reapply highlighting
