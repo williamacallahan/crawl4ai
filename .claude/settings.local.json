@@ -30,7 +30,27 @@
       "Bash(sips -g pixelWidth -g pixelHeight kakao-favicon-64.png)",
       "Bash(sips -g pixelWidth -g pixelHeight vfo.png xp3.png)",
       "Bash(ping -c 2 -W 3 haiku-4.tail5038c7.ts.net)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(/private/tmp/claude-501/-Users-williamcallahan-Developer-git-crawl4ai/a3178a5a-76f1-417c-bf89-024c2cfd79f9/scratchpad/haiku4_watch.sh *)",
+      "Bash(/Users/williamcallahan/.claude/skills/agent-browser/scripts/run fill *)",
+      "Bash(\"$HOME/.claude/skills/agent-browser/scripts/run\" --session c4ai-auth open https://crawl4ai.haiku.host/playground/ && \"$HOME/.claude/skills/agent-browser/scripts/run\" --session c4ai-auth wait --load networkidle)",
+      "Bash(/Users/williamcallahan/.claude/skills/agent-browser/scripts/run --session c4ai-auth snapshot -i)",
+      "Bash(/Users/williamcallahan/.claude/skills/agent-browser/scripts/run --session c4ai-auth click @e14)",
+      "Bash(\"$HOME/.claude/skills/agent-browser/scripts/run\" --session c4ai-auth click @e2 && sleep 4 && \"$HOME/.claude/skills/agent-browser/scripts/run\" --session c4ai-auth screenshot /private/tmp/claude-501/-Users-williamcallahan-Developer-git-crawl4ai/a3178a5a-76f1-417c-bf89-024c2cfd79f9/scratchpad/dogfood-output/screenshots/monitor-auth.png && \"$HOME/.claude/skills/agent-browser/scripts/run\" --session c4ai-auth errors 2>&1 | head -4)",
+      "Bash(PYTHONPATH=\"$PWD:$PWD/deploy/docker\" /Users/williamcallahan/Developer/git/crawl4ai/.venv/bin/python -m pytest -q --no-header deploy/docker/tests/test_rollout_verifier.py 2>&1 | tail -6)",
+      "Bash(PYTHONPATH=\"/Users/williamcallahan/Developer/git/crawl4ai:/Users/williamcallahan/Developer/git/crawl4ai/deploy/docker\" /Users/williamcallahan/Developer/git/crawl4ai/.venv/bin/python -m pytest -q --no-header deploy/docker/tests/test_rollout_verifier.py -k \"eligible_nodes or legacy or foreign or ready_capacity or stock_update\" 2>&1 | tail -4)",
+      "Bash(git checkout *)",
+      "Bash(node /Users/williamcallahan/.claude/skills/ce-simplify-code/scripts/context.mjs)",
+      "Bash(PYTHONPATH=\"$PWD:$PWD/deploy/docker\" /Users/williamcallahan/Developer/git/crawl4ai/.venv/bin/python -m pytest -q --no-header deploy/docker/tests/test_rollout_verifier.py 2>&1 | tail -2)",
+      "Bash(grep *)",
+      "Bash(node *)",
+      "Bash(/private/tmp/claude-501/-Users-williamcallahan-Developer-git-crawl4ai/a3178a5a-76f1-417c-bf89-024c2cfd79f9/scratchpad/poll_codex.sh *)",
+      "Bash(git *)",
+      "Bash(/private/tmp/claude-501/-Users-williamcallahan-Developer-git-crawl4ai/a3178a5a-76f1-417c-bf89-024c2cfd79f9/scratchpad/reconcile_watch.sh *)",
+      "Bash(/private/tmp/claude-501/-Users-williamcallahan-Developer-git-crawl4ai/a3178a5a-76f1-417c-bf89-024c2cfd79f9/scratchpad/final_run_watch.sh)",
+      "Bash(AB=\"$HOME/.claude/skills/agent-browser/scripts/run\"; S=\"crawl4ai-dogfood-0831\"; rm -f /Users/williamcallahan/Developer/git/crawl4ai/dogfood-output/videos/issue-001-repro.webm; $AB --session $S open https://crawl4ai.haiku.host/playground/ >/dev/null 2>&1; $AB --session $S record start /Users/williamcallahan/Developer/git/crawl4ai/dogfood-output/videos/issue-001-repro.webm 2>&1|tail -1)",
+      "Bash(AB=\"$HOME/.claude/skills/agent-browser/scripts/run\"; S=\"crawl4ai-dogfood-0831\"; rm -f /Users/williamcallahan/Developer/git/crawl4ai/dogfood-output/videos/issue-002-repro.webm; $AB --session $S record start /Users/williamcallahan/Developer/git/crawl4ai/dogfood-output/videos/issue-002-repro.webm >/dev/null 2>&1; $AB --session $S eval '\\(\\(\\)=>JSON.stringify\\({tokenLen:\\(window.getToken\\(\\)||\"\"\\).length}\\)\\)\\(\\)' 2>&1|tail -1)",
+      "Bash(/private/tmp/claude-501/-Users-williamcallahan-Developer-git-crawl4ai/a3178a5a-76f1-417c-bf89-024c2cfd79f9/scratchpad/respread_watch.sh)"
     ]
   },
   "enableAllProjectMcpServers": false
