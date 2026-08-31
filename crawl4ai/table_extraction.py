@@ -240,10 +240,11 @@ class DefaultTableExtraction(TableExtractionStrategy):
                 colspan = int(cell.get("colspan", 1))
                 headers.extend([text] * colspan)
         else:
-            # Check first row for headers
+            # Only infer headers from semantic <th> cells; a first row of <td>
+            # is data, so leave headers empty and generate defaults below.
             first_row = table.xpath(".//tr[1]")
             if first_row:
-                for cell in first_row[0].xpath(".//th|.//td"):
+                for cell in first_row[0].xpath(".//th"):
                     text = cell.text_content().strip()
                     colspan = int(cell.get("colspan", 1))
                     headers.extend([text] * colspan)
