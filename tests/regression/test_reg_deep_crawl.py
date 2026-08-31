@@ -552,6 +552,66 @@ async def test_dfs_max_pages_one(local_server):
 
 
 @pytest.mark.asyncio
+async def test_dfs_max_pages_enforced_batch(local_server):
+    """DFS with max_pages>1 in batch mode must stop at exactly max_pages (no overshoot).
+
+    Regression test for the bug where the inner-loop ``break`` only exits the
+    ``for result in url_results`` loop, leaving URLs already on the stack to be
+    processed by the outer ``while stack`` loop and exceeding max_pages.
+    """
+    base = _to_ip_url(local_server)
+    hub_url = base + "/deep/hub"
+    strategy = DFSDeepCrawlStrategy(max_depth=5, max_pages=3)
+    config = CrawlerRunConfig(deep_crawl_strategy=strategy, verbose=False)
+
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        results = await crawler.arun(url=hub_url, config=config)
+
+        result_list = list(results)
+        assert len(result_list) <= 3, (
+            f"DFS batch should not exceed max_pages=3, got {len(result_list)} results: "
+            f"{[r.url for r in result_list]}"
+        )
+        assert len(result_list) == 3, (
+            f"DFS batch should crawl exactly max_pages=3 pages (site has plenty), "
+            f"got {len(result_list)}: {[r.url for r in result_list]}"
+        )
+        # The first page must be the hub (depth 0)
+        assert "/deep/hub" in result_list[0].url
+
+
+@pytest.mark.asyncio
+async def test_dfs_max_pages_enforced_stream(local_server):
+    """DFS with max_pages>1 in stream mode must stop at exactly max_pages (no overshoot).
+
+    Same regression as the batch test but exercises ``_arun_stream``.
+    """
+    base = _to_ip_url(local_server)
+    hub_url = base + "/deep/hub"
+    strategy = DFSDeepCrawlStrategy(max_depth=5, max_pages=3)
+    config = CrawlerRunConfig(
+        deep_crawl_strategy=strategy,
+        stream=True,
+        verbose=False,
+    )
+
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        results = []
+        async for result in await crawler.arun(url=hub_url, config=config):
+            results.append(result)
+
+        assert len(results) <= 3, (
+            f"DFS stream should not exceed max_pages=3, got {len(results)} results: "
+            f"{[r.url for r in results]}"
+        )
+        assert len(results) == 3, (
+            f"DFS stream should crawl exactly max_pages=3 pages (site has plenty), "
+            f"got {len(results)}: {[r.url for r in results]}"
+        )
+        assert "/deep/hub" in results[0].url
+
+
+@pytest.mark.asyncio
 async def test_bfs_depth_zero(local_server):
     """BFS with max_depth=0 should only return the start page."""
     base = _to_ip_url(local_server)
