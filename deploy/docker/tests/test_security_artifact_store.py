@@ -140,3 +140,107 @@ class TestJanitor:
         assert reaped >= 2
         # the fresh one survives
         store.resolve_artifact(meta["artifact_id"])
+
+
+class TestWriteFailureCleanup:
+    """Regression for orphan-on-write-failure (introduced in 60886d1).
+
+    A failed `f.write()` used to leave a partially-written file on disk with no
+    cleanup. Because quota is checked pre-write against the larger requested
+    size, a partial orphan leaves total usage <= quota, so the janitor's
+    quota-based reaper never runs and TTL reaping takes up to 1 hour. A single
+    transient I/O error could block legitimate retries for that whole window.
+    The fix wraps the write in try/except OSError and unlinks the orphan.
+    """
+
+    @staticmethod
+    def _install_failing_fdopen(monkeypatch, *, partial_bytes: int = 0,
+                               fail_times: int = 1):
+        """Patch `os.fdopen` so the next `fail_times` calls return a file whose
+        `write()` raises OSError. If `partial_bytes > 0`, that many leading
+        bytes are flushed to disk before the error to mimic a mid-stream
+        failure leaving a non-empty partial file. Subsequent calls revert to
+        the real `os.fdopen` so retries can succeed."""
+        real_fdopen = os.fdopen
+
+        class _FailingWriter:
+            def __init__(self, fd):
+                self._f = real_fdopen(fd, "wb")
+                self._partial = partial_bytes
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self._f.close()  # flushes any partial bytes to disk
+                return False
+
+            def write(self, data):
+                if self._partial:
+                    self._f.write(data[:self._partial])
+                    self._partial = 0
+                raise OSError("simulated disk I/O error during write")
+
+        state = {"remaining": fail_times}
+
+        def patched_fdopen(fd, mode):
+            if state["remaining"] > 0:
+                state["remaining"] -= 1
+                return _FailingWriter(fd)
+            return real_fdopen(fd, mode)
+
+        monkeypatch.setattr(os, "fdopen", patched_fdopen)
+
+    @pytest.mark.parametrize("partial_bytes", [0, 200])
+    def test_failed_write_unlinks_orphan_and_reraises(self, store, monkeypatch, partial_bytes):
+        # A failed write must reraise OSError AND leave no orphan behind,
+        # whether the failure happens before any bytes land (0) or mid-stream
+        # leaving a partial file (200) - the actual bug scenario.
+        self._install_failing_fdopen(monkeypatch, partial_bytes=partial_bytes)
+        with pytest.raises(OSError):
+            store.write_artifact("png", b"x" * 500)
+        assert os.listdir(store.ARTIFACT_DIR) == []
+
+    def test_failed_write_preserves_existing_artifacts(self, store, monkeypatch):
+        keep_meta = store.write_artifact("png", b"keep-me")
+        self._install_failing_fdopen(monkeypatch)
+        with pytest.raises(OSError):
+            store.write_artifact("png", b"x" * 200)
+        # The pre-existing legitimate artifact survives untouched.
+        path, mime = store.resolve_artifact(keep_meta["artifact_id"])
+        assert mime == "image/png"
+        with open(path, "rb") as f:
+            assert f.read() == b"keep-me"
+        remaining = os.listdir(store.ARTIFACT_DIR)
+        assert len(remaining) == 1
+
+    def test_failed_write_does_not_block_subsequent_writes(self, store, monkeypatch):
+        # Reproduce the report's impact scenario at the small test quota (4096).
+        # 3000 bytes of legitimate artifacts already stored.
+        for _ in range(3):
+            store.write_artifact("png", b"y" * 1000)
+        # A 900-byte write passes quota (3000 + 900 = 3900 <= 4096) but fails
+        # mid-stream leaving a 500-byte orphan. fail_times=1 so the retry
+        # below uses the real os.fdopen.
+        self._install_failing_fdopen(monkeypatch, partial_bytes=500, fail_times=1)
+        with pytest.raises(OSError):
+            store.write_artifact("png", b"z" * 900)
+        # WITHOUT the fix: orphan persists (total = 3500), retry of 900 bytes
+        # would be rejected (3500 + 900 = 4400 > 4096) -> QuotaExceeded.
+        # WITH the fix: orphan is gone (total = 3000), retry succeeds.
+        meta = store.write_artifact("png", b"z" * 900)
+        assert meta["size"] == 900
+        store.resolve_artifact(meta["artifact_id"])
+
+    def test_unlink_failure_does_not_mask_original_oserror(self, store, monkeypatch):
+        # If the cleanup unlink also fails, the outer `raise` must still
+        # surface the original write OSError (the inner except OSError: pass
+        # must swallow only the unlink error).
+        self._install_failing_fdopen(monkeypatch, partial_bytes=100)
+
+        def failing_unlink(path):
+            raise OSError("simulated cleanup failure")
+
+        monkeypatch.setattr(os, "unlink", failing_unlink)
+        with pytest.raises(OSError, match="simulated disk I/O error during write"):
+            store.write_artifact("png", b"x" * 400)
