@@ -111,6 +111,24 @@ _SCRIPT_BLOCK_RE = re.compile(r'<script\b[\s\S]*?</script>', re.IGNORECASE)
 _TAG_RE = re.compile(r'<[^>]+>')
 _BODY_RE = re.compile(r'<body\b', re.IGNORECASE)
 
+# Elements hidden via inline CSS. The opening quote of the style attribute is
+# captured and reused as a backreference so the value may contain the *other*
+# quote character (e.g. style="font-family:'Arial';display:none"). The closing
+# tag uses the captured tag name so matches don't bleed across elements.
+# Case-insensitive, DOTALL so multi-line hidden blocks are matched. The
+# (?<=\s) guard ensures "style" is a real attribute (preceded by whitespace),
+# not e.g. a "style=" substring inside another attribute's value.
+_HIDDEN_CONTENT_PATTERNS = [
+    re.compile(
+        r'<([a-z]+)\b[^>]*(?<=\s)style=(["\'])(?:(?!\2).)*?display\s*:\s*none(?:(?!\2).)*\2[^>]*>.*?</\1>',
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r'<([a-z]+)\b[^>]*(?<=\s)style=(["\'])(?:(?!\2).)*?visibility\s*:\s*hidden(?:(?!\2).)*\2[^>]*>.*?</\1>',
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
+
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
@@ -160,6 +178,11 @@ def _structural_integrity_check(html: str) -> Tuple[bool, str]:
     # Signal 2: Minimal visible text after stripping scripts/styles/tags
     body_match = re.search(r'<body\b[^>]*>([\s\S]*)</body>', html, re.IGNORECASE)
     body_content = body_match.group(1) if body_match else html
+    # Drop elements hidden via inline CSS (display:none / visibility:hidden)
+    # so their text does not inflate the visible-text count. Otherwise a
+    # block page can pad with CSS-hidden text to bypass the minimal_text signal.
+    for _hidden_re in _HIDDEN_CONTENT_PATTERNS:
+        body_content = _hidden_re.sub('', body_content)
     stripped = _SCRIPT_BLOCK_RE.sub('', body_content)
     stripped = _STYLE_TAG_RE.sub('', stripped)
     visible_text = _TAG_RE.sub('', stripped).strip()
