@@ -135,7 +135,12 @@ async def llm_permit(redis, config):
         heartbeat.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat
-        await redis.eval(_RELEASE_LLM_PERMIT, 1, LLM_PERMIT_KEY, token)
+        try:
+            await redis.eval(_RELEASE_LLM_PERMIT, 1, LLM_PERMIT_KEY, token)
+        except Exception:
+            # Cleanup must never mask the result of the protected work; the
+            # permit self-releases via TTL when the Lua compare-and-del fails.
+            logger.exception("Failed to release LLM permit during cleanup")
 
 
 async def _enqueue_job(background_tasks, factory, principal=None, on_cancel=None):
