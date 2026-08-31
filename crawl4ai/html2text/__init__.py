@@ -1199,23 +1199,3 @@ class CustomHTML2Text(HTML2Text):
 
         # Default behavior for other tags
         super().handle_data(data, entity_char)
-
-    #     # Handle pre tags
-    #     if tag == 'pre':
-    #         if start:
-    #             self.o('```\n')
-    #             self.inside_pre = True
-    #         else:
-    #             self.o('\n```')
-    #             self.inside_pre = False
-    #     # elif tag in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-    #     #     pass
-    #     else:
-    #         super().handle_tag(tag, attrs, start)
-
-    # def handle_data(self, data, entity_char=False):
-    #     """Override handle_data to capture content within preserved tags."""
-    #     if self.preserve_depth > 0:
-    #         self.preserved_content.append(data)
-    #         return
-    #     super().handle_data(data, entity_char)
