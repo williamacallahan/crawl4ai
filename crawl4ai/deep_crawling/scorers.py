@@ -1,14 +1,9 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Optional
-from dataclasses import dataclass
-from urllib.parse import urlparse, unquote
 import re
-import logging
 from functools import lru_cache
 from array import array
 import ctypes
-import platform
-PLATFORM = platform.system()
 
 # Pre-computed scores for common year differences
 _SCORE_LOOKUP = [1.0, 0.5, 0.3333333333333333, 0.25]
@@ -165,13 +160,7 @@ class KeywordRelevanceScorer(URLScorer):
         self._case_sensitive = case_sensitive
         # Pre-process keywords once
         self._keywords = [k if case_sensitive else k.lower() for k in keywords]
-    
-    @lru_cache(maxsize=10000)
-    def _url_bytes(self, url: str) -> bytes:
-        """Cache decoded URL bytes"""
-        return url.encode('utf-8') if self._case_sensitive else url.lower().encode('utf-8')
-    
-    
+
     def _calculate_score(self, url: str) -> float:
         """Fast string matching without regex or byte conversion"""
         if not self._case_sensitive:
