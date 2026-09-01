@@ -175,7 +175,17 @@ class WorkQueue:
 
     async def _release(self, principal: str | None, claim_token: str | None) -> None:
         if self.redis is not None:
-            await release_principal_quota(self.redis, claim_token)
+            try:
+                await release_principal_quota(self.redis, claim_token)
+            except Exception:
+                # Same failure class as the LLM-permit release (#63): a Redis
+                # blip here must not kill the worker task, skip task_done(), or
+                # replace a QueueFull/QuotaExceeded with a connection error.
+                # Unlike the permit key these quota hashes have no TTL, so a
+                # swallowed failure leaks one slot for this principal.
+                logger.exception(
+                    "Failed to release principal quota (claim %s)", claim_token
+                )
             return
         if not principal:
             return
