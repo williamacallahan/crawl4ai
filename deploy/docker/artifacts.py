@@ -96,8 +96,15 @@ def _write_artifact(kind: str, data: bytes) -> dict:
     # symlink at the final component. Server-chosen name => no traversal.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
     return {"artifact_id": artifact_id, "mime": mime, "size": len(data)}
 
 
