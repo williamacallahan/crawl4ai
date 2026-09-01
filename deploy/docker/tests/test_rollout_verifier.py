@@ -772,6 +772,20 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     assert len(calls) == fail_on
 
 
+def _wire_final_evidence(monkeypatch, tasks):
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(CANDIDATE, REVISION))
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {
+            url: sorted(instances) for url in rollout.HEALTH_URLS
+        },
+    )
+    monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: tasks)
+
+
 def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, capsys):
     path = tmp_path / "evidence.jsonl"
     rows = [
@@ -783,6 +797,7 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
     monkeypatch.setenv("GITHUB_SHA", REVISION)
     rollout._task_proof_path().write_text(json.dumps({
         "revision": REVISION,
+        "image": CANDIDATE,
         "baselineRevision": "baseline",
         "tasks": ["task1", "task2", "task3"],
         "nodes": ["haiku-4", "haiku-5", "haiku-9"],
@@ -797,11 +812,9 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
     monkeypatch.setattr(
         rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
     )
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
-    monkeypatch.setattr(
-        rollout,
-        "_verify_tasks",
-        lambda *_args: {
+    _wire_final_evidence(
+        monkeypatch,
+        {
             "tasks": ["task1", "task2", "task3"],
             "nodes": ["haiku-4", "haiku-5", "haiku-9"],
             "instances": ["one", "two", "three"],
@@ -810,7 +823,7 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
     rollout.evidence()
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["publicInstances"] == {
-        url: ["three", "one", "two"] for url in rollout.HEALTH_URLS
+        url: ["one", "three", "two"] for url in rollout.HEALTH_URLS
     }
     rows[0]["revision"] = "baseline"
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
@@ -819,6 +832,15 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
     rows[0]["revision"] = "foreign"
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     with pytest.raises(RuntimeError, match="foreign revision"):
+        rollout.evidence()
+    rows[0]["revision"] = REVISION
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    monkeypatch.setattr(
+        rollout,
+        "verify_route",
+        lambda *_args: (_ for _ in ()).throw(ValueError("route changed")),
+    )
+    with pytest.raises(ValueError, match="route changed"):
         rollout.evidence()
 
 
@@ -841,6 +863,7 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
     monkeypatch.setenv("GITHUB_SHA", REVISION)
     rollout._task_proof_path().write_text(json.dumps({
         "revision": REVISION,
+        "image": CANDIDATE,
         "baselineRevision": "baseline",
         "tasks": ["task1", "task2", "task3"],
         "nodes": ["haiku-4", "haiku-5", "haiku-9"],
@@ -853,11 +876,9 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
     monkeypatch.setattr(
         rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
     )
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
-    monkeypatch.setattr(
-        rollout,
-        "_verify_tasks",
-        lambda *_args: {
+    _wire_final_evidence(
+        monkeypatch,
+        {
             "tasks": ["task1", "task2", "task3"],
             "nodes": ["haiku-4", "haiku-5", "haiku-9"],
             "instances": ["one", "two", "three"],
@@ -890,6 +911,7 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
     monkeypatch.setenv("APPLICATION_ID", "app")
     rollout._task_proof_path().write_text(json.dumps({
         "revision": REVISION,
+        "image": CANDIDATE,
         "baselineRevision": "baseline",
         "tasks": ["task1", "task2", "task3"],
         "nodes": ["haiku-4", "haiku-5", "haiku-9"],
@@ -901,11 +923,9 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
     monkeypatch.setattr(
         rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
     )
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
-    monkeypatch.setattr(
-        rollout,
-        "_verify_tasks",
-        lambda *_args: {
+    _wire_final_evidence(
+        monkeypatch,
+        {
             "tasks": ["task1", "task2", "task4"],
             "nodes": ["haiku-4", "haiku-5", "haiku-18"],
             "instances": ["one", "two", "four"],

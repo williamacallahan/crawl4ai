@@ -757,10 +757,19 @@ def deploy() -> None:
     task_proof = _verify_tasks(app_name, candidate, revision, ready)
     verify_route(base, api_key, application_id, app_name)
     public_instances = _verify_public(revision, task_proof["instances"])
+    post_public = _application(base, api_key, application_id)
+    _policy(post_public)
+    if not _record_converged(post_public, candidate, revision):
+        raise RuntimeError("candidate metadata changed during public proof")
+    _running_spec(
+        _service_spec(app_name), candidate, _labels(revision), placements=(PLACEMENT,)
+    )
+    verify_route(base, api_key, application_id, app_name)
     if _verify_tasks(app_name, candidate, revision, ready) != task_proof:
         raise RuntimeError("Crawl4AI task census changed during public proof")
     proof = {
         "revision": revision,
+        "image": candidate,
         "baselineRevision": baseline_revision,
         **task_proof,
         "publicInstances": public_instances,
@@ -843,23 +852,29 @@ def evidence() -> None:
         set(public_instances.get(url, [])) != expected for url in HEALTH_URLS
     ):
         raise RuntimeError("each public domain must observe every authoritative task")
-    application = _application(
-        os.environ["DOKPLOY_URL"],
-        os.environ["DOKPLOY_API_KEY"],
-        os.environ["APPLICATION_ID"],
-    )
-    if application.get("labelsSwarm") != _labels(revision):
+    base = os.environ["DOKPLOY_URL"]
+    api_key = os.environ["DOKPLOY_API_KEY"]
+    application_id = os.environ["APPLICATION_ID"]
+    application = _application(base, api_key, application_id)
+    _policy(application)
+    image = str(task_proof.get("image", ""))
+    if not _record_converged(application, image, revision):
         raise RuntimeError("candidate metadata changed before final evidence")
-    current_task_proof = _verify_tasks(
-        str(application["appName"]),
-        str(application["dockerImage"]),
-        revision,
-        _eligible_nodes(),
+    app_name = str(application["appName"])
+    _running_spec(
+        _service_spec(app_name), image, _labels(revision), placements=(PLACEMENT,)
     )
-    if current_task_proof != {
+    verify_route(base, api_key, application_id, app_name)
+    ready = _eligible_nodes()
+    recorded_task_proof = {
         key: task_proof.get(key) for key in ("tasks", "nodes", "instances")
-    }:
+    }
+    if _verify_tasks(app_name, image, revision, ready) != recorded_task_proof:
         raise RuntimeError("Crawl4AI task census changed before final evidence")
+    current_public_instances = _verify_public(revision, sorted(expected))
+    verify_route(base, api_key, application_id, app_name)
+    if _verify_tasks(app_name, image, revision, ready) != recorded_task_proof:
+        raise RuntimeError("Crawl4AI task census changed during final evidence")
     observed_urls = set()
     for row in rows:
         observed_revision = row.get("revision")
@@ -877,7 +892,7 @@ def evidence() -> None:
             {
                 "publicSuccesses": len(rows),
                 "publicFailures": 0,
-                "publicInstances": public_instances,
+                "publicInstances": current_public_instances,
             },
             separators=(",", ":"),
         )
