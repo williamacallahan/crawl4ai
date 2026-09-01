@@ -364,13 +364,10 @@ class ContentTypeFilter(URLFilter):
     @lru_cache(maxsize=1000)
     def _extract_extension(url: str) -> str:
         """Extracts file extension from a URL."""
-        # Remove scheme (http://, https://) if present
-        if "://" in url:
-            url = url.split("://", 1)[-1]  # Get everything after '://'
-
-        # Remove domain (everything up to the first '/')
-        path_start = url.find("/")
-        path = url[path_start:] if path_start != -1 else ""
+        # Parse only the path component so query strings and fragments
+        # (e.g. "page.html?highlight=code", "manual.pdf#page=2") do not
+        # become part of the extracted extension and cause false negatives.
+        path = urlparse(url).path
 
         # Extract last filename in path
         filename = path.rsplit("/", 1)[-1] if "/" in path else ""
