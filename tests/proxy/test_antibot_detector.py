@@ -195,6 +195,51 @@ check("Structural: hidden multi-line block (DOTALL)",
         '<div style="display:none">' + ('pad text\n' * 30) + '</div></body></html>'),
     True, "minimal_text")
 
+# Shapes a regex-based strip cannot handle (the parser-based strip must):
+check("Structural: hidden block with nested same-tag child",
+    is_blocked(200, _hidden_block('display:none').replace(
+        '<div style="display:none">', '<div style="display:none"><div>x</div>')),
+    True, "minimal_text")
+
+check("Structural: hidden with unquoted style attribute",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+        '<div style=display:none>' + ('pad text ' * 12) + '</div></body></html>'),
+    True, "minimal_text")
+
+check("Structural: hidden with whitespace before = in style attribute",
+    is_blocked(200, _hidden_block('display:none').replace('style=', 'style =')),
+    True, "minimal_text")
+
+check("Structural: HTML5 hidden attribute",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+        '<div hidden>' + ('pad text ' * 12) + '</div></body></html>'),
+    True, "minimal_text")
+
+check("Structural: unclosed hidden element still stripped",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+        '<div style="display:none">' + ('pad text ' * 12) + '</body></html>'),
+    True, "minimal_text")
+
+# Adversarial input that made the earlier regex approach backtrack
+# quadratically (~8s at 44KB). The parser path is linear; the loose wall-clock
+# bound only trips on a reintroduced blow-up, not normal machine variance.
+import time as _time
+_adv = ('<html><body><p>hello world content here</p>'
+        + '<a style="x' * 4000 + '</body></html>')
+_t0 = _time.perf_counter()
+_adv_result = is_blocked(200, _adv)
+_adv_elapsed = _time.perf_counter() - _t0
+check("Structural: adversarial unterminated-style page is not misclassified",
+    _adv_result, False)
+check("Structural: adversarial 44KB page processed within 5s bound",
+    (_adv_elapsed < 5.0, f"took {_adv_elapsed:.3f}s"), True)
+
 
 # =========================================================================
 # TRUE NEGATIVES — legitimate pages that MUST NOT be flagged
