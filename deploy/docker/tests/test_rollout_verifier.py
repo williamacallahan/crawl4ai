@@ -343,6 +343,25 @@ def test_running_spec_rejects_artifact_drift():
         rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
 
 
+def test_running_spec_requires_record_labels_beside_control_plane_labels():
+    # Dokploy stamps dokploy.deployment.id on every rendered ContainerSpec since
+    # its 2026-09-01 build; exact label equality then failed every rollout (runs
+    # 33541789332 and 33544931205) although the record's own labels were intact.
+    stamped = service_spec()
+    stamped["TaskTemplate"]["ContainerSpec"]["Labels"]["dokploy.deployment.id"] = "row"
+    rollout._running_spec(stamped, BASELINE, rollout._labels("baseline"))
+
+    for missing_or_changed in ("otel.service.version", "otel.logs.enabled"):
+        changed = service_spec()
+        changed["TaskTemplate"]["ContainerSpec"]["Labels"]["dokploy.deployment.id"] = "row"
+        changed["TaskTemplate"]["ContainerSpec"]["Labels"][missing_or_changed] = "other"
+        with pytest.raises(ValueError, match="labels"):
+            rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
+        del changed["TaskTemplate"]["ContainerSpec"]["Labels"][missing_or_changed]
+        with pytest.raises(ValueError, match="labels"):
+            rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
+
+
 @pytest.mark.parametrize(
     ("custom_definition", "custom_reference", "wrong_url", "wrong_router"),
     [
@@ -492,6 +511,8 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         }
         for index in range(1, 4)
     }
+    # Dokploy's own stamp beside the record's labels must not read as drift.
+    runtimes["task1"]["labels"]["dokploy.deployment.id"] = "row"
     network = [{
         "Id": "network",
         "Services": {
@@ -559,6 +580,28 @@ def test_verify_tasks_rejects_vip_membership_drift(monkeypatch, drift):
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
     with pytest.raises(RuntimeError, match="VIP membership"):
+        rollout._verify_tasks(
+            "crawl4ai",
+            BASELINE,
+            "baseline",
+            frozenset({"haiku-5", "haiku-9", "haiku-18"}),
+            False,
+        )
+
+
+@pytest.mark.parametrize("drift", ["missing", "changed"])
+def test_verify_tasks_rejects_record_label_drift_beside_control_plane_labels(
+    monkeypatch, drift
+):
+    rows, runtimes = _healed_baseline_rows()
+    labels = runtimes["task2"]["labels"]
+    labels["dokploy.deployment.id"] = "row"
+    if drift == "missing":
+        del labels["otel.logs.enabled"]
+    else:
+        labels["otel.service.version"] = "other"
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    with pytest.raises(RuntimeError, match="identity drifted"):
         rollout._verify_tasks(
             "crawl4ai",
             BASELINE,

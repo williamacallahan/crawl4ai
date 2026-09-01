@@ -392,7 +392,12 @@ def _running_spec(
 ) -> None:
     task = spec.get("TaskTemplate") or {}
     container = task.get("ContainerSpec") or {}
-    if container.get("Image") != image or container.get("Labels") != labels:
+    # The record owns its labels; Dokploy stamps its own (dokploy.deployment.id
+    # since the 2026-09-01 control-plane build) beside them, so require the
+    # record's labels rather than exact equality.
+    if container.get("Image") != image or not (
+        labels.items() <= (container.get("Labels") or {}).items()
+    ):
         raise ValueError("running artifact or labels differ from Dokploy")
     _verify_llm_environment(container.get("Env"))
     if container.get("Healthcheck") != HEALTHCHECK:
@@ -607,7 +612,7 @@ def _verify_tasks(
         runtime = _task_runtime(task_id[:12], str(network_details["Id"]))
         if (
             runtime["image"] != image
-            or runtime["labels"] != _labels(revision)
+            or not (_labels(revision).items() <= runtime["labels"].items())
             or runtime["addresses"] != {vip_by_task[task_id].get("EndpointIP")}
         ):
             raise RuntimeError("Crawl4AI task identity drifted")
