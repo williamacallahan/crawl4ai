@@ -77,7 +77,6 @@ class Crawl4aiDockerClient:
         browser_config: Optional[BrowserConfig] = None,
         crawler_config: Optional[CrawlerRunConfig] = None,
         hooks: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
-        hooks_timeout: int = 30
     ) -> Dict[str, Any]:
         """Prepare request data from configs.
 
@@ -93,7 +92,7 @@ class Crawl4aiDockerClient:
 
         Legacy code-based hooks (``Dict[str, Callable]`` or ``Dict[str, str]``)
         are accepted for backward-compatibility but no longer sent: the server
-        would silently ignore them. A ``DeprecationWarning`` is emitted instead.
+        would silently ignore them. A ``FutureWarning`` is emitted instead.
         """
         if self._token:
             self._http_client.headers["Authorization"] = f"Bearer {self._token}"
@@ -120,7 +119,7 @@ class Crawl4aiDockerClient:
 
         Returns ``{"hooks": [<HookSpec>, ...]}`` for declarative input, or
         ``None`` when the input is the legacy code-based format (after emitting
-        a ``DeprecationWarning``), so the server is never sent a payload it
+        a ``FutureWarning``), so the server is never sent a payload it
         would silently drop.
         """
         # Declarative: a bare list of hook specs.
@@ -141,8 +140,13 @@ class Crawl4aiDockerClient:
             "instead, e.g. {'hooks': [{'action': 'block_resources', 'params': "
             "{'resource_types': ['image']}}]}. See deploy/docker/MIGRATION.md. "
             "The legacy hooks were not sent.",
-            DeprecationWarning,
-            stacklevel=3,
+            # FutureWarning: shown by Python's default warning filter even
+            # outside __main__ — a DeprecationWarning would be invisible to
+            # exactly the application code this targets, reproducing the
+            # silent no-op one layer up.
+            FutureWarning,
+            # user code -> crawl() -> _prepare_request() -> here
+            stacklevel=4,
         )
         return None
 
@@ -190,12 +194,18 @@ class Crawl4aiDockerClient:
                    Legacy code-based hooks (``Dict[str, Callable]`` or
                    ``Dict[str, str]``) are no longer executed by the server
                    (removed in 0.9.0 for RCE prevention); passing one emits a
-                   ``DeprecationWarning`` and the hooks are not sent. Use the
+                   ``FutureWarning`` and the hooks are not sent. Use the
                    in-process SDK (``AsyncWebCrawler``) for arbitrary hook
                    code.
+
+                   The server rejects hooks with HTTP 403 (raised here as
+                   ``RequestError``) unless it runs with
+                   ``CRAWL4AI_HOOKS_ENABLED=true``.
             hooks_timeout: Timeout in seconds for the HTTP request to the
-                           server (not a per-hook execution timeout; that
-                           field was removed from the server schema in 0.9.0).
+                           server on the non-streaming path (the streaming
+                           path uses the client's default timeout; not a
+                           per-hook execution timeout — that field was
+                           removed from the server schema in 0.9.0).
 
         Returns:
             Single CrawlResult, list of results, or async generator for streaming
@@ -213,7 +223,7 @@ class Crawl4aiDockerClient:
         """
         await self._check_server()
 
-        data = self._prepare_request(urls, browser_config, crawler_config, hooks, hooks_timeout)
+        data = self._prepare_request(urls, browser_config, crawler_config, hooks)
         is_streaming = crawler_config and crawler_config.stream
 
         self.logger.info(f"Crawling {len(urls)} URLs {'(streaming)' if is_streaming else ''}", tag="CRAWL")

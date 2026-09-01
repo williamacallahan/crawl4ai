@@ -78,7 +78,7 @@ def test_legacy_callable_hooks_emit_deprecation_warning_and_return_none():
     async def my_hook(page, context, **kwargs):
         return page
 
-    with pytest.warns(DeprecationWarning, match="Code-based hooks"):
+    with pytest.warns(FutureWarning, match="Code-based hooks"):
         assert Crawl4aiDockerClient._build_hooks_payload(
             {"on_page_context_created": my_hook}
         ) is None
@@ -86,7 +86,7 @@ def test_legacy_callable_hooks_emit_deprecation_warning_and_return_none():
 
 def test_legacy_string_hooks_emit_deprecation_warning_and_return_none():
     legacy = {"before_goto": "async def hook(page, context, url, **kwargs):\n    return page\n"}
-    with pytest.warns(DeprecationWarning, match="Code-based hooks"):
+    with pytest.warns(FutureWarning, match="Code-based hooks"):
         assert Crawl4aiDockerClient._build_hooks_payload(legacy) is None
 
 
@@ -165,7 +165,7 @@ async def test_crawl_with_legacy_hooks_warns_and_sends_no_hooks(client, monkeypa
     async def my_hook(page, context, **kwargs):
         return page
 
-    with pytest.warns(DeprecationWarning, match="Code-based hooks"):
+    with pytest.warns(FutureWarning, match="Code-based hooks"):
         await client.crawl(
             ["https://example.com"],
             hooks={"on_page_context_created": my_hook},

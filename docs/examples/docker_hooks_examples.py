@@ -1,3 +1,18 @@
+"""
+.. warning::
+    Code-based (callable / string) hooks shown in this file are NO LONGER
+    EXECUTED by the Docker server (removed in 0.9.0 to prevent RCE).
+    Passing them to ``Crawl4aiDockerClient.crawl`` emits a ``FutureWarning``
+    and the crawl runs WITHOUT hooks. Use declarative hooks instead::
+
+        await client.crawl(urls, hooks={"hooks": [
+            {"action": "block_resources", "params": {"resource_types": ["image"]}},
+        ]})
+
+    Available actions: ``GET /hooks/info`` on the server (requires
+    ``CRAWL4AI_HOOKS_ENABLED=true``). See ``deploy/docker/MIGRATION.md``.
+    Callable hooks still work with the in-process SDK (``AsyncWebCrawler``).
+"""
 #!/usr/bin/env python3
 """
 🚀 Crawl4AI Docker Hooks System - Complete Examples
