@@ -18,6 +18,8 @@ Detection is layered:
 import re
 from typing import Optional, Tuple
 
+from lxml import html as lxml_html
+
 
 # ---------------------------------------------------------------------------
 # Tier 1: High-confidence structural markers (single signal sufficient)
@@ -111,6 +113,44 @@ _SCRIPT_BLOCK_RE = re.compile(r'<script\b[\s\S]*?</script>', re.IGNORECASE)
 _TAG_RE = re.compile(r'<[^>]+>')
 _BODY_RE = re.compile(r'<body\b', re.IGNORECASE)
 
+# Inline-CSS declarations that hide an element. Hidden-subtree removal is
+# parser-based (lxml) rather than regex: a regex cannot pair nested tags
+# (an inner </div> ends the match early, leaving padding "visible") and the
+# tempered-dot patterns backtrack quadratically on adversarial input.
+_INLINE_HIDDEN_RE = re.compile(
+    r'display\s*:\s*none|visibility\s*:\s*hidden', re.IGNORECASE
+)
+
+
+def _visible_text_len(html: str) -> Optional[int]:
+    """Length of body text, excluding scripts, styles, elements with the
+    HTML5 ``hidden`` attribute, and inline-CSS-hidden subtrees.
+
+    Returns None when the document cannot be parsed; the caller then falls
+    back to the regex pipeline, which cannot exclude hidden elements.
+    ponytail: whole subtrees are dropped — a descendant that re-shows itself
+    (visibility:visible inside visibility:hidden) is still excluded, and
+    stylesheet/class-based hiding and opacity are out of scope. Upgrade path:
+    computed styles via a real renderer, if FPs ever matter here.
+    """
+    try:
+        body = lxml_html.document_fromstring(html).body
+        if body is None:
+            return None
+    except Exception:
+        return None
+    doomed = [
+        el for el in body.iter()
+        if el.tag in ('script', 'style')
+        or el.get('hidden') is not None
+        or _INLINE_HIDDEN_RE.search(el.get('style') or '')
+    ]
+    for el in doomed:
+        parent = el.getparent()
+        if parent is not None:
+            parent.remove(el)
+    return len(body.text_content().strip())
+
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
@@ -157,13 +197,17 @@ def _structural_integrity_check(html: str) -> Tuple[bool, str]:
     if not _BODY_RE.search(html):
         return True, f"Structural: no <body> tag ({html_len} bytes)"
 
-    # Signal 2: Minimal visible text after stripping scripts/styles/tags
-    body_match = re.search(r'<body\b[^>]*>([\s\S]*)</body>', html, re.IGNORECASE)
-    body_content = body_match.group(1) if body_match else html
-    stripped = _SCRIPT_BLOCK_RE.sub('', body_content)
-    stripped = _STYLE_TAG_RE.sub('', stripped)
-    visible_text = _TAG_RE.sub('', stripped).strip()
-    visible_len = len(visible_text)
+    # Signal 2: Minimal visible text after stripping scripts/styles/tags and
+    # hidden subtrees. Otherwise a block page can pad with CSS-hidden text to
+    # bypass the minimal_text signal.
+    visible_len = _visible_text_len(html)
+    if visible_len is None:
+        # Unparseable markup: regex fallback without hidden-element exclusion.
+        body_match = re.search(r'<body\b[^>]*>([\s\S]*)</body>', html, re.IGNORECASE)
+        body_content = body_match.group(1) if body_match else html
+        stripped = _SCRIPT_BLOCK_RE.sub('', body_content)
+        stripped = _STYLE_TAG_RE.sub('', stripped)
+        visible_len = len(_TAG_RE.sub('', stripped).strip())
     if visible_len < 50:
         signals.append("minimal_text")
 

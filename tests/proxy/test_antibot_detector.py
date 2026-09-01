@@ -155,6 +155,91 @@ check("HTTP 403 near-empty (10 bytes)",
     is_blocked(403, '<html></html>'),
     True, "403")
 
+# --- Structural bypass via CSS-hidden text (regression) ---
+# HTTP 200 block page with short visible text and a <p> (so the
+# no_content_elements signal does NOT fire). Without stripping CSS-hidden
+# content, the hidden text inflates visible_text past 50 chars and the page
+# bypasses the minimal_text signal. The fix strips hidden elements first.
+# The HTML comment keeps html.strip() above the near-empty 100-byte threshold
+# so the structural path (not near-empty) is what catches these.
+_HIDDEN_BLOCK_PROSE = "Checking your browser."
+_HIDDEN_BLOCK_TEMPLATE = (
+    '<html><!-- padding padding padding padding padding padding padding padding -->'
+    '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+    '<div style={q}{css}{q}>' + ('pad text ' * 12) + '</div></body></html>'
+)
+
+def _hidden_block(css, quote='"'):
+    return _HIDDEN_BLOCK_TEMPLATE.format(q=quote, css=css)
+
+check("Structural: hidden display:none text cannot pad past minimal_text",
+    is_blocked(200, _hidden_block('display:none')),
+    True, "minimal_text")
+
+check("Structural: hidden visibility:hidden variant",
+    is_blocked(200, _hidden_block('visibility:hidden')),
+    True, "minimal_text")
+
+check("Structural: hidden with single-quoted attribute",
+    is_blocked(200, _hidden_block('display:none', quote="'")),
+    True, "minimal_text")
+
+check("Structural: hidden style value embeds the other quote char",
+    is_blocked(200, _hidden_block("font-family:'Arial';display:none")),
+    True, "minimal_text")
+
+check("Structural: hidden multi-line block (DOTALL)",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+        '<div style="display:none">' + ('pad text\n' * 30) + '</div></body></html>'),
+    True, "minimal_text")
+
+# Shapes a regex-based strip cannot handle (the parser-based strip must):
+check("Structural: hidden block with nested same-tag child",
+    is_blocked(200, _hidden_block('display:none').replace(
+        '<div style="display:none">', '<div style="display:none"><div>x</div>')),
+    True, "minimal_text")
+
+check("Structural: hidden with unquoted style attribute",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+        '<div style=display:none>' + ('pad text ' * 12) + '</div></body></html>'),
+    True, "minimal_text")
+
+check("Structural: hidden with whitespace before = in style attribute",
+    is_blocked(200, _hidden_block('display:none').replace('style=', 'style =')),
+    True, "minimal_text")
+
+check("Structural: HTML5 hidden attribute",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+        '<div hidden>' + ('pad text ' * 12) + '</div></body></html>'),
+    True, "minimal_text")
+
+check("Structural: unclosed hidden element still stripped",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>' + _HIDDEN_BLOCK_PROSE + '</p>'
+        '<div style="display:none">' + ('pad text ' * 12) + '</body></html>'),
+    True, "minimal_text")
+
+# Adversarial input that made the earlier regex approach backtrack
+# quadratically (~8s at 44KB). The parser path is linear; the loose wall-clock
+# bound only trips on a reintroduced blow-up, not normal machine variance.
+import time as _time
+_adv = ('<html><body><p>hello world content here</p>'
+        + '<a style="x' * 4000 + '</body></html>')
+_t0 = _time.perf_counter()
+_adv_result = is_blocked(200, _adv)
+_adv_elapsed = _time.perf_counter() - _t0
+check("Structural: adversarial unterminated-style page is not misclassified",
+    _adv_result, False)
+check("Structural: adversarial 44KB page processed within 5s bound",
+    (_adv_elapsed < 5.0, f"took {_adv_elapsed:.3f}s"), True)
+
 
 # =========================================================================
 # TRUE NEGATIVES — legitimate pages that MUST NOT be flagged
@@ -278,6 +363,28 @@ check("Short thank you page (200, 120 bytes)",
     is_blocked(200, '<html><body><h1>Thank You!</h1><p>Your order has been placed. Confirmation email sent.</p></body></html>'),
     False)
 
+# --- Legitimate pages with CSS-hidden content (false-positive guards) ---
+# Real pages hide content for accessibility (skip links) and SEO. Stripping
+# that hidden content must NOT push their visible text below the minimal_text
+# threshold. Also, data-style= is not a real hiding attribute; its content
+# must remain visible (the (?<=\s)style= guard in the regex enforces this).
+check("Landing page with hidden a11y skip link",
+    is_blocked(200,
+        '<html><body>'
+        '<a href="#main" style="display:none">Skip to main content</a>'
+        '<h1>Welcome to our site</h1>'
+        '<p>This is the landing page with plenty of visible prose describing the product.</p>'
+        '<p>More paragraphs of genuine marketing copy for the homepage.</p>'
+        '</body></html>'),
+    False)
+
+check("data-style= must not be treated as CSS-hidden",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding -->'
+        '<body><p style="color:red">Checking your browser.</p>'
+        '<span data-style="display:none">' + ('pad text ' * 12) + '</span></body></html>'),
+    False)
+
 
 # =========================================================================
 # EDGE CASES
@@ -319,6 +426,21 @@ check("200 + whitespace-padded but 89 bytes content (above threshold for meaning
 check("200 + exactly 100 bytes stripped (at threshold, no body = structural fail)",
     is_blocked(200, 'x' * 100),
     True, "no <body>")
+
+# CSS-hidden stripping must not over-match non-hidden display/visibility values.
+check("display:block is not treated as hidden (still detected via minimal_text)",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>Checking your browser.</p>'
+        '<div style="display:block">' + ('pad text ' * 12) + '</div></body></html>'),
+    False)
+
+check("visibility:visible is not treated as hidden",
+    is_blocked(200,
+        '<html><!-- padding padding padding padding padding padding padding padding -->'
+        '<body><p>Checking your browser.</p>'
+        '<div style="visibility:visible">' + ('pad text ' * 12) + '</div></body></html>'),
+    False)
 
 
 # =========================================================================
