@@ -394,11 +394,16 @@ class ContentTypeFilter(URLFilter):
         )
         self._check_extension = check_extension
 
-        # Pre-compute extension map for allowed types
+        # Pre-compute extension map for allowed types. An allowed type matches
+        # a MIME exactly ("application/x-httpd-php") or as a bare top-level
+        # category ("text" matches all text/*). Substring matching is wrong
+        # here: "application/x-httpd-php" must not also admit
+        # "application/x-httpd-php-source" (.phps).
         self._ext_map = frozenset(
             ext
-            for ext, mime in self._MIME_MAP.items()
-            if any(allowed in mime for allowed in self.allowed_types)
+            for ext, mime in ext_map.items()
+            if mime in self.allowed_types
+            or mime.split("/", 1)[0] in self.allowed_types
         )
 
     @lru_cache(maxsize=1000)

@@ -25,8 +25,7 @@ class TestContentTypeFilter:
             ("http://example.com/page.json", ["application/json"], True),
             ("http://example.com/image.png", ["text/html"], False),
             ("http://example.com/document.pdf", ["application/pdf"], True),
-            ("http://example.com/page", ["text/html"], True), # No extension, allowed
-            ("http://example.com/page", ["text/html"], False), # No extension, disallowed
+            ("http://example.com/page", ["text/html"], True), # No extension: cannot judge, always allowed
             ("http://example.com/page.unknown", ["text/html"], False), # Unknown extension
             
             # Tests for PHP extensions
