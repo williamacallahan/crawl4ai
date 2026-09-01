@@ -240,10 +240,12 @@ class DefaultTableExtraction(TableExtractionStrategy):
                 colspan = int(cell.get("colspan", 1))
                 headers.extend([text] * colspan)
         else:
-            # Check first row for headers
+            # Only adopt the first row as headers when it is all <th>; a row
+            # mixing <th> (row label) with <td> data must stay data, otherwise
+            # the short th-derived header list truncates every data row.
             first_row = table.xpath(".//tr[1]")
-            if first_row:
-                for cell in first_row[0].xpath(".//th|.//td"):
+            if first_row and not first_row[0].xpath(".//td"):
+                for cell in first_row[0].xpath(".//th"):
                     text = cell.text_content().strip()
                     colspan = int(cell.get("colspan", 1))
                     headers.extend([text] * colspan)
@@ -269,6 +271,7 @@ class DefaultTableExtraction(TableExtractionStrategy):
             aligned_rows.append(aligned)
         
         # Generate default headers if none found
+        has_headers = bool(thead_rows) or bool(headers)
         if not headers and max_columns > 0:
             headers = [f"Column {i+1}" for i in range(max_columns)]
         
@@ -276,7 +279,7 @@ class DefaultTableExtraction(TableExtractionStrategy):
         metadata = {
             "row_count": len(aligned_rows),
             "column_count": max_columns,
-            "has_headers": bool(thead_rows) or bool(table.xpath(".//tr[1]/th")),
+            "has_headers": has_headers,
             "has_caption": bool(caption),
             "has_summary": bool(summary)
         }
