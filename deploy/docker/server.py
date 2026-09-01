@@ -1155,6 +1155,10 @@ async def get_context(
     - If "code" is specified, returns the code context.
     - If "doc" is specified, returns the documentation context.
     - If "all" is specified, returns both code and documentation contexts.
+    - When a query is provided but matches no terms in the corpus, the
+      corresponding result lists ("code_results" and/or "doc_results") are
+      empty rather than populated with irrelevant score=0.0 chunks. Use
+      query=None to retrieve the full, unfiltered context.
     """
     # load contexts
     base = os.path.dirname(__file__)
@@ -1188,10 +1192,13 @@ async def get_context(
         bm25 = BM25Okapi([c.split() for c in code_chunks])
         scores = bm25.get_scores(tokens)
         max_sc = float(scores.max()) if scores.size > 0 else 0.0
-        cutoff = max_sc * score_ratio
-        picked = [(c, s) for c, s in zip(code_chunks, scores) if s >= cutoff]
-        picked = sorted(picked, key=lambda x: x[1], reverse=True)[:max_results]
-        results["code_results"] = [{"text": c, "score": s} for c, s in picked]
+        if max_sc <= 0:
+            results["code_results"] = []
+        else:
+            cutoff = max_sc * score_ratio
+            picked = [(c, s) for c, s in zip(code_chunks, scores) if s >= cutoff]
+            picked = sorted(picked, key=lambda x: x[1], reverse=True)[:max_results]
+            results["code_results"] = [{"text": c, "score": s} for c, s in picked]
 
     # doc BM25 over markdown sections
     if context_type in ("doc", "all"):
@@ -1199,14 +1206,17 @@ async def get_context(
         bm25d = BM25Okapi([sec.split() for sec in sections])
         scores_d = bm25d.get_scores(tokens)
         max_sd = float(scores_d.max()) if scores_d.size > 0 else 0.0
-        cutoff_d = max_sd * score_ratio
-        idxs = [i for i, s in enumerate(scores_d) if s >= cutoff_d]
-        neighbors = set(i for idx in idxs for i in (idx-1, idx, idx+1))
-        valid = [i for i in sorted(neighbors) if 0 <= i < len(sections)]
-        valid = valid[:max_results]
-        results["doc_results"] = [
-            {"text": sections[i], "score": scores_d[i]} for i in valid
-        ]
+        if max_sd <= 0:
+            results["doc_results"] = []
+        else:
+            cutoff_d = max_sd * score_ratio
+            idxs = [i for i, s in enumerate(scores_d) if s >= cutoff_d]
+            neighbors = set(i for idx in idxs for i in (idx-1, idx, idx+1))
+            valid = [i for i in sorted(neighbors) if 0 <= i < len(sections)]
+            valid = valid[:max_results]
+            results["doc_results"] = [
+                {"text": sections[i], "score": scores_d[i]} for i in valid
+            ]
 
     return JSONResponse(results)
 
