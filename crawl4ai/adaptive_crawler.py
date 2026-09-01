@@ -223,7 +223,9 @@ class AdaptiveConfig:
     embedding_quality_min_confidence: float = 0.7  # Minimum confidence for validated systems
     embedding_quality_max_confidence: float = 0.95  # Maximum realistic confidence
     embedding_quality_scale_factor: float = 0.833  # Scaling factor for confidence mapping
-    # Example: Validated system with learning_score=0.5 → confidence = 0.7 + (0.5-0.4)*0.833 = 0.78
+    # Example: Validated system with coverage_score=0.5 → confidence = 0.7 + (0.5-0.4)*0.833 = 0.78
+    # Note: coverage_score is a mean best-cosine similarity; realistic corpora often
+    # land at 0.2-0.4, so validated crawls sit at the 0.7 floor by design.
     # These control how internal scores map to user-friendly confidence percentages
     
     def validate(self):
@@ -1670,7 +1672,7 @@ class AdaptiveCrawler:
                     else:
                         print(f"  Overall Confidence: {self.confidence:.2%} [NOT VALIDATED]")
                         
-                print(f"  Learning Score: {self.state.metrics.get('learning_score', 0):.2%}")
+                print(f"  Coverage Score: {self.state.metrics.get('coverage_score', 0):.2%}")
                 print(f"  Validation Score: {self.state.metrics.get('validation_confidence', 0):.2%}")
                 
             else:
