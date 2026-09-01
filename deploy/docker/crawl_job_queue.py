@@ -221,17 +221,7 @@ end
 if redis.call('HEXISTS', KEYS[2], 'payload') == 1 then
   return 0
 end
-local recovered_owner = ''
-local stream_entry = redis.call('XRANGE', KEYS[3], ARGV[3], ARGV[3], 'COUNT', 1)
-if #stream_entry > 0 then
-  local fields = stream_entry[1][2]
-  for index = 1, #fields, 2 do
-    if fields[index] == 'owner' then
-      recovered_owner = fields[index + 1]
-      break
-    end
-  end
-end
+local recovered_owner = ARGV[11]
 if redis.call('EXISTS', KEYS[1]) == 1 then
   if redis.call('HGET', KEYS[1], 'status') ~= ARGV[4]
     or redis.call('HGET', KEYS[1], 'protocol_version') ~= ARGV[10] then
@@ -709,7 +699,7 @@ class CrawlJobQueue:
         """Fenced cleanup for an entry whose durable payload is absent."""
         # The quota lease key is per-principal; recover the owner from the
         # Stream entry's immutable 'owner' field before the fenced script runs
-        # (the script re-reads the same field for the result hash).
+        # and thread it through ARGV (the script must not re-read it).
         stream_owner = ""
         for _stream_id, fields in await self.redis.xrange(
             self.settings.stream, entry.stream_id, entry.stream_id, count=1
@@ -732,6 +722,7 @@ class CrawlJobQueue:
             get_redis_task_ttl(self.config),
             entry.task_id,
             self.settings.protocol_version,
+            stream_owner,
         )
         if int(discarded) != 1:
             raise CrawlJobLeaseLost(

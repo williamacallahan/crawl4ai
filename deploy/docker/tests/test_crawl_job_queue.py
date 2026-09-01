@@ -430,6 +430,7 @@ class FakeRedis:
             task_ttl,
             task_id,
             protocol_version,
+            stream_owner,
         ) = args
         if self.pending.get(stream_id) != consumer:
             return 0
@@ -441,14 +442,6 @@ class FakeRedis:
             or self.hashes[task_key].get("protocol_version") != str(protocol_version)
         ):
             return 0
-        stream_owner = next(
-            (
-                fields.get("owner", "")
-                for candidate_id, fields in self.streams[stream]
-                if candidate_id == stream_id
-            ),
-            "",
-        )
         owner = self.hashes[task_key].get("owner", "") if task_exists else ""
         if not owner:
             owner = stream_owner
