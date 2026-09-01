@@ -5,6 +5,12 @@ All notable changes to Crawl4AI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Docker client hooks are no longer silently ignored**: `Crawl4aiDockerClient` was still sending the legacy `{"hooks": {"code": ..., "timeout": ...}}` shape after the 0.9.0 server removed the `code`/`timeout` fields from `HookConfig` (replaced by declarative actions to prevent RCE). Pydantic dropped those unknown fields, so `HookConfig(hooks=[])` ran every crawl with no hooks and no warning. The client now sends the server's declarative format (`{"hooks": [{"action": ..., "params": {...}}]}`, also accepted as a bare list) and emits a `FutureWarning` (visible under Python's default warning filter, unlike `DeprecationWarning`) for legacy code-based hooks, which are dropped instead of being sent as a payload the server would silently ignore. `hooks_timeout` remains the HTTP request timeout on the non-streaming path (as before); it is no longer embedded in the payload, since the per-hook execution timeout field was removed from the server schema. See `deploy/docker/MIGRATION.md`.
+
 ## [0.9.0] - 2026-06-18
 
 0.9.0 is a major, secure-by-default release of the Crawl4AI Docker API server. The out-of-the-box deployment is now hardened with defense in depth: authentication is on by default, the server binds loopback unless you give it a token, and the network request body is treated as an untrusted trust boundary. This release contains breaking changes for the self-hosted HTTP server only. The core pip library (SDK / in-process use) is unchanged.

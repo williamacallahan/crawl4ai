@@ -504,7 +504,8 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                     break
         except Exception as e:
             # If anything goes wrong, make sure we refill the queue with what we've got
-            self.monitor.update_memory_status(f"QUEUE_ERROR: {str(e)}")
+            if self.monitor:
+                self.monitor.update_memory_status(f"QUEUE_ERROR: {str(e)}")
         
         # Calculate queue statistics
         if temp_items and self.monitor:

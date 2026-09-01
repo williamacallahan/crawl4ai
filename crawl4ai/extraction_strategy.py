@@ -2809,6 +2809,9 @@ class RegexExtractionStrategy(ExtractionStrategy):
 
         # ── clean & load JSON (fix common escape mistakes *before* json.loads)
         raw = resp.choices[0].message.content
+        if not raw or not raw.strip():
+            finish_reason = getattr(resp.choices[0], "finish_reason", "unknown")
+            raise ValueError(f"LLM returned no content (finish_reason: {finish_reason})")
         raw = raw.replace("\x08", "\\b")                     # stray back-space → \b
         raw = re.sub(r'(?<!\\)\\(?![\\u"])', r"\\\\", raw)   # lone \ → \\
 

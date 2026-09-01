@@ -51,6 +51,10 @@ class TestContentTypeFilter:
 
             # Test case-insensitivity of allowed_types
             ("http://example.com/index.php", ["APPLICATION/X-HTTPD-PHP"], True),
+
+            # Query strings / fragments must not become part of the extension
+            ("http://example.com/guide.html?highlight=keyword", ["text/html"], True),
+            ("http://example.com/doc.pdf#page=2", ["text/html"], False),
         ],
     )
     def test_apply(self, url, allowed_types, expected):
@@ -68,6 +72,12 @@ class TestContentTypeFilter:
             ("http://example.com/nodot", ""),
             ("http://example.com/.config", "config"), # hidden file with extension
             ("http://example.com/path/to/archive.BIG.zip", "zip"), # Case test
+            # Query strings, fragments and ';' path params must be stripped
+            # before extracting the extension (they previously leaked in and
+            # caused false negatives, e.g. "html?highlight=keyword").
+            ("http://example.com/guide.html?highlight=keyword", "html"),
+            ("http://example.com/manual.pdf#page=5", "pdf"),
+            ("http://example.com/photo.jpg;width=100", "jpg"),
         ]
     )
     def test_extract_extension(self, url, expected_extension):

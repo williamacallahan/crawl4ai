@@ -377,6 +377,141 @@ def test_lost_llm_permit_cancels_the_protected_operation():
     assert error.detail == "Crawl4AI LLM capacity lease was lost"
 
 
+def test_llm_permit_release_failure_does_not_discard_successful_work():
+    """A Redis failure during permit release must not mask a successful body.
+
+    Regression: previously a ConnectionError raised by the release Lua call in
+    the ``finally`` block propagated to callers, turning successful LLM work
+    into HTTP 500 responses.
+    """
+    redis = PermitRedis()
+    redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
+    config = load_config()
+    config["llm"]["permit_ttl_seconds"] = 300
+
+    async def exercise():
+        result = None
+        async with api.llm_permit(redis, config):
+            result = "SUCCESS: LLM answer generated"
+        return result
+
+    result = asyncio.run(exercise())
+
+    assert result == "SUCCESS: LLM answer generated"
+    # The renewal heartbeat never fires for a fast body with a 300s TTL, so the
+    # only eval call is the release attempt: it must still be made, and it must
+    # not raise out of the context manager.
+    redis.eval.assert_awaited_once()
+
+
+def test_llm_permit_release_failure_does_not_mask_body_exception():
+    """Release cleanup failure must not replace the body's original exception."""
+    redis = PermitRedis()
+    redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
+    config = load_config()
+    config["llm"]["permit_ttl_seconds"] = 300
+
+    async def exercise():
+        async with api.llm_permit(redis, config):
+            raise RuntimeError("LLM body failed")
+
+    with pytest.raises(RuntimeError, match="LLM body failed"):
+        asyncio.run(exercise())
+
+
+def test_llm_permit_release_failure_does_not_mask_lease_lost_signal():
+    """Release failure must not hide the lease-lost HTTPException raised on cancellation."""
+    redis = PermitRedis()
+    redis.eval = AsyncMock(side_effect=[0, ConnectionError("Redis connection lost")])
+    config = load_config()
+    config["llm"]["permit_ttl_seconds"] = 0.03
+
+    async def exercise():
+        with pytest.raises(api.HTTPException) as error:
+            async with api.llm_permit(redis, config):
+                await asyncio.sleep(1)
+        return error.value
+
+    error = asyncio.run(exercise())
+
+    assert error.status_code == 503
+    assert error.detail == "Crawl4AI LLM capacity lease was lost"
+
+
+def test_handle_llm_qa_returns_result_when_permit_release_fails(monkeypatch):
+    """End-to-end: handle_llm_qa must return the answer even if Redis release fails.
+
+    Without the fix, the ConnectionError from the release cleanup surfaced as an
+    HTTP 500 from handle_llm_qa's catch-all, discarding the successful answer.
+    """
+    completion = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="answer"))]
+    )
+
+    async def arun(_crawler, *args, **kwargs):
+        return SimpleNamespace(
+            success=True,
+            markdown=SimpleNamespace(
+                fit_markdown="context",
+                raw_markdown="context",
+            ),
+        )
+
+    monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
+    monkeypatch.setattr(api, "_crawler_arun", arun)
+    monkeypatch.setattr(
+        api,
+        "aperform_completion_with_backoff",
+        AsyncMock(return_value=completion),
+    )
+    monkeypatch.setattr(
+        llm_broker,
+        "resolve_llm",
+        lambda *_args, **_kwargs: {
+            "provider": "test/provider",
+            "api_token": "test-only",
+            "temperature": 0.0,
+            "base_url": None,
+            "extra_args": {
+                "timeout": 300,
+                "num_retries": 0,
+                "reasoning_effort": "low",
+                "max_tokens": 4096,
+            },
+        },
+    )
+    async def get_crawler(_browser_config):
+        return object()
+
+    async def release_crawler(_crawler):
+        return None
+
+    monkeypatch.setattr(crawler_pool, "get_crawler", get_crawler)
+    monkeypatch.setattr(crawler_pool, "release_crawler", release_crawler)
+    monkeypatch.setattr(egress_broker, "enforce_egress", lambda _config: None)
+
+    redis = PermitRedis()
+    redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
+
+    answer = asyncio.run(
+        api.handle_llm_qa(
+            "https://example.com",
+            "question",
+            {
+                **load_config(),
+                "llm": {
+                    "provider": "test/provider",
+                    "api_key": "test-only",
+                },
+            },
+            redis=redis,
+        )
+    )
+
+    assert answer == "answer"
+    api.aperform_completion_with_backoff.assert_awaited_once()
+
+
 def test_markdown_generation_does_not_block_the_event_loop():
     class SlowMarkdownGenerator(MarkdownGenerationStrategy):
         def generate_markdown(self, **_kwargs):

@@ -2351,10 +2351,15 @@ def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_
         # Parse query parameters
         params = parse_qs(query)
         
-        # Remove tracking parameters (example - customize as needed)
-        tracking_params = ['utm_source', 'utm_medium', 'utm_campaign', 'ref', 'fbclid']
-        for param in tracking_params:
-            if param in params:
+        # Remove tracking parameters. Keep this set in sync with the
+        # `default_tracking` set in `normalize_url` so deep-crawl deduplication
+        # matches the general URL normalizer.
+        tracking_params = {
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term',
+            'utm_content', 'gclid', 'fbclid', 'ref', 'ref_src'
+        }
+        for param in list(params.keys()):
+            if param.lower() in tracking_params:
                 del params[param]
                 
         # Rebuild query string, sorted for consistency
