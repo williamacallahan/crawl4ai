@@ -569,6 +569,7 @@ async def test_health_uses_effective_redis_client_when_lifespan_is_active(
     finally:
         server_module.app.state.readiness_checks_active = False
     assert response.status_code == 200
+    assert response.headers["connection"] == "close"
     payload = response.json()
     assert payload["components"]["redis"] == "ready"
     assert payload["revision"] == "0123456789abcdef"
@@ -594,6 +595,7 @@ async def test_health_reports_unavailable_effective_redis_without_details(
     finally:
         server_module.app.state.readiness_checks_active = False
     assert response.status_code == 503
+    assert response.headers["connection"] == "close"
     assert response.json()["components"]["redis"] == "unavailable"
     assert "topology detail" not in response.text
 

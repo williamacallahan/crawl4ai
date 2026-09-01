@@ -959,6 +959,7 @@ async def get_hooks_info():
 
 @app.get(HEALTH_PATH)
 async def health():
+    headers = {"Connection": "close"}
     payload = {
         "status": "unhealthy",
         "timestamp": time.time(),
@@ -968,18 +969,18 @@ async def health():
         "components": {"api": "unavailable"},
     }
     if not getattr(app.state, "readiness_checks_active", False):
-        return JSONResponse(payload, status_code=503)
+        return JSONResponse(payload, status_code=503, headers=headers)
     try:
         await asyncio.wait_for(redis.ping(), timeout=2.0)
         payload["status"] = "ok"
         payload["components"] = {"api": "ready", "redis": "ready"}
-        return payload
+        return JSONResponse(payload, headers=headers)
     except Exception as exc:
         # Log the failure class: a fast ConnectionError points at the overlay /
         # stale pooled connection, a TimeoutError at a stalled Redis.
         logger.warning("health: redis ping failed: %r", exc)
         payload["components"]["redis"] = "unavailable"
-        return JSONResponse(payload, status_code=503)
+        return JSONResponse(payload, status_code=503, headers=headers)
 
 
 @app.get(config["observability"]["prometheus"]["endpoint"])
