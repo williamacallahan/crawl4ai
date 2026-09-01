@@ -173,3 +173,19 @@ async def test_crawl_with_legacy_hooks_warns_and_sends_no_hooks(client, monkeypa
 
     # Legacy hooks are dropped (not sent as a payload the server would ignore).
     assert "hooks" not in captured["json"]
+
+
+def test_api_token_sets_bearer_header():
+    """A static CRAWL4AI_API_TOKEN must authenticate every request.
+
+    The server binds beyond loopback only with a credential configured, and
+    every endpoint except /health rejects requests without a Bearer token, so
+    the client needs a static-token lane besides the JWT authenticate() flow.
+    """
+    c = Crawl4aiDockerClient(
+        base_url="http://localhost:0", verbose=False, api_token="static-token"
+    )
+    try:
+        assert c._http_client.headers["Authorization"] == "Bearer static-token"
+    finally:
+        asyncio.run(c.close())

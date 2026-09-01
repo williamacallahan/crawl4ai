@@ -32,15 +32,26 @@ Notes:
   docs/examples/docker_client_hooks_example.py and deploy/docker/MIGRATION.md.
 
 Requirements:
-- Docker server running, e.g.:
-    docker run -p 11235:11235 -e CRAWL4AI_HOOKS_ENABLED=true unclecode/crawl4ai:latest
+- Docker server running. This image refuses to boot its embedded Redis
+  without an operator-set password, and binds beyond loopback only when an
+  API credential is configured, so both env vars are required:
+    docker run -p 11235:11235 \
+      -e REDIS_PASSWORD=<pick-a-password> \
+      -e CRAWL4AI_API_TOKEN=<pick-a-token> \
+      -e CRAWL4AI_HOOKS_ENABLED=true \
+      unclecode/crawl4ai:latest
+- export CRAWL4AI_API_TOKEN=<the-same-token> before running this script.
+  Every endpoint except /health requires it as a Bearer credential.
 """
 
 import json
+import os
 
 import requests
 
 DOCKER_URL = "http://localhost:11235"
+API_TOKEN = os.environ.get("CRAWL4AI_API_TOKEN", "")
+AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
 
 
 def print_section(title: str):
@@ -53,7 +64,9 @@ def example_1_discover_actions():
     """GET /hooks/info is the source of truth for actions and parameters."""
     print_section("1. Discover available actions (GET /hooks/info)")
 
-    info = requests.get(f"{DOCKER_URL}/hooks/info", timeout=10).json()
+    info = requests.get(
+        f"{DOCKER_URL}/hooks/info", headers=AUTH_HEADERS, timeout=10
+    ).json()
     print(json.dumps(info["usage"], indent=2))
     for name, entry in info["available_actions"].items():
         print(f"\n- {name} ({entry['hook_point']}): {entry['description']}")
@@ -81,7 +94,7 @@ def example_2_performance_crawl():
         "crawler_config": {"cache_mode": "bypass"},
     }
 
-    response = requests.post(f"{DOCKER_URL}/crawl", json=payload, timeout=60)
+    response = requests.post(f"{DOCKER_URL}/crawl", json=payload, headers=AUTH_HEADERS, timeout=60)
     if response.status_code == 403:
         print("Hooks are disabled on this server (CRAWL4AI_HOOKS_ENABLED != true)")
         return
@@ -123,7 +136,7 @@ def example_3_authentication_crawl():
         },
     }
 
-    response = requests.post(f"{DOCKER_URL}/crawl", json=payload, timeout=60)
+    response = requests.post(f"{DOCKER_URL}/crawl", json=payload, headers=AUTH_HEADERS, timeout=60)
     if response.status_code == 403:
         print("Hooks are disabled on this server (CRAWL4AI_HOOKS_ENABLED != true)")
         return
@@ -146,7 +159,7 @@ def example_4_wait_for_slow_pages():
         },
     }
 
-    response = requests.post(f"{DOCKER_URL}/crawl", json=payload, timeout=60)
+    response = requests.post(f"{DOCKER_URL}/crawl", json=payload, headers=AUTH_HEADERS, timeout=60)
     if response.status_code == 403:
         print("Hooks are disabled on this server (CRAWL4AI_HOOKS_ENABLED != true)")
         return
@@ -163,6 +176,8 @@ def main():
     except Exception:
         print(f"Server not reachable at {DOCKER_URL}.")
         print("Start it with: docker run -p 11235:11235 "
+              "-e REDIS_PASSWORD=<pick-a-password> "
+              "-e CRAWL4AI_API_TOKEN=<pick-a-token> "
               "-e CRAWL4AI_HOOKS_ENABLED=true unclecode/crawl4ai:latest")
         return
 

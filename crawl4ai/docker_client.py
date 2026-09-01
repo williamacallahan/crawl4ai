@@ -34,8 +34,12 @@ class Crawl4aiDockerClient:
         timeout: float = 30.0,
         verify_ssl: bool = True,
         verbose: bool = True,
-        log_file: Optional[str] = None
+        log_file: Optional[str] = None,
+        api_token: Optional[str] = None,
     ):
+        """``api_token`` is the server's static ``CRAWL4AI_API_TOKEN``, sent as
+        a Bearer credential on every request. Use ``authenticate(email)``
+        instead when the server runs with JWT enabled."""
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
         self.logger = AsyncLogger(log_file=log_file, log_level=LogLevel.DEBUG, verbose=verbose)
@@ -44,7 +48,9 @@ class Crawl4aiDockerClient:
             verify=verify_ssl,
             headers={"Content-Type": "application/json"}
         )
-        self._token: Optional[str] = None
+        self._token: Optional[str] = api_token
+        if self._token:
+            self._http_client.headers["Authorization"] = f"Bearer {self._token}"
 
     async def authenticate(self, email: str) -> None:
         """Authenticate with the server and store the token."""

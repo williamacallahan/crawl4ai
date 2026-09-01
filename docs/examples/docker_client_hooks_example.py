@@ -18,18 +18,28 @@ Callable Python hooks still exist - but only in-process, with the SDK
 (``AsyncWebCrawler``). The last example shows that path.
 
 Requirements:
-- Docker server running, e.g.:
-    docker run -p 11235:11235 -e CRAWL4AI_HOOKS_ENABLED=true unclecode/crawl4ai:latest
+- Docker server running. This image refuses to boot its embedded Redis
+  without an operator-set password, and binds beyond loopback only when an
+  API credential is configured, so both env vars are required:
+    docker run -p 11235:11235 \
+      -e REDIS_PASSWORD=<pick-a-password> \
+      -e CRAWL4AI_API_TOKEN=<pick-a-token> \
+      -e CRAWL4AI_HOOKS_ENABLED=true \
+      unclecode/crawl4ai:latest
+- export CRAWL4AI_API_TOKEN=<the-same-token> before running this script.
 - pip install crawl4ai
 """
 
 import asyncio
+import os
 
 import requests
 
 from crawl4ai import Crawl4aiDockerClient
 
 API_BASE_URL = "http://localhost:11235"
+API_TOKEN = os.environ.get("CRAWL4AI_API_TOKEN", "")
+AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
 
 
 def show_available_actions():
@@ -38,7 +48,9 @@ def show_available_actions():
     print("Available declarative hook actions (GET /hooks/info)")
     print("=" * 70)
 
-    info = requests.get(f"{API_BASE_URL}/hooks/info", timeout=10).json()
+    info = requests.get(
+        f"{API_BASE_URL}/hooks/info", headers=AUTH_HEADERS, timeout=10
+    ).json()
     for name, entry in info["available_actions"].items():
         print(f"  - {name} ({entry['hook_point']}): {entry['description']}")
     print(f"\nRequest shape: {info['usage']['shape']}")
@@ -51,7 +63,7 @@ async def crawl_with_performance_hooks():
     print("Performance: block resources + scroll to bottom")
     print("=" * 70)
 
-    async with Crawl4aiDockerClient(base_url=API_BASE_URL, verbose=False) as client:
+    async with Crawl4aiDockerClient(base_url=API_BASE_URL, api_token=API_TOKEN, verbose=False) as client:
         result = await client.crawl(
             ["https://httpbin.org/html"],
             hooks={
@@ -81,7 +93,7 @@ async def crawl_with_authentication_hooks():
 
     credentials = base64.b64encode(b"user:passwd").decode("ascii")
 
-    async with Crawl4aiDockerClient(base_url=API_BASE_URL, verbose=False) as client:
+    async with Crawl4aiDockerClient(base_url=API_BASE_URL, api_token=API_TOKEN, verbose=False) as client:
         result = await client.crawl(
             ["https://httpbin.org/basic-auth/user/passwd"],
             hooks={
@@ -131,7 +143,7 @@ async def crawl_multiple_urls_with_hooks():
         ]
     }
 
-    async with Crawl4aiDockerClient(base_url=API_BASE_URL, verbose=False) as client:
+    async with Crawl4aiDockerClient(base_url=API_BASE_URL, api_token=API_TOKEN, verbose=False) as client:
         results = await client.crawl(
             [
                 "https://httpbin.org/html",
