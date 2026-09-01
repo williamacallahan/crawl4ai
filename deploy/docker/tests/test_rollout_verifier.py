@@ -592,22 +592,28 @@ def test_ingress_host_accepts_one_running_dokploy_traefik(monkeypatch):
     rollout._verify_ingress_host()
 
 
-def test_public_proof_accepts_an_authoritative_instance_from_each_route(monkeypatch):
+def test_public_proof_observes_every_authoritative_instance_in_any_order(monkeypatch):
     instances = ["one", "two", "three"]
     responses = {
-        rollout.HEALTH_URLS[0]: "three",
-        rollout.HEALTH_URLS[1]: "two",
+        rollout.HEALTH_URLS[0]: iter(["three", "one", "two"]),
+        rollout.HEALTH_URLS[1]: iter(["two", "three", "one"]),
     }
 
     def request(url, *_args):
         route_url = next(route for route in rollout.HEALTH_URLS if url.startswith(route))
-        return health(responses[route_url])
+        return health(next(responses[route_url]))
 
     monkeypatch.setattr(rollout, "_request_json", request)
     assert rollout._verify_public(REVISION, instances) == {
-        rollout.HEALTH_URLS[0]: "three",
-        rollout.HEALTH_URLS[1]: "two",
+        url: sorted(instances) for url in rollout.HEALTH_URLS
     }
+
+
+def test_public_proof_rejects_a_missing_healthy_backend(monkeypatch):
+    monkeypatch.setattr(rollout, "PUBLIC_PROOF_ATTEMPTS", 3)
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: health("one"))
+    with pytest.raises(RuntimeError, match="did not observe every authoritative task"):
+        rollout._verify_public(REVISION, ["one", "two", "three"])
 
 
 def test_public_proof_rejects_an_unknown_instance(monkeypatch):
@@ -668,7 +674,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(
         rollout,
         "_verify_public",
-        lambda _revision, instances: {url: instances[0] for url in rollout.HEALTH_URLS},
+        lambda _revision, instances: {url: instances for url in rollout.HEALTH_URLS},
     )
     monkeypatch.setattr(
         rollout,
@@ -678,7 +684,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     rollout.deploy()
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["publicInstances"] == {
-        url: "a" for url in rollout.HEALTH_URLS
+        url: ["a", "b", "c"] for url in rollout.HEALTH_URLS
     }
     # The Redis proof must precede the first write, not merely happen.
     assert events == ["verify_redis", "application.update", "application.deploy"]
@@ -782,7 +788,7 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
         "nodes": ["haiku-4", "haiku-5", "haiku-9"],
         "instances": ["one", "two", "three"],
         "publicInstances": {
-            url: "one" for url in rollout.HEALTH_URLS
+            url: ["three", "one", "two"] for url in rollout.HEALTH_URLS
         },
     }))
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
@@ -804,7 +810,7 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
     rollout.evidence()
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["publicInstances"] == {
-        url: "one" for url in rollout.HEALTH_URLS
+        url: ["three", "one", "two"] for url in rollout.HEALTH_URLS
     }
     rows[0]["revision"] = "baseline"
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
@@ -823,11 +829,11 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
         {"ok": True, "url": url, "revision": REVISION, "instance": "one"}
         for url in rollout.HEALTH_URLS
     ]
-    coverage = {url: "one" for url in rollout.HEALTH_URLS}
+    coverage = {url: ["one", "two", "three"] for url in rollout.HEALTH_URLS}
     if failure == "missing":
-        coverage.pop(rollout.HEALTH_URLS[0])
+        coverage[rollout.HEALTH_URLS[0]] = ["one", "two"]
     elif failure == "unknown-proof":
-        coverage[rollout.HEALTH_URLS[0]] = "unknown"
+        coverage[rollout.HEALTH_URLS[0]] = ["one", "two", "unknown"]
     else:
         rows[0]["instance"] = "unknown"
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
@@ -860,7 +866,7 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
     message = (
         "unknown candidate instance"
         if failure == "unknown-monitor"
-        else "does not identify authoritative tasks"
+        else "every authoritative task"
     )
     with pytest.raises(RuntimeError, match=message):
         rollout.evidence()
@@ -888,7 +894,9 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
         "tasks": ["task1", "task2", "task3"],
         "nodes": ["haiku-4", "haiku-5", "haiku-9"],
         "instances": ["one", "two", "three"],
-        "publicInstances": {url: "one" for url in rollout.HEALTH_URLS},
+        "publicInstances": {
+            url: ["one", "two", "three"] for url in rollout.HEALTH_URLS
+        },
     }))
     monkeypatch.setattr(
         rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)

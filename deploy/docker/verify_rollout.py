@@ -48,6 +48,7 @@ RESOURCES = {
 DELAY_NS = 400_000_000_000
 STOP_GRACE_NS = 390_000_000_000
 TIMEOUT_SECONDS = 4_000
+PUBLIC_PROOF_ATTEMPTS = REPLICAS * 4
 # Crawl4AI's durable job queue and task state live in this one external Redis.
 # Nothing in the deploy path proved its wiring, so a lost volume, an unpinned
 # or duplicated replica, or a reintroduced appendfsync=always would first
@@ -623,18 +624,27 @@ def _verify_tasks(
     }
 
 
-def _verify_public(revision: str, instances: list[str]) -> dict[str, str]:
+def _verify_public(revision: str, instances: list[str]) -> dict[str, list[str]]:
     expected = set(instances)
-    observed = {}
-    for url in HEALTH_URLS:
-        health = _request_json(f"{url}?verify={uuid.uuid4()}")
-        if not _exact_health(health, revision):
-            raise RuntimeError("public Crawl4AI returned unhealthy or wrong-revision health")
-        instance = str(health["instance"])
-        if instance not in expected:
-            raise RuntimeError("public Crawl4AI returned an unknown task instance")
-        observed[url] = instance
-    return observed
+    observed = {url: set() for url in HEALTH_URLS}
+    # Client connection churn alone does not control Traefik's upstream reuse;
+    # the gate passes only after each route returns every authoritative identity.
+    for _ in range(PUBLIC_PROOF_ATTEMPTS):
+        for url, seen in observed.items():
+            if seen == expected:
+                continue
+            health = _request_json(f"{url}?verify={uuid.uuid4()}")
+            if not _exact_health(health, revision):
+                raise RuntimeError(
+                    "public Crawl4AI returned unhealthy or wrong-revision health"
+                )
+            instance = str(health["instance"])
+            if instance not in expected:
+                raise RuntimeError("public Crawl4AI returned an unknown task instance")
+            seen.add(instance)
+        if all(seen == expected for seen in observed.values()):
+            return {url: sorted(seen) for url, seen in observed.items()}
+    raise RuntimeError("each public domain did not observe every authoritative task")
 
 
 def _task_proof_path() -> Path:
@@ -830,9 +840,9 @@ def evidence() -> None:
     ):
         raise RuntimeError("authoritative task proof does not match the candidate")
     if set(public_instances) != set(HEALTH_URLS) or any(
-        instance not in expected for instance in public_instances.values()
+        set(public_instances.get(url, [])) != expected for url in HEALTH_URLS
     ):
-        raise RuntimeError("public route proof does not identify authoritative tasks")
+        raise RuntimeError("each public domain must observe every authoritative task")
     application = _application(
         os.environ["DOKPLOY_URL"],
         os.environ["DOKPLOY_API_KEY"],
