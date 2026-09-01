@@ -32,7 +32,11 @@ from crawl4ai.async_configs import (
 
 logger = logging.getLogger(__name__)
 
-CRAWL_JOB_PROTOCOL_VERSION = 2
+# v3: per-principal quota moved from the v1 hash pair to lease ZSETs (#76).
+# The version bump keeps mixed-version replicas on disjoint streams during a
+# rolling deploy, so an old worker can never complete a new job and strand its
+# +inf quota member (or vice versa).
+CRAWL_JOB_PROTOCOL_VERSION = 3
 
 
 class CrawlJobLeaseLost(RuntimeError):
@@ -467,7 +471,10 @@ class CrawlJobQueue:
         """Create the consumer group without skipping work queued before startup."""
         if self.settings.protocol_version > 1:
             suffix = f":v{self.settings.protocol_version}"
-            legacy_stream = self.settings.stream.removesuffix(suffix)
+            base_stream = self.settings.stream.removesuffix(suffix)
+            previous = self.settings.protocol_version - 1
+            # v1 streams carried no suffix; later versions carry :v{n}.
+            legacy_stream = base_stream if previous == 1 else f"{base_stream}:v{previous}"
             if await self.redis.xlen(legacy_stream):
                 raise RuntimeError(
                     f"legacy crawl jobs remain in {legacy_stream}; refusing v{self.settings.protocol_version} worker startup"

@@ -43,12 +43,11 @@ PRINCIPAL_QUOTA_LEASE_PREFIX = "crawl4ai:jobs:principal-leases:v2:"
 # frees its quota slot; add heartbeat renewal if legitimate >1h jobs appear.
 QUOTA_LEASE_TTL_S = 3600
 
-# The v1 hash pair this ZSET replaced; deleted at boot so leaked v1 state does
-# not linger in Redis. Remove after one release.
-_LEGACY_QUOTA_KEYS = (
-    "crawl4ai:jobs:principal-counts:v1",
-    "crawl4ai:jobs:principal-claims:v1",
-)
+# The v1 hash pair this ZSET replaced (crawl4ai:jobs:principal-counts:v1 and
+# crawl4ai:jobs:principal-claims:v1) is left untouched: old replicas keep
+# enforcing on it consistently until the rollout completes, after which it is
+# inert residue an operator may DEL. Deleting it at boot would erase the old
+# replicas' live accounting mid-rollout and triple the admitted budget.
 
 
 def principal_lease_key(principal: str) -> str:
@@ -143,11 +142,6 @@ class WorkQueue:
         return self._q is not None
 
     async def start(self) -> None:
-        if self.redis is not None:
-            try:
-                await self.redis.delete(*_LEGACY_QUOTA_KEYS)
-            except Exception:
-                logger.warning("Could not delete legacy principal-quota keys", exc_info=True)
         self._q = asyncio.Queue(maxsize=self.maxsize)
         self._tasks = [asyncio.create_task(self._worker()) for _ in range(self.workers)]
         logger.info(

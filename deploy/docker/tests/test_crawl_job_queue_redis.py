@@ -416,19 +416,26 @@ def test_durable_quota_lease_never_expires(redis_url):
         client = aioredis.from_url(redis_url, decode_responses=True)
         config = queue_config()
         config["crawl_jobs"]["stream"] = "crawl-jobs-lease-ttl"
+        queue = CrawlJobQueue(client, config)
+        task_id = ""
         try:
-            queue = CrawlJobQueue(client, config)
             await queue.ensure_group()
-            await queue.enqueue(
+            task_id = await queue.enqueue(
                 ["https://example.com"], {}, {}, None, None, owner="lease-bob"
             )
-            await asyncio.sleep(0.25)
+            # The durable claim must be exactly +inf: any finite score would
+            # let a backlog job outwait its lease and lose the slot.
+            score = await client.zscore(principal_lease_key("lease-bob"), task_id)
+            assert score == float("inf")
             with pytest.raises(CrawlJobPrincipalQuotaExceeded):
                 await queue.enqueue(
                     ["https://second.example"], {}, {}, None, None, owner="lease-bob"
                 )
         finally:
-            await client.delete("crawl-jobs-lease-ttl")
+            await client.delete(queue.settings.stream)
+            if task_id:
+                await client.delete(queue.task_key(task_id))
+                await client.delete(queue.payload_key(task_id))
             await client.delete(principal_lease_key("lease-bob"))
             await client.aclose()
 
