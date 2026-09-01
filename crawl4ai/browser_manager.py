@@ -564,8 +564,11 @@ async def clone_runtime_state(
 
         page = dst.pages[0] if dst.pages else await dst.new_page()
         await page.goto(url, wait_until="domcontentloaded")
-        for k, v in kvs:
-            await page.evaluate("(k,v)=>localStorage.setItem(k,v)", k, v)
+        for item in kvs:
+            await page.evaluate(
+                "({name, value}) => localStorage.setItem(name, value)",
+                item,
+            )
 
     # ── 3. runtime-mutable extras from configs ────────────────────────────────
     # headers
