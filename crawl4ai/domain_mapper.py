@@ -163,6 +163,7 @@ class DomainMapper:
 
         self._seeder: Optional[AsyncUrlSeeder] = None
         self._rate_sem: Optional[asyncio.Semaphore] = None
+        self._host_schemes: Dict[str, str] = {}
 
     # ──────────────────────── lifecycle
 
@@ -473,6 +474,9 @@ class DomainMapper:
         validated: Set[str] = set()
         # Track redirects so we can map canonical hosts
         self._host_redirects: Dict[str, str] = {}
+        # Track which scheme successfully reached each host so subsequent
+        # scanning methods use the same scheme (handles HTTP-only hosts).
+        self._host_schemes: Dict[str, str] = {}
 
         async def check(host: str):
             for scheme in ("https", "http"):
@@ -488,6 +492,7 @@ class DomainMapper:
                             target_host = urlparse(urljoin(url, loc)).netloc.lower().split(":")[0]
                             if target_host != host:
                                 self._host_redirects[host] = target_host
+                    self._host_schemes[host] = scheme
                     return host
                 except Exception:
                     continue
@@ -624,7 +629,8 @@ class DomainMapper:
     ) -> Optional[Soft404Fingerprint]:
         """Fetch a known-bad URL to fingerprint soft-404 responses."""
         random_path = f"/c4ai-probe-{uuid.uuid4().hex[:12]}"
-        url = f"https://{host}{random_path}"
+        scheme = getattr(self, "_host_schemes", {}).get(host, "https")
+        url = f"{scheme}://{host}{random_path}"
         try:
             resp = await self.client.get(
                 url, timeout=config.http_timeout, follow_redirects=True
@@ -761,9 +767,10 @@ class DomainMapper:
     ) -> List[str]:
         """Probe common paths on a host, filtering soft-404s."""
         valid_urls: List[str] = []
+        scheme = getattr(self, "_host_schemes", {}).get(host, "https")
 
         async def probe_one(path: str) -> Optional[str]:
-            url = f"https://{host}{path}"
+            url = f"{scheme}://{host}{path}"
             try:
                 if self._rate_sem:
                     async with self._rate_sem:
@@ -818,9 +825,10 @@ class DomainMapper:
     async def _discover_feeds(self, host: str, config: "DomainMapperConfig") -> List[str]:
         """Discover URLs from RSS/Atom feeds."""
         discovered: List[str] = []
+        scheme = getattr(self, "_host_schemes", {}).get(host, "https")
 
         for feed_path in FEED_PATHS:
-            url = f"https://{host}{feed_path}"
+            url = f"{scheme}://{host}{feed_path}"
             try:
                 resp = await self.client.get(
                     url, timeout=config.http_timeout, follow_redirects=True
@@ -904,7 +912,8 @@ class DomainMapper:
     ) -> List[str]:
         """Extract internal links from a host's homepage."""
         urls: List[str] = []
-        base_url = f"https://{host}/"
+        scheme = getattr(self, "_host_schemes", {}).get(host, "https")
+        base_url = f"{scheme}://{host}/"
 
         try:
             resp = await self.client.get(
