@@ -2,6 +2,8 @@
 
 The **`SSLCertificate`** class encapsulates an SSL certificate’s data and allows exporting it in various formats (PEM, DER, JSON, or text). It’s used within **Crawl4AI** whenever you set **`fetch_ssl_certificate=True`** in your **`CrawlerRunConfig`**.  
 
+> **HTTPS only**: certificates are fetched only for `https://` URLs. For `http://` (and `file://`/`raw:`) URLs the crawl result's `ssl_certificate` is `None` — this means "not applicable", not "fetch failed". The check uses the requested URL, so an `http://` URL that redirects to HTTPS also yields `None`.
+
 ## 1. Overview
 
 **Location**: `crawl4ai/ssl_certificate.py`

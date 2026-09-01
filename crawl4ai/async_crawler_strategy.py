@@ -728,7 +728,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # but captured messages can still be logged after retrieval
             # Get SSL certificate information if requested and URL is HTTPS
             ssl_cert = None
-            if config.fetch_ssl_certificate:
+            if config.fetch_ssl_certificate and url.lower().startswith("https://"):
                 ssl_cert = SSLCertificate.from_url(url)
 
             # Set up download handling

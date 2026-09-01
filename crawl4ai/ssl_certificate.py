@@ -62,11 +62,18 @@ class SSLCertificate(dict):
     def from_url(url: str, timeout: int = 10) -> Optional["SSLCertificate"]:
         """
         Create SSLCertificate instance from a URL. Fetches cert info and initializes.
-        (Fetching logic remains the same)
+
+        Only HTTPS URLs are eligible: an SSL/TLS certificate only exists for TLS
+        connections, so fetching a certificate for an HTTP URL (or any non-HTTPS
+        scheme) would silently connect to port 443 and return a certificate that
+        was never used for the actual request. Returns ``None`` for such URLs.
         """
         cert_info_raw = None # Variable to hold the fetched dict
         try:
-            hostname = urlparse(url).netloc
+            parsed = urlparse(url)
+            if parsed.scheme.lower() != "https":
+                return None
+            hostname = parsed.netloc
             if ":" in hostname:
                 hostname = hostname.split(":")[0]
 
