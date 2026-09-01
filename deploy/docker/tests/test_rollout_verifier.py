@@ -492,14 +492,29 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         }
         for index in range(1, 4)
     }
+    network = [{
+        "Id": "network",
+        "Services": {
+            "crawl4ai": {
+                "Tasks": [
+                    {
+                        "Name": f"{row['Name']}.{row['ID']}",
+                        "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
+                    }
+                    for row in rows[:3]
+                ]
+            }
+        },
+    }]
     def run(command, **_kwargs):
         if command[1:3] == ["service", "ps"]:
             return subprocess.CompletedProcess(
                 command, 0, "\n".join(json.dumps(row) for row in rows), ""
             )
-        return subprocess.CompletedProcess(command, 0, "network\n", "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(network), "")
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
+    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: None)
     monkeypatch.setattr(
         rollout,
         "_task_state",
@@ -524,7 +539,94 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
     assert len(proof["instances"]) == 3
 
 
-def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
+@pytest.mark.parametrize("drift", ["missing", "extra"])
+def test_verify_tasks_rejects_vip_membership_drift(monkeypatch, drift):
+    rows, runtimes = _healed_baseline_rows()
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    original_run = rollout.subprocess.run
+
+    def run(command, **kwargs):
+        result = original_run(command, **kwargs)
+        if command[1:4] == ["network", "inspect", "--verbose"]:
+            network = json.loads(result.stdout)
+            tasks = network[0]["Services"]["crawl4ai"]["Tasks"]
+            if drift == "missing":
+                tasks.pop()
+            else:
+                tasks.append({"Name": "crawl4ai.4.foreign", "EndpointIP": "10.0.1.99"})
+            return subprocess.CompletedProcess(command, 0, json.dumps(network), "")
+        return result
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="VIP membership"):
+        rollout._verify_tasks(
+            "crawl4ai",
+            BASELINE,
+            "baseline",
+            frozenset({"haiku-5", "haiku-9", "haiku-18"}),
+            False,
+        )
+
+
+@pytest.mark.parametrize("containers", ["", "one\ntwo\n"])
+def test_ingress_host_requires_one_running_dokploy_traefik(monkeypatch, containers):
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 0, containers, ""
+        ),
+    )
+    with pytest.raises(RuntimeError, match="public ingress host"):
+        rollout._verify_ingress_host()
+
+
+def test_ingress_host_accepts_one_running_dokploy_traefik(monkeypatch):
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 0, "container\n", ""
+        ),
+    )
+    rollout._verify_ingress_host()
+
+
+def test_public_proof_accepts_an_authoritative_instance_from_each_route(monkeypatch):
+    instances = ["one", "two", "three"]
+    responses = {
+        rollout.HEALTH_URLS[0]: "three",
+        rollout.HEALTH_URLS[1]: "two",
+    }
+
+    def request(url, *_args):
+        route_url = next(route for route in rollout.HEALTH_URLS if url.startswith(route))
+        return health(responses[route_url])
+
+    monkeypatch.setattr(rollout, "_request_json", request)
+    assert rollout._verify_public(REVISION, instances) == {
+        rollout.HEALTH_URLS[0]: "three",
+        rollout.HEALTH_URLS[1]: "two",
+    }
+
+
+def test_public_proof_rejects_an_unknown_instance(monkeypatch):
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: health("unknown"))
+    with pytest.raises(RuntimeError, match="unknown task instance"):
+        rollout._verify_public(REVISION, ["one", "two", "three"])
+
+
+@pytest.mark.parametrize(
+    "response",
+    [health("one", revision="wrong"), {**health("one"), "status": "degraded"}],
+)
+def test_public_proof_rejects_wrong_revision_or_unhealthy_response(monkeypatch, response):
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: response)
+    with pytest.raises(RuntimeError, match="unhealthy or wrong-revision"):
+        rollout._verify_public(REVISION, ["one", "two", "three"])
+
+
+def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys):
     state = application()
     posts = []
     events = []
@@ -538,14 +640,9 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
             state["labelsSwarm"] = payload["labelsSwarm"]
             state["placementSwarm"] = payload["placementSwarm"]
 
-    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
-    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
-    monkeypatch.setenv("APPLICATION_ID", "app")
-    monkeypatch.setenv("IMAGE", "registry.example/crawl4ai")
-    monkeypatch.setenv("IMAGE_DIGEST", "sha256:candidate")
-    monkeypatch.setenv("GITHUB_SHA", REVISION)
-    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    _deploy_env(monkeypatch)
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
     monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
     monkeypatch.setattr(
         rollout,
@@ -570,10 +667,19 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     )
     monkeypatch.setattr(
         rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: instances[0] for url in rollout.HEALTH_URLS},
+    )
+    monkeypatch.setattr(
+        rollout,
         "_request_json",
         lambda url, *_args: health(revision="baseline" if "baseline=" in url else REVISION),
     )
     rollout.deploy()
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["publicInstances"] == {
+        url: "a" for url in rollout.HEALTH_URLS
+    }
     # The Redis proof must precede the first write, not merely happen.
     assert events == ["verify_redis", "application.update", "application.deploy"]
     assert [url.rsplit("/", 1)[-1] for url, _ in posts] == [
@@ -583,6 +689,9 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     assert "idempotencyKey" not in posts[1][1]
     assert posts[0][1]["placementSwarm"] == rollout.PLACEMENT
     assert "expectedDockerImage" not in posts[0][1]
+    proof = json.loads(rollout._task_proof_path().read_text())
+    assert proof["instances"] == ["a", "b", "c"]
+    assert set(proof["publicInstances"]) == set(rollout.HEALTH_URLS)
 
     state = application()
     posts.clear()
@@ -596,6 +705,20 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch):
     posts.clear()
     events.clear()
     deployments[:] = [{"deploymentId": "old", "status": "done"}]
+    proofs = iter([
+        {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
+        {"tasks": ["1", "2", "3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["a", "b", "c"]},
+        {"tasks": ["1", "2", "4"], "nodes": ["haiku-4", "haiku-5", "haiku-18"], "instances": ["a", "b", "d"]},
+    ])
+    monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: next(proofs))
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    with pytest.raises(RuntimeError, match="task census changed"):
+        rollout.deploy()
+
+    state = application()
+    posts.clear()
+    events.clear()
+    monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: {})
     update_states = iter(["completed", "rollback_paused", "completed", "completed"])
     monkeypatch.setattr(rollout, "_update_state", lambda _name: next(update_states))
     with pytest.raises(RuntimeError, match="rollback_paused"):
@@ -643,7 +766,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     assert len(calls) == fail_on
 
 
-def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path):
+def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, capsys):
     path = tmp_path / "evidence.jsonl"
     rows = [
         {"ok": True, "url": url, "revision": REVISION, "instance": "one"}
@@ -652,10 +775,135 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path):
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
     monkeypatch.setenv("GITHUB_SHA", REVISION)
+    rollout._task_proof_path().write_text(json.dumps({
+        "revision": REVISION,
+        "baselineRevision": "baseline",
+        "tasks": ["task1", "task2", "task3"],
+        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "instances": ["one", "two", "three"],
+        "publicInstances": {
+            url: "one" for url in rollout.HEALTH_URLS
+        },
+    }))
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    monkeypatch.setattr(
+        rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
+    )
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: {
+            "tasks": ["task1", "task2", "task3"],
+            "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+            "instances": ["one", "two", "three"],
+        },
+    )
     rollout.evidence()
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["publicInstances"] == {
+        url: "one" for url in rollout.HEALTH_URLS
+    }
     rows[0]["revision"] = "baseline"
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     with pytest.raises(RuntimeError, match="each public domain"):
+        rollout.evidence()
+    rows[0]["revision"] = "foreign"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    with pytest.raises(RuntimeError, match="foreign revision"):
+        rollout.evidence()
+
+
+@pytest.mark.parametrize("failure", ["missing", "unknown-proof", "unknown-monitor"])
+def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, failure):
+    path = tmp_path / "evidence.jsonl"
+    rows = [
+        {"ok": True, "url": url, "revision": REVISION, "instance": "one"}
+        for url in rollout.HEALTH_URLS
+    ]
+    coverage = {url: "one" for url in rollout.HEALTH_URLS}
+    if failure == "missing":
+        coverage.pop(rollout.HEALTH_URLS[0])
+    elif failure == "unknown-proof":
+        coverage[rollout.HEALTH_URLS[0]] = "unknown"
+    else:
+        rows[0]["instance"] = "unknown"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
+    monkeypatch.setenv("GITHUB_SHA", REVISION)
+    rollout._task_proof_path().write_text(json.dumps({
+        "revision": REVISION,
+        "baselineRevision": "baseline",
+        "tasks": ["task1", "task2", "task3"],
+        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "instances": ["one", "two", "three"],
+        "publicInstances": coverage,
+    }))
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    monkeypatch.setattr(
+        rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
+    )
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: {
+            "tasks": ["task1", "task2", "task3"],
+            "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+            "instances": ["one", "two", "three"],
+        },
+    )
+    message = (
+        "unknown candidate instance"
+        if failure == "unknown-monitor"
+        else "does not identify authoritative tasks"
+    )
+    with pytest.raises(RuntimeError, match=message):
+        rollout.evidence()
+
+
+def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
+    path = tmp_path / "evidence.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps(
+                {"ok": True, "url": url, "revision": REVISION, "instance": "one"}
+            )
+            for url in rollout.HEALTH_URLS
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
+    monkeypatch.setenv("GITHUB_SHA", REVISION)
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    rollout._task_proof_path().write_text(json.dumps({
+        "revision": REVISION,
+        "baselineRevision": "baseline",
+        "tasks": ["task1", "task2", "task3"],
+        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "instances": ["one", "two", "three"],
+        "publicInstances": {url: "one" for url in rollout.HEALTH_URLS},
+    }))
+    monkeypatch.setattr(
+        rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
+    )
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: {
+            "tasks": ["task1", "task2", "task4"],
+            "nodes": ["haiku-4", "haiku-5", "haiku-18"],
+            "instances": ["one", "two", "four"],
+        },
+    )
+    with pytest.raises(RuntimeError, match="task census changed before final evidence"):
         rollout.evidence()
 
 
@@ -824,14 +1072,33 @@ def _healed_baseline_rows():
 
 
 def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
+    current = [
+        row for row in rows if str(row.get("DesiredState", "")).lower() == "running"
+    ]
+    network = [{
+        "Id": "network",
+        "Services": {
+            "crawl4ai": {
+                "Tasks": [
+                    {
+                        "Name": f"{row['Name']}.{row['ID']}",
+                        "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
+                    }
+                    for row in current
+                ]
+            }
+        },
+    }]
+
     def run(command, **_kwargs):
         if command[1:3] == ["service", "ps"]:
             return subprocess.CompletedProcess(
                 command, 0, "\n".join(json.dumps(row) for row in rows), ""
             )
-        return subprocess.CompletedProcess(command, 0, "network\n", "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(network), "")
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
+    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: None)
     monkeypatch.setattr(
         rollout,
         "_task_state",

@@ -515,9 +515,30 @@ def _service_tasks(app_name: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in listed.stdout.splitlines() if line]
 
 
+def _verify_ingress_host() -> None:
+    ingress = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            "name=^/dokploy-traefik$",
+            "--filter",
+            "status=running",
+            "--format",
+            "{{.ID}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if len(ingress.stdout.splitlines()) != 1:
+        raise RuntimeError("rollout verifier is not running on the public ingress host")
+
+
 def _verify_tasks(
     app_name: str, image: str, revision: str, ready: frozenset[str], converged: bool = True
 ) -> dict[str, Any]:
+    _verify_ingress_host()
     rows = _service_tasks(app_name)
     current = [
         row for row in rows
@@ -566,18 +587,27 @@ def _verify_tasks(
         ):
             raise RuntimeError("Swarm task history contradicts the start-first rollout")
     network = subprocess.run(
-        ["docker", "network", "inspect", "dokploy-network", "--format", "{{.ID}}"],
+        ["docker", "network", "inspect", "--verbose", "dokploy-network"],
         check=True,
         capture_output=True,
         text=True,
-    ).stdout.strip()
+    )
+    network_details = json.loads(network.stdout)[0]
+    vip_tasks = (network_details.get("Services") or {}).get(app_name, {}).get("Tasks") or []
+    vip_by_task = {
+        str(task.get("Name", "")).rsplit(".", 1)[-1]: task for task in vip_tasks
+    }
+    current_ids = {str(row["ID"]) for row in current}
+    if set(vip_by_task) != current_ids:
+        raise RuntimeError("native Swarm VIP membership differs from running tasks")
     instances: set[str] = set()
     for row in current:
-        runtime = _task_runtime(str(row["ID"])[:12], network)
+        task_id = str(row["ID"])
+        runtime = _task_runtime(task_id[:12], str(network_details["Id"]))
         if (
             runtime["image"] != image
             or runtime["labels"] != _labels(revision)
-            or not runtime["addresses"]
+            or runtime["addresses"] != {vip_by_task[task_id].get("EndpointIP")}
         ):
             raise RuntimeError("Crawl4AI task identity drifted")
         health = _request_json(f"http://{next(iter(runtime['addresses']))}:11235/health")
@@ -591,6 +621,24 @@ def _verify_tasks(
         "nodes": sorted(nodes),
         "instances": sorted(instances),
     }
+
+
+def _verify_public(revision: str, instances: list[str]) -> dict[str, str]:
+    expected = set(instances)
+    observed = {}
+    for url in HEALTH_URLS:
+        health = _request_json(f"{url}?verify={uuid.uuid4()}")
+        if not _exact_health(health, revision):
+            raise RuntimeError("public Crawl4AI returned unhealthy or wrong-revision health")
+        instance = str(health["instance"])
+        if instance not in expected:
+            raise RuntimeError("public Crawl4AI returned an unknown task instance")
+        observed[url] = instance
+    return observed
+
+
+def _task_proof_path() -> Path:
+    return Path(f"{os.environ['ROLLOUT_MONITOR_PATH']}.tasks.json")
 
 
 def _record_converged(app: dict[str, Any], candidate: str, revision: str) -> bool:
@@ -698,15 +746,22 @@ def deploy() -> None:
         raise RuntimeError("not enough Ready eligible nodes to place every replica")
     task_proof = _verify_tasks(app_name, candidate, revision, ready)
     verify_route(base, api_key, application_id, app_name)
-    for url in HEALTH_URLS:
-        if not all(
-            _exact_health(_request_json(f"{url}?verify={uuid.uuid4()}"), revision)
-            for _ in range(4)
-        ):
-            raise RuntimeError("public Crawl4AI health did not converge")
+    public_instances = _verify_public(revision, task_proof["instances"])
+    if _verify_tasks(app_name, candidate, revision, ready) != task_proof:
+        raise RuntimeError("Crawl4AI task census changed during public proof")
+    proof = {
+        "revision": revision,
+        "baselineRevision": baseline_revision,
+        **task_proof,
+        "publicInstances": public_instances,
+    }
+    _task_proof_path().write_text(json.dumps(proof, separators=(",", ":")))
     print(
         json.dumps(
-            {"deploymentId": deployment["deploymentId"], "revision": revision, **task_proof},
+            {
+                "deploymentId": deployment["deploymentId"],
+                **proof,
+            },
             separators=(",", ":"),
         )
     )
@@ -763,16 +818,60 @@ def evidence() -> None:
     if not rows or any(not row.get("ok") for row in rows):
         raise RuntimeError("public rollout evidence contains a failure")
     revision = os.environ["GITHUB_SHA"]
-    if any(
-        not any(
-            row.get("revision") == revision
-            for row in rows
-            if row.get("url") == url
-        )
-        for url in HEALTH_URLS
+    task_proof = json.loads(_task_proof_path().read_text())
+    expected = set(task_proof.get("instances", []))
+    public_instances = task_proof.get("publicInstances") or {}
+    baseline_revision = task_proof.get("baselineRevision")
+    if (
+        task_proof.get("revision") != revision
+        or not isinstance(baseline_revision, str)
+        or not baseline_revision
+        or len(expected) != REPLICAS
     ):
+        raise RuntimeError("authoritative task proof does not match the candidate")
+    if set(public_instances) != set(HEALTH_URLS) or any(
+        instance not in expected for instance in public_instances.values()
+    ):
+        raise RuntimeError("public route proof does not identify authoritative tasks")
+    application = _application(
+        os.environ["DOKPLOY_URL"],
+        os.environ["DOKPLOY_API_KEY"],
+        os.environ["APPLICATION_ID"],
+    )
+    if application.get("labelsSwarm") != _labels(revision):
+        raise RuntimeError("candidate metadata changed before final evidence")
+    current_task_proof = _verify_tasks(
+        str(application["appName"]),
+        str(application["dockerImage"]),
+        revision,
+        _eligible_nodes(),
+    )
+    if current_task_proof != {
+        key: task_proof.get(key) for key in ("tasks", "nodes", "instances")
+    }:
+        raise RuntimeError("Crawl4AI task census changed before final evidence")
+    observed_urls = set()
+    for row in rows:
+        observed_revision = row.get("revision")
+        if observed_revision not in {baseline_revision, revision}:
+            raise RuntimeError("public rollout evidence contains a foreign revision")
+        if observed_revision != revision:
+            continue
+        if row.get("instance") not in expected:
+            raise RuntimeError("public rollout evidence contains an unknown candidate instance")
+        observed_urls.add(row.get("url"))
+    if not set(HEALTH_URLS) <= observed_urls:
         raise RuntimeError("each public domain must observe the candidate revision")
-    print(json.dumps({"publicSuccesses": len(rows), "publicFailures": 0}, separators=(",", ":")))
+    print(
+        json.dumps(
+            {
+                "publicSuccesses": len(rows),
+                "publicFailures": 0,
+                "publicInstances": public_instances,
+            },
+            separators=(",", ":"),
+        )
+    )
 
 
 def main() -> None:
