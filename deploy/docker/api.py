@@ -1133,11 +1133,21 @@ async def handle_crawl_request(
             "server_peak_memory_mb": peak_mem_mb
         }
 
-        # Track request completion
+        # Track request completion. The handler owns the verdict: an
+        # all-failed crawl is the caller's 502 (server.py /crawl) or a failed
+        # job (crawl_job_worker), so recording it as success/200 here counted
+        # every upstream failure as a success in /monitor (issue #18).
         try:
             from monitor import get_monitor
             await get_monitor().track_request_end(
-                request_id, success=True, pool_hit=True, status_code=200
+                request_id,
+                success=any_url_succeeded,
+                error=None if any_url_succeeded else (
+                    (processed_results[0].get("error_message") if processed_results else None)
+                    or "Crawl failed"
+                ),
+                pool_hit=True,
+                status_code=200 if any_url_succeeded else status.HTTP_502_BAD_GATEWAY,
             )
         except Exception:
             pass

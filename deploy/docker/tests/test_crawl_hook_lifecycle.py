@@ -742,3 +742,59 @@ def test_late_500_records_type_name_never_its_detail(monkeypatch):
     assert fake.closed[-1]["status_code"] == 500
     assert fake.closed[-1]["error"] == "request aborted: HTTPException"
     assert "raw internals" not in fake.closed[-1]["error"]
+
+
+def test_all_failed_crawl_is_recorded_as_a_gateway_failure(monkeypatch):
+    """The handler owns the verdict: recording success/200 before the caller's
+    502 counted every all-failed crawl as a success in /monitor (issue #18)."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(
+        monkeypatch,
+        FakeCrawler(mode="crawl_failure", failure_message="Blocked by anti-bot protection"),
+    )
+
+    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert response["success"] is False
+    assert fake.closed == [
+        {
+            "success": False,
+            "error": "Blocked by anti-bot protection",
+            "pool_hit": True,
+            "status_code": 502,
+        }
+    ]
+
+
+def test_monitor_error_text_is_the_sanitized_message(monkeypatch):
+    """/monitor/logs/errors is readable by any data-scope principal, so the
+    recorded text must be the correlated, path-free form, never the library's
+    raw error_message."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler(mode="crawl_failure"))
+
+    run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert fake.closed[-1]["error"].startswith("Crawl failed (correlation_id=")
+    assert "/app/" not in fake.closed[-1]["error"]
+
+
+def test_successful_crawl_is_recorded_as_a_success(monkeypatch):
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler())
+
+    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert response["success"] is True
+    assert fake.closed == [
+        {"success": True, "error": None, "pool_hit": True, "status_code": 200}
+    ]
