@@ -14,7 +14,7 @@ from rich.console import Console
 # (which pulls in many optional deps like aiofiles, OpenSSL, playwright …).
 _spec = importlib.util.spec_from_file_location(
     "crawl4ai.async_logger",
-    Path(__file__).parent.parent / "crawl4ai" / "async_logger.py",
+    Path(__file__).parents[2] / "crawl4ai" / "async_logger.py",
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]

@@ -51,21 +51,32 @@ jobs:
             --network "container:$HOSTNAME" \
             docker.io/library/redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf >/dev/null
           trap 'docker rm --force "$redis_container" >/dev/null 2>&1 || true' EXIT
+          # Directory discovery, not a file list: a test added by a PR runs
+          # here automatically (issue #72). --ignore is the explicit opt-out
+          # for files needing a live server/docker SDK (test_1..7, monitor
+          # demo) or an installed Playwright browser (the test_reg_* crawls);
+          # "not network" skips tests marked as hitting real external URLs.
           REDIS_URL=redis://127.0.0.1:6379/0 \
           PYTHONPATH="$PWD:$PWD/deploy/docker" .venv/bin/python -m pytest -q --no-header \
-            deploy/docker/tests/test_auth.py \
-            deploy/docker/tests/test_crawl_hook_lifecycle.py \
-            deploy/docker/tests/test_crawl_job_queue.py \
-            deploy/docker/tests/test_crawl_job_queue_redis.py \
-            deploy/docker/tests/test_crawl_job_contract.py \
-            deploy/docker/tests/test_rollout_verifier.py \
-            deploy/docker/tests/test_runtime_ui_repairs.py \
-            deploy/docker/tests/test_security_headers_xss.py \
-            deploy/docker/tests/test_server_crawler_defaults.py \
-            deploy/docker/tests/test_resource_policy.py \
-            tests/test_async_logger_stderr.py \
-            tests/test_crawl_failure_severity.py \
-            tests/test_memory_cgroup.py
+            -m "not network" \
+            deploy/docker/tests/ \
+            tests/regression/ \
+            tests/deep_crwaling/ \
+            --ignore=deploy/docker/tests/test_1_basic.py \
+            --ignore=deploy/docker/tests/test_2_memory.py \
+            --ignore=deploy/docker/tests/test_3_pool.py \
+            --ignore=deploy/docker/tests/test_4_concurrent.py \
+            --ignore=deploy/docker/tests/test_5_pool_stress.py \
+            --ignore=deploy/docker/tests/test_6_multi_endpoint.py \
+            --ignore=deploy/docker/tests/test_7_cleanup.py \
+            --ignore=deploy/docker/tests/test_monitor_demo.py \
+            --ignore=tests/regression/test_cdp_session_leak.py \
+            --ignore=tests/regression/test_reg_browser.py \
+            --ignore=tests/regression/test_reg_content.py \
+            --ignore=tests/regression/test_reg_core_crawl.py \
+            --ignore=tests/regression/test_reg_deep_crawl.py \
+            --ignore=tests/regression/test_reg_edge_cases.py \
+            --ignore=tests/regression/test_reg_extraction.py
 
   # Each architecture builds on a runner of that architecture. QEMU emulation is
   # NOT viable here: the Dockerfile launches Chromium as a build-time smoke test

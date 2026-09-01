@@ -8,7 +8,7 @@ from pathlib import Path
 
 def test_setup_build_does_not_create_crawl4ai_cache(tmp_path: Path) -> None:
     env = os.environ | {"CRAWL4_AI_BASE_DIRECTORY": str(tmp_path)}
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     uv = shutil.which("uv")
     assert uv is not None
 

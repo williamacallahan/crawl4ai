@@ -18,7 +18,7 @@ import pytest
 # deploy/docker holds ``schemas`` (imported as a bare module by the server
 # tests); put it on sys.path so we can cross-validate the client payload
 # against the real ``HookConfig`` without starting the server.
-_DEPLOY_DOCKER = Path(__file__).resolve().parents[1] / "deploy" / "docker"
+_DEPLOY_DOCKER = Path(__file__).resolve().parents[2] / "deploy" / "docker"
 if str(_DEPLOY_DOCKER) not in sys.path:
     sys.path.insert(0, str(_DEPLOY_DOCKER))
 
