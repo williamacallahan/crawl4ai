@@ -243,12 +243,31 @@ class TestNormalizeUrlForDeepCrawl:
         assert "#anchor" not in result
 
     def test_tracking_params_removed(self):
-        """utm_source and similar tracking params should be removed."""
-        result = normalize_url_for_deep_crawl(
-            "/page?utm_source=google&keep=yes", "http://x.com"
+        """The full set of 9 tracking params should be removed (keep in sync
+        with normalize_url). Regression guard for the deep-crawl dedup set
+        being silently trimmed back to a smaller subset.
+        """
+        all_tracking = (
+            "utm_source=g&utm_medium=cpc&utm_campaign=spring&utm_term=shoes"
+            "&utm_content=ad1&gclid=abc&fbclid=xyz&ref=news&ref_src=email"
         )
-        assert "utm_source" not in result
+        result = normalize_url_for_deep_crawl(
+            f"/page?{all_tracking}&keep=yes", "http://x.com"
+        )
+        for param in ("utm_source", "utm_medium", "utm_campaign", "utm_term",
+                      "utm_content", "gclid", "fbclid", "ref", "ref_src"):
+            assert param not in result, f"{param} should be stripped: {result}"
         assert "keep=yes" in result
+
+    def test_tracking_removal_case_insensitive(self):
+        """Tracking param removal must be case-insensitive (matches normalize_url)."""
+        result = normalize_url_for_deep_crawl(
+            "/page?UTM_SOURCE=test&GCLID=x&Ref_Src=tw&data=1", "http://x.com"
+        )
+        assert "UTM_SOURCE" not in result
+        assert "GCLID" not in result
+        assert "Ref_Src" not in result
+        assert "data=1" in result
 
     def test_hostname_lowercased(self):
         """Hostname should be lowercased."""
