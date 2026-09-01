@@ -94,6 +94,25 @@ def test_no_thead_first_row_td_with_colspan_keeps_all_columns():
     assert data["metadata"]["column_count"] == 3
 
 
+def test_no_thead_mixed_th_td_first_row_keeps_all_columns():
+    # Row-header pattern: <th scope="row"> label + <td> data cells, no <thead>.
+    # The lone <th> must not become the only header — that would cap
+    # max_columns at 1 and truncate every data row.
+    table = (
+        "<table><caption>c</caption><tbody>"
+        "<tr><th>Region</th><td>North</td><td>South</td></tr>"
+        "<tr><th>Sales</th><td>100</td><td>50</td></tr>"
+        "<tr><th>Costs</th><td>80</td><td>30</td></tr>"
+        "</tbody></table>"
+    )
+    _, data = _extract(table)
+
+    assert data["headers"] == ["Column 1", "Column 2"]
+    assert data["rows"] == [["North", "South"], ["100", "50"], ["80", "30"]]
+    assert data["metadata"]["column_count"] == 2
+    assert data["metadata"]["has_headers"] is False
+
+
 def test_extract_tables_no_thead_no_duplication():
     # End-to-end via the public extract_tables() entry point: the table passes
     # the data-table threshold and is returned exactly once, unduplicated.
