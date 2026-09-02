@@ -8,6 +8,7 @@ from threading import Thread
 import pytest
 
 import swarm_observer as observer
+import swarm_observer_server as observer_server
 import verify_rollout as rollout
 
 BASELINE = "registry.example/crawl4ai@sha256:baseline"
@@ -1298,7 +1299,6 @@ def test_baseline_keeps_unassigned_attempts_strict(monkeypatch):
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
         rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
-
 OBSERVER_INCOMPLETE = observer.CoverageSnapshot(3, 2, 1)
 OBSERVER_COMPLETE = observer.CoverageSnapshot(3, 3, 3)
 OBSERVER_MISMATCH = observer.NetworkDbFdbComparison.DESTINATION_MISMATCH
@@ -1310,6 +1310,7 @@ def test_initial_incomplete_is_reported_once_until_full_recovery(tmp_path):
     assert latch.observe(
         OBSERVER_INCOMPLETE, OBSERVER_MISMATCH
     ) == observer.CoverageDiagnostic(3, 2, 1, OBSERVER_MISMATCH)
+    latch.acknowledge()
     assert (
         latch.observe(OBSERVER_INCOMPLETE, observer.NetworkDbFdbComparison.MISSING)
         is None
@@ -1333,6 +1334,7 @@ def test_full_to_incomplete_is_reported_once_until_recovery(tmp_path):
     assert latch.observe(
         OBSERVER_INCOMPLETE, OBSERVER_MISMATCH
     ) == observer.CoverageDiagnostic(3, 2, 1, OBSERVER_MISMATCH)
+    latch.acknowledge()
     assert (
         latch.observe(OBSERVER_INCOMPLETE, observer.NetworkDbFdbComparison.INCONCLUSIVE)
         is None
@@ -1348,11 +1350,15 @@ def test_latch_state_survives_a_restart_and_resets_after_recovery(tmp_path):
     first = observer.CoverageEpisodeLatch(state_path)
 
     assert first.observe(OBSERVER_INCOMPLETE, OBSERVER_MISMATCH) is not None
-    assert state_path.read_bytes() == b"open\n"
+    assert state_path.read_bytes() == b"pending\n"
     restarted = observer.CoverageEpisodeLatch(state_path)
-    assert restarted.observe(OBSERVER_INCOMPLETE, OBSERVER_MISMATCH) is None
+    assert restarted.observe(OBSERVER_INCOMPLETE, OBSERVER_MISMATCH) is not None
+    restarted.acknowledge()
+    assert state_path.read_bytes() == b"open\n"
+    emitted = observer.CoverageEpisodeLatch(state_path)
+    assert emitted.observe(OBSERVER_INCOMPLETE, OBSERVER_MISMATCH) is None
     assert (
-        restarted.observe(OBSERVER_COMPLETE, observer.NetworkDbFdbComparison.CONSISTENT)
+        emitted.observe(OBSERVER_COMPLETE, observer.NetworkDbFdbComparison.CONSISTENT)
         is None
     )
     assert state_path.read_bytes() == b"closed\n"
@@ -1433,7 +1439,24 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
     }
     monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: None)
     monkeypatch.setattr(observer.rollout, "_service_tasks", lambda _service: rows)
-    monkeypatch.setattr(observer, "_network_details", lambda: {"Id": "network"})
+    monkeypatch.setattr(
+        observer,
+        "_network_details",
+        lambda: {
+            "Id": "network",
+            "Services": {
+                "crawl4ai": {
+                    "Tasks": [
+                        {
+                            "Name": task_id,
+                            "Info": {"Host IP": f"100.0.0.{index + 10}"},
+                        }
+                        for index, task_id in enumerate(runtimes)
+                    ]
+                }
+            },
+        },
+    )
     monkeypatch.setattr(
         observer.rollout,
         "_task_runtime",
@@ -1451,7 +1474,7 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
             revision=REVISION,
         ),
     )
-    monkeypatch.setattr(observer, "_public_coverage", lambda _direct: 2)
+    monkeypatch.setattr(observer, "_public_coverage", lambda _direct, _deadline: 2)
     monkeypatch.setattr(
         observer,
         "_fdb_comparison",
@@ -1498,16 +1521,24 @@ def test_public_coverage_accepts_each_task_revision_and_intersects_routes(monkey
     monkeypatch.setattr(observer.rollout, "_request_json", public_health)
     monkeypatch.setattr(observer.rollout, "PUBLIC_PROOF_ATTEMPTS", 2)
 
-    assert observer._public_coverage(direct) == 2
+    assert observer._public_coverage(direct, observer.time.monotonic() + 10) == 2
+
+
+def test_public_coverage_stops_at_the_sample_deadline(monkeypatch):
+    monkeypatch.setattr(
+        observer.rollout,
+        "_request_json",
+        lambda _url: pytest.fail("deadline must stop the public request"),
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        observer._public_coverage({"one": REVISION}, observer.time.monotonic() - 1)
 
 
 def test_fdb_comparison_distinguishes_missing_and_wrong_destinations(monkeypatch):
     task = [{"ID": "task-1", "Node": "node-1"}]
     runtime = {"task-1": {"addresses": {"10.0.1.38"}}}
-    monkeypatch.setattr(observer.socket, "gethostname", lambda: "ingress")
-    monkeypatch.setattr(
-        observer, "_node_addresses", lambda _node: {"node-1": "100.0.0.9"}
-    )
+    data_path = {"task-1": "100.0.0.9"}
 
     def bridge(destination):
         return subprocess.CompletedProcess(
@@ -1523,21 +1554,21 @@ def test_fdb_comparison_distinguishes_missing_and_wrong_destinations(monkeypatch
         observer.subprocess, "run", lambda *_args, **_kwargs: bridge(None)
     )
     assert (
-        observer._fdb_comparison("network-id", task, runtime)
+        observer._fdb_comparison("network-id", task, runtime, data_path)
         is observer.NetworkDbFdbComparison.MISSING
     )
     monkeypatch.setattr(
         observer.subprocess, "run", lambda *_args, **_kwargs: bridge("100.0.0.8")
     )
     assert (
-        observer._fdb_comparison("network-id", task, runtime)
+        observer._fdb_comparison("network-id", task, runtime, data_path)
         is observer.NetworkDbFdbComparison.DESTINATION_MISMATCH
     )
     monkeypatch.setattr(
         observer.subprocess, "run", lambda *_args, **_kwargs: bridge("100.0.0.9")
     )
     assert (
-        observer._fdb_comparison("network-id", task, runtime)
+        observer._fdb_comparison("network-id", task, runtime, data_path)
         is observer.NetworkDbFdbComparison.CONSISTENT
     )
     monkeypatch.setattr(
@@ -1548,30 +1579,35 @@ def test_fdb_comparison_distinguishes_missing_and_wrong_destinations(monkeypatch
         ),
     )
     assert (
-        observer._fdb_comparison("network-id", task, runtime)
+        observer._fdb_comparison("network-id", task, runtime, data_path)
         is observer.NetworkDbFdbComparison.INCONCLUSIVE
     )
 
 
 def test_sampling_failure_replaces_a_stale_healthy_sample(monkeypatch, tmp_path):
-    state = observer.ObserverState("crawl4ai", tmp_path / "state")
-    state._snapshot = OBSERVER_COMPLETE
+    state_path = tmp_path / "state"
+    metrics_path = tmp_path / "metrics"
+    monkeypatch.setenv("CRAWL4AI_SWARM_SERVICE", "crawl4ai")
+    monkeypatch.setenv("CRAWL4AI_OBSERVER_STATE_PATH", str(state_path))
+    monkeypatch.setenv("CRAWL4AI_OBSERVER_METRICS_PATH", str(metrics_path))
     monkeypatch.setattr(
         observer,
         "sample",
         lambda _service: (_ for _ in ()).throw(RuntimeError("private detail")),
     )
 
-    state.refresh()
+    observer.write_sample()
 
-    assert state.metrics_text().endswith("crawl4ai_coverage_complete 0\n")
+    assert metrics_path.read_text().endswith("crawl4ai_coverage_complete 0\n")
+    assert state_path.read_bytes() == b"open\n"
 
 
 def test_metrics_endpoint_exposes_only_the_fixed_contract(tmp_path):
-    state = observer.ObserverState("crawl4ai", tmp_path / "state")
-    state._snapshot = OBSERVER_COMPLETE
-    server = observer.http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0), observer._handler(state)
+    path = tmp_path / "metrics"
+    path.write_text(OBSERVER_COMPLETE.metrics_text())
+    metrics = observer_server.MetricsFile(path, 60)
+    server = observer_server.http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), observer_server.handler(metrics)
     )
     thread = Thread(target=server.serve_forever)
     thread.start()
@@ -1583,7 +1619,18 @@ def test_metrics_endpoint_exposes_only_the_fixed_contract(tmp_path):
         assert response.read().decode() == OBSERVER_COMPLETE.metrics_text()
         connection.request("GET", "/tasks")
         assert connection.getresponse().status == 404
+        connection.request("POST", "/metrics")
+        assert connection.getresponse().status == 501
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_metrics_endpoint_fails_closed_when_the_sampler_is_stale(monkeypatch, tmp_path):
+    path = tmp_path / "metrics"
+    path.write_text(OBSERVER_COMPLETE.metrics_text())
+    monkeypatch.setattr(observer_server.time, "time", lambda: path.stat().st_mtime + 61)
+
+    with pytest.raises(TimeoutError, match="stale"):
+        observer_server.MetricsFile(path, 60).read()

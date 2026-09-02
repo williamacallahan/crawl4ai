@@ -1,21 +1,13 @@
-"""Identity-free output state for the continuous Crawl4AI coverage observer.
-
-Docker discovery and reachability sampling stay with ``verify_rollout``. This
-module accepts only its aggregate counts and bounded NetworkDB/FDB outcome.
-"""
+"""Privileged Crawl4AI coverage sampler with identity-free durable output."""
 
 from __future__ import annotations
 
-import http.server
 import ipaddress
 import json
 import os
-import socket
 import subprocess
 import tempfile
-import threading
 import time
-import urllib.parse
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -25,10 +17,30 @@ from typing import Any
 import verify_rollout as rollout
 
 
-DEFAULT_BIND = "127.0.0.1"
-DEFAULT_PORT = 9476
-DEFAULT_INTERVAL_SECONDS = 15.0
 DEFAULT_STATE_PATH = "/var/lib/crawl4ai-swarm-observer/episode.state"
+DEFAULT_METRICS_PATH = "/var/lib/crawl4ai-swarm-observer/metrics.prom"
+SAMPLE_DEADLINE_SECONDS = 45.0
+
+
+def _atomic_replace(
+    path: str | Path, content: bytes, mode: int, *, durable: bool
+) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", dir=target.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(content)
+            if durable:
+                output.flush()
+                os.fsync(output.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _validate_counts(
@@ -141,13 +153,14 @@ class CoverageEpisodeLatch:
     """Persist whether the current incomplete-coverage episode was reported."""
 
     _OPEN = b"open\n"
+    _PENDING = b"pending\n"
     _CLOSED = b"closed\n"
 
     def __init__(self, state_path: str | Path) -> None:
         self._state_path = Path(state_path)
         if not self._state_path.name:
             raise ValueError("state_path must name a file")
-        self._episode_open = self._load()
+        self._state = self._load()
 
     def observe(
         self,
@@ -160,41 +173,34 @@ class CoverageEpisodeLatch:
         if not isinstance(networkdb_fdb_comparison, NetworkDbFdbComparison):
             raise TypeError("networkdb_fdb_comparison must be a NetworkDbFdbComparison")
         if snapshot.complete:
-            if self._episode_open:
-                self._persist(False)
-                self._episode_open = False
+            if self._state != self._CLOSED:
+                self._persist(self._CLOSED)
+                self._state = self._CLOSED
             return None
-        if self._episode_open:
+        if self._state == self._OPEN:
             return None
-        self._persist(True)
-        self._episode_open = True
+        if self._state == self._CLOSED:
+            self._persist(self._PENDING)
+            self._state = self._PENDING
         return CoverageDiagnostic.from_snapshot(snapshot, networkdb_fdb_comparison)
 
-    def _load(self) -> bool:
+    def acknowledge(self) -> None:
+        if self._state != self._PENDING:
+            raise RuntimeError("coverage diagnostic is not pending")
+        self._persist(self._OPEN)
+        self._state = self._OPEN
+
+    def _load(self) -> bytes:
         try:
             state = self._state_path.read_bytes()
         except FileNotFoundError:
-            return False
-        if state == self._OPEN:
-            return True
-        if state == self._CLOSED:
-            return False
+            return self._CLOSED
+        if state in {self._OPEN, self._PENDING, self._CLOSED}:
+            return state
         raise ValueError("coverage episode state is invalid")
 
-    def _persist(self, episode_open: bool) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self._state_path.name}.", dir=self._state_path.parent
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as state_file:
-                state_file.write(self._OPEN if episode_open else self._CLOSED)
-                state_file.flush()
-                os.fsync(state_file.fileno())
-            os.replace(temporary_path, self._state_path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
+    def _persist(self, state: bytes) -> None:
+        _atomic_replace(self._state_path, state, 0o600, durable=True)
 
 
 def _network_details() -> dict[str, Any]:
@@ -211,30 +217,6 @@ def _network_details() -> dict[str, Any]:
     return details[0]
 
 
-def _node_addresses(node: set[str]) -> dict[str, str]:
-    if not node:
-        return {}
-    inspected = subprocess.run(
-        [
-            "docker",
-            "node",
-            "inspect",
-            "--format",
-            "{{json .Description.Hostname}}\t{{json .Status.Addr}}",
-            *sorted(node),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    return {
-        str(json.loads(hostname)): str(json.loads(address))
-        for line in inspected.stdout.splitlines()
-        for hostname, address in [line.split("\t", 1)]
-    }
-
-
 def _overlay_mac(address: str) -> str:
     octet = ipaddress.IPv4Address(address).packed
     return "02:42:" + ":".join(f"{part:02x}" for part in octet)
@@ -244,19 +226,15 @@ def _fdb_comparison(
     network_id: str,
     task: list[dict[str, Any]],
     runtime_by_task: dict[str, dict[str, Any]],
+    data_path_by_task: dict[str, str],
 ) -> NetworkDbFdbComparison:
-    local_node = socket.gethostname()
-    node_address = _node_addresses({str(row.get("Node")) for row in task})
     expected = {}
     for row in task:
         task_id = str(row["ID"])
-        node = str(row.get("Node"))
-        if node == local_node:
-            continue
         address = runtime_by_task[task_id]["addresses"]
-        if len(address) != 1 or node not in node_address:
+        if len(address) != 1 or task_id not in data_path_by_task:
             return NetworkDbFdbComparison.INCONCLUSIVE
-        expected[_overlay_mac(next(iter(address)))] = node_address[node]
+        expected[_overlay_mac(next(iter(address)))] = data_path_by_task[task_id]
     namespace = Path("/var/run/docker/netns") / f"1-{network_id[:12]}"
     result = subprocess.run(
         [
@@ -291,13 +269,15 @@ def _fdb_comparison(
     return NetworkDbFdbComparison.CONSISTENT
 
 
-def _public_coverage(direct_instance: dict[str, str]) -> int:
+def _public_coverage(direct_instance: dict[str, str], deadline: float) -> int:
     if not direct_instance:
         return 0
     observed = []
     for url in rollout.HEALTH_URLS:
         seen = set()
         for _ in range(rollout.PUBLIC_PROOF_ATTEMPTS):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("coverage sampling deadline expired")
             try:
                 health = rollout._request_json(f"{url}?observer={uuid.uuid4()}")
             except Exception:
@@ -317,6 +297,7 @@ def _public_coverage(direct_instance: dict[str, str]) -> int:
 
 def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]:
     """Reuse the rollout verifier's task and health owners for one stable sample."""
+    deadline = time.monotonic() + SAMPLE_DEADLINE_SECONDS
     rollout._verify_ingress_host()
     before = rollout._service_tasks(service_name)
     current = [
@@ -324,9 +305,20 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
     ]
     authoritative_task_count = len(current)
     network = _network_details()
+    data_path_by_task = {
+        str(task.get("Name", "")).rsplit(".", 1)[-1]: str(
+            (task.get("Info") or {}).get("Host IP", "")
+        )
+        for task in (network.get("Services") or {})
+        .get(service_name, {})
+        .get("Tasks", [])
+        if (task.get("Info") or {}).get("Host IP")
+    }
     runtime_by_task = {}
     direct_instance = {}
     for row in current:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("coverage sampling deadline expired")
         if not str(row.get("CurrentState", "")).startswith("Running "):
             continue
         task_id = str(row["ID"])
@@ -345,6 +337,20 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
                 direct_instance[runtime["container"]] = revision
         except Exception:
             continue
+    snapshot = CoverageSnapshot(
+        authoritative_task_count,
+        len(direct_instance),
+        _public_coverage(direct_instance, deadline),
+    )
+    if snapshot.complete or len(runtime_by_task) != authoritative_task_count:
+        comparison = NetworkDbFdbComparison.INCONCLUSIVE
+    else:
+        try:
+            comparison = _fdb_comparison(
+                str(network["Id"]), current, runtime_by_task, data_path_by_task
+            )
+        except Exception:
+            comparison = NetworkDbFdbComparison.INCONCLUSIVE
     after_ids = {
         str(row["ID"])
         for row in rollout._service_tasks(service_name)
@@ -352,92 +358,32 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
     }
     if after_ids != {str(row["ID"]) for row in current}:
         raise RuntimeError("Crawl4AI task census changed during coverage sampling")
-    snapshot = CoverageSnapshot(
-        authoritative_task_count,
-        len(direct_instance),
-        _public_coverage(direct_instance),
-    )
-    if snapshot.complete or len(runtime_by_task) != authoritative_task_count:
-        comparison = NetworkDbFdbComparison.INCONCLUSIVE
-    else:
-        try:
-            comparison = _fdb_comparison(str(network["Id"]), current, runtime_by_task)
-        except Exception:
-            comparison = NetworkDbFdbComparison.INCONCLUSIVE
     return snapshot, comparison
 
 
-class ObserverState:
-    def __init__(self, service_name: str, state_path: str | Path) -> None:
-        self._service_name = service_name
-        self._latch = CoverageEpisodeLatch(state_path)
-        self._snapshot = CoverageSnapshot(0, 0, 0)
-        self._lock = threading.Lock()
-
-    def refresh(self) -> None:
-        try:
-            snapshot, comparison = sample(self._service_name)
-        except Exception as error:
-            snapshot = CoverageSnapshot(0, 0, 0)
-            comparison = NetworkDbFdbComparison.INCONCLUSIVE
-            print(
-                f"crawl4ai coverage sampling failed: {type(error).__name__}",
-                flush=True,
-            )
-        diagnostic = self._latch.observe(snapshot, comparison)
-        if diagnostic is not None:
-            print(diagnostic.text(), flush=True)
-        with self._lock:
-            self._snapshot = snapshot
-
-    def metrics_text(self) -> str:
-        with self._lock:
-            return self._snapshot.metrics_text()
+def _write_metrics(path: str | Path, metrics: str) -> None:
+    _atomic_replace(path, metrics.encode(), 0o644, durable=False)
 
 
-def _handler(state: ObserverState) -> type[http.server.BaseHTTPRequestHandler]:
-    class MetricsHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            if urllib.parse.urlsplit(self.path).path != "/metrics":
-                self.send_error(http.HTTPStatus.NOT_FOUND)
-                return
-            body = state.metrics_text().encode()
-            self.send_response(http.HTTPStatus.OK)
-            self.send_header("Content-Type", "text/plain; version=0.0.4")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, _format: str, *_arguments: object) -> None:
-            return
-
-    return MetricsHandler
-
-
-def serve() -> None:
-    service_name = os.environ["CRAWL4AI_SWARM_SERVICE"]
-    bind = os.environ.get("CRAWL4AI_OBSERVER_BIND", DEFAULT_BIND)
-    port = int(os.environ.get("CRAWL4AI_OBSERVER_PORT", DEFAULT_PORT))
-    interval = float(
-        os.environ.get("CRAWL4AI_OBSERVER_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS)
+def write_sample() -> None:
+    latch = CoverageEpisodeLatch(
+        os.environ.get("CRAWL4AI_OBSERVER_STATE_PATH", DEFAULT_STATE_PATH)
     )
-    if interval < 1:
-        raise ValueError("CRAWL4AI_OBSERVER_INTERVAL_SECONDS must be at least 1")
-    state = ObserverState(
-        service_name,
-        os.environ.get("CRAWL4AI_OBSERVER_STATE_PATH", DEFAULT_STATE_PATH),
+    try:
+        snapshot, comparison = sample(os.environ["CRAWL4AI_SWARM_SERVICE"])
+    except Exception as error:
+        snapshot = CoverageSnapshot(0, 0, 0)
+        comparison = NetworkDbFdbComparison.INCONCLUSIVE
+        print(f"crawl4ai coverage sampling failed: {type(error).__name__}", flush=True)
+    diagnostic = latch.observe(snapshot, comparison)
+    if diagnostic is not None:
+        print(diagnostic.text(), flush=True)
+        latch.acknowledge()
+    _write_metrics(
+        os.environ.get("CRAWL4AI_OBSERVER_METRICS_PATH", DEFAULT_METRICS_PATH),
+        snapshot.metrics_text(),
     )
-
-    server = http.server.ThreadingHTTPServer((bind, port), _handler(state))
-    threading.Thread(
-        target=server.serve_forever, name="metrics-server", daemon=True
-    ).start()
-    while True:
-        started = time.monotonic()
-        state.refresh()
-        delay = interval - (time.monotonic() - started)
-        time.sleep(interval if delay <= 0 else delay)
 
 
 if __name__ == "__main__":
-    serve()
+    write_sample()
