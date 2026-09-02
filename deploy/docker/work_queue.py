@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
@@ -28,40 +29,49 @@ logger = logging.getLogger("crawl4ai.workqueue")
 JobFactory = Callable[[], Awaitable[None]]
 CancellationCallback = Callable[[], Awaitable[None]]
 
-PRINCIPAL_QUOTA_COUNTS_KEY = "crawl4ai:jobs:principal-counts:v1"
-PRINCIPAL_QUOTA_CLAIMS_KEY = "crawl4ai:jobs:principal-claims:v1"
+# One ZSET per principal (member = claim id, score = expiry deadline) is the
+# sole owner of "active background jobs per principal". It is shared with the
+# durable crawl queue: durable claims carry score +inf because their release is
+# atomic inside the terminal-state Lua scripts and a pending backlog job may
+# legitimately wait longer than any lease. In-process claims carry a finite
+# deadline so a claim orphaned by a failed release or a killed process expires
+# instead of consuming the slot forever (#76). Not cluster-safe key layout;
+# the deployment runs a single Redis.
+PRINCIPAL_QUOTA_LEASE_PREFIX = "crawl4ai:jobs:principal-leases:v2:"
+
+# ponytail: fixed lease, no renewal. An in-process job outliving it temporarily
+# frees its quota slot; add heartbeat renewal if legitimate >1h jobs appear.
+QUOTA_LEASE_TTL_S = 3600
+
+# The v1 hash pair this ZSET replaced (crawl4ai:jobs:principal-counts:v1 and
+# crawl4ai:jobs:principal-claims:v1) is left untouched: old replicas keep
+# enforcing on it consistently until the rollout completes, after which it is
+# inert residue an operator may DEL. Deleting it at boot would erase the old
+# replicas' live accounting mid-rollout and triple the admitted budget.
+
+
+def principal_lease_key(principal: str) -> str:
+    return PRINCIPAL_QUOTA_LEASE_PREFIX + principal
+
 
 _ACQUIRE_PRINCIPAL_QUOTA_SCRIPT = """
 -- crawl4ai:acquire-principal-quota
-if tonumber(ARGV[1]) <= 0 or ARGV[2] == '' then
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3])
+if redis.call('ZSCORE', KEYS[1], ARGV[2]) then
   return 1
 end
-if redis.call('HEXISTS', KEYS[2], ARGV[3]) == 1 then
-  return 1
-end
-local active = tonumber(redis.call('HGET', KEYS[1], ARGV[2]) or '0')
-if active >= tonumber(ARGV[1]) then
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[1]) then
   return 0
 end
-redis.call('HSET', KEYS[2], ARGV[3], ARGV[2])
-redis.call('HINCRBY', KEYS[1], ARGV[2], 1)
+redis.call('ZADD', KEYS[1], ARGV[4], ARGV[2])
 return 1
 """
 
 _RELEASE_PRINCIPAL_QUOTA_SCRIPT = """
 -- crawl4ai:release-principal-quota
-local principal = redis.call('HGET', KEYS[2], ARGV[1])
-if not principal then
-  return 0
-end
-redis.call('HDEL', KEYS[2], ARGV[1])
-local active = tonumber(redis.call('HGET', KEYS[1], principal) or '0')
-if active <= 1 then
-  redis.call('HDEL', KEYS[1], principal)
-else
-  redis.call('HINCRBY', KEYS[1], principal, -1)
-end
-return 1
+local released = redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
+return released
 """
 
 
@@ -73,27 +83,30 @@ async def acquire_principal_quota(
 ) -> bool:
     if per_principal <= 0 or not principal:
         return True
+    now = time.time()
     acquired = await redis.eval(
         _ACQUIRE_PRINCIPAL_QUOTA_SCRIPT,
-        2,
-        PRINCIPAL_QUOTA_COUNTS_KEY,
-        PRINCIPAL_QUOTA_CLAIMS_KEY,
+        1,
+        principal_lease_key(principal),
         per_principal,
-        principal,
         claim_token,
+        now,
+        now + QUOTA_LEASE_TTL_S,
     )
     return int(acquired) == 1
 
 
-async def release_principal_quota(redis: Any, claim_token: str | None) -> bool:
-    if not claim_token:
+async def release_principal_quota(
+    redis: Any, principal: str | None, claim_token: str | None
+) -> bool:
+    if not claim_token or not principal:
         return False
     released = await redis.eval(
         _RELEASE_PRINCIPAL_QUOTA_SCRIPT,
-        2,
-        PRINCIPAL_QUOTA_COUNTS_KEY,
-        PRINCIPAL_QUOTA_CLAIMS_KEY,
+        1,
+        principal_lease_key(principal),
         claim_token,
+        time.time(),
     )
     return int(released) == 1
 
@@ -176,13 +189,12 @@ class WorkQueue:
     async def _release(self, principal: str | None, claim_token: str | None) -> None:
         if self.redis is not None:
             try:
-                await release_principal_quota(self.redis, claim_token)
+                await release_principal_quota(self.redis, principal, claim_token)
             except Exception:
                 # Same failure class as the LLM-permit release (#63): a Redis
                 # blip here must not kill the worker task, skip task_done(), or
                 # replace a QueueFull/QuotaExceeded with a connection error.
-                # Unlike the permit key these quota hashes have no TTL, so a
-                # swallowed failure leaks one slot for this principal.
+                # The unreleased lease self-expires after QUOTA_LEASE_TTL_S.
                 logger.exception(
                     "Failed to release principal quota (claim %s)", claim_token
                 )

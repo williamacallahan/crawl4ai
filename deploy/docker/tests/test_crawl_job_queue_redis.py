@@ -377,3 +377,66 @@ def test_accepted_llm_task_is_failed_when_shutdown_drains_queue(redis_url, monke
             await client.aclose()
 
     asyncio.run(exercise())
+
+
+def test_leaked_quota_lease_expires_and_frees_the_slot(redis_url, monkeypatch):
+    """A claim orphaned by a failed release or a killed process must self-heal.
+
+    Issue #76: the v1 hash accounting leaked such claims forever. The lease
+    ZSET purges expired members on the next acquire, so the slot returns
+    without any operator repair.
+    """
+    import work_queue as work_queue_module
+    from work_queue import acquire_principal_quota, principal_lease_key
+
+    async def exercise():
+        client = aioredis.from_url(redis_url, decode_responses=True)
+        monkeypatch.setattr(work_queue_module, "QUOTA_LEASE_TTL_S", 0.2)
+        try:
+            assert await acquire_principal_quota(client, 1, "lease-alice", "leaked")
+            # The leaked claim (never released) holds the only slot.
+            assert not await acquire_principal_quota(client, 1, "lease-alice", "next")
+            await asyncio.sleep(0.25)
+            # The lease expired; the slot is usable again.
+            assert await acquire_principal_quota(client, 1, "lease-alice", "next")
+        finally:
+            await client.delete(principal_lease_key("lease-alice"))
+            await client.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_durable_quota_lease_never_expires(redis_url):
+    """Durable backlog claims carry score +inf: a pending job may outwait any
+    lease, and its release is atomic in the terminal-state scripts."""
+    from crawl_job_queue import CrawlJobPrincipalQuotaExceeded, CrawlJobQueue
+    from work_queue import principal_lease_key
+
+    async def exercise():
+        client = aioredis.from_url(redis_url, decode_responses=True)
+        config = queue_config()
+        config["crawl_jobs"]["stream"] = "crawl-jobs-lease-ttl"
+        queue = CrawlJobQueue(client, config)
+        task_id = ""
+        try:
+            await queue.ensure_group()
+            task_id = await queue.enqueue(
+                ["https://example.com"], {}, {}, None, None, owner="lease-bob"
+            )
+            # The durable claim must be exactly +inf: any finite score would
+            # let a backlog job outwait its lease and lose the slot.
+            score = await client.zscore(principal_lease_key("lease-bob"), task_id)
+            assert score == float("inf")
+            with pytest.raises(CrawlJobPrincipalQuotaExceeded):
+                await queue.enqueue(
+                    ["https://second.example"], {}, {}, None, None, owner="lease-bob"
+                )
+        finally:
+            await client.delete(queue.settings.stream)
+            if task_id:
+                await client.delete(queue.task_key(task_id))
+                await client.delete(queue.payload_key(task_id))
+            await client.delete(principal_lease_key("lease-bob"))
+            await client.aclose()
+
+    asyncio.run(exercise())

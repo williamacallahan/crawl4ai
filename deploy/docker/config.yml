@@ -49,10 +49,12 @@ redis:
 # stalls the single Redis thread and takes every replica's /health down), so a
 # Redis host crash can lose up to ~1s of freshly accepted job state.
 crawl_jobs:
-  # The runtime appends :v2 to stream/group. New workers fail startup while the
-  # unsuffixed v1 stream is nonempty, leaving old workers to drain it before the
-  # rollout can advance.
-  protocol_version: 2
+  # The runtime appends :v3 to stream/group. New workers fail startup while the
+  # previous version's stream (:v2) is nonempty, leaving old workers to drain
+  # it before the rollout can advance. v3 moved per-principal quotas to lease
+  # ZSETs (#76); disjoint streams keep mixed-version replicas from completing
+  # each other's jobs with mismatched quota accounting.
+  protocol_version: 3
   stream: "crawl-jobs"
   group: "crawl-workers"
   lease_seconds: 20

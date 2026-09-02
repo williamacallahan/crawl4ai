@@ -195,13 +195,8 @@ def test_redis_pins_encode_the_2026_08_28_incident_invariants():
     """The drift check is only as good as what it pins, so pin the two values
     the incident was about rather than trusting the comparison alone."""
     assert "everysec" in rollout.REDIS_COMMAND and "always" not in rollout.REDIS_COMMAND
-    assert (
-        rollout.REDIS_COMMAND[rollout.REDIS_COMMAND.index("--appendfsync") + 1]
-        == "everysec"
-    )
-    assert (
-        rollout.REDIS_COMMAND[rollout.REDIS_COMMAND.index("--appendonly") + 1] == "yes"
-    )
+    assert rollout.REDIS_COMMAND[rollout.REDIS_COMMAND.index("--appendfsync") + 1] == "everysec"
+    assert rollout.REDIS_COMMAND[rollout.REDIS_COMMAND.index("--appendonly") + 1] == "yes"
     assert rollout.REDIS_MOUNTS == [
         {"Type": "volume", "Source": "crawl4ai-redis-data", "Target": "/data"}
     ]
@@ -211,12 +206,8 @@ def test_redis_pins_encode_the_2026_08_28_incident_invariants():
 
 def test_redis_proof_rejects_durability_drift(monkeypatch):
     def check(spec=None, tasks=None):
-        monkeypatch.setattr(
-            rollout, "_service_spec", lambda _n: copy.deepcopy(spec or redis_spec())
-        )
-        monkeypatch.setattr(
-            rollout, "_service_tasks", lambda _n: copy.deepcopy(tasks or redis_tasks())
-        )
+        monkeypatch.setattr(rollout, "_service_spec", lambda _n: copy.deepcopy(spec or redis_spec()))
+        monkeypatch.setattr(rollout, "_service_tasks", lambda _n: copy.deepcopy(tasks or redis_tasks()))
         rollout._verify_redis()
 
     check()
@@ -247,9 +238,7 @@ def test_redis_proof_rejects_durability_drift(monkeypatch):
     # came from a healthcheck that was too tight.
     relaxed = redis_spec()
     relaxed["TaskTemplate"]["ContainerSpec"]["Healthcheck"]["Retries"] = 5
-    relaxed["TaskTemplate"]["ContainerSpec"]["Healthcheck"]["StartPeriod"] = (
-        60_000_000_000
-    )
+    relaxed["TaskTemplate"]["ContainerSpec"]["Healthcheck"]["StartPeriod"] = 60_000_000_000
     check(spec=relaxed)
 
     drifted = redis_spec()
@@ -355,6 +344,25 @@ def test_running_spec_rejects_artifact_drift():
     )
     with pytest.raises(ValueError, match="stop grace"):
         rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
+
+
+def test_running_spec_requires_record_labels_beside_control_plane_labels():
+    # Dokploy stamps dokploy.deployment.id on every rendered ContainerSpec since
+    # its 2026-09-01 build; exact label equality then failed every rollout (runs
+    # 33541789332 and 33544931205) although the record's own labels were intact.
+    stamped = service_spec()
+    stamped["TaskTemplate"]["ContainerSpec"]["Labels"]["dokploy.deployment.id"] = "row"
+    rollout._running_spec(stamped, BASELINE, rollout._labels("baseline"))
+
+    for missing_or_changed in ("otel.service.version", "otel.logs.enabled"):
+        changed = service_spec()
+        changed["TaskTemplate"]["ContainerSpec"]["Labels"]["dokploy.deployment.id"] = "row"
+        changed["TaskTemplate"]["ContainerSpec"]["Labels"][missing_or_changed] = "other"
+        with pytest.raises(ValueError, match="labels"):
+            rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
+        del changed["TaskTemplate"]["ContainerSpec"]["Labels"][missing_or_changed]
+        with pytest.raises(ValueError, match="labels"):
+            rollout._running_spec(changed, BASELINE, rollout._labels("baseline"))
 
 
 @pytest.mark.parametrize(
@@ -465,9 +473,7 @@ def test_task_runtime_guards_the_container_id_swarm_omits(monkeypatch):
     )
 
     def run(command, **_kwargs):
-        assert (
-            "{{if .Status.ContainerStatus}}" in command[command.index("--format") + 1]
-        )
+        assert "{{if .Status.ContainerStatus}}" in command[command.index("--format") + 1]
         return subprocess.CompletedProcess(command, 0, output, "")
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
@@ -508,23 +514,22 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         }
         for index in range(1, 4)
     }
-    network = [
-        {
-            "Id": "network",
-            "Services": {
-                "crawl4ai": {
-                    "Tasks": [
-                        {
-                            "Name": f"{row['Name']}.{row['ID']}",
-                            "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
-                        }
-                        for row in rows[:3]
-                    ]
-                }
-            },
-        }
-    ]
-
+    # Dokploy's own stamp beside the record's labels must not read as drift.
+    runtimes["task1"]["labels"]["dokploy.deployment.id"] = "row"
+    network = [{
+        "Id": "network",
+        "Services": {
+            "crawl4ai": {
+                "Tasks": [
+                    {
+                        "Name": f"{row['Name']}.{row['ID']}",
+                        "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
+                    }
+                    for row in rows[:3]
+                ]
+            }
+        },
+    }]
     def run(command, **_kwargs):
         if command[1:3] == ["service", "ps"]:
             return subprocess.CompletedProcess(
@@ -543,21 +548,17 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
             else ("shutdown", "shutdown")
         ),
     )
-    monkeypatch.setattr(rollout, "_task_runtime", lambda task, _network: runtimes[task])
+    monkeypatch.setattr(
+        rollout, "_task_runtime", lambda task, _network: runtimes[task]
+    )
     monkeypatch.setattr(
         rollout,
         "_request_json",
         lambda url, *_args: health(
-            next(
-                runtime["container"]
-                for runtime in runtimes.values()
-                if next(iter(runtime["addresses"])) in url
-            )
+            next(runtime["container"] for runtime in runtimes.values() if next(iter(runtime["addresses"])) in url)
         ),
     )
-    proof = rollout._verify_tasks(
-        "crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES
-    )
+    proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES)
     assert proof["nodes"] == ["haiku-4", "haiku-5", "haiku-9"]
     assert len(proof["instances"]) == 3
 
@@ -582,6 +583,28 @@ def test_verify_tasks_rejects_vip_membership_drift(monkeypatch, drift):
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
     with pytest.raises(RuntimeError, match="VIP membership"):
+        rollout._verify_tasks(
+            "crawl4ai",
+            BASELINE,
+            "baseline",
+            frozenset({"haiku-5", "haiku-9", "haiku-18"}),
+            False,
+        )
+
+
+@pytest.mark.parametrize("drift", ["missing", "changed"])
+def test_verify_tasks_rejects_record_label_drift_beside_control_plane_labels(
+    monkeypatch, drift
+):
+    rows, runtimes = _healed_baseline_rows()
+    labels = runtimes["task2"]["labels"]
+    labels["dokploy.deployment.id"] = "row"
+    if drift == "missing":
+        del labels["otel.logs.enabled"]
+    else:
+        labels["otel.service.version"] = "other"
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    with pytest.raises(RuntimeError, match="identity drifted"):
         rollout._verify_tasks(
             "crawl4ai",
             BASELINE,
@@ -623,9 +646,7 @@ def test_public_proof_observes_every_authoritative_instance_in_any_order(monkeyp
     }
 
     def request(url, *_args):
-        route_url = next(
-            route for route in rollout.HEALTH_URLS if url.startswith(route)
-        )
+        route_url = next(route for route in rollout.HEALTH_URLS if url.startswith(route))
         return health(next(responses[route_url]))
 
     monkeypatch.setattr(rollout, "_request_json", request)
@@ -651,9 +672,7 @@ def test_public_proof_rejects_an_unknown_instance(monkeypatch):
     "response",
     [health("one", revision="wrong"), {**health("one"), "status": "degraded"}],
 )
-def test_public_proof_rejects_wrong_revision_or_unhealthy_response(
-    monkeypatch, response
-):
+def test_public_proof_rejects_wrong_revision_or_unhealthy_response(monkeypatch, response):
     monkeypatch.setattr(rollout, "_request_json", lambda *_args: response)
     with pytest.raises(RuntimeError, match="unhealthy or wrong-revision"):
         rollout._verify_public(REVISION, ["one", "two", "three"])
@@ -685,13 +704,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(rollout, "_post_json", post)
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
-    monkeypatch.setattr(
-        rollout,
-        "_service_spec",
-        lambda _name: service_spec(
-            state["dockerImage"], state["labelsSwarm"]["otel.service.version"]
-        ),
-    )
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(state["dockerImage"], state["labelsSwarm"]["otel.service.version"]))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: events.append("verify_redis"))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
@@ -702,11 +715,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(
         rollout,
         "_verify_tasks",
-        lambda *_args: {
-            "tasks": ["1", "2", "3"],
-            "nodes": ["haiku-4", "haiku-5", "haiku-9"],
-            "instances": ["a", "b", "c"],
-        },
+        lambda *_args: {"tasks": ["1", "2", "3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["a", "b", "c"]},
     )
     monkeypatch.setattr(
         rollout,
@@ -716,9 +725,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(
         rollout,
         "_request_json",
-        lambda url, *_args: health(
-            revision="baseline" if "baseline=" in url else REVISION
-        ),
+        lambda url, *_args: health(revision="baseline" if "baseline=" in url else REVISION),
     )
     rollout.deploy()
     receipt = json.loads(capsys.readouterr().out)
@@ -750,25 +757,11 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     posts.clear()
     events.clear()
     deployments[:] = [{"deploymentId": "old", "status": "done"}]
-    proofs = iter(
-        [
-            {
-                "tasks": ["old1", "old2", "old3"],
-                "nodes": ["haiku-4", "haiku-5", "haiku-9"],
-                "instances": ["old-a", "old-b", "old-c"],
-            },
-            {
-                "tasks": ["1", "2", "3"],
-                "nodes": ["haiku-4", "haiku-5", "haiku-9"],
-                "instances": ["a", "b", "c"],
-            },
-            {
-                "tasks": ["1", "2", "4"],
-                "nodes": ["haiku-4", "haiku-5", "haiku-18"],
-                "instances": ["a", "b", "d"],
-            },
-        ]
-    )
+    proofs = iter([
+        {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
+        {"tasks": ["1", "2", "3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["a", "b", "c"]},
+        {"tasks": ["1", "2", "4"], "nodes": ["haiku-4", "haiku-5", "haiku-18"], "instances": ["a", "b", "d"]},
+    ])
     monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: next(proofs))
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     with pytest.raises(RuntimeError, match="task census changed"):
@@ -827,9 +820,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
 
 def _wire_final_evidence(monkeypatch, tasks):
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
-    monkeypatch.setattr(
-        rollout, "_service_spec", lambda _name: service_spec(CANDIDATE, REVISION)
-    )
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(CANDIDATE, REVISION))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
         rollout,
@@ -850,21 +841,17 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
     monkeypatch.setenv("GITHUB_SHA", REVISION)
-    rollout._task_proof_path().write_text(
-        json.dumps(
-            {
-                "revision": REVISION,
-                "image": CANDIDATE,
-                "baselineRevision": "baseline",
-                "tasks": ["task1", "task2", "task3"],
-                "nodes": ["haiku-4", "haiku-5", "haiku-9"],
-                "instances": ["one", "two", "three"],
-                "publicInstances": {
-                    url: ["three", "one", "two"] for url in rollout.HEALTH_URLS
-                },
-            }
-        )
-    )
+    rollout._task_proof_path().write_text(json.dumps({
+        "revision": REVISION,
+        "image": CANDIDATE,
+        "baselineRevision": "baseline",
+        "tasks": ["task1", "task2", "task3"],
+        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "instances": ["one", "two", "three"],
+        "publicInstances": {
+            url: ["three", "one", "two"] for url in rollout.HEALTH_URLS
+        },
+    }))
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
     monkeypatch.setenv("DOKPLOY_API_KEY", "key")
     monkeypatch.setenv("APPLICATION_ID", "app")
@@ -920,19 +907,15 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
     monkeypatch.setenv("GITHUB_SHA", REVISION)
-    rollout._task_proof_path().write_text(
-        json.dumps(
-            {
-                "revision": REVISION,
-                "image": CANDIDATE,
-                "baselineRevision": "baseline",
-                "tasks": ["task1", "task2", "task3"],
-                "nodes": ["haiku-4", "haiku-5", "haiku-9"],
-                "instances": ["one", "two", "three"],
-                "publicInstances": coverage,
-            }
-        )
-    )
+    rollout._task_proof_path().write_text(json.dumps({
+        "revision": REVISION,
+        "image": CANDIDATE,
+        "baselineRevision": "baseline",
+        "tasks": ["task1", "task2", "task3"],
+        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "instances": ["one", "two", "three"],
+        "publicInstances": coverage,
+    }))
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
     monkeypatch.setenv("DOKPLOY_API_KEY", "key")
     monkeypatch.setenv("APPLICATION_ID", "app")
@@ -972,21 +955,17 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
     monkeypatch.setenv("DOKPLOY_API_KEY", "key")
     monkeypatch.setenv("APPLICATION_ID", "app")
-    rollout._task_proof_path().write_text(
-        json.dumps(
-            {
-                "revision": REVISION,
-                "image": CANDIDATE,
-                "baselineRevision": "baseline",
-                "tasks": ["task1", "task2", "task3"],
-                "nodes": ["haiku-4", "haiku-5", "haiku-9"],
-                "instances": ["one", "two", "three"],
-                "publicInstances": {
-                    url: ["one", "two", "three"] for url in rollout.HEALTH_URLS
-                },
-            }
-        )
-    )
+    rollout._task_proof_path().write_text(json.dumps({
+        "revision": REVISION,
+        "image": CANDIDATE,
+        "baselineRevision": "baseline",
+        "tasks": ["task1", "task2", "task3"],
+        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "instances": ["one", "two", "three"],
+        "publicInstances": {
+            url: ["one", "two", "three"] for url in rollout.HEALTH_URLS
+        },
+    }))
     monkeypatch.setattr(
         rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
     )
@@ -1071,62 +1050,38 @@ def test_monitor_failure_sample_is_attributable(monkeypatch, tmp_path):
 
 def _node_commands(nodes):
     """Stub docker node ls/inspect for a fleet of (hostname, labeled, state, availability)."""
-
     def run(cmd, **_kwargs):
         if cmd[1] == "node" and cmd[2] == "ls":
-            return subprocess.CompletedProcess(
-                cmd, 0, "".join(f"id{i}\n" for i in range(len(nodes))), ""
-            )
+            return subprocess.CompletedProcess(cmd, 0, "".join(f"id{i}\n" for i in range(len(nodes))), "")
         lines = []
         for hostname, labeled, state, availability in nodes:
             labels = {"crawl4ai-eligible": "true"} if labeled else {}
-            lines.append(
-                "\t".join(
-                    [
-                        json.dumps(hostname),
-                        json.dumps(labels),
-                        json.dumps(state),
-                        json.dumps(availability),
-                    ]
-                )
-            )
-        return subprocess.CompletedProcess(
-            cmd, 0, "".join(line + "\n" for line in lines), ""
-        )
-
+            lines.append("\t".join([
+                json.dumps(hostname), json.dumps(labels),
+                json.dumps(state), json.dumps(availability),
+            ]))
+        return subprocess.CompletedProcess(cmd, 0, "".join(line + "\n" for line in lines), "")
     return run
 
 
 def test_eligible_nodes_excludes_a_down_member_without_failing(monkeypatch):
     # A down node is a capacity event: it leaves the result, not raises.
-    monkeypatch.setattr(
-        rollout.subprocess,
-        "run",
-        _node_commands(
-            [
-                ("haiku-0", False, "ready", "active"),
-                ("haiku-4", True, "down", "active"),
-                ("haiku-5", True, "ready", "active"),
-                ("haiku-9", True, "ready", "active"),
-                ("haiku-18", True, "ready", "active"),
-            ]
-        ),
-    )
+    monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
+        ("haiku-0", False, "ready", "active"),
+        ("haiku-4", True, "down", "active"),
+        ("haiku-5", True, "ready", "active"),
+        ("haiku-9", True, "ready", "active"),
+        ("haiku-18", True, "ready", "active"),
+    ]))
     assert rollout._eligible_nodes() == frozenset({"haiku-5", "haiku-9", "haiku-18"})
 
 
 def test_eligible_nodes_flags_membership_drift_even_when_ready(monkeypatch):
-    monkeypatch.setattr(
-        rollout.subprocess,
-        "run",
-        _node_commands(
-            [
-                ("haiku-4", True, "ready", "active"),
-                ("haiku-5", True, "ready", "active"),
-                ("haiku-9", True, "ready", "active"),
-            ]
-        ),
-    )
+    monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
+        ("haiku-4", True, "ready", "active"),
+        ("haiku-5", True, "ready", "active"),
+        ("haiku-9", True, "ready", "active"),
+    ]))
     with pytest.raises(RuntimeError, match="inventory drifted"):
         rollout._eligible_nodes()
 
@@ -1165,48 +1120,18 @@ def _healed_baseline_rows():
     # haiku-4 died holding slot 1; Swarm healed the replica onto haiku-18,
     # and the ghost task on the dead node can never confirm its shutdown.
     rows = [
-        {
-            "ID": "task1",
-            "Name": "crawl4ai.1",
-            "Node": "haiku-18",
-            "DesiredState": "Running",
-            "CurrentState": "Running 1m",
-        },
-        {
-            "ID": "ghost1",
-            "Name": "crawl4ai.1",
-            "Node": "haiku-4",
-            "DesiredState": "Shutdown",
-            "CurrentState": "Running 12 hours ago",
-        },
-        {
-            "ID": "task2",
-            "Name": "crawl4ai.2",
-            "Node": "haiku-5",
-            "DesiredState": "Running",
-            "CurrentState": "Running 1h",
-        },
-        {
-            "ID": "old2",
-            "Name": "crawl4ai.2",
-            "Node": "haiku-9",
-            "DesiredState": "Shutdown",
-            "CurrentState": "Shutdown 1h",
-        },
-        {
-            "ID": "task3",
-            "Name": "crawl4ai.3",
-            "Node": "haiku-9",
-            "DesiredState": "Running",
-            "CurrentState": "Running 1h",
-        },
-        {
-            "ID": "old3",
-            "Name": "crawl4ai.3",
-            "Node": "haiku-5",
-            "DesiredState": "Shutdown",
-            "CurrentState": "Shutdown 1h",
-        },
+        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-18",
+         "DesiredState": "Running", "CurrentState": "Running 1m"},
+        {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-4",
+         "DesiredState": "Shutdown", "CurrentState": "Running 12 hours ago"},
+        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-5",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-9",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-9",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-5",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
     ]
     runtimes = {
         f"task{index}": {
@@ -1224,22 +1149,20 @@ def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
     current = [
         row for row in rows if str(row.get("DesiredState", "")).lower() == "running"
     ]
-    network = [
-        {
-            "Id": "network",
-            "Services": {
-                "crawl4ai": {
-                    "Tasks": [
-                        {
-                            "Name": f"{row['Name']}.{row['ID']}",
-                            "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
-                        }
-                        for row in current
-                    ]
-                }
-            },
-        }
-    ]
+    network = [{
+        "Id": "network",
+        "Services": {
+            "crawl4ai": {
+                "Tasks": [
+                    {
+                        "Name": f"{row['Name']}.{row['ID']}",
+                        "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
+                    }
+                    for row in current
+                ]
+            }
+        },
+    }]
 
     def run(command, **_kwargs):
         if command[1:3] == ["service", "ps"]:
@@ -1254,12 +1177,9 @@ def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
         rollout,
         "_task_state",
         lambda task: (
-            ("running", "running")
-            if task.startswith("task")
-            else ("shutdown", "running")
-            if task.startswith("ghost")
-            else ("shutdown", "rejected")
-            if task.startswith("reject")
+            ("running", "running") if task.startswith("task")
+            else ("shutdown", "running") if task.startswith("ghost")
+            else ("shutdown", "rejected") if task.startswith("reject")
             else ("shutdown", "shutdown")
         ),
     )
@@ -1268,11 +1188,7 @@ def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
         rollout,
         "_request_json",
         lambda url, *_args: health(
-            next(
-                r["container"]
-                for r in runtimes.values()
-                if next(iter(r["addresses"])) in url
-            ),
+            next(r["container"] for r in runtimes.values() if next(iter(r["addresses"])) in url),
             revision=revision,
         ),
     )
@@ -1319,19 +1235,13 @@ def test_deploy_requires_ready_capacity_not_full_fleet(monkeypatch):
     monkeypatch.setattr(rollout, "_application", lambda *_args: application())
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
-    monkeypatch.setattr(
-        rollout, "_post_json", lambda *_args: pytest.fail("no write may happen")
-    )
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
 
     # Three ready of four labeled nodes is enough capacity: the gate passes
     # and evaluation reaches the baseline task census.
-    monkeypatch.setattr(
-        rollout,
-        "_eligible_nodes",
-        lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"}),
-    )
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"}))
     monkeypatch.setattr(
         rollout,
         "_verify_tasks",
@@ -1341,12 +1251,8 @@ def test_deploy_requires_ready_capacity_not_full_fleet(monkeypatch):
         rollout.deploy()
 
     # Two ready nodes cannot place three replicas: fail before the census.
-    monkeypatch.setattr(
-        rollout, "_verify_tasks", lambda *_args: pytest.fail("census must not run")
-    )
-    monkeypatch.setattr(
-        rollout, "_eligible_nodes", lambda: frozenset({"haiku-9", "haiku-18"})
-    )
+    monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: pytest.fail("census must not run"))
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-9", "haiku-18"}))
     with pytest.raises(RuntimeError, match="not enough Ready eligible nodes"):
         rollout.deploy()
 
@@ -1360,9 +1266,7 @@ def test_deploy_rejects_a_reintroduced_cap_once_the_record_converged(monkeypatch
     monkeypatch.setattr(rollout, "_application", lambda *_args: application())
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: spec)
-    monkeypatch.setattr(
-        rollout, "_post_json", lambda *_args: pytest.fail("no write may happen")
-    )
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
     with pytest.raises(ValueError, match="running placement drifted"):
         rollout.deploy()
 
@@ -1376,13 +1280,9 @@ def test_deploy_tolerates_legacy_live_spec_only_while_record_is_legacy(monkeypat
     monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: spec)
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
     monkeypatch.setattr(
-        rollout, "_post_json", lambda *_args: pytest.fail("no write may happen")
-    )
-    monkeypatch.setattr(
-        rollout,
-        "_verify_redis",
-        lambda: (_ for _ in ()).throw(SystemExit("baseline spec accepted")),
+        rollout, "_verify_redis", lambda: (_ for _ in ()).throw(SystemExit("baseline spec accepted"))
     )
     with pytest.raises(SystemExit, match="baseline spec accepted"):
         rollout.deploy()
@@ -1392,21 +1292,12 @@ def test_baseline_keeps_unassigned_attempts_strict(monkeypatch):
     # A rejected scheduling attempt has no node; it is not a stranded ghost
     # and must not excuse the withdrawal proof.
     rows, runtimes = _healed_baseline_rows()
-    rows.insert(
-        1,
-        {
-            "ID": "reject1",
-            "Name": "crawl4ai.1",
-            "Node": "",
-            "DesiredState": "Shutdown",
-            "CurrentState": "Rejected 1h",
-        },
-    )
+    rows.insert(1, {"ID": "reject1", "Name": "crawl4ai.1", "Node": "",
+                    "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"})
     ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
         rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
-
 
 OBSERVER_INCOMPLETE = observer.CoverageSnapshot(3, 2, 1)
 OBSERVER_COMPLETE = observer.CoverageSnapshot(3, 3, 3)

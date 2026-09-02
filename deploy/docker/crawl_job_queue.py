@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,10 +20,7 @@ from utils import (
     get_redis_task_ttl,
     validate_url_destination,
 )
-from work_queue import (
-    PRINCIPAL_QUOTA_CLAIMS_KEY,
-    PRINCIPAL_QUOTA_COUNTS_KEY,
-)
+from work_queue import principal_lease_key
 
 from crawl4ai import BrowserConfig, CrawlerRunConfig
 from crawl4ai.async_configs import (
@@ -34,7 +32,11 @@ from crawl4ai.async_configs import (
 
 logger = logging.getLogger(__name__)
 
-CRAWL_JOB_PROTOCOL_VERSION = 2
+# v3: per-principal quota moved from the v1 hash pair to lease ZSETs (#76).
+# The version bump keeps mixed-version replicas on disjoint streams during a
+# rolling deploy, so an old worker can never complete a new job and strand its
+# +inf quota member (or vice versa).
+CRAWL_JOB_PROTOCOL_VERSION = 3
 
 
 class CrawlJobLeaseLost(RuntimeError):
@@ -61,12 +63,15 @@ class CrawlJobPayloadRejected(ValueError):
 
 _ENQUEUE_IF_CAPACITY_SCRIPT = """
 -- crawl4ai:enqueue
+-- KEYS[4] is the shared per-principal quota lease ZSET (see work_queue.py).
+-- Durable claims carry score +inf: their release is atomic in the terminal
+-- scripts, and a pending backlog job may outlive any finite lease.
 if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[1]) then
   return 0
 end
 if tonumber(ARGV[2]) > 0 and ARGV[11] ~= '' then
-  local pending = tonumber(redis.call('HGET', KEYS[4], ARGV[11]) or '0')
-  if pending >= tonumber(ARGV[2]) then
+  redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', ARGV[13])
+  if redis.call('ZCARD', KEYS[4]) >= tonumber(ARGV[2]) then
     return -1
   end
 end
@@ -81,8 +86,7 @@ redis.call(
   'protocol_version', ARGV[12], 'owner', ARGV[11]
 )
 if tonumber(ARGV[2]) > 0 and ARGV[11] ~= '' then
-  redis.call('HSET', KEYS[5], ARGV[10], ARGV[11])
-  redis.call('HINCRBY', KEYS[4], ARGV[11], 1)
+  redis.call('ZADD', KEYS[4], '+inf', ARGV[10])
 end
 return 1
 """
@@ -202,16 +206,7 @@ redis.call(
 if tonumber(ARGV[10]) > 0 then
   redis.call('EXPIRE', KEYS[2], ARGV[10])
 end
-local claim_owner = redis.call('HGET', KEYS[5], ARGV[13])
-if claim_owner then
-  redis.call('HDEL', KEYS[5], ARGV[13])
-  local pending = tonumber(redis.call('HGET', KEYS[4], claim_owner) or '0')
-  if pending <= 1 then
-    redis.call('HDEL', KEYS[4], claim_owner)
-  else
-    redis.call('HINCRBY', KEYS[4], claim_owner, -1)
-  end
-end
+redis.call('ZREM', KEYS[4], ARGV[13])
 redis.call('DEL', KEYS[1])
 redis.call('XACK', KEYS[3], ARGV[11], ARGV[12])
 redis.call('XDEL', KEYS[3], ARGV[12])
@@ -230,20 +225,7 @@ end
 if redis.call('HEXISTS', KEYS[2], 'payload') == 1 then
   return 0
 end
-local claim_owner = redis.call('HGET', KEYS[5], ARGV[9]) or ''
-local recovered_owner = claim_owner
-if recovered_owner == '' then
-  local stream_entry = redis.call('XRANGE', KEYS[3], ARGV[3], ARGV[3], 'COUNT', 1)
-  if #stream_entry > 0 then
-    local fields = stream_entry[1][2]
-    for index = 1, #fields, 2 do
-      if fields[index] == 'owner' then
-        recovered_owner = fields[index + 1]
-        break
-      end
-    end
-  end
-end
+local recovered_owner = ARGV[11]
 if redis.call('EXISTS', KEYS[1]) == 1 then
   if redis.call('HGET', KEYS[1], 'status') ~= ARGV[4]
     or redis.call('HGET', KEYS[1], 'protocol_version') ~= ARGV[10] then
@@ -269,15 +251,7 @@ else
 end
 -- XAUTOCLAIM must never leave a lease-only payload hash behind.
 redis.call('DEL', KEYS[2])
-if claim_owner ~= '' then
-  redis.call('HDEL', KEYS[5], ARGV[9])
-  local pending = tonumber(redis.call('HGET', KEYS[4], claim_owner) or '0')
-  if pending <= 1 then
-    redis.call('HDEL', KEYS[4], claim_owner)
-  else
-    redis.call('HINCRBY', KEYS[4], claim_owner, -1)
-  end
-end
+redis.call('ZREM', KEYS[4], ARGV[9])
 redis.call('XACK', KEYS[3], ARGV[1], ARGV[3])
 redis.call('XDEL', KEYS[3], ARGV[3])
 return 1
@@ -402,14 +376,6 @@ class CrawlJobQueue:
     def payload_key(self, task_id: str) -> str:
         return f"{self.payload_prefix}{task_id}"
 
-    @property
-    def principal_pending_key(self) -> str:
-        return PRINCIPAL_QUOTA_COUNTS_KEY
-
-    @property
-    def principal_claims_key(self) -> str:
-        return PRINCIPAL_QUOTA_CLAIMS_KEY
-
     @staticmethod
     def _created_at() -> str:
         return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
@@ -505,7 +471,10 @@ class CrawlJobQueue:
         """Create the consumer group without skipping work queued before startup."""
         if self.settings.protocol_version > 1:
             suffix = f":v{self.settings.protocol_version}"
-            legacy_stream = self.settings.stream.removesuffix(suffix)
+            base_stream = self.settings.stream.removesuffix(suffix)
+            previous = self.settings.protocol_version - 1
+            # v1 streams carried no suffix; later versions carry :v{n}.
+            legacy_stream = base_stream if previous == 1 else f"{base_stream}:v{previous}"
             if await self.redis.xlen(legacy_stream):
                 raise RuntimeError(
                     f"legacy crawl jobs remain in {legacy_stream}; refusing v{self.settings.protocol_version} worker startup"
@@ -545,12 +514,11 @@ class CrawlJobQueue:
         )
         enqueued = await self.redis.eval(
             _ENQUEUE_IF_CAPACITY_SCRIPT,
-            5,
+            4,
             self.settings.stream,
             self.task_key(task_id),
             self.payload_key(task_id),
-            self.principal_pending_key,
-            self.principal_claims_key,
+            principal_lease_key(owner or ""),
             self.settings.max_pending_jobs,
             self.settings.per_principal,
             TaskStatus.PROCESSING.value,
@@ -563,6 +531,7 @@ class CrawlJobQueue:
             task_id,
             owner or "",
             self.settings.protocol_version,
+            time.time(),
         )
         if int(enqueued) == -1:
             raise CrawlJobPrincipalQuotaExceeded(self.settings.per_principal)
@@ -709,12 +678,11 @@ class CrawlJobQueue:
         status = TaskStatus.COMPLETED.value if error is None else TaskStatus.FAILED.value
         completed = await self.redis.eval(
             _COMPLETE_SCRIPT,
-            5,
+            4,
             self.payload_key(entry.task_id),
             self.task_key(entry.task_id),
             self.settings.stream,
-            self.principal_pending_key,
-            self.principal_claims_key,
+            principal_lease_key(payload.get("owner") or ""),
             attempt.fence_token,
             attempt.consumer,
             status,
@@ -736,14 +704,21 @@ class CrawlJobQueue:
 
     async def discard_missing_payload(self, entry: CrawlJobEntry, consumer: str) -> None:
         """Fenced cleanup for an entry whose durable payload is absent."""
+        # The quota lease key is per-principal; recover the owner from the
+        # Stream entry's immutable 'owner' field before the fenced script runs
+        # and thread it through ARGV (the script must not re-read it).
+        stream_owner = ""
+        for _stream_id, fields in await self.redis.xrange(
+            self.settings.stream, entry.stream_id, entry.stream_id, count=1
+        ) or []:
+            stream_owner = _as_text(_field(fields, "owner") or "")
         discarded = await self.redis.eval(
             _DISCARD_MISSING_PAYLOAD_SCRIPT,
-            5,
+            4,
             self.task_key(entry.task_id),
             self.payload_key(entry.task_id),
             self.settings.stream,
-            self.principal_pending_key,
-            self.principal_claims_key,
+            principal_lease_key(stream_owner),
             self.settings.group,
             consumer,
             entry.stream_id,
@@ -754,6 +729,7 @@ class CrawlJobQueue:
             get_redis_task_ttl(self.config),
             entry.task_id,
             self.settings.protocol_version,
+            stream_owner,
         )
         if int(discarded) != 1:
             raise CrawlJobLeaseLost(

@@ -1061,7 +1061,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
     if crawl_request.hooks and crawl_request.hooks.hooks:
         hooks_config = {'hooks': crawl_request.hooks.hooks}
     
-    crawler, gen, hooks_info = await handle_stream_crawl_request(
+    crawler, gen, hooks_info, request_id = await handle_stream_crawl_request(
         urls=crawl_request.urls,
         browser_config=crawl_request.browser_config,
         crawler_config=crawl_request.crawler_config,
@@ -1080,7 +1080,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         headers["X-Hooks-Status"] = json.dumps(hooks_info['status']['status'])
     
     return StreamingResponse(
-        stream_results(crawler, gen),
+        stream_results(crawler, gen, request_id),
         media_type="application/x-ndjson",
         headers=headers,
     )

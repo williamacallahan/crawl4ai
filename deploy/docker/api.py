@@ -902,9 +902,72 @@ async def _await_before_deadline(awaitable, deadline_at: Optional[float]):
     return await asyncio.wait_for(awaitable, timeout=remaining)
 
 
-async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) -> AsyncGenerator[bytes, None]:
-    """Stream results with heartbeats and completion markers."""
+async def _track_request_start(endpoint: str, urls: List[str], browser_config: dict) -> str:
+    """Register a request on the monitor; the monitor is never critical."""
+    request_id = f"req_{uuid4().hex[:8]}"
+    try:
+        from monitor import get_monitor
+        await get_monitor().track_request_start(
+            request_id, endpoint, urls[0] if urls else "batch", browser_config
+        )
+    except Exception:
+        pass
+    return request_id
+
+
+async def _close_aborted_request(request_id: str, pending: Optional[BaseException]) -> None:
+    """Close a still-active monitor entry from the exception that aborted it.
+
+    Every exit that skipped an explicit track_request_end — SSRF 400s,
+    request-validation 400s, deadline 504s, client cancellation — would
+    otherwise leave the entry "active" forever (issue #2). Deliberate-status
+    HTTPException details are already client-safe; anything else gets a type
+    name only, because /monitor/* returns this text to any data-scope principal.
+    """
+    try:
+        from monitor import get_monitor
+        monitor = get_monitor()
+        # The still-active guard is load-bearing, not redundant with the one
+        # inside track_request_end: when the caller already recorded (e.g. the
+        # correlated, sanitized 500), this must never overwrite it with the
+        # in-flight exception's detail — the generic 500 carries raw str(e).
+        if request_id not in monitor.active_requests:
+            return
+        if isinstance(pending, HTTPException) and pending.status_code != 500:
+            aborted_status = pending.status_code
+            aborted_error = str(pending.detail)[:500]
+        else:
+            aborted_status = 500
+            aborted_error = (
+                f"request aborted: {type(pending).__name__}" if pending else "request aborted"
+            )
+        await monitor.track_request_end(
+            request_id, success=False, error=aborted_error, status_code=aborted_status
+        )
+    except BaseException:
+        # Monitor not critical — and nothing here may shadow the caller's
+        # crawler disposal, cancellation included.
+        pass
+
+
+async def stream_results(
+    crawler: AsyncWebCrawler,
+    results_gen: AsyncGenerator,
+    request_id: Optional[str] = None,
+) -> AsyncGenerator[bytes, None]:
+    """Stream results with heartbeats and completion markers.
+
+    The HTTP status is already 200 once bytes flow, so the monitor record
+    carries the crawl verdict: success when any URL succeeded and the stream
+    reached its completion marker (issue #78).
+    """
     from utils import datetime_handler
+    any_url_succeeded = False
+    first_error: Optional[str] = None
+    # Cleared only when the completion marker is produced: a consumer that
+    # closes the generator early (client gone while parked on a write) must
+    # not be recorded as a success.
+    terminal_error: Optional[str] = "Stream closed before completion"
     try:
         async for result in results_gen:
             try:
@@ -914,6 +977,10 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
                     result_dict["error_message"] = public_crawl_error(
                         result_dict["error_message"], result_dict.get("url")
                     )
+                if result_dict.get("success"):
+                    any_url_succeeded = True
+                elif first_error is None:
+                    first_error = result_dict.get("error_message") or "Crawl failed"
                 result_dict['server_memory_mb'] = server_memory_mb
                 if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
                     result_dict["fit_html"] = None
@@ -930,23 +997,32 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
                 }
                 yield (json.dumps(error_response) + "\n").encode('utf-8')
 
+        terminal_error = None
         yield json.dumps({"status": "completed"}).encode('utf-8')
-        
+
     except asyncio.TimeoutError:
         logger.warning("Streaming crawl exceeded its wall-clock deadline")
-        yield (json.dumps({
-            "status": "failed",
-            "error": "Crawl exceeded the time limit",
-        }) + "\n").encode("utf-8")
+        terminal_error = "Crawl exceeded the time limit"
+        yield (json.dumps({"status": "failed", "error": terminal_error}) + "\n").encode("utf-8")
     except Exception:
         logger.exception("Streaming crawl failed")
-        yield (json.dumps({
-            "status": "failed",
-            "error": "Streaming crawl failed",
-        }) + "\n").encode("utf-8")
+        terminal_error = "Streaming crawl failed"
+        yield (json.dumps({"status": "failed", "error": terminal_error}) + "\n").encode("utf-8")
     except asyncio.CancelledError:
         logger.warning("Client disconnected during streaming")
+        terminal_error = "Client disconnected during streaming"
     finally:
+        if request_id is not None:
+            try:
+                from monitor import get_monitor
+                await get_monitor().track_request_end(
+                    request_id,
+                    success=any_url_succeeded and terminal_error is None,
+                    error=terminal_error or (None if any_url_succeeded else first_error or "Crawl failed"),
+                    status_code=200,
+                )
+            except BaseException:
+                pass  # Monitor not critical; never shadow the disposal below.
         await _dispose_crawler(crawler)
 
 
@@ -978,16 +1054,8 @@ async def handle_crawl_request(
         if deadline_seconds > 0
         else None
     )
-    # Track request start
-    request_id = f"req_{uuid4().hex[:8]}"
+    request_id = await _track_request_start("/crawl", urls, browser_config)
     crawler: Optional[AsyncWebCrawler] = None
-    try:
-        from monitor import get_monitor
-        await get_monitor().track_request_start(
-            request_id, "/crawl", urls[0] if urls else "batch", browser_config
-        )
-    except Exception:
-        pass  # Monitor not critical
 
     start_mem_mb = _get_memory_mb() # <--- Get memory before
     start_time = time.time()
@@ -1133,11 +1201,21 @@ async def handle_crawl_request(
             "server_peak_memory_mb": peak_mem_mb
         }
 
-        # Track request completion
+        # Track request completion. The handler owns the verdict: an
+        # all-failed crawl is the caller's 502 (server.py /crawl) or a failed
+        # job (crawl_job_worker), so recording it as success/200 here counted
+        # every upstream failure as a success in /monitor (issue #18).
         try:
             from monitor import get_monitor
             await get_monitor().track_request_end(
-                request_id, success=True, pool_hit=True, status_code=200
+                request_id,
+                success=any_url_succeeded,
+                error=None if any_url_succeeded else (
+                    (processed_results[0].get("error_message") if processed_results else None)
+                    or "Crawl failed"
+                ),
+                pool_hit=True,
+                status_code=200 if any_url_succeeded else status.HTTP_502_BAD_GATEWAY,
             )
         except Exception:
             pass
@@ -1193,43 +1271,7 @@ async def handle_crawl_request(
             })
         )
     finally:
-        # Every exit that skipped an explicit track_request_end — SSRF 400s,
-        # request-validation 400s, deadline 504s, client cancellation — would
-        # otherwise leave the monitor entry "active" forever (issue #2).
-        # Deliberate-status HTTPException details on those paths are already
-        # client-safe; anything else gets a type name only, because
-        # /monitor/* returns this text to any data-scope principal.
-        try:
-            from monitor import get_monitor
-            monitor = get_monitor()
-            # The still-active guard is load-bearing, not redundant with the
-            # one inside track_request_end: when a branch above already
-            # recorded (e.g. the correlated, sanitized 500), this block must
-            # never overwrite it with the in-flight exception's detail — the
-            # generic 500 HTTPException carries raw str(e).
-            if request_id in monitor.active_requests:
-                pending = sys.exc_info()[1]
-                if isinstance(pending, HTTPException) and pending.status_code != 500:
-                    # Deliberate-status details (400/502/503/504...) are
-                    # client-safe; the generic 500's detail embeds raw str(e).
-                    aborted_status = pending.status_code
-                    aborted_error = str(pending.detail)[:500]
-                else:
-                    aborted_status = 500
-                    aborted_error = (
-                        f"request aborted: {type(pending).__name__}"
-                        if pending else "request aborted"
-                    )
-                await monitor.track_request_end(
-                    request_id,
-                    success=False,
-                    error=aborted_error,
-                    status_code=aborted_status,
-                )
-        except BaseException:
-            # Monitor not critical — and nothing here may shadow the crawler
-            # disposal below, cancellation included.
-            pass
+        await _close_aborted_request(request_id, sys.exc_info()[1])
         await _dispose_crawler(crawler)
 
 async def handle_stream_crawl_request(
@@ -1238,7 +1280,7 @@ async def handle_stream_crawl_request(
     crawler_config: dict,
     config: dict,
     hooks_config: Optional[dict] = None
-) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict]]:
+) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict], str]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
     crawler: Optional[AsyncWebCrawler] = None
@@ -1250,6 +1292,9 @@ async def handle_stream_crawl_request(
         if deadline_seconds > 0
         else None
     )
+    # The entry stays active until stream_results closes it (issue #78); only
+    # a setup failure below closes it here.
+    request_id = await _track_request_start("/crawl/stream", urls, browser_config)
     try:
         # SSRF guard: validate every seed URL's destination before fetching,
         # mirroring handle_crawl_request. The streaming path previously skipped
@@ -1335,7 +1380,7 @@ async def handle_stream_crawl_request(
 
         if deadline_at is not None:
             results_gen = _stream_before_deadline(results_gen, deadline_at)
-        return crawler, results_gen, hooks_info
+        return crawler, results_gen, hooks_info, request_id
 
     except (UntrustedConfigError, HookValidationError) as e:
         await _dispose_crawler(crawler)
@@ -1361,6 +1406,10 @@ async def handle_stream_crawl_request(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+    finally:
+        pending = sys.exc_info()[1]
+        if pending is not None:
+            await _close_aborted_request(request_id, pending)
         
 async def handle_crawl_job(
     redis,

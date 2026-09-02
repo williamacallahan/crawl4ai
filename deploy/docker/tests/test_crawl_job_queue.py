@@ -24,6 +24,7 @@ from crawl_job_queue import (  # noqa: E402
     CrawlJobQueueFull,
 )
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
+from work_queue import principal_lease_key  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -39,7 +40,7 @@ def queue_config(**overrides):
     settings = {
         "stream": "crawl-jobs",
         "group": "crawl-workers",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "lease_seconds": 2,
         "heartbeat_seconds": 1,
         "read_block_ms": 1,
@@ -54,6 +55,7 @@ def queue_config(**overrides):
 class FakeRedis:
     def __init__(self):
         self.hashes = defaultdict(dict)
+        self.zsets = defaultdict(dict)  # key -> {member: score}
         self.streams = defaultdict(list)
         self.groups = set()
         self.pending = {}
@@ -101,6 +103,26 @@ class FakeRedis:
         self.streams[stream].append((stream_id, dict(fields)))
         return stream_id
 
+    async def xrange(self, stream, start, end, count=None):
+        return [
+            (stream_id, dict(fields))
+            for stream_id, fields in self.streams[stream]
+            if stream_id == start == end
+        ]
+
+    def _zset_purge(self, key, cutoff):
+        self.zsets[key] = {
+            member: score
+            for member, score in self.zsets[key].items()
+            if score > float(cutoff)
+        }
+
+    def _zset_add(self, key, member, score):
+        self.zsets[key][member] = float(score)
+
+    def _zset_remove(self, key, member):
+        self.zsets[key].pop(member, None)
+
     async def xlen(self, stream):
         return len(self.streams[stream])
 
@@ -138,19 +160,19 @@ class FakeRedis:
             task_id,
             owner,
             protocol_version,
+            now,
         ) = args
         (
             stream,
             task_key,
             payload_key,
-            principal_pending_key,
-            principal_claims_key,
+            principal_lease_key,
         ) = keys
         if len(self.streams[stream]) >= int(max_pending_jobs):
             return 0
         if owner and int(per_principal) > 0:
-            pending = int(self.hashes[principal_pending_key].get(owner, "0"))
-            if pending >= int(per_principal):
+            self._zset_purge(principal_lease_key, now)
+            if len(self.zsets[principal_lease_key]) >= int(per_principal):
                 return -1
         await self.hset(
             task_key,
@@ -185,8 +207,7 @@ class FakeRedis:
             },
         )
         if owner and int(per_principal) > 0:
-            await self.hset(principal_claims_key, task_id, owner)
-            await self.hincrby(principal_pending_key, owner, 1)
+            self._zset_add(principal_lease_key, task_id, float("inf"))
         return 1
 
     async def _eval_claim_stale(self, keys, args):
@@ -350,8 +371,7 @@ class FakeRedis:
             payload_key,
             task_key,
             stream,
-            principal_pending_key,
-            principal_claims_key,
+            principal_lease_key,
         ) = keys
         (
             fence_token,
@@ -386,14 +406,7 @@ class FakeRedis:
         )
         if int(task_ttl) > 0:
             await self.expire(task_key, int(task_ttl))
-        claim_owner = self.hashes[principal_claims_key].get(task_id)
-        if claim_owner:
-            await self.hdel(principal_claims_key, task_id)
-            pending = int(self.hashes[principal_pending_key].get(claim_owner, "0"))
-            if pending <= 1:
-                await self.hdel(principal_pending_key, claim_owner)
-            else:
-                await self.hincrby(principal_pending_key, claim_owner, -1)
+        self._zset_remove(principal_lease_key, task_id)
         await self.delete(payload_key)
         await self.xack(stream, group, stream_id)
         await self.xdel(stream, stream_id)
@@ -404,8 +417,7 @@ class FakeRedis:
             task_key,
             payload_key,
             stream,
-            principal_pending_key,
-            principal_claims_key,
+            principal_lease_key,
         ) = keys
         (
             group,
@@ -418,6 +430,7 @@ class FakeRedis:
             task_ttl,
             task_id,
             protocol_version,
+            stream_owner,
         ) = args
         if self.pending.get(stream_id) != consumer:
             return 0
@@ -429,16 +442,7 @@ class FakeRedis:
             or self.hashes[task_key].get("protocol_version") != str(protocol_version)
         ):
             return 0
-        claim_owner = self.hashes[principal_claims_key].get(task_id, "")
-        stream_owner = next(
-            (
-                fields.get("owner", "")
-                for candidate_id, fields in self.streams[stream]
-                if candidate_id == stream_id
-            ),
-            "",
-        )
-        owner = self.hashes[task_key].get("owner", "") if task_exists else claim_owner
+        owner = self.hashes[task_key].get("owner", "") if task_exists else ""
         if not owner:
             owner = stream_owner
         if task_exists:
@@ -471,13 +475,7 @@ class FakeRedis:
             if int(task_ttl) > 0:
                 await self.expire(task_key, int(task_ttl))
         await self.delete(payload_key)
-        if claim_owner:
-            await self.hdel(principal_claims_key, task_id)
-            pending = int(self.hashes[principal_pending_key].get(claim_owner, "0"))
-            if pending <= 1:
-                await self.hdel(principal_pending_key, claim_owner)
-            else:
-                await self.hincrby(principal_pending_key, claim_owner, -1)
+        self._zset_remove(principal_lease_key, task_id)
         await self.xack(stream, group, stream_id)
         await self.xdel(stream, stream_id)
         return 1
@@ -503,7 +501,7 @@ class FakeRedis:
         return []
 
     async def xack(self, stream, group, stream_id):
-        assert group == "crawl-workers:v2"
+        assert group == "crawl-workers:v3"
         self.pending.pop(stream_id, None)
         self.acks.append((stream, stream_id))
         return 1
@@ -556,7 +554,7 @@ def test_enqueue_persists_payload_before_stream_visibility():
     assert redis.hashes[queue.task_key(task_id)]["status"] == "processing"
     assert redis.streams[queue.settings.stream][0][1] == {
         "task_id": task_id,
-        "protocol_version": "2",
+        "protocol_version": "3",
         "owner": "",
     }
     assert redis.expires == []
@@ -564,29 +562,30 @@ def test_enqueue_persists_payload_before_stream_visibility():
     assert "XADD" in redis.eval_scripts[0]
 
 
-def test_protocol_v2_refuses_startup_while_legacy_stream_entries_remain():
+def test_protocol_v3_refuses_startup_while_v2_stream_entries_remain():
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
-    asyncio.run(redis.xadd("crawl-jobs", {"task_id": "legacy"}))
+    # The previous protocol's stream is the versioned :v2 name, not the bare v1 name.
+    asyncio.run(redis.xadd("crawl-jobs:v2", {"task_id": "legacy"}))
 
     queue, task_id = enqueue(redis, queue_config())
-    with pytest.raises(RuntimeError, match="legacy crawl jobs remain"):
+    with pytest.raises(RuntimeError, match="legacy crawl jobs remain in crawl-jobs:v2"):
         asyncio.run(queue.ensure_group())
 
-    assert queue.settings.stream == "crawl-jobs:v2"
-    assert queue.settings.group == "crawl-workers:v2"
-    assert queue.payload_key(task_id).startswith("crawl-job:v2:")
-    assert redis.streams["crawl-jobs"] == [("1-0", {"task_id": "legacy"})]
-    assert ("crawl-jobs:v2", "crawl-workers:v2") not in redis.groups
+    assert queue.settings.stream == "crawl-jobs:v3"
+    assert queue.settings.group == "crawl-workers:v3"
+    assert queue.payload_key(task_id).startswith("crawl-job:v3:")
+    assert redis.streams["crawl-jobs:v2"] == [("1-0", {"task_id": "legacy"})]
+    assert ("crawl-jobs:v3", "crawl-workers:v3") not in redis.groups
 
 
 def test_protocol_names_are_not_double_suffixed_and_other_versions_are_rejected():
     queue = CrawlJobQueue(
         FakeRedis(),
-        queue_config(stream="custom:v2", group="workers:v2"),
+        queue_config(stream="custom:v3", group="workers:v3"),
     )
-    assert queue.settings.stream == "custom:v2"
-    assert queue.settings.group == "workers:v2"
+    assert queue.settings.stream == "custom:v3"
+    assert queue.settings.group == "workers:v3"
 
     with pytest.raises(ValueError, match="protocol_version"):
         CrawlJobQueue(FakeRedis(), queue_config(protocol_version=1))
@@ -646,7 +645,7 @@ def test_enqueue_persists_canonical_untrusted_config_dumps(browser_config):
     )
 
     payload = json.loads(redis.hashes[queue.payload_key(task_id)]["payload"])
-    assert payload["protocol_version"] == 2
+    assert payload["protocol_version"] == 3
     assert payload["browser_config"]["type"] == "BrowserConfig"
     assert payload["browser_config"]["params"]["headless"] is False
     assert set(payload["browser_config"]["params"]) == {"headless"}
@@ -1088,7 +1087,7 @@ def test_missing_payload_terminalizes_task_and_releases_owner_quota():
     assert task["status"] == "failed"
     assert task["owner"] == "alice"
     assert "payload is missing" in task["error"]
-    assert "alice" not in redis.hashes[queue.principal_pending_key]
+    assert task_id not in redis.zsets[principal_lease_key("alice")]
 
 
 def test_stale_missing_payload_cleanup_cannot_overwrite_valid_completion_or_double_release():
@@ -1111,7 +1110,7 @@ def test_stale_missing_payload_cleanup_cannot_overwrite_valid_completion_or_doub
     task = redis.hashes[queue.task_key(task_id)]
     assert task["status"] == "completed"
     assert json.loads(task["result"]) == {"worker": "b"}
-    assert "alice" not in redis.hashes[queue.principal_pending_key]
+    assert task_id not in redis.zsets[principal_lease_key("alice")]
 
     _queue, replacement = enqueue(redis, config, owner="alice")
     with pytest.raises(CrawlJobPrincipalQuotaExceeded):
@@ -1142,7 +1141,7 @@ def test_missing_task_and_payload_produce_observable_terminal_record():
     task = redis.hashes[queue.task_key(task_id)]
     assert task["status"] == "failed"
     assert task["owner"] == "alice"
-    assert task["protocol_version"] == "2"
+    assert task["protocol_version"] == "3"
 
 
 def test_worker_heartbeats_during_a_long_crawl():

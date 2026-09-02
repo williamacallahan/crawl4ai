@@ -45,7 +45,7 @@ DEFAULT_CONFIG = {
         "ssl": False,
     },
     "crawl_jobs": {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "stream": "crawl-jobs",
         "group": "crawl-workers",
         "lease_seconds": 20,

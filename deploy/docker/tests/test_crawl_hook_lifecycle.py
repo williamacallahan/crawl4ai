@@ -263,7 +263,7 @@ def test_stream_close_closes_dedicated_hook_crawler(monkeypatch):
     released, dedicated = install_fakes(monkeypatch, pooled)
 
     async def exercise():
-        crawler, results, _hooks = await api.handle_stream_crawl_request(
+        crawler, results, _hooks, _request = await api.handle_stream_crawl_request(
             ["https://example.com"], {}, {}, crawl_config(),
             hooks_config={"hooks": [{"action": "test"}]},
         )
@@ -347,7 +347,7 @@ def test_streamed_failure_record_is_sanitized(monkeypatch):
     install_fakes(monkeypatch, pooled)
 
     async def exercise():
-        crawler, results, _hooks = await api.handle_stream_crawl_request(
+        crawler, results, _hooks, _request = await api.handle_stream_crawl_request(
             ["https://example.com"], {}, {}, crawl_config()
         )
         output = api.stream_results(crawler, results)
@@ -439,7 +439,7 @@ def test_streaming_wall_clock_deadline_emits_failure_and_releases(monkeypatch):
     released, _dedicated = install_fakes(monkeypatch, pooled)
 
     async def exercise():
-        crawler, results, _hooks = await api.handle_stream_crawl_request(
+        crawler, results, _hooks, _request = await api.handle_stream_crawl_request(
             ["https://example.com"], {}, {}, crawl_config(wall_clock_s=0.01)
         )
         output = api.stream_results(crawler, results)
@@ -457,7 +457,7 @@ def test_streaming_generator_failure_emits_terminal_failure_and_releases(monkeyp
     released, _dedicated = install_fakes(monkeypatch, pooled)
 
     async def exercise():
-        crawler, results, _hooks = await api.handle_stream_crawl_request(
+        crawler, results, _hooks, _request = await api.handle_stream_crawl_request(
             ["https://example.com"], {}, {}, crawl_config()
         )
         output = api.stream_results(crawler, results)
@@ -742,3 +742,144 @@ def test_late_500_records_type_name_never_its_detail(monkeypatch):
     assert fake.closed[-1]["status_code"] == 500
     assert fake.closed[-1]["error"] == "request aborted: HTTPException"
     assert "raw internals" not in fake.closed[-1]["error"]
+
+
+def test_all_failed_crawl_is_recorded_as_a_gateway_failure(monkeypatch):
+    """The handler owns the verdict: recording success/200 before the caller's
+    502 counted every all-failed crawl as a success in /monitor (issue #18)."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(
+        monkeypatch,
+        FakeCrawler(mode="crawl_failure", failure_message="Blocked by anti-bot protection"),
+    )
+
+    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert response["success"] is False
+    assert fake.closed == [
+        {
+            "success": False,
+            "error": "Blocked by anti-bot protection",
+            "pool_hit": True,
+            "status_code": 502,
+        }
+    ]
+
+
+def test_monitor_error_text_is_the_sanitized_message(monkeypatch):
+    """/monitor/logs/errors is readable by any data-scope principal, so the
+    recorded text must be the correlated, path-free form, never the library's
+    raw error_message."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler(mode="crawl_failure"))
+
+    run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert fake.closed[-1]["error"].startswith("Crawl failed (correlation_id=")
+    assert "/app/" not in fake.closed[-1]["error"]
+
+
+def test_successful_crawl_is_recorded_as_a_success(monkeypatch):
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler())
+
+    response = run(api.handle_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+
+    assert response["success"] is True
+    assert fake.closed == [
+        {"success": True, "error": None, "pool_hit": True, "status_code": 200}
+    ]
+
+
+def test_streamed_crawl_is_recorded_on_the_monitor(monkeypatch):
+    """/crawl/stream never registered with the monitor (issue #78): the entry
+    opens in the handler and closes with the crawl verdict when the stream
+    finishes; the HTTP status is already 200 by then."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(
+        monkeypatch,
+        FakeCrawler(mode="crawl_failure", failure_message="Blocked by anti-bot protection"),
+    )
+
+    async def exercise():
+        crawler, results, _hooks, request_id = await api.handle_stream_crawl_request(
+            ["https://example.com"], {}, {}, crawl_config()
+        )
+        assert request_id in fake.active_requests
+        async for _chunk in api.stream_results(crawler, results, request_id):
+            pass
+
+    run(exercise())
+    assert fake.active_requests == {}
+    assert fake.closed == [
+        {"success": False, "error": "Blocked by anti-bot protection", "status_code": 200}
+    ]
+
+
+def test_stream_closed_before_completion_is_not_a_success(monkeypatch):
+    """A consumer that closes the generator after a successful chunk but
+    before the completion marker (client gone while parked on a write) must
+    not be recorded as a success."""
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler())
+
+    async def exercise():
+        crawler, results, _hooks, request_id = await api.handle_stream_crawl_request(
+            ["https://example.com"], {}, {}, crawl_config()
+        )
+        output = api.stream_results(crawler, results, request_id)
+        assert json.loads((await anext(output)).decode())["success"] is True
+        await output.aclose()
+
+    run(exercise())
+    assert fake.active_requests == {}
+    assert fake.closed == [
+        {"success": False, "error": "Stream closed before completion", "status_code": 200}
+    ]
+
+
+def test_streamed_success_and_setup_rejection_are_recorded(monkeypatch):
+    import monitor as monitor_module
+
+    fake = LeakCheckMonitor()
+    monkeypatch.setattr(monitor_module, "get_monitor", lambda: fake)
+    install_fakes(monkeypatch, FakeCrawler())
+
+    async def exercise():
+        crawler, results, _hooks, request_id = await api.handle_stream_crawl_request(
+            ["https://example.com"], {}, {}, crawl_config()
+        )
+        async for _chunk in api.stream_results(crawler, results, request_id):
+            pass
+
+    run(exercise())
+    assert fake.closed[-1] == {"success": True, "error": None, "status_code": 200}
+
+    def blocked(_url):
+        raise HTTPException(status_code=400, detail="URL blocked (SSRF protection): URL blocked")
+
+    monkeypatch.setattr(api, "validate_url_destination", blocked)
+    with pytest.raises(HTTPException) as error:
+        run(api.handle_stream_crawl_request(["https://example.com"], {}, {}, crawl_config()))
+    assert error.value.status_code == 400
+    assert fake.active_requests == {}
+    assert fake.closed[-1] == {
+        "success": False,
+        "error": "URL blocked (SSRF protection): URL blocked",
+        "status_code": 400,
+    }
