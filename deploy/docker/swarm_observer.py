@@ -298,7 +298,7 @@ def _public_coverage(direct_instance: dict[str, str], deadline: float) -> int:
 def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]:
     """Reuse the rollout verifier's task and health owners for one stable sample."""
     deadline = time.monotonic() + SAMPLE_DEADLINE_SECONDS
-    rollout._verify_ingress_host()
+    ingress_pid = rollout._verify_ingress_host()
     before = rollout._service_tasks(service_name)
     current = [
         row for row in before if str(row.get("DesiredState", "")).lower() == "running"
@@ -329,7 +329,10 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
             revision = str(runtime["labels"].get("otel.service.version", ""))
             if len(address) != 1:
                 continue
-            health = rollout._request_json(f"http://{next(iter(address))}:11235/health")
+            health = rollout._request_json(
+                f"http://{next(iter(address))}:11235/health",
+                network_namespace_pid=ingress_pid,
+            )
             if (
                 rollout._exact_health(health, revision)
                 and health["instance"] == runtime["container"]

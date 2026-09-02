@@ -628,15 +628,43 @@ def test_ingress_host_requires_one_running_dokploy_traefik(monkeypatch, containe
         rollout._verify_ingress_host()
 
 
-def test_ingress_host_accepts_one_running_dokploy_traefik(monkeypatch):
-    monkeypatch.setattr(
-        rollout.subprocess,
-        "run",
-        lambda command, **_kwargs: subprocess.CompletedProcess(
-            command, 0, "container\n", ""
+def test_ingress_host_uses_fixed_read_only_docker_projections(monkeypatch):
+    invocation = []
+
+    def run(command, **kwargs):
+        invocation.append((command, kwargs))
+        stdout = "container-id\n" if command[1] == "ps" else "4321\n"
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+
+    assert rollout._verify_ingress_host() == 4321
+    assert invocation == [
+        (
+            [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--filter",
+                "name=^/dokploy-traefik$",
+                "--filter",
+                "status=running",
+                "--format",
+                "{{.ID}}",
+            ],
+            {"check": True, "capture_output": True, "text": True},
         ),
-    )
-    rollout._verify_ingress_host()
+        (
+            [
+                "docker",
+                "inspect",
+                "container-id",
+                "--format",
+                "{{.State.Pid}}",
+            ],
+            {"check": True, "capture_output": True, "text": True},
+        ),
+    ]
 
 
 def test_public_proof_observes_every_authoritative_instance_in_any_order(monkeypatch):
@@ -1018,6 +1046,58 @@ def test_request_json_failure_carries_curl_diagnosis(monkeypatch):
     assert error.value.curl_exit == 56
     assert "curl exit 56" in str(error.value)
     assert "Connection reset" in str(error.value)
+
+
+def test_request_json_uses_namespace_argv_and_existing_bounds(monkeypatch):
+    invocation = []
+    url = "http://10.0.1.38:11235/health"
+
+    def run(command, **kwargs):
+        invocation.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, json.dumps(health("one")), "")
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+
+    assert rollout._request_json(url, network_namespace_pid=4321) == health("one")
+    assert invocation == [
+        (
+            [
+                "nsenter",
+                "--net=/proc/4321/ns/net",
+                "curl",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "15",
+                "--max-filesize",
+                "65536",
+                "--config",
+                "-",
+                url,
+            ],
+            {"input": "", "text": True, "capture_output": True, "timeout": 20},
+        )
+    ]
+
+
+@pytest.mark.parametrize("network_namespace_pid", [True, 1.5, 0])
+def test_request_json_rejects_an_invalid_network_namespace_pid(
+    monkeypatch, network_namespace_pid
+):
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("invalid PID must not execute a command"),
+    )
+
+    with pytest.raises(ValueError, match="PID must be a positive integer"):
+        rollout._request_json(
+            "http://10.0.1.38:11235/health",
+            network_namespace_pid=network_namespace_pid,
+        )
 
 
 def test_monitor_failure_sample_is_attributable(monkeypatch, tmp_path):
@@ -1437,7 +1517,7 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
         }
         for index in range(3)
     }
-    monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: None)
+    monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: 4321)
     monkeypatch.setattr(observer.rollout, "_service_tasks", lambda _service: rows)
     monkeypatch.setattr(
         observer,
@@ -1462,18 +1542,20 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
         "_task_runtime",
         lambda task_id, _network: runtimes[task_id],
     )
-    monkeypatch.setattr(
-        observer.rollout,
-        "_request_json",
-        lambda url: health(
+    direct_probe = []
+
+    def direct_health(url, *, network_namespace_pid):
+        direct_probe.append((url, network_namespace_pid))
+        return health(
             next(
                 runtime["container"]
                 for runtime in runtimes.values()
                 if next(iter(runtime["addresses"])) in url
             ),
             revision=REVISION,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(observer.rollout, "_request_json", direct_health)
     monkeypatch.setattr(observer, "_public_coverage", lambda _direct, _deadline: 2)
     monkeypatch.setattr(
         observer,
@@ -1485,6 +1567,8 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
 
     assert snapshot == observer.CoverageSnapshot(3, 3, 2)
     assert comparison is observer.NetworkDbFdbComparison.CONSISTENT
+    assert len(direct_probe) == 3
+    assert {namespace_pid for _url, namespace_pid in direct_probe} == {4321}
 
 
 def test_sample_rejects_a_task_census_change(monkeypatch):

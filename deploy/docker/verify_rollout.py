@@ -140,17 +140,35 @@ class CurlError(RuntimeError):
         self.curl_exit = curl_exit
 
 
-def _request_json(url: str, api_key: str | None = None) -> Any:
+def _request_json(
+    url: str,
+    api_key: str | None = None,
+    *,
+    network_namespace_pid: int | None = None,
+) -> Any:
     config = ""
     if api_key:
         escaped = api_key.replace("\\", "\\\\").replace('"', '\\"')
         config = f'header = "x-api-key: {escaped}"\n'
+    command = [
+        "curl", "--silent", "--show-error", "--fail",
+        "--connect-timeout", "5", "--max-time", "15",
+        "--max-filesize", "65536", "--config", "-", url,
+    ]
+    if network_namespace_pid is not None:
+        if (
+            isinstance(network_namespace_pid, bool)
+            or not isinstance(network_namespace_pid, int)
+            or network_namespace_pid <= 0
+        ):
+            raise ValueError("network namespace PID must be a positive integer")
+        command = [
+            "nsenter",
+            f"--net=/proc/{network_namespace_pid}/ns/net",
+            *command,
+        ]
     response = subprocess.run(
-        [
-            "curl", "--silent", "--show-error", "--fail",
-            "--connect-timeout", "5", "--max-time", "15",
-            "--max-filesize", "65536", "--config", "-", url,
-        ],
+        command,
         input=config,
         text=True,
         capture_output=True,
@@ -521,11 +539,12 @@ def _service_tasks(app_name: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in listed.stdout.splitlines() if line]
 
 
-def _verify_ingress_host() -> None:
+def _verify_ingress_host() -> int:
     ingress = subprocess.run(
         [
             "docker",
             "ps",
+            "--no-trunc",
             "--filter",
             "name=^/dokploy-traefik$",
             "--filter",
@@ -537,8 +556,22 @@ def _verify_ingress_host() -> None:
         capture_output=True,
         text=True,
     )
-    if len(ingress.stdout.splitlines()) != 1:
+    container = ingress.stdout.splitlines()
+    if len(container) != 1:
         raise RuntimeError("rollout verifier is not running on the public ingress host")
+    inspected = subprocess.run(
+        ["docker", "inspect", container[0], "--format", "{{.State.Pid}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        pid = int(inspected.stdout.strip())
+    except ValueError as error:
+        raise RuntimeError("public ingress network namespace PID is invalid") from error
+    if pid <= 0:
+        raise RuntimeError("public ingress network namespace PID is invalid")
+    return pid
 
 
 def _verify_tasks(
