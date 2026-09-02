@@ -1,0 +1,30 @@
+[Unit]
+Description=Crawl4AI ingress coverage observer
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/crawl4ai/swarm-observer.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+WorkingDirectory=/opt/crawl4ai-swarm-observer/current
+ExecStart=/usr/bin/python3 /opt/crawl4ai-swarm-observer/current/swarm_observer.py
+Restart=on-failure
+RestartSec=5
+StateDirectory=crawl4ai-swarm-observer
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
