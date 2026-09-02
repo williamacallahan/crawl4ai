@@ -14,7 +14,8 @@ StateDirectory=crawl4ai-swarm-observer
 StateDirectoryMode=0755
 UMask=0077
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_SYS_ADMIN
+# CAP_SYS_PTRACE: opening /proc/<ingress-pid>/ns/net is a ptrace-read check
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

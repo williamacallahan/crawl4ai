@@ -42,6 +42,7 @@ activate() {
     # shellcheck disable=SC1091
     . /etc/crawl4ai/swarm-observer.env
     curl --fail --silent --show-error --max-time 10 \
+        --retry 5 --retry-connrefused --retry-delay 1 --retry-max-time 15 \
         "http://$CRAWL4AI_OBSERVER_BIND:$CRAWL4AI_OBSERVER_PORT/metrics"
 }
 
