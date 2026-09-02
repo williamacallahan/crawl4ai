@@ -64,8 +64,7 @@ case "$action" in
         service_name=${CRAWL4AI_SWARM_SERVICE:?set CRAWL4AI_SWARM_SERVICE}
         bind=${CRAWL4AI_OBSERVER_BIND:?set CRAWL4AI_OBSERVER_BIND}
         port=${CRAWL4AI_OBSERVER_PORT:-9476}
-        max_age=${CRAWL4AI_OBSERVER_MAX_AGE_SECONDS:-60}
-        case "$service_name$bind$port$max_age" in
+        case "$service_name$bind$port" in
             *[!A-Za-z0-9_.:-]*)
                 echo "observer settings contain unsupported characters" >&2
                 exit 64
@@ -95,7 +94,6 @@ case "$action" in
             printf 'CRAWL4AI_SWARM_SERVICE=%s\n' "$service_name"
             printf 'CRAWL4AI_OBSERVER_BIND=%s\n' "$bind"
             printf 'CRAWL4AI_OBSERVER_PORT=%s\n' "$port"
-            printf 'CRAWL4AI_OBSERVER_MAX_AGE_SECONDS=%s\n' "$max_age"
             printf 'CRAWL4AI_OBSERVER_STATE_PATH=/var/lib/crawl4ai-swarm-observer/episode.state\n'
             printf 'CRAWL4AI_OBSERVER_METRICS_PATH=/var/lib/crawl4ai-swarm-observer/metrics.prom\n'
         } >"$environment"

@@ -67,14 +67,9 @@ def handler(metrics: MetricsFile) -> type[http.server.BaseHTTPRequestHandler]:
 def serve() -> None:
     bind = os.environ.get("CRAWL4AI_OBSERVER_BIND", DEFAULT_BIND)
     port = int(os.environ.get("CRAWL4AI_OBSERVER_PORT", DEFAULT_PORT))
-    max_age = float(
-        os.environ.get("CRAWL4AI_OBSERVER_MAX_AGE_SECONDS", DEFAULT_MAX_AGE_SECONDS)
-    )
-    if max_age <= 0:
-        raise ValueError("CRAWL4AI_OBSERVER_MAX_AGE_SECONDS must be positive")
     metrics = MetricsFile(
         os.environ.get("CRAWL4AI_OBSERVER_METRICS_PATH", DEFAULT_METRICS_PATH),
-        max_age,
+        DEFAULT_MAX_AGE_SECONDS,
     )
     http.server.ThreadingHTTPServer((bind, port), handler(metrics)).serve_forever()
 
