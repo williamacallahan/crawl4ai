@@ -823,6 +823,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
+    monkeypatch.setattr(rollout, "_ensure_rollback_source", lambda _image: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: {})
     monkeypatch.setattr(
@@ -1313,6 +1314,9 @@ def _deploy_env(monkeypatch):
     monkeypatch.setenv("GITHUB_SHA", REVISION)
     monkeypatch.setenv("GITHUB_RUN_ID", "1")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    # Seeding the rollback source is an infrastructure precondition orthogonal
+    # to what these tests assert; it has its own tests below.
+    monkeypatch.setattr(rollout, "_ensure_rollback_source", lambda _image: None)
 
 
 def test_deploy_requires_ready_capacity_not_full_fleet(monkeypatch):
@@ -1722,3 +1726,48 @@ def test_metrics_endpoint_fails_closed_when_the_sampler_is_stale(monkeypatch, tm
 
     with pytest.raises(TimeoutError, match="stale"):
         observer_server.MetricsFile(path, 60).read()
+
+
+# --- rollback-registry source (issue #83) -----------------------------------
+# Dokploy tags the currently-running service image on the Dokploy host before it
+# touches the service. When that image is absent the tag fails, the deployment
+# ends "error", and the Swarm service is never updated at all.
+
+
+def _docker_image_calls(inspect_rc):
+    calls = []
+
+    def run(cmd, *a, **kw):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, inspect_rc, "", "")
+        if cmd[:2] == ["docker", "pull"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    return run, calls
+
+
+def test_ensure_rollback_source_pulls_when_the_host_lacks_the_image(monkeypatch):
+    run, calls = _docker_image_calls(inspect_rc=1)
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    rollout._ensure_rollback_source("registry.example/crawl4ai@sha256:deadbeef")
+    assert ["docker", "pull", "registry.example/crawl4ai@sha256:deadbeef"] in calls
+
+
+def test_ensure_rollback_source_does_not_pull_when_already_present(monkeypatch):
+    run, calls = _docker_image_calls(inspect_rc=0)
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    rollout._ensure_rollback_source("registry.example/crawl4ai@sha256:deadbeef")
+    assert not any(c[:2] == ["docker", "pull"] for c in calls)
+
+
+def test_ensure_rollback_source_raises_when_the_pull_fails(monkeypatch):
+    def run(cmd, *a, **kw):
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        raise subprocess.CalledProcessError(1, cmd, "", "manifest unknown")
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        rollout._ensure_rollback_source("registry.example/crawl4ai@sha256:deadbeef")

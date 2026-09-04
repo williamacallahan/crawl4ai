@@ -229,6 +229,29 @@ def _service_spec(app_name: str) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
+def _ensure_rollback_source(image: str) -> None:
+    """Make sure the deploy host holds the image Dokploy will tag for rollback.
+
+    Dokploy's rollback-registry step runs `docker tag` against the *currently
+    running* service image, on the Dokploy host, before it touches the service.
+    That image is only ever there by accident: whichever runner built it keeps a
+    copy, and `runs-on: [self-hosted, Linux, X64, williamacallahan]` can place
+    the X64 build on any eligible runner. When haiku-0 does not have it the tag
+    fails, the deployment ends `error`, and the Swarm service is never updated
+    (2026-09-02 tag v63, 2026-09-04 tag v75).
+
+    This job runs on canonical-haiku-0, which *is* the Dokploy host, so pulling
+    here puts the image exactly where the tag will look for it. The digest moves
+    with every rollout, so it cannot be seeded once and left alone.
+    """
+    present = subprocess.run(
+        ["docker", "image", "inspect", image], capture_output=True, text=True
+    )
+    if present.returncode == 0:
+        return
+    subprocess.run(["docker", "pull", image], check=True, capture_output=True, text=True)
+
+
 def _update_state(app_name: str) -> str:
     result = subprocess.run(
         [
@@ -729,8 +752,10 @@ def deploy() -> None:
         if application.get("placementSwarm") == _LEGACY_PLACEMENT
         else (PLACEMENT,)
     )
-    _running_spec(
-        _service_spec(app_name), baseline, baseline_labels, placements=baseline_placements
+    running_spec = _service_spec(app_name)
+    _running_spec(running_spec, baseline, baseline_labels, placements=baseline_placements)
+    _ensure_rollback_source(
+        str(running_spec["TaskTemplate"]["ContainerSpec"]["Image"])
     )
     _verify_redis()
     verify_route(base, api_key, application_id, app_name)
