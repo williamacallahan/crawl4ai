@@ -494,7 +494,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
             "DesiredState": "Running",
             "CurrentState": "Running 1m",
         }
-        for index, node in enumerate(("haiku-4", "haiku-5", "haiku-9"), 1)
+        for index, node in enumerate(("haiku-6", "haiku-5", "haiku-9"), 1)
     ]
     rows += [
         {
@@ -560,7 +560,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         ),
     )
     proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES)
-    assert proof["nodes"] == ["haiku-4", "haiku-5", "haiku-9"]
+    assert proof["nodes"] == ["haiku-5", "haiku-6", "haiku-9"]
     assert len(proof["instances"]) == 3
 
 
@@ -744,7 +744,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(
         rollout,
         "_verify_tasks",
-        lambda *_args: {"tasks": ["1", "2", "3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["a", "b", "c"]},
+        lambda *_args: {"tasks": ["1", "2", "3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["a", "b", "c"]},
     )
     monkeypatch.setattr(
         rollout,
@@ -787,9 +787,9 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     events.clear()
     deployments[:] = [{"deploymentId": "old", "status": "done"}]
     proofs = iter([
-        {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
-        {"tasks": ["1", "2", "3"], "nodes": ["haiku-4", "haiku-5", "haiku-9"], "instances": ["a", "b", "c"]},
-        {"tasks": ["1", "2", "4"], "nodes": ["haiku-4", "haiku-5", "haiku-18"], "instances": ["a", "b", "d"]},
+        {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
+        {"tasks": ["1", "2", "3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["a", "b", "c"]},
+        {"tasks": ["1", "2", "4"], "nodes": ["haiku-5", "haiku-6", "haiku-18"], "instances": ["a", "b", "d"]},
     ])
     monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: next(proofs))
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
@@ -876,7 +876,7 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
         "image": CANDIDATE,
         "baselineRevision": "baseline",
         "tasks": ["task1", "task2", "task3"],
-        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "nodes": ["haiku-5", "haiku-6", "haiku-9"],
         "instances": ["one", "two", "three"],
         "publicInstances": {
             url: ["three", "one", "two"] for url in rollout.HEALTH_URLS
@@ -892,7 +892,7 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
         monkeypatch,
         {
             "tasks": ["task1", "task2", "task3"],
-            "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+            "nodes": ["haiku-5", "haiku-6", "haiku-9"],
             "instances": ["one", "two", "three"],
         },
     )
@@ -942,7 +942,7 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
         "image": CANDIDATE,
         "baselineRevision": "baseline",
         "tasks": ["task1", "task2", "task3"],
-        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "nodes": ["haiku-5", "haiku-6", "haiku-9"],
         "instances": ["one", "two", "three"],
         "publicInstances": coverage,
     }))
@@ -956,7 +956,7 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
         monkeypatch,
         {
             "tasks": ["task1", "task2", "task3"],
-            "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+            "nodes": ["haiku-5", "haiku-6", "haiku-9"],
             "instances": ["one", "two", "three"],
         },
     )
@@ -990,7 +990,7 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
         "image": CANDIDATE,
         "baselineRevision": "baseline",
         "tasks": ["task1", "task2", "task3"],
-        "nodes": ["haiku-4", "haiku-5", "haiku-9"],
+        "nodes": ["haiku-5", "haiku-6", "haiku-9"],
         "instances": ["one", "two", "three"],
         "publicInstances": {
             url: ["one", "two", "three"] for url in rollout.HEALTH_URLS
@@ -1003,7 +1003,7 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
         monkeypatch,
         {
             "tasks": ["task1", "task2", "task4"],
-            "nodes": ["haiku-4", "haiku-5", "haiku-18"],
+            "nodes": ["haiku-5", "haiku-6", "haiku-18"],
             "instances": ["one", "two", "four"],
         },
     )
@@ -1151,14 +1151,13 @@ def test_eligible_nodes_excludes_a_down_member_without_failing(monkeypatch):
     # its label, so the inventory check still sees the full ELIGIBLE_NODES set.
     monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
         ("haiku-0", False, "ready", "active"),
-        ("haiku-4", True, "down", "drain"),
+        ("haiku-18", True, "down", "drain"),
         ("haiku-5", True, "ready", "active"),
         ("haiku-6", True, "ready", "active"),
         ("haiku-9", True, "ready", "active"),
-        ("haiku-18", True, "ready", "active"),
     ]))
     assert rollout._eligible_nodes() == frozenset(
-        {"haiku-5", "haiku-6", "haiku-9", "haiku-18"}
+        {"haiku-5", "haiku-6", "haiku-9"}
     )
 
 
@@ -1203,12 +1202,12 @@ def test_running_spec_strict_mode_rejects_legacy_placement():
 
 
 def _healed_baseline_rows():
-    # haiku-4 died holding slot 1; Swarm healed the replica onto haiku-18,
+    # haiku-6 died holding slot 1; Swarm healed the replica onto haiku-18,
     # and the ghost task on the dead node can never confirm its shutdown.
     rows = [
         {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-18",
          "DesiredState": "Running", "CurrentState": "Running 1m"},
-        {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-4",
+        {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-6",
          "DesiredState": "Shutdown", "CurrentState": "Running 12 hours ago"},
         {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-5",
          "DesiredState": "Running", "CurrentState": "Running 1h"},
@@ -1353,7 +1352,7 @@ def test_deploy_requires_a_spare_node_for_start_first(monkeypatch):
     with pytest.raises(RuntimeError, match="start-first needs a spare eligible node") as excess:
         rollout.deploy()
     assert "3 replicas, 3 Ready" in str(excess.value)
-    assert "not Ready: haiku-4, haiku-6" in str(excess.value)
+    assert "not Ready: haiku-6" in str(excess.value)
 
     # Below REPLICAS fails the same way; the count is not a second gate.
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-9", "haiku-18"}))

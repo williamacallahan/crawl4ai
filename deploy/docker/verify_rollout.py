@@ -17,12 +17,9 @@ import yaml
 
 REPLICAS = 3
 # Every node carrying the crawl4ai-eligible label, drained ones included: the
-# inventory check compares labels, not readiness, so a node stays here until its
-# label is actually removed. haiku-6 joined 2026-09-04 while haiku-4 is drained
-# for hardware repair — start-first needs at least one eligible node beyond
-# REPLICAS, and without a replacement Swarm packs two tasks onto one node.
-# Remove haiku-6 here in the same change that removes its label.
-ELIGIBLE_NODES = frozenset({"haiku-4", "haiku-5", "haiku-6", "haiku-9", "haiku-18"})
+# inventory check compares labels, not readiness. haiku-4 was retired after its
+# hardware outage; haiku-6 now supplies the spare start-first slot.
+ELIGIBLE_NODES = frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"})
 LLM_PROVIDER = "openai/qwen3.8-27b"
 LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 HEALTH_URLS = (
@@ -40,7 +37,7 @@ NODE_CONSTRAINT = "node.labels.crawl4ai-eligible==true"
 # A down eligible node is a capacity event, not a rollout failure. Placement
 # carries no MaxReplicas cap: the hard cap turned any single down node into a
 # rollout deadlock — start-first had no legal overlap slot, for the update and
-# for its automatic rollback alike (2026-08-30, haiku-4). The scheduler's
+# for its automatic rollback alike (2026-08-30). The scheduler's
 # default same-service spread keeps replicas apart when capacity allows, and
 # _verify_tasks fail-closes on the end state if they ever land together.
 PLACEMENT = {"Constraints": [NODE_CONSTRAINT]}
@@ -840,7 +837,7 @@ def deploy() -> None:
     # MaxReplicas cap to forbid it, Swarm satisfies start-first by packing two
     # tasks onto one node rather than leaving one Pending. _verify_tasks then
     # rejects the end state as a placement fault, which names the symptom and
-    # not the missing node (2026-09-04, haiku-4 drained). Fail here instead,
+    # not the missing node. Fail here instead,
     # before any write, naming the node that has to come back.
     if len(ready) <= REPLICAS:
         raise RuntimeError(
