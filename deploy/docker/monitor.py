@@ -235,6 +235,7 @@ class MonitorStats:
         net = psutil.net_io_counters()
 
         # Pool status — lock-free snapshot (issue #1754)
+        import crawler_pool
         from crawler_pool import get_pool_snapshot
         snap = get_pool_snapshot()
         # TODO: Track actual browser process memory instead of estimates
@@ -262,7 +263,14 @@ class MonitorStats:
             },
             "janitor": {
                 "next_cleanup_estimate": "adaptive",  # Would need janitor state
-                "memory_pressure": "LOW" if mem_pct < 60 else "MEDIUM" if mem_pct < 80 else "HIGH"
+                "memory_pressure": "LOW" if mem_pct < 60 else "MEDIUM" if mem_pct < 80 else "HIGH",
+                # None until the first pass completes. A value that keeps growing
+                # means reclamation has stopped while the container still reports
+                # healthy — the failure this field exists to make visible.
+                "seconds_since_last_pass": (
+                    int(time.time() - crawler_pool.LAST_JANITOR_PASS)
+                    if crawler_pool.LAST_JANITOR_PASS else None
+                ),
             }
         }
 
@@ -309,31 +317,36 @@ class MonitorStats:
                 "sig": permanent_sig[:8] if permanent_sig else "unknown",
                 "age_seconds": int(now - self.start_time),
                 "last_used_seconds": int(now - last_used.get(permanent_sig, now)),
-                "memory_mb": 270,
+                "memory_mb": 270,  # Static estimate; container.memory_percent is measured
                 "hits": usage_count.get(permanent_sig, 0),
+                "active_requests": getattr(permanent, "active_requests", 0),
                 "killable": False
             })
 
         for sig, crawler in hot_pool.items():
+            active = getattr(crawler, "active_requests", 0)
             browsers.append({
                 "type": "hot",
                 "sig": sig[:8],
                 "age_seconds": int(now - self.start_time),  # Approximation
                 "last_used_seconds": int(now - last_used.get(sig, now)),
-                "memory_mb": 180,  # Estimate
+                "memory_mb": 180,  # Static estimate; container.memory_percent is measured
                 "hits": usage_count.get(sig, 0),
-                "killable": True
+                "active_requests": active,
+                "killable": active == 0
             })
 
         for sig, crawler in cold_pool.items():
+            active = getattr(crawler, "active_requests", 0)
             browsers.append({
                 "type": "cold",
                 "sig": sig[:8],
                 "age_seconds": int(now - self.start_time),
                 "last_used_seconds": int(now - last_used.get(sig, now)),
-                "memory_mb": 180,
+                "memory_mb": 180,  # Static estimate; container.memory_percent is measured
                 "hits": usage_count.get(sig, 0),
-                "killable": True
+                "active_requests": active,
+                "killable": active == 0
             })
 
         return browsers

@@ -124,6 +124,9 @@ crawler:
     max_pages: 12                          # ← Per-worker GLOBAL_SEM and dispatcher permits
     max_browser_instances: 12              # ← Per-worker browser-process ceiling
     idle_ttl_sec: 300                     # ← 30 min janitor cutoff
+    stale_lease_s: 0                      # leak backstop ceiling; 0 = auto: max(2 x limits.wall_clock_s, 21600).
+                                          # If you set wall_clock_s: 0 for very long crawls, raise this above
+                                          # your longest crawl or the janitor may force-close it mid-flight.
   browser:
     kwargs:
       headless: true

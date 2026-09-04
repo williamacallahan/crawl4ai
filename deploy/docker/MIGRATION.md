@@ -146,6 +146,22 @@ limits:
 
 To keep the previous behavior exactly, set the caps you don't want to `0`.
 
+### The pool janitor force-closes leaked browsers
+
+A pooled browser that reports "busy" but that no request has touched for longer
+than a ceiling - `crawler.pool.stale_lease_s`, default `0` = automatic
+`max(2 × wall_clock_s, 21600)` seconds - with `wall_clock_s: 0` here, that is the
+6 h floor - is treated as pinned by a
+leaked/hung request. The janitor force-closes it and logs
+`🚨 Leaked request counter ... force-closing` at ERROR level. That line means a
+request hung or leaked; it is cleanup working as intended, not a crash.
+
+The server cannot tell a hung browser from one serving a very long crawl -
+streaming crawls in particular have no wall-clock deadline. If your crawls
+(streaming or with `wall_clock_s: 0`) can legitimately run longer than 6 h, set
+`stale_lease_s` higher than your longest expected crawl, or the janitor may
+close a browser mid-crawl once it passes the ceiling.
+
 ### Error responses are generic
 
 5xx responses return `{"error": "Internal server error", "correlation_id": "…"}`.
