@@ -1773,3 +1773,75 @@ def test_ensure_rollback_source_reports_why_the_pull_failed(monkeypatch):
     monkeypatch.setattr(rollout.subprocess, "run", run)
     with pytest.raises(RuntimeError, match="authentication required"):
         rollout._ensure_rollback_source("registry.example/crawl4ai@sha256:deadbeef")
+
+
+# --- stranded-record healing (issue #83) -------------------------------------
+# Dokploy deploys FROM the record, so a deploy must move the record to the
+# candidate before the service can follow. A failure after that strands the
+# record on an image the service never ran; the next run then dies in
+# _running_spec instead of on the real cause. The failing run must not repair
+# this (see test_deploy_does_not_compensate_for_ambiguous_write) - the next one
+# does, at a point where nothing is in flight.
+
+
+def _heal_wiring(monkeypatch, record, running_image, running_revision, deployments):
+    posts = []
+    healed = dict(record)
+
+    def post(url, _key, body):
+        posts.append(body)
+        healed["dockerImage"] = body["dockerImage"]
+        healed["labelsSwarm"] = body["labelsSwarm"]
+
+    monkeypatch.setattr(
+        rollout, "_service_spec",
+        lambda _n: service_spec(image=running_image, revision=running_revision),
+    )
+    monkeypatch.setattr(rollout, "_deployments", lambda *_a: deployments)
+    monkeypatch.setattr(rollout, "_post_json", post)
+    monkeypatch.setattr(rollout, "_application", lambda *_a: healed)
+    monkeypatch.setattr(rollout, "_policy", lambda _a: None)
+    return posts, healed
+
+
+def test_heal_rewrites_a_record_the_service_never_ran(monkeypatch):
+    record = application()
+    record["dockerImage"] = "registry.example/crawl4ai@sha256:strandedcandidate"
+    posts, healed = _heal_wiring(monkeypatch, record, BASELINE, "baseline", [])
+    out = rollout._heal_stranded_record("https://dokploy", "key", "app", "svc", record)
+    assert posts == [{
+        "applicationId": "app",
+        "dockerImage": BASELINE,
+        "labelsSwarm": rollout._labels("baseline"),
+    }]
+    assert out["dockerImage"] == BASELINE
+
+
+def test_heal_is_a_noop_when_the_record_already_matches(monkeypatch):
+    record = application()
+    posts, _ = _heal_wiring(monkeypatch, record, record["dockerImage"], "baseline", [])
+    assert rollout._heal_stranded_record("https://dokploy", "key", "app", "svc", record) is record
+    assert posts == [], "an aligned record must not be rewritten"
+
+
+def test_heal_refuses_while_a_dokploy_deployment_is_running(monkeypatch):
+    # A live deploy means the record is ahead on purpose, not stranded.
+    record = application()
+    record["dockerImage"] = "registry.example/crawl4ai@sha256:strandedcandidate"
+    posts, _ = _heal_wiring(
+        monkeypatch, record, BASELINE, "baseline", [{"status": "running"}]
+    )
+    with pytest.raises(RuntimeError, match="nonterminal Dokploy deployment"):
+        rollout._heal_stranded_record("https://dokploy", "key", "app", "svc", record)
+    assert posts == [], "must not rewrite the record mid-deploy"
+
+
+def test_heal_refuses_a_mutable_running_artifact(monkeypatch):
+    record = application()
+    record["dockerImage"] = "registry.example/crawl4ai@sha256:strandedcandidate"
+    posts, _ = _heal_wiring(
+        monkeypatch, record, "registry.example/crawl4ai:latest", "baseline", []
+    )
+    with pytest.raises(ValueError, match="no immutable artifact"):
+        rollout._heal_stranded_record("https://dokploy", "key", "app", "svc", record)
+    assert posts == []

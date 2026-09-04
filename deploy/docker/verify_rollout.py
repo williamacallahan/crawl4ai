@@ -229,6 +229,64 @@ def _service_spec(app_name: str) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
+def _heal_stranded_record(
+    base: str,
+    api_key: str,
+    application_id: str,
+    app_name: str,
+    application: dict[str, Any],
+) -> dict[str, Any]:
+    """Realign a record left describing an image the service never ran.
+
+    Dokploy deploys FROM the record, so a deploy must patch the record to the
+    candidate before the service can move. When anything after that fails, the
+    record is stranded on the candidate while the service still runs the
+    baseline, and the next run dies in _running_spec with "running artifact or
+    labels differ from Dokploy" - a different error than the real one, which is
+    how one failure turns into a chain of unrelated ones (2026-09-04, run
+    33852834121, which needed a manual REST repair).
+
+    The failing run must NOT repair this itself: a failed write has an ambiguous
+    outcome, and compensating for it is exactly what
+    test_deploy_does_not_compensate_for_ambiguous_write forbids. Healing belongs
+    here instead, at the start of the next run, where nothing is in flight - the
+    Swarm update is terminal and no Dokploy deployment is running - so the live
+    service is authoritative and the repair is unambiguous.
+    """
+    running = _service_spec(app_name)["TaskTemplate"]["ContainerSpec"]
+    running_image = str(running.get("Image", ""))
+    if application.get("dockerImage") == running_image:
+        return application
+    running_revision = (running.get("Labels") or {}).get("otel.service.version")
+    if "@sha256:" not in running_image or not isinstance(running_revision, str):
+        raise ValueError("running service has no immutable artifact to heal from")
+    if any(
+        row.get("status") not in {"done", "error", "cancelled"}
+        for row in _deployments(base, api_key, application_id)
+    ):
+        raise RuntimeError("Crawl4AI already has a nonterminal Dokploy deployment")
+    print(
+        f"record points at {application.get('dockerImage')} but the service runs "
+        f"{running_image}; healing the record to the running artifact"
+    )
+    _post_json(
+        f"{base.rstrip('/')}/api/application.update",
+        api_key,
+        {
+            "applicationId": application_id,
+            "dockerImage": running_image,
+            "labelsSwarm": _labels(running_revision),
+        },
+    )
+    healed = _application(base, api_key, application_id)
+    _policy(healed)
+    if healed.get("dockerImage") != running_image or healed.get("labelsSwarm") != _labels(
+        running_revision
+    ):
+        raise RuntimeError("record did not converge on the running artifact")
+    return healed
+
+
 def _ensure_rollback_source(image: str) -> None:
     """Make sure the deploy host holds the image Dokploy will tag for rollback.
 
@@ -750,6 +808,14 @@ def deploy() -> None:
     app_name = str(application["appName"])
     if _update_state(app_name) != "completed":
         raise RuntimeError("Crawl4AI already has a nonterminal Swarm update")
+    # Nothing is in flight now, so a record that disagrees with the service is a
+    # previous run's stranded candidate, not a live deploy. Repair it here.
+    application = _heal_stranded_record(base, api_key, application_id, app_name, application)
+    baseline = str(application.get("dockerImage", ""))
+    baseline_labels = application.get("labelsSwarm")
+    baseline_revision = (baseline_labels or {}).get("otel.service.version")
+    if not isinstance(baseline_revision, str) or not baseline_revision:
+        raise ValueError("stock Dokploy baseline has no revision")
     # The live service may keep the legacy cap only while the Dokploy record
     # still carries it; once the record has converged, a capped live spec is
     # reintroduced drift, not transition residue.
