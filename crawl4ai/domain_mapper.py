@@ -17,17 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
-import pathlib
 import re
-import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -47,7 +43,6 @@ from .async_logger import AsyncLoggerBase, AsyncLogger
 from .async_url_seeder import AsyncUrlSeeder, _parse_head
 from .utils import (
     normalize_url,
-    get_base_domain,
     is_external_url,
     quick_extract_links,
 )
@@ -158,8 +153,6 @@ class DomainMapper:
         self.base_directory = Path(
             base_directory or os.getenv("CRAWL4_AI_BASE_DIRECTORY", Path.home())
         )
-        self.cache_dir = self.base_directory / ".crawl4ai" / "domain_mapper_cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._seeder: Optional[AsyncUrlSeeder] = None
         self._rate_sem: Optional[asyncio.Semaphore] = None
@@ -1092,50 +1085,3 @@ class DomainMapper:
         # Sort by relevance
         results.sort(key=lambda x: x.get("relevance_score", 0.0), reverse=True)
         return results
-
-    # ════════════════════════════════════════════════════════════════════════
-    #  CACHING
-    # ════════════════════════════════════════════════════════════════════════
-
-    def _cache_key(self, domain: str, config: "DomainMapperConfig") -> str:
-        """Generate cache key from domain + config."""
-        config_str = f"{config.source}:{config.filter_nonsense_urls}:{config.soft_404_detection}"
-        h = hashlib.md5(config_str.encode()).hexdigest()[:8]
-        safe_domain = re.sub(r"[/?#]+", "_", domain)
-        return f"scan_{safe_domain}_{h}.json"
-
-    def _read_scan_cache(self, domain: str, config: "DomainMapperConfig") -> Optional[List[Dict]]:
-        """Read cached scan results if valid."""
-        if config.force:
-            return None
-        path = self.cache_dir / self._cache_key(domain, config)
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text())
-            if data.get("version") != 1:
-                return None
-            created = datetime.fromisoformat(data["created_at"].replace("Z", "+00:00"))
-            age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
-            if age_hours > config.cache_ttl_hours:
-                return None
-            return data.get("results", [])
-        except Exception:
-            return None
-
-    def _write_scan_cache(
-        self, domain: str, config: "DomainMapperConfig", results: List[Dict]
-    ):
-        """Write scan results to cache."""
-        path = self.cache_dir / self._cache_key(domain, config)
-        try:
-            data = {
-                "version": 1,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "domain": domain,
-                "result_count": len(results),
-                "results": results,
-            }
-            path.write_text(json.dumps(data, default=str))
-        except Exception:
-            pass
