@@ -208,29 +208,6 @@ __all__ = [
 ]
 
 
-# def is_sync_version_installed():
-#     try:
-#         import selenium # noqa
-
-#         return True
-#     except ImportError:
-#         return False
-
-
-# if is_sync_version_installed():
-#     try:
-#         from .web_crawler import WebCrawler
-
-#         __all__.append("WebCrawler")
-#     except ImportError:
-#         print(
-#             "Warning: Failed to import WebCrawler even though selenium is installed. This might be due to other missing dependencies."
-#         )
-# else:
-#     WebCrawler = None
-#     # import warnings
-#     # print("Warning: Synchronous WebCrawler is not available. Install crawl4ai[sync] for synchronous support. However, please note that the synchronous version will be deprecated soon.")
-
 # Disable all Pydantic warnings
 warnings.filterwarnings("ignore", module="pydantic")
 # pydantic_warnings.filter_warnings()
