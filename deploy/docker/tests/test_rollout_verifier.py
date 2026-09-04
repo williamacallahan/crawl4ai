@@ -1762,12 +1762,14 @@ def test_ensure_rollback_source_does_not_pull_when_already_present(monkeypatch):
     assert not any(c[:2] == ["docker", "pull"] for c in calls)
 
 
-def test_ensure_rollback_source_raises_when_the_pull_fails(monkeypatch):
+def test_ensure_rollback_source_reports_why_the_pull_failed(monkeypatch):
+    # A bare CalledProcessError cannot distinguish "not logged in" from
+    # "manifest unknown"; the deploy job needs to know which.
     def run(cmd, *a, **kw):
         if cmd[:3] == ["docker", "image", "inspect"]:
             return subprocess.CompletedProcess(cmd, 1, "", "")
-        raise subprocess.CalledProcessError(1, cmd, "", "manifest unknown")
+        return subprocess.CompletedProcess(cmd, 1, "", "denied: authentication required\n")
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError, match="authentication required"):
         rollout._ensure_rollback_source("registry.example/crawl4ai@sha256:deadbeef")

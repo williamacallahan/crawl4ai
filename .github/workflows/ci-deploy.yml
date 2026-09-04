@@ -206,6 +206,15 @@ jobs:
       - name: Build deploy env
         run: uv sync --locked --only-group deploy
 
+      # verify_rollout seeds the rollback source here: Dokploy tags the running
+      # service image on this host before it touches the service, and the pull
+      # that guarantees it is present needs registry auth like build and merge.
+      - name: Registry login
+        env:
+          REGISTRY_USER: ${{ secrets.NEXUS_DOCKER_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.NEXUS_DOCKER_PASSWORD }}
+        run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
+
       - name: Deploy through the native Swarm VIP
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
@@ -240,3 +249,9 @@ jobs:
           name: crawl4ai-rollout-${{ github.sha }}
           path: ${{ runner.temp }}/crawl4ai-rollout-monitor.jsonl
           if-no-files-found: warn
+
+      # Same reason as build and merge: an authenticated session otherwise
+      # stays in ~/.docker/config.json for whatever job lands here next.
+      - name: Drop registry credentials
+        if: always()
+        run: docker logout docker.iocloudhost.net || true

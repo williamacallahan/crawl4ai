@@ -249,7 +249,13 @@ def _ensure_rollback_source(image: str) -> None:
     )
     if present.returncode == 0:
         return
-    subprocess.run(["docker", "pull", image], check=True, capture_output=True, text=True)
+    pull = subprocess.run(["docker", "pull", image], capture_output=True, text=True)
+    if pull.returncode != 0:
+        # Surface the reason: swallowing it turns an auth or manifest problem
+        # into a bare CalledProcessError with no way to tell them apart.
+        raise RuntimeError(
+            f"could not seed the rollback source {image}: {pull.stderr.strip()}"
+        )
 
 
 def _update_state(app_name: str) -> str:
