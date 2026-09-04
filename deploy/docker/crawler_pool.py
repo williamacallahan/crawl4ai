@@ -32,17 +32,26 @@ MAX_BROWSER_INSTANCES = CONFIG.get("crawler", {}).get("pool", {}).get(
 )
 ADMISSION_SEM = asyncio.Semaphore(MAX_ACTIVE_REQUESTS)
 DEFAULT_CONFIG_SIG = None  # Cached sig for default config
+_CLOSE_TASKS = set()  # In-flight background closes; close_all() drains them at shutdown
+
+
+def _pos(v):
+    """Config values can be null, a bool, or a string; only a positive number counts."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0
+
 
 # Leak-backstop ceiling: a "busy" browser untouched past it is force-closed.
 # 6h floor: streams have no deadline and nothing refreshes LAST_USED mid-crawl.
-def _pos(v): return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0
 _WALL_CLOCK = _pos(CONFIG.get("limits", {}).get("wall_clock_s", 0))
 STALE_CEILING = _pos(CONFIG.get("crawler", {}).get("pool", {}).get("stale_lease_s", 0)) or max(2 * _WALL_CLOCK, 21600)
 
 # Timestamp of the last completed janitor pass. The task is retained on
 # app.state, so a mid-life raise parks its exception until shutdown and prints
 # nothing: reclamation stops silently and the container stays "healthy" while
-# refusing every new browser. Health surfaces read this to tell the difference.
+# refusing every new browser. /monitor/health reports this as
+# janitor.seconds_since_last_pass; the container healthcheck does NOT read it
+# and still returns 200 while get_crawler refuses, so recovering a wedged
+# replica is an operator/scheduled-restart action, not an automatic one.
 LAST_JANITOR_PASS = 0.0
 
 
@@ -386,10 +395,8 @@ async def close_all():
     if _CLOSE_TASKS:
         with suppress(Exception):
             await asyncio.wait_for(
-                asyncio.gather(*list(_CLOSE_TASKS), return_exceptions=True), timeout=65
+                asyncio.gather(*_CLOSE_TASKS, return_exceptions=True), timeout=65
             )
-
-_CLOSE_TASKS = set()
 
 def _close_in_background(crawler: AsyncWebCrawler):
     """Close a browser without holding the pool LOCK.
@@ -402,7 +409,17 @@ def _close_in_background(crawler: AsyncWebCrawler):
             # 60s gives Playwright's own graceful-then-SIGKILL cycle room to finish
             await asyncio.wait_for(crawler.close(), timeout=60)
         except asyncio.TimeoutError:
-            logger.warning("⚠️ Browser close timed out after 60s - abandoning (its processes may linger)")
+            # close() hung partway through browser_manager.close(), which runs
+            # playwright.stop() last - so the node driver and its Chromium
+            # process group are still alive with nothing referencing them.
+            # Stopping the driver transport makes its exit handler SIGKILL the
+            # whole group; without this the abandoned browser's memory stays
+            # charged to the container for its life.
+            logger.warning("⚠️ Browser close timed out after 60s - stopping its Playwright driver")
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    crawler.crawler_strategy.browser_manager.playwright.stop(), timeout=5
+                )
         except Exception:
             pass
     task = asyncio.create_task(_close())
@@ -415,9 +432,7 @@ async def janitor():
     while True:
         try:
             await _janitor_pass()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
+        except Exception:  # CancelledError is a BaseException, so shutdown still propagates
             # Never let one bad pass end reclamation. logger.error, not info:
             # the deployed log level drops INFO, which is why the previous
             # silent stall was invisible for 28h.
@@ -443,50 +458,30 @@ async def _janitor_pass():
 
     now = time.time()
     async with LOCK:
-        # Clean cold pool
-        for sig in list(COLD_POOL.keys()):
-            if now - LAST_USED.get(sig, now) > cold_ttl:
-                crawler = COLD_POOL[sig]
+        # Both pools, same rule: cold first (less valuable), hot gets the longer TTL.
+        for tier, pool, ttl in (("cold", COLD_POOL, cold_ttl), ("hot", HOT_POOL, hot_ttl)):
+            for sig in list(pool.keys()):
+                if now - LAST_USED.get(sig, now) <= ttl:
+                    continue
+                crawler = pool[sig]
                 idle_time = now - LAST_USED[sig]
-                if getattr(crawler, 'active_requests', 0) > 0:
+                active = getattr(crawler, 'active_requests', 0)
+                if active > 0:
                     if idle_time <= STALE_CEILING:
                         continue  # still serving requests, skip
-                    logger.error(f"🚨 Leaked request counter (sig={sig[:8]}, active={crawler.active_requests}, idle={idle_time:.0f}s > {STALE_CEILING}s) - force-closing")
+                    logger.error(f"🚨 Leaked request counter (sig={sig[:8]}, active={active}, idle={idle_time:.0f}s > {STALE_CEILING}s) - force-closing")
                 else:
-                    logger.info(f"🧹 Closing cold browser (sig={sig[:8]}, idle={idle_time:.0f}s)")
+                    logger.info(f"🧹 Closing {tier} browser (sig={sig[:8]}, idle={idle_time:.0f}s)")
                 _close_in_background(crawler)  # close() can hang; never await it under LOCK
-                COLD_POOL.pop(sig, None)
+                pool.pop(sig, None)
                 LAST_USED.pop(sig, None)
                 USAGE_COUNT.pop(sig, None)
 
                 # Track in monitor
                 try:
                     from monitor import get_monitor
-                    await get_monitor().track_janitor_event("close_cold", sig, {"idle_seconds": int(idle_time), "ttl": cold_ttl})
-                except Exception:  # bare except would swallow CancelledError and outlive shutdown
-                    pass
-
-        # Clean hot pool (more conservative)
-        for sig in list(HOT_POOL.keys()):
-            if now - LAST_USED.get(sig, now) > hot_ttl:
-                crawler = HOT_POOL[sig]
-                idle_time = now - LAST_USED[sig]
-                if getattr(crawler, 'active_requests', 0) > 0:
-                    if idle_time <= STALE_CEILING:
-                        continue  # still serving requests, skip
-                    logger.error(f"🚨 Leaked request counter (sig={sig[:8]}, active={crawler.active_requests}, idle={idle_time:.0f}s > {STALE_CEILING}s) - force-closing")
-                else:
-                    logger.info(f"🧹 Closing hot browser (sig={sig[:8]}, idle={idle_time:.0f}s)")
-                _close_in_background(crawler)  # close() can hang; never await it under LOCK
-                HOT_POOL.pop(sig, None)
-                LAST_USED.pop(sig, None)
-                USAGE_COUNT.pop(sig, None)
-
-                # Track in monitor
-                try:
-                    from monitor import get_monitor
-                    await get_monitor().track_janitor_event("close_hot", sig, {"idle_seconds": int(idle_time), "ttl": hot_ttl})
-                except Exception:  # bare except would swallow CancelledError and outlive shutdown
+                    await get_monitor().track_janitor_event(f"close_{tier}", sig, {"idle_seconds": int(idle_time), "ttl": ttl})
+                except Exception:  # not bare: that would swallow CancelledError and outlive shutdown
                     pass
 
         # Log pool stats

@@ -235,9 +235,8 @@ class MonitorStats:
         net = psutil.net_io_counters()
 
         # Pool status — lock-free snapshot (issue #1754)
-        import crawler_pool
-        from crawler_pool import get_pool_snapshot
-        snap = get_pool_snapshot()
+        import crawler_pool  # module, not `from`: LAST_JANITOR_PASS is rebound each pass
+        snap = crawler_pool.get_pool_snapshot()
         # TODO: Track actual browser process memory instead of estimates
         # These are conservative estimates based on typical Chromium usage
         permanent_mem = 270 if snap["permanent"] else 0  # Estimate: ~270MB for permanent browser

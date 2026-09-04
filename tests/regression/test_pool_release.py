@@ -33,6 +33,12 @@ class _FakeStrategy:
         )()
 
 
+def _resolve_ceiling(*, wall_clock_s, stale_lease_s):
+    """Mirror of crawler_pool's ceiling derivation, applied to shipped values."""
+    pos = crawler_pool._pos
+    return pos(stale_lease_s) or max(2 * pos(wall_clock_s), 21600)
+
+
 class FakeCrawler:
     """Stand-in for AsyncWebCrawler.
 
@@ -69,6 +75,10 @@ def clean_pool():
     _reset_pool()
     for t in list(crawler_pool._CLOSE_TASKS):
         t.cancel()
+    # Tests that drive the real get_crawler take an admission permit and never
+    # release it; without this the permits drain across the file and a later
+    # test blocks instead of failing.
+    crawler_pool.ADMISSION_SEM = asyncio.Semaphore(crawler_pool.MAX_ACTIVE_REQUESTS)
 
 
 async def _drain_close_tasks():
@@ -249,6 +259,20 @@ class TestJanitorSweep:
         assert c.closed is True
 
 
+def _reloaded_ceiling(*, wall_clock_s, stale_lease_s):
+    """STALE_CEILING as the real module computes it from a patched config."""
+    cfg = copy.deepcopy(utils.load_config())
+    cfg["limits"]["wall_clock_s"] = wall_clock_s
+    cfg["crawler"]["pool"]["stale_lease_s"] = stale_lease_s
+    orig = utils.load_config
+    utils.load_config = lambda: cfg
+    try:
+        return importlib.reload(crawler_pool).STALE_CEILING
+    finally:
+        utils.load_config = orig
+        importlib.reload(crawler_pool)
+
+
 class TestStaleCeiling:
 
     def test_ceiling_derives_from_the_wall_clock(self):
@@ -263,38 +287,30 @@ class TestStaleCeiling:
         (45, 45), (86400, 86400),                    # a real value is used as written
     ])
     def test_stale_lease_override_resolves_through_the_real_module(self, configured, expected):
-        cfg = copy.deepcopy(utils.load_config())
-        cfg["limits"]["wall_clock_s"] = 1800
-        cfg["crawler"]["pool"]["stale_lease_s"] = configured
-        orig = utils.load_config
-        utils.load_config = lambda: cfg
-        try:
-            assert importlib.reload(crawler_pool).STALE_CEILING == expected
-        finally:
-            utils.load_config = orig
-            importlib.reload(crawler_pool)
+        assert _reloaded_ceiling(wall_clock_s=1800, stale_lease_s=configured) == expected
 
     def test_bad_wall_clock_value_never_breaks_import(self):
-        cfg = copy.deepcopy(utils.load_config())
-        cfg["limits"]["wall_clock_s"] = "10m"  # nonsense -> fall back, never break the janitor
-        cfg["crawler"]["pool"]["stale_lease_s"] = 0
-        orig = utils.load_config
-        utils.load_config = lambda: cfg
-        try:
-            assert importlib.reload(crawler_pool).STALE_CEILING == 21600
-        finally:
-            utils.load_config = orig
-            importlib.reload(crawler_pool)
+        # nonsense wall clock -> fall back to the floor, never break the janitor
+        assert _reloaded_ceiling(wall_clock_s="10m", stale_lease_s=0) == 21600
 
     def test_shipped_config_bounds_a_leaked_lease(self):
-        """A leaked active_requests counter must always have a finite ceiling.
+        """The config the image actually ships must yield a finite ceiling.
 
         This repo ships wall_clock_s: 0 (deep crawls here legitimately outrun any
         per-crawl deadline), so STALE_CEILING is the only thing standing between a
-        leaked counter and a browser pinned for the container's life.
+        leaked counter and a browser pinned for the container's life. Asserting
+        against the constant alone would restate its own formula, so read the
+        shipped config.yml and resolve the ceiling from those values.
         """
-        assert crawler_pool.STALE_CEILING > 0
-        assert crawler_pool.STALE_CEILING >= 21600
+        shipped = utils.load_config()
+        ceiling = _resolve_ceiling(
+            wall_clock_s=shipped.get("limits", {}).get("wall_clock_s", 0),
+            stale_lease_s=shipped.get("crawler", {}).get("pool", {}).get("stale_lease_s", 0),
+        )
+        assert 0 < ceiling < float("inf"), (
+            "shipped config leaves a leaked active_requests counter unbounded"
+        )
+        assert ceiling == crawler_pool.STALE_CEILING
 
 
 class TestCloseAllDrainsBackgroundCloses:
@@ -426,7 +442,6 @@ class TestReleaseNeverSuspends:
     """
 
     def test_release_completes_without_yielding_to_the_event_loop(self):
-        _reset_pool()
         crawler = FakeCrawler(active_requests=1)
         coro = crawler_pool.release_crawler(crawler)
         try:
@@ -442,7 +457,6 @@ class TestReleaseNeverSuspends:
 
     @pytest.mark.asyncio
     async def test_release_decrements_even_while_the_pool_lock_is_held(self):
-        _reset_pool()
         crawler = FakeCrawler(active_requests=1)
         async with crawler_pool.LOCK:
             await crawler_pool.release_crawler(crawler)

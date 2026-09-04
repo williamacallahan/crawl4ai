@@ -293,9 +293,16 @@ Two safeguards keep the pool un-pinnable (issue #2202):
   touched within `STALE_CEILING` (`pool.stale_lease_s`; `0` = auto
   `max(2 × limits.wall_clock_s, 21600)`). A counter stuck past that means a request
   hung or leaked, so the browser is force-closed instead of pinned forever.
-- **Background close**: `close()` on a wedged browser can hang, so the janitor never
-  awaits it while holding LOCK. Closes run as fire-and-forget tasks with a 60s cap;
-  `close_all()` drains them (65s cap) so shutdown is clean.
+- **Background close**: `close()` on a wedged browser can hang, so the janitor and
+  `close_all()` never await it while holding LOCK. Closes run as fire-and-forget
+  tasks with a 60s cap, after which the browser's Playwright driver is stopped so
+  its Chromium process group cannot survive unreferenced; `close_all()` drains the
+  tasks (65s cap) so shutdown is clean.
+
+  This covers the janitor and shutdown only. `_discard_if_unavailable`,
+  `_make_browser_capacity`, `release_dedicated_crawler`, and the `/monitor`
+  kill/restart actions still await an untimed `close()` under LOCK, so a browser
+  wedged on one of those paths can still stall `get_crawler` server-wide.
 
 **Config Signature Generation:**
 
