@@ -23,8 +23,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Never recycle while a deploy is rolling the same service.
-  group: crawl4ai-swarm-rollout
+  # Must be ci-deploy.yml's group verbatim: a recycle and a deploy both roll the
+  # same Swarm service, and a second roller trips verify_rollout's overlap gate.
+  group: crawl4ai-deploy
   cancel-in-progress: false
 
 jobs:
