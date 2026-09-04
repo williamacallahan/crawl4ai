@@ -386,6 +386,11 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
             self.monitor.start()
             
         results = []
+        # Bound before the try: the queue-fill loop below can raise, and the
+        # finally cancels these. run_urls_stream binds it here for the same
+        # reason. Leaving it unbound turns any such error into an
+        # UnboundLocalError that replaces the real exception.
+        active_tasks = []
 
         try:
             # Initialize task queue
@@ -395,8 +400,6 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                     self.monitor.add_task(task_id, url)
                 # Add to queue with initial priority 0, retry count 0, and current time
                 await self.task_queue.put((0, (url, task_id, 0, time.time())))
-
-            active_tasks = []
 
             # Process until both queues are empty
             while not self.task_queue.empty() or active_tasks:
