@@ -16,7 +16,7 @@ from crawl_job_queue import (
     CrawlJobLeaseLost,
     CrawlJobQueue,
 )
-from crawler_pool import close_all
+from crawler_pool import close_all, janitor
 from egress_proxy import start_pinning_proxy, stop_pinning_proxy
 from fastapi import HTTPException, status
 from redis import asyncio as aioredis
@@ -282,11 +282,21 @@ async def run_worker() -> None:
     queue = CrawlJobQueue(redis, config)
     consumer = f"{socket.gethostname()}-{os.getpid()}"
     proxy = None
+    # Each worker process owns a private browser pool (the pools in
+    # crawler_pool are module globals, and supervisord runs numprocs=2 of
+    # this program beside gunicorn). Without its own janitor nothing here
+    # ever closes an idle browser, so a worker's pool only grows - up to
+    # crawler.pool.max_browser_instances of them - and that memory counts
+    # against the same container limit that gunicorn's get_crawler checks.
+    # It is also invisible to /monitor/*, which reads the gunicorn process.
+    pool_janitor = asyncio.create_task(janitor())
     try:
         proxy = await start_pinning_proxy()
         worker = CrawlJobWorker(queue, config, consumer)
         await worker.run()
     finally:
+        pool_janitor.cancel()
+        await asyncio.gather(pool_janitor, return_exceptions=True)
         try:
             await close_all()
         finally:
