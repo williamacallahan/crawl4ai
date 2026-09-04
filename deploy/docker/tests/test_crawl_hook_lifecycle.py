@@ -495,6 +495,12 @@ def configure_dedicated_pool(
     monkeypatch.setattr(crawler_pool, "AsyncWebCrawler", factory)
 
 
+async def _drain_pool_close_tasks():
+    tasks = list(crawler_pool._CLOSE_TASKS)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_dedicated_hook_crawlers_share_pool_admission_and_instance_cap(
     monkeypatch,
@@ -560,6 +566,7 @@ async def test_dedicated_admission_released_when_start_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="browser start failed"):
         await crawler_pool.get_dedicated_crawler(BrowserConfig())
 
+    await _drain_pool_close_tasks()
     assert created[0].closed
     assert crawler_pool.COLD_POOL == {}
     assert crawler_pool.ADMISSION_SEM._value == 1
@@ -647,6 +654,8 @@ async def test_dedicated_release_finishes_cleanup_when_cancelled(monkeypatch):
         crawler_pool.release_dedicated_crawler(crawler)
     )
     await blocking_crawler.close_started.wait()
+    await asyncio.wait_for(crawler_pool.LOCK.acquire(), timeout=1)
+    crawler_pool.LOCK.release()
     release_task.cancel()
     await asyncio.sleep(0)
     assert not release_task.done()
@@ -658,6 +667,31 @@ async def test_dedicated_release_finishes_cleanup_when_cancelled(monkeypatch):
     assert blocking_crawler.closed
     assert not getattr(crawler, "_docker_request_owned")
     assert getattr(crawler, "_docker_pool_sig") is None
+    assert crawler_pool.COLD_POOL == {}
+    assert crawler_pool.ADMISSION_SEM._value == 1
+
+
+@pytest.mark.asyncio
+async def test_dedicated_release_survives_cancellation_while_waiting_for_pool_lock(
+    monkeypatch,
+):
+    crawler = FakeCrawler()
+    configure_dedicated_pool(monkeypatch, lambda **_kwargs: crawler, capacity=1)
+    crawler = await crawler_pool.get_dedicated_crawler(BrowserConfig())
+
+    async with crawler_pool.LOCK:
+        release_task = asyncio.create_task(
+            crawler_pool.release_dedicated_crawler(crawler)
+        )
+        await asyncio.sleep(0)
+        release_task.cancel()
+        await asyncio.sleep(0)
+        assert not release_task.done()
+
+    with pytest.raises(asyncio.CancelledError):
+        await release_task
+
+    assert crawler.closed
     assert crawler_pool.COLD_POOL == {}
     assert crawler_pool.ADMISSION_SEM._value == 1
 

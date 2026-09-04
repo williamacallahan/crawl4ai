@@ -158,26 +158,18 @@ class KillBrowserRequest(BaseModel):
 async def force_cleanup():
     """Force immediate janitor cleanup (kills idle cold pool browsers)."""
     try:
-        from contextlib import suppress
+        from crawler_pool import retire_pool_crawlers
 
-        from crawler_pool import COLD_POOL, LAST_USED, LOCK, USAGE_COUNT
-
-        killed_count = 0
-        async with LOCK:
-            for sig in list(COLD_POOL.keys()):
-                # Kill all cold pool browsers immediately
-                logger.info(f"🧹 Force cleanup: closing cold browser (sig={sig[:8]})")
-                with suppress(Exception):
-                    await COLD_POOL[sig].close()
-                COLD_POOL.pop(sig, None)
-                LAST_USED.pop(sig, None)
-                USAGE_COUNT.pop(sig, None)
-                killed_count += 1
+        retired = await retire_pool_crawlers(cold_only=True)
+        for sig, _pool_type in retired:
+            logger.info(f"🧹 Force cleanup: closing cold browser (sig={sig[:8]})")
 
         monitor = get_monitor()
-        await monitor.track_janitor_event("force_cleanup", "manual", {"killed": killed_count})
+        await monitor.track_janitor_event(
+            "force_cleanup", "manual", {"killed": len(retired)}
+        )
 
-        return {"success": True, "killed_browsers": killed_count}
+        return {"success": True, "killed_browsers": len(retired)}
     except Exception as e:
         logger.error(f"Error during force cleanup: {e}")
         raise HTTPException(500, str(e))
@@ -191,61 +183,23 @@ async def kill_browser(req: KillBrowserRequest):
         sig: Browser config signature (first 8 chars)
     """
     try:
-        from contextlib import suppress
-
         from crawler_pool import (
-            COLD_POOL,
             DEFAULT_CONFIG_SIG,
-            HOT_POOL,
-            LAST_USED,
-            LOCK,
-            USAGE_COUNT,
+            retire_pool_crawlers,
         )
 
-        # Find full signature matching prefix
-        target_sig = None
-        pool_type = None
+        if DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig):
+            raise HTTPException(403, "Cannot kill permanent browser. Use restart instead.")
 
-        async with LOCK:
-            # Check hot pool
-            for sig in HOT_POOL.keys():
-                if sig.startswith(req.sig):
-                    target_sig = sig
-                    pool_type = "hot"
-                    break
+        retired = await retire_pool_crawlers(req.sig)
+        if not retired:
+            raise HTTPException(404, f"Browser with sig={req.sig} not found")
+        target_sig, pool_type = retired[0]
 
-            # Check cold pool
-            if not target_sig:
-                for sig in COLD_POOL.keys():
-                    if sig.startswith(req.sig):
-                        target_sig = sig
-                        pool_type = "cold"
-                        break
-
-            # Check if trying to kill permanent
-            if DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig):
-                raise HTTPException(403, "Cannot kill permanent browser. Use restart instead.")
-
-            if not target_sig:
-                raise HTTPException(404, f"Browser with sig={req.sig} not found")
-
-            # Warn if there are active requests (browser might be in use)
-            monitor = get_monitor()
-            active_count = len(monitor.get_active_requests())
-            if active_count > 0:
-                logger.warning(f"Killing browser {target_sig[:8]} while {active_count} requests are active - may cause failures")
-
-            # Kill the browser
-            if pool_type == "hot":
-                browser = HOT_POOL.pop(target_sig)
-            else:
-                browser = COLD_POOL.pop(target_sig)
-
-            with suppress(Exception):
-                await browser.close()
-
-            LAST_USED.pop(target_sig, None)
-            USAGE_COUNT.pop(target_sig, None)
+        monitor = get_monitor()
+        active_count = len(monitor.get_active_requests())
+        if active_count > 0:
+            logger.warning(f"Killing browser {target_sig[:8]} while {active_count} requests are active - may cause failures")
 
         logger.info(f"🔪 Killed {pool_type} browser (sig={target_sig[:8]})")
 
@@ -268,16 +222,10 @@ async def restart_browser(req: KillBrowserRequest):
         sig: Browser config signature (first 8 chars), or "permanent"
     """
     try:
-        from contextlib import suppress
-
         from crawler_pool import (
-            COLD_POOL,
             DEFAULT_CONFIG_SIG,
-            HOT_POOL,
-            LAST_USED,
-            LOCK,
-            USAGE_COUNT,
             init_permanent,
+            retire_pool_crawlers,
         )
         # Handle permanent browser restart
         if req.sig == "permanent" or (DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig)):
@@ -289,40 +237,10 @@ async def restart_browser(req: KillBrowserRequest):
             return {"success": True, "restarted": "permanent"}
 
         # Handle hot/cold browser restart
-        target_sig = None
-        pool_type = None
-        async with LOCK:
-            # Find browser
-            for sig in HOT_POOL.keys():
-                if sig.startswith(req.sig):
-                    target_sig = sig
-                    pool_type = "hot"
-                    # Would need to reconstruct config (not stored currently)
-                    break
-
-            if not target_sig:
-                for sig in COLD_POOL.keys():
-                    if sig.startswith(req.sig):
-                        target_sig = sig
-                        pool_type = "cold"
-                        break
-
-            if not target_sig:
-                raise HTTPException(404, f"Browser with sig={req.sig} not found")
-
-            # Kill existing
-            if pool_type == "hot":
-                browser = HOT_POOL.pop(target_sig)
-            else:
-                browser = COLD_POOL.pop(target_sig)
-
-            with suppress(Exception):
-                await browser.close()
-
-            # Note: We can't easily recreate with same config without storing it
-            # For now, just kill and let new requests create fresh ones
-            LAST_USED.pop(target_sig, None)
-            USAGE_COUNT.pop(target_sig, None)
+        retired = await retire_pool_crawlers(req.sig)
+        if not retired:
+            raise HTTPException(404, f"Browser with sig={req.sig} not found")
+        target_sig, pool_type = retired[0]
 
         logger.info(f"🔄 Restarted {pool_type} browser (sig={target_sig[:8]})")
 

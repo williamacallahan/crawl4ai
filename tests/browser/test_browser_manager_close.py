@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,15 @@ async def test_close_iterates_over_context_snapshot():
     manager.logger = SimpleNamespace(error=lambda **_: None)
     manager._using_cached_cdp = manager._launched_persistent = False
     manager._context_refcounts = manager._context_last_used = manager._page_to_sig = {}
+    manager._page_to_admission = {}
+    manager._owned_pages_in_use = {}
+    manager._background_tasks = set()
+    manager._active_acquisitions = set()
+    manager._recycle_lock = asyncio.Lock()
+    manager._recycle_done = asyncio.Event()
+    manager._recycle_done.set()
+    manager._recycle_due = manager._recycling = manager._closing = False
+    manager._recycle_task = None
     first, second = _Context(manager), _Context()
     manager.contexts_by_config = {"first": first, "second": second}
 
