@@ -520,3 +520,37 @@ async def test_a_failing_browser_close_still_ends_the_chromium_process():
     # to skip both and leave the Chromium charged to the container for life.
     assert cleaned.is_set()
     assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_driver_does_not_deadlock_the_restart(monkeypatch):
+    monkeypatch.setattr(browser_manager_module, "RECYCLE_CLOSE_SECONDS", 0.05)
+    monkeypatch.setattr(browser_manager_module, "RECYCLE_START_SECONDS", 1.0)
+    monkeypatch.setattr(browser_manager_module, "DRIVER_STOP_SECONDS", 0.05)
+    manager = _manager()
+    wedged = asyncio.Event()
+    started = asyncio.Event()
+
+    class _Playwright:
+        async def stop(self):
+            await wedged.wait()
+
+    async def close(*, _for_recycle=False):
+        await wedged.wait()
+
+    async def start():
+        # start() re-enters close() whenever playwright is still set, and that
+        # close awaits the recycle task this restart is running inside. The
+        # timeout branch has to drop the driver reference or the restart
+        # deadlocks against itself and the barrier never reopens.
+        assert manager.playwright is None
+        started.set()
+
+    manager.playwright = _Playwright()
+    manager.close = close
+    manager.start = start
+    manager._recycle_task = asyncio.current_task()
+
+    assert await asyncio.wait_for(manager._restart_browser(), timeout=3)
+    assert started.is_set()
+    wedged.set()

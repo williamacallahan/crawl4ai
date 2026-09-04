@@ -27,10 +27,23 @@ CANCELLATION_GRACE_SECONDS = 20.0
 # wedges the whole browser rather than degrading it.
 RECYCLE_CLOSE_SECONDS = 60.0
 RECYCLE_START_SECONDS = 120.0
-RECYCLE_WAIT_SECONDS = RECYCLE_CLOSE_SECONDS + RECYCLE_START_SECONDS + 30.0
+# The whole worst-case legitimate recycle: a close that runs its cap, one
+# absorbed cancellation inside it, the driver-stop fallback, a launch, and
+# margin. Derived rather than picked, so a waiter cannot start failing while a
+# healthy recycle is still running.
+RECYCLE_WAIT_SECONDS = (
+    RECYCLE_CLOSE_SECONDS
+    + CANCELLATION_GRACE_SECONDS
+    + 5.0
+    + RECYCLE_START_SECONDS
+    + 30.0
+)
 # Discarding one page must not outlast Playwright's own close, and must never
 # hold the request that is already rolling its allocation back.
 PAGE_CLOSE_SECONDS = 30.0
+# Stopping the driver transport is the last resort for a wedged close; its exit
+# handler ends the whole Chromium group. Capped because it can wedge too.
+DRIVER_STOP_SECONDS = 5.0
 
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
@@ -772,6 +785,10 @@ class BrowserManager:
         # by managers, but a manager must only remove pages it marked itself.
         self._browser_endpoint_key: Optional[str] = None
         self._owned_pages_in_use = {}
+        # Allocations abandoned past their cancellation grace, held only so the
+        # event loop keeps a reference until they land and clean up after
+        # themselves. Deliberately not in _background_tasks; close() drains those.
+        self._abandoned_tasks = set()
 
         # Recycling is a drain barrier, not a context-signature rotation.  A
         # token is issued before allocation and remains live until its page is
@@ -1653,6 +1670,13 @@ class BrowserManager:
                 )
             except asyncio.TimeoutError:
                 self._abandon_hung_task(task, on_abandon)
+                # Re-arm the cancellation rather than only raising it. Callers
+                # such as _run_cleanup catch BaseException, which would clear
+                # the request's cancelled state and send the next absorber on
+                # this path back to an unbounded wait.
+                current = asyncio.current_task()
+                if current is not None:
+                    current.cancel()
                 raise asyncio.CancelledError from None
             except asyncio.CancelledError:
                 if task.cancelled():
@@ -1678,9 +1702,14 @@ class BrowserManager:
                 raise
 
     def _abandon_hung_task(self, task, on_abandon) -> None:
-        """Stop waiting on a task, but still close whatever it hands back."""
-        if isinstance(task, asyncio.Task):
-            self._track_background_task(task)
+        """Stop waiting on a task, but still close whatever it hands back.
+
+        The task is held here rather than in _background_tasks: close() drains
+        those, and re-waiting on a task already declared hung would spend
+        another grace period on every close.
+        """
+        self._abandoned_tasks.add(task)
+        task.add_done_callback(self._abandoned_tasks.discard)
         if on_abandon is None:
             return
 
@@ -1693,7 +1722,12 @@ class BrowserManager:
                 return
             if value is None:
                 return
-            self._track_background_task(asyncio.create_task(on_abandon(value)))
+            try:
+                self._track_background_task(asyncio.create_task(on_abandon(value)))
+            except RuntimeError:
+                # No running loop: the interpreter is shutting down and the
+                # process is about to take the page with it.
+                pass
 
         task.add_done_callback(_close_late_result)
 
@@ -1790,9 +1824,14 @@ class BrowserManager:
 
     async def _admit_page_acquisition(self):
         """Issue a drain token only while the browser admits new pages."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + RECYCLE_WAIT_SECONDS
         while True:
             try:
-                await asyncio.wait_for(self._recycle_done.wait(), RECYCLE_WAIT_SECONDS)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(self._recycle_done.wait(), remaining)
             except asyncio.TimeoutError:
                 # Fail the request rather than hold it: a caller that returns
                 # gives its pool permit back, and an unbounded wait here would
@@ -1864,12 +1903,18 @@ class BrowserManager:
             # group, so a wedged close neither holds the barrier nor leaves
             # its process charged to the container.
             try:
-                await asyncio.wait_for(self._stop_playwright(), timeout=5)
-            except BaseException:
+                await asyncio.wait_for(
+                    self._stop_playwright(), DRIVER_STOP_SECONDS
+                )
+            except Exception:
                 pass
             self.browser = None
             self.managed_browser = None
             self.default_context = None
+            # Dropped even when stop() hung: start() calls close() whenever
+            # playwright is still set, and that close awaits this very recycle
+            # task - the restart would deadlock against itself.
+            self.playwright = None
         async with self._recycle_lock:
             if self._closing:
                 return False
@@ -2175,7 +2220,15 @@ class BrowserManager:
                 recycle_task = self._recycle_task
             if recycle_task and recycle_task is not asyncio.current_task():
                 try:
-                    await asyncio.shield(recycle_task)
+                    await asyncio.wait_for(
+                        asyncio.shield(recycle_task), RECYCLE_WAIT_SECONDS
+                    )
+                except asyncio.CancelledError:
+                    # crawler_pool's 60s close cap cancels here. Swallowing it
+                    # would let close() return normally, so the cap never
+                    # raises TimeoutError and never stops the driver whose exit
+                    # handler is what ends an abandoned Chromium group.
+                    raise
                 except BaseException:
                     pass
 
