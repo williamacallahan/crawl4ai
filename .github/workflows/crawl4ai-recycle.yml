@@ -1,0 +1,74 @@
+# Nightly rolling recycle of the crawl4ai Swarm service.
+#
+# Belt-and-suspenders behind the browser-pool reclamation fixes: even with the
+# janitor sweeping every process, a long-lived Chromium is never recycled by the
+# pool itself (the permanent browser's process is only ever replaced when the
+# task restarts), so a periodic recycle bounds any residual growth.
+#
+# `docker service update --force` re-creates the tasks under the service's own
+# UpdateConfig -- Parallelism 1, 400s Delay, start-first, FailureAction rollback
+# -- so this is one replica at a time, health-gated, with automatic rollback. It
+# introduces no new container, daemon or dependency.
+#
+# This lives here rather than in a Dokploy scheduled task because Dokploy's
+# schedules do not execute: both `scheduleType: server` and `dokploy-server`
+# accept a command, return HTTP 200 from schedule.create and schedule.runManually
+# and then run nothing (probed 2026-09-04 with a marker file on haiku-5 and on
+# the Dokploy host; neither appeared).
+name: crawl4ai recycle
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  # Never recycle while a deploy is rolling the same service.
+  group: crawl4ai-swarm-rollout
+  cancel-in-progress: false
+
+jobs:
+  recycle:
+    # canonical-haiku-0 is a Swarm manager, which `docker service` requires.
+    runs-on: [self-hosted, Linux, X64, williamacallahan, canonical-haiku-0]
+    timeout-minutes: 45
+    steps:
+      - name: Recycle crawl4ai replicas one at a time
+        env:
+          SERVICE: crawl4ai-yq1svi
+        run: |
+          set -euo pipefail
+
+          state() {
+            docker service inspect "$SERVICE" \
+              --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{else}}none{{end}}'
+          }
+
+          if [ "$(state)" = "updating" ]; then
+            echo "A rollout is already in flight; leaving it alone."
+            exit 0
+          fi
+
+          docker service update --force --detach "$SERVICE"
+
+          # Parallelism 1 over 3 replicas at 400s Delay, plus the 400s Monitor on
+          # the last task, is ~20 minutes; give it room and fail loudly if the
+          # rollout pauses or rolls back rather than reporting a false success.
+          for _ in $(seq 1 80); do
+            sleep 30
+            s="$(state)"
+            echo "UpdateStatus=$s"
+            case "$s" in
+              completed)
+                docker service ps "$SERVICE" --filter desired-state=running \
+                  --format '{{.Node}} {{.CurrentState}}'
+                exit 0 ;;
+              paused|rollback_started|rollback_paused)
+                echo "::error::crawl4ai recycle ended in $s"
+                docker service ps "$SERVICE" --no-trunc | head -20
+                exit 1 ;;
+            esac
+          done
+
+          echo "::error::crawl4ai recycle did not converge within the timeout"
+          exit 1
