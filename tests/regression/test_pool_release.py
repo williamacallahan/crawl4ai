@@ -137,6 +137,40 @@ class TestReleaseCrawler:
             await handler()
         assert c.active_requests == 0
 
+    @pytest.mark.asyncio
+    async def test_retirement_unblocks_waiting_admission(self):
+        """Detaching a dead crawler returns every lease before its close ends."""
+        from crawl4ai import BrowserConfig
+
+        cfg = BrowserConfig(headless=True)
+        target = FakeCrawler()
+        crawler_pool.HOT_POOL[crawler_pool._sig(cfg)] = target
+        stale = FakeCrawler(2)
+        stale.crawler_strategy.browser_manager.browser.connected = False
+        crawler_pool.COLD_POOL["stale"] = stale
+        crawler_pool.ADMISSION_SEM = asyncio.Semaphore(0)
+
+        waiting = asyncio.create_task(crawler_pool.get_crawler(cfg))
+        await asyncio.sleep(0)
+        assert not waiting.done()
+
+        async with crawler_pool.LOCK:
+            close_task = crawler_pool._discard_if_unavailable(
+                crawler_pool.COLD_POOL, "stale", "Cold"
+            )
+
+        assert close_task is not None
+        assert stale.active_requests == 0
+        admitted = await asyncio.wait_for(waiting, timeout=1)
+        assert admitted is target
+
+        await crawler_pool.release_crawler(stale)
+        await crawler_pool.release_crawler(stale)
+        assert crawler_pool.ADMISSION_SEM._value == 1
+        await crawler_pool.release_crawler(target)
+        assert crawler_pool.ADMISSION_SEM._value == 2
+        await close_task
+
 
 # ---------------------------------------------------------------------------
 # janitor sweep: idle TTL + stale-lease backstop, driven through the real loop
@@ -166,6 +200,7 @@ class TestJanitorSweep:
     @pytest.mark.asyncio
     async def test_force_closes_a_cold_browser_busy_past_the_ceiling(self, monkeypatch, caplog):
         c = FakeCrawler(1)  # counter stuck at 1, nobody using it
+        crawler_pool.ADMISSION_SEM = asyncio.Semaphore(0)
         crawler_pool.COLD_POOL["deadbeefcafe"] = c
         crawler_pool.LAST_USED["deadbeefcafe"] = (
             crawler_pool.time.time() - crawler_pool.STALE_CEILING - 1
@@ -180,6 +215,11 @@ class TestJanitorSweep:
         assert c.closed is True, "janitor never reclaimed the pinned browser"
         assert "deadbeefcafe" not in crawler_pool.COLD_POOL
         assert "deadbeef" in caplog.text, "force-close must log an ERROR naming the signature"
+        assert c.active_requests == 0
+        assert crawler_pool.ADMISSION_SEM._value == 1
+        await crawler_pool.release_crawler(c)
+        await crawler_pool.release_crawler(c)
+        assert crawler_pool.ADMISSION_SEM._value == 1
 
     @pytest.mark.asyncio
     async def test_force_closes_a_hot_browser_busy_past_the_ceiling(self, monkeypatch):
@@ -314,6 +354,16 @@ class TestStaleCeiling:
 
 
 class TestCloseAllDrainsBackgroundCloses:
+
+    @pytest.mark.asyncio
+    async def test_close_helper_reuses_its_retained_task(self):
+        c = FakeCrawler()
+
+        first = crawler_pool._close_in_background(c)
+        second = crawler_pool._close_in_background(c)
+
+        assert first is second
+        await first
 
     @pytest.mark.asyncio
     async def test_close_all_waits_for_pending_close_tasks(self):

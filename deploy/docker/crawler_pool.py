@@ -94,6 +94,56 @@ def _set_active_requests(crawler: AsyncWebCrawler, active: int) -> None:
     setattr(crawler, "active_requests", active)
 
 
+async def _start_or_retire(crawler: AsyncWebCrawler) -> None:
+    try:
+        await crawler.start()
+    except BaseException:
+        _retire_crawler(crawler)
+        _close_in_background(crawler)
+        raise
+
+
+def _retire_crawler(crawler: AsyncWebCrawler) -> int:
+    """Release every admission lease after a crawler is detached for good."""
+    if getattr(crawler, "_docker_admission_released", False) is True:
+        return 0
+
+    outstanding = max(0, _active_requests(crawler))
+    setattr(crawler, "_docker_admission_released", True)
+    _set_active_requests(crawler, 0)
+    for _ in range(outstanding):
+        ADMISSION_SEM.release()
+    return outstanding
+
+
+def _detach_pool_crawler(
+    pool: Dict[str, AsyncWebCrawler], sig: str
+) -> AsyncWebCrawler:
+    """Remove a pooled crawler before its close can run."""
+    crawler = pool.pop(sig)
+    LAST_USED.pop(sig, None)
+    USAGE_COUNT.pop(sig, None)
+    _retire_crawler(crawler)
+    return crawler
+
+
+def _detach_permanent() -> Optional[AsyncWebCrawler]:
+    """Remove the permanent crawler before its close can run."""
+    global PERMANENT, DEFAULT_CONFIG_SIG
+    crawler = PERMANENT
+    if not crawler:
+        return None
+
+    sig = DEFAULT_CONFIG_SIG
+    PERMANENT = None
+    DEFAULT_CONFIG_SIG = None
+    if sig:
+        LAST_USED.pop(sig, None)
+        USAGE_COUNT.pop(sig, None)
+    _retire_crawler(crawler)
+    return crawler
+
+
 def _is_live(crawler: AsyncWebCrawler) -> bool:
     """Return whether the crawler still owns a usable Playwright browser."""
     try:
@@ -108,70 +158,47 @@ def _is_live(crawler: AsyncWebCrawler) -> bool:
         return False
 
 
-async def _close_even_if_cancelled(crawler: AsyncWebCrawler) -> None:
-    """Finish browser close before propagating caller cancellation."""
-    close_task = asyncio.create_task(crawler.close())
-    try:
-        await asyncio.shield(close_task)
-    except asyncio.CancelledError:
-        with suppress(Exception):
-            await close_task
-        raise
-
-
-async def _start_or_close(crawler: AsyncWebCrawler, tier: str) -> None:
-    try:
-        await crawler.start()
-    except BaseException:
-        try:
-            await _close_even_if_cancelled(crawler)
-        except Exception:
-            logger.warning(
-                "%s browser cleanup failed after start error", tier, exc_info=True
-            )
-        raise
-
-
-async def _discard_if_unavailable(
+def _discard_if_unavailable(
     pool: Dict[str, AsyncWebCrawler], sig: str, tier: str
-) -> bool:
+) -> Optional[asyncio.Task]:
     crawler = pool[sig]
     if _is_live(crawler):
-        return False
+        return None
     logger.warning(f"{tier} pool browser is unavailable; replacing it (sig={sig[:8]})")
-    pool.pop(sig)
-    with suppress(Exception):
-        await _close_even_if_cancelled(crawler)
-    LAST_USED.pop(sig, None)
-    USAGE_COUNT.pop(sig, None)
-    return True
+    return _close_in_background(_detach_pool_crawler(pool, sig))
 
 
-async def _make_browser_capacity() -> None:
-    """Evict one idle browser before admitting a new configuration."""
-    browser_count = (1 if PERMANENT else 0) + len(HOT_POOL) + len(COLD_POOL)
-    if browser_count < MAX_BROWSER_INSTANCES:
-        return
+def _browser_count() -> int:
+    return (
+        (1 if PERMANENT else 0)
+        + len(HOT_POOL)
+        + len(COLD_POOL)
+        + sum(not task.done() for task in _CLOSE_TASKS)
+    )
+
+
+def _make_browser_capacity() -> Optional[asyncio.Task]:
+    """Schedule an idle eviction, or wait for an existing close, before growth."""
+    if _browser_count() < MAX_BROWSER_INSTANCES:
+        return None
+
+    for task in _CLOSE_TASKS:
+        if not task.done():
+            return task
 
     idle_browser = [
         (LAST_USED.get(sig, 0), sig, pool)
         for pool in (COLD_POOL, HOT_POOL)
         for sig, crawler in pool.items()
-        if getattr(crawler, "active_requests", 0) == 0
+        if _active_requests(crawler) == 0
     ]
-    if not idle_browser:
-        raise RuntimeError("Crawler browser pool is at capacity")
+    if idle_browser:
+        _, idle_sig, idle_pool = min(idle_browser, key=lambda candidate: candidate[0])
+        crawler = _detach_pool_crawler(idle_pool, idle_sig)
+        logger.info(f"🧹 Replaced idle browser at pool capacity (sig={idle_sig[:8]})")
+        return _close_in_background(crawler)
 
-    _, idle_sig, idle_pool = min(idle_browser, key=lambda candidate: candidate[0])
-    crawler = idle_pool.pop(idle_sig)
-    try:
-        await _close_even_if_cancelled(crawler)
-    except Exception:
-        logger.warning("Idle browser cleanup failed during replacement", exc_info=True)
-    finally:
-        LAST_USED.pop(idle_sig, None)
-        USAGE_COUNT.pop(idle_sig, None)
-    logger.info(f"🧹 Replaced idle browser at pool capacity (sig={idle_sig[:8]})")
+    raise RuntimeError("Crawler browser pool is at capacity")
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Get crawler from pool with tiered strategy."""
@@ -192,26 +219,29 @@ async def get_dedicated_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     admission lease remains held from creation through disposal.
     """
     await ADMISSION_SEM.acquire()
-    crawler: Optional[AsyncWebCrawler] = None
     try:
-        async with LOCK:
-            mem_pct = get_container_memory_percent()
-            if mem_pct >= MEM_LIMIT:
-                raise MemoryError(
-                    f"Memory at {mem_pct:.1f}%, refusing dedicated browser"
-                )
-            await _make_browser_capacity()
-            crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
-            await _start_or_close(crawler, "Dedicated")
+        while True:
+            close_task = None
+            async with LOCK:
+                mem_pct = get_container_memory_percent()
+                if mem_pct >= MEM_LIMIT:
+                    raise MemoryError(
+                        f"Memory at {mem_pct:.1f}%, refusing dedicated browser"
+                    )
+                close_task = _make_browser_capacity()
+                if close_task is None:
+                    crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
+                    await _start_or_retire(crawler)
 
-            sig = f"dedicated:{uuid.uuid4().hex}"
-            setattr(crawler, "_docker_request_owned", True)
-            setattr(crawler, "_docker_pool_sig", sig)
-            _set_active_requests(crawler, 1)
-            COLD_POOL[sig] = crawler
-            LAST_USED[sig] = time.time()
-            USAGE_COUNT[sig] = 1
-            return crawler
+                    sig = f"dedicated:{uuid.uuid4().hex}"
+                    setattr(crawler, "_docker_request_owned", True)
+                    setattr(crawler, "_docker_pool_sig", sig)
+                    _set_active_requests(crawler, 1)
+                    COLD_POOL[sig] = crawler
+                    LAST_USED[sig] = time.time()
+                    USAGE_COUNT[sig] = 1
+                    return crawler
+            await asyncio.shield(close_task)
     except BaseException:
         ADMISSION_SEM.release()
         raise
@@ -223,114 +253,138 @@ async def release_dedicated_crawler(crawler: AsyncWebCrawler) -> None:
     Cleanup runs in a shielded task so caller cancellation cannot leave a live
     browser registered or leak the shared semaphore permit.
     """
-    if getattr(crawler, "_docker_admission_released", False):
-        return
-
     existing_cleanup = getattr(crawler, "_docker_release_task", None)
     if isinstance(existing_cleanup, asyncio.Task):
         try:
             await asyncio.shield(existing_cleanup)
         except asyncio.CancelledError:
             with suppress(Exception):
-                await existing_cleanup
+                await asyncio.shield(existing_cleanup)
             raise
+        return
+
+    if getattr(crawler, "_docker_admission_released", False) is True:
         return
 
     sig = getattr(crawler, "_docker_pool_sig", None)
     if not isinstance(sig, str) or not sig.startswith("dedicated:"):
         raise RuntimeError("Crawler does not own a dedicated admission lease")
 
-    async def close_and_unregister() -> None:
+    async def detach_and_close() -> None:
         async with LOCK:
-            try:
-                await crawler.close()
-            finally:
-                if sig and COLD_POOL.get(sig) is crawler:
-                    COLD_POOL.pop(sig, None)
-                    LAST_USED.pop(sig, None)
-                    USAGE_COUNT.pop(sig, None)
-                _set_active_requests(crawler, 0)
+            if getattr(crawler, "_docker_admission_released", False) is True:
+                return
+            if COLD_POOL.get(sig) is crawler:
+                detached = _detach_pool_crawler(COLD_POOL, sig)
+            else:
+                LAST_USED.pop(sig, None)
+                USAGE_COUNT.pop(sig, None)
+                detached = crawler
+                _retire_crawler(crawler)
+            setattr(crawler, "_docker_request_owned", False)
+            setattr(crawler, "_docker_pool_sig", None)
+            close_task = _close_in_background(detached)
+        await asyncio.shield(close_task)
 
-    cleanup_task = asyncio.create_task(close_and_unregister())
+    cleanup_task = asyncio.create_task(detach_and_close())
     setattr(crawler, "_docker_release_task", cleanup_task)
     try:
         await asyncio.shield(cleanup_task)
     except asyncio.CancelledError:
         with suppress(Exception):
-            await cleanup_task
+            await asyncio.shield(cleanup_task)
         raise
     finally:
-        setattr(crawler, "_docker_request_owned", False)
-        setattr(crawler, "_docker_pool_sig", None)
-        setattr(crawler, "_docker_release_task", None)
-        setattr(crawler, "_docker_admission_released", True)
-        ADMISSION_SEM.release()
+        if getattr(crawler, "_docker_release_task", None) is cleanup_task:
+            setattr(crawler, "_docker_release_task", None)
 
 
 async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Resolve a crawler after request admission has bounded pool growth."""
     sig = _sig(cfg)
-    async with LOCK:
-        # Check permanent browser for default config
-        if PERMANENT and _is_default_config(sig):
-            if not _is_live(PERMANENT):
-                logger.warning("Permanent browser is unavailable; replacing it")
-                await _init_permanent_locked(cfg, force=True)
-            LAST_USED[sig] = time.time()
-            USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
-            _set_active_requests(PERMANENT, _active_requests(PERMANENT) + 1)
-            logger.info("🔥 Using permanent browser")
-            return PERMANENT
+    while True:
+        close_task = None
+        replace_permanent = False
+        promoted = None
+        async with LOCK:
+            # Check permanent browser for default config
+            if PERMANENT and _is_default_config(sig):
+                if not _is_live(PERMANENT):
+                    logger.warning("Permanent browser is unavailable; replacing it")
+                    close_task = await _init_permanent_locked(cfg, force=True)
+                    replace_permanent = close_task is not None
+                else:
+                    LAST_USED[sig] = time.time()
+                    USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
+                    _set_active_requests(PERMANENT, _active_requests(PERMANENT) + 1)
+                    logger.info("🔥 Using permanent browser")
+                    return PERMANENT
 
-        # Check hot pool
-        if sig in HOT_POOL and not await _discard_if_unavailable(HOT_POOL, sig, "Hot"):
-            crawler = HOT_POOL[sig]
-            LAST_USED[sig] = time.time()
-            USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
-            active_requests = _active_requests(crawler) + 1
-            _set_active_requests(crawler, active_requests)
-            logger.info(f"♨️  Using hot pool browser (sig={sig[:8]}, active={active_requests})")
+            # Check hot pool
+            if close_task is None and sig in HOT_POOL:
+                close_task = _discard_if_unavailable(HOT_POOL, sig, "Hot")
+                if close_task is None:
+                    crawler = HOT_POOL[sig]
+                    LAST_USED[sig] = time.time()
+                    USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
+                    active_requests = _active_requests(crawler) + 1
+                    _set_active_requests(crawler, active_requests)
+                    logger.info(f"♨️  Using hot pool browser (sig={sig[:8]}, active={active_requests})")
+                    return crawler
+
+            # Check cold pool (promote to hot if used 3+ times)
+            if close_task is None and sig in COLD_POOL:
+                close_task = _discard_if_unavailable(COLD_POOL, sig, "Cold")
+                if close_task is None:
+                    LAST_USED[sig] = time.time()
+                    USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
+                    crawler = COLD_POOL[sig]
+                    _set_active_requests(crawler, _active_requests(crawler) + 1)
+
+                    if USAGE_COUNT[sig] >= 3:
+                        logger.info(f"⬆️  Promoting to hot pool (sig={sig[:8]}, count={USAGE_COUNT[sig]})")
+                        HOT_POOL[sig] = COLD_POOL.pop(sig)
+                        promoted = (crawler, USAGE_COUNT[sig])
+                    else:
+                        logger.info(f"❄️  Using cold pool browser (sig={sig[:8]})")
+                        return crawler
+
+            if close_task is None and promoted is None:
+                # Memory check before creating new
+                mem_pct = get_container_memory_percent()
+                if mem_pct >= MEM_LIMIT:
+                    logger.error(f"💥 Memory pressure: {mem_pct:.1f}% >= {MEM_LIMIT}%")
+                    raise MemoryError(f"Memory at {mem_pct:.1f}%, refusing new browser")
+
+                # Create new in cold pool
+                close_task = _make_browser_capacity()
+                if close_task is None:
+                    logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]}, mem={mem_pct:.1f}%)")
+                    crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
+                    await _start_or_retire(crawler)
+                    _set_active_requests(crawler, 1)
+                    COLD_POOL[sig] = crawler
+                    LAST_USED[sig] = time.time()
+                    USAGE_COUNT[sig] = 1
+                    return crawler
+        if promoted is not None:
+            crawler, count = promoted
+            try:
+                from monitor import get_monitor
+
+                await get_monitor().track_janitor_event(
+                    "promote", sig, {"count": count}
+                )
+            except asyncio.CancelledError:
+                _set_active_requests(crawler, max(0, _active_requests(crawler) - 1))
+                raise
+            except Exception:
+                pass
             return crawler
 
-        # Check cold pool (promote to hot if used 3+ times)
-        if sig in COLD_POOL and not await _discard_if_unavailable(COLD_POOL, sig, "Cold"):
-            LAST_USED[sig] = time.time()
-            USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
-            crawler = COLD_POOL[sig]
-            _set_active_requests(crawler, _active_requests(crawler) + 1)
-
-            if USAGE_COUNT[sig] >= 3:
-                logger.info(f"⬆️  Promoting to hot pool (sig={sig[:8]}, count={USAGE_COUNT[sig]})")
-                HOT_POOL[sig] = COLD_POOL.pop(sig)
-
-                # Track promotion in monitor
-                try:
-                    from monitor import get_monitor
-                    await get_monitor().track_janitor_event("promote", sig, {"count": USAGE_COUNT[sig]})
-                except Exception:
-                    pass
-
-                return HOT_POOL[sig]
-
-            logger.info(f"❄️  Using cold pool browser (sig={sig[:8]})")
-            return crawler
-
-        # Memory check before creating new
-        mem_pct = get_container_memory_percent()
-        if mem_pct >= MEM_LIMIT:
-            logger.error(f"💥 Memory pressure: {mem_pct:.1f}% >= {MEM_LIMIT}%")
-            raise MemoryError(f"Memory at {mem_pct:.1f}%, refusing new browser")
-
-        # Create new in cold pool
-        await _make_browser_capacity()
-        logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]}, mem={mem_pct:.1f}%)")
-        crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
-        await _start_or_close(crawler, "Pooled")
-        _set_active_requests(crawler, 1)
-        COLD_POOL[sig] = crawler
-        LAST_USED[sig] = time.time()
-        USAGE_COUNT[sig] = 1
-        return crawler
+        await asyncio.shield(close_task)
+        if replace_permanent:
+            await init_permanent(cfg)
 
 async def release_crawler(crawler: AsyncWebCrawler):
     """Decrement active request count for a pooled crawler.
@@ -344,66 +398,78 @@ async def release_crawler(crawler: AsyncWebCrawler):
     # stays pinned against the janitor's active_requests check forever.
     # The event loop is single-threaded and neither call below suspends, so
     # the read-modify-write needs no lock.
-    try:
-        _set_active_requests(crawler, max(0, _active_requests(crawler) - 1))
-    finally:
-        ADMISSION_SEM.release()
+    if getattr(crawler, "_docker_admission_released", False) is True:
+        return
+    active = _active_requests(crawler)
+    if active > 0:
+        _set_active_requests(crawler, active - 1)
+    ADMISSION_SEM.release()
 
 
-async def _init_permanent_locked(cfg: BrowserConfig, *, force: bool = False) -> None:
+async def _init_permanent_locked(
+    cfg: BrowserConfig, *, force: bool = False
+) -> Optional[asyncio.Task]:
     global PERMANENT, DEFAULT_CONFIG_SIG
     if PERMANENT and not force and _is_live(PERMANENT):
-        return
+        return None
     if PERMANENT:
-        with suppress(Exception):
-            await _close_even_if_cancelled(PERMANENT)
-        PERMANENT = None
-        if DEFAULT_CONFIG_SIG:
-            LAST_USED.pop(DEFAULT_CONFIG_SIG, None)
-            USAGE_COUNT.pop(DEFAULT_CONFIG_SIG, None)
+        return _close_in_background(_detach_permanent())
+
+    close_task = _make_browser_capacity()
+    if close_task is not None:
+        return close_task
 
     sig = _sig(cfg)
     logger.info("🔥 Creating permanent default browser")
     crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
-    await _start_or_close(crawler, "Permanent")
+    await _start_or_retire(crawler)
     PERMANENT = crawler
     DEFAULT_CONFIG_SIG = sig
     LAST_USED[sig] = time.time()
     USAGE_COUNT[sig] = 0
+    return None
 
 
 async def init_permanent(cfg: BrowserConfig, *, force: bool = False) -> None:
     """Initialize or atomically replace the permanent default browser."""
-    async with LOCK:
-        await _init_permanent_locked(cfg, force=force)
+    while True:
+        async with LOCK:
+            close_task = await _init_permanent_locked(cfg, force=force)
+            if close_task is None:
+                return
+        await asyncio.shield(close_task)
 
 
 async def close_all():
     """Close all browsers."""
     async with LOCK:
-        # Through _close_in_background so one wedged browser can't hang shutdown
-        # while holding LOCK; the drain below is the single bounded wait point.
         if PERMANENT:
-            _close_in_background(PERMANENT)
-        for c in list(HOT_POOL.values()) + list(COLD_POOL.values()):
-            _close_in_background(c)
-        HOT_POOL.clear()
-        COLD_POOL.clear()
-        LAST_USED.clear()
-        USAGE_COUNT.clear()
+            _close_in_background(_detach_permanent())
+        for pool in (HOT_POOL, COLD_POOL):
+            for sig in list(pool):
+                _close_in_background(_detach_pool_crawler(pool, sig))
     # Drain all closes (janitor's included) so shutdown doesn't destroy live tasks.
     if _CLOSE_TASKS:
         with suppress(Exception):
             await asyncio.wait_for(
-                asyncio.gather(*_CLOSE_TASKS, return_exceptions=True), timeout=65
+                asyncio.gather(
+                    *(asyncio.shield(task) for task in _CLOSE_TASKS),
+                    return_exceptions=True,
+                ),
+                timeout=65,
             )
 
-def _close_in_background(crawler: AsyncWebCrawler):
+
+def _close_in_background(crawler: AsyncWebCrawler) -> asyncio.Task:
     """Close a browser without holding the pool LOCK.
 
     close() on a wedged browser can hang; awaiting it under LOCK would freeze
     get_crawler() and every future janitor pass for the whole server.
     """
+    existing = getattr(crawler, "_docker_close_task", None)
+    if isinstance(existing, asyncio.Task):
+        return existing
+
     async def _close():
         try:
             # 60s gives Playwright's own graceful-then-SIGKILL cycle room to finish
@@ -423,8 +489,43 @@ def _close_in_background(crawler: AsyncWebCrawler):
         except Exception:
             pass
     task = asyncio.create_task(_close())
+    setattr(crawler, "_docker_close_task", task)
     _CLOSE_TASKS.add(task)
     task.add_done_callback(_CLOSE_TASKS.discard)
+    return task
+
+
+async def retire_pool_crawlers(
+    sig_prefix: Optional[str] = None, *, cold_only: bool = False
+) -> list[tuple[str, str]]:
+    """Detach matching pool crawlers and finish their bounded closes."""
+    retired = []
+    close_tasks = []
+    pools = (("cold", COLD_POOL),) if cold_only else (("hot", HOT_POOL), ("cold", COLD_POOL))
+
+    async with LOCK:
+        for pool_type, pool in pools:
+            signatures = [
+                sig
+                for sig in pool
+                if sig_prefix is None or sig.startswith(sig_prefix)
+            ]
+            if sig_prefix is not None:
+                signatures = signatures[:1]
+            for sig in signatures:
+                crawler = _detach_pool_crawler(pool, sig)
+                close_tasks.append(_close_in_background(crawler))
+                retired.append((sig, pool_type))
+            if retired and sig_prefix is not None:
+                break
+
+    if close_tasks:
+        await asyncio.gather(
+            *(asyncio.shield(task) for task in close_tasks),
+            return_exceptions=True,
+        )
+    return retired
+
 
 async def janitor():
     """Adaptive cleanup based on memory pressure."""
@@ -472,10 +573,7 @@ async def _janitor_pass():
                     logger.error(f"🚨 Leaked request counter (sig={sig[:8]}, active={active}, idle={idle_time:.0f}s > {STALE_CEILING}s) - force-closing")
                 else:
                     logger.info(f"🧹 Closing {tier} browser (sig={sig[:8]}, idle={idle_time:.0f}s)")
-                _close_in_background(crawler)  # close() can hang; never await it under LOCK
-                pool.pop(sig, None)
-                LAST_USED.pop(sig, None)
-                USAGE_COUNT.pop(sig, None)
+                _close_in_background(_detach_pool_crawler(pool, sig))
 
                 # Track in monitor
                 try:

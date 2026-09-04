@@ -754,17 +754,27 @@ class BrowserManager:
         # for all racers). Prevents 'Target page/context closed' errors.
         self._page_lock = asyncio.Lock()
 
-        # Browser endpoint key for global page tracking (set after browser starts)
+        # Browser endpoint key for global page tracking (set after browser starts).
+        # Keep this manager's contribution separately: CDP endpoint keys are shared
+        # by managers, but a manager must only remove pages it marked itself.
         self._browser_endpoint_key: Optional[str] = None
+        self._owned_pages_in_use = {}
 
-        # Browser recycling state (version-based approach)
+        # Recycling is a drain barrier, not a context-signature rotation.  A
+        # token is issued before allocation and remains live until its page is
+        # released (or its session is killed), so a threshold cannot race a
+        # partially-created page.
         self._pages_served = 0
-        self._browser_version = 1  # included in signature, bump to create new browser
-        self._pending_cleanup = {}  # old_sig -> {"browser": browser, "contexts": [...], "done": Event}
-        self._pending_cleanup_lock = asyncio.Lock()
-        self._max_pending_browsers = 3  # safety cap — block if too many draining
-        self._cleanup_slot_available = asyncio.Event()
-        self._cleanup_slot_available.set()  # starts open
+        self._recycle_due = False
+        self._recycling = False
+        self._closing = False
+        self._recycle_lock = asyncio.Lock()
+        self._recycle_done = asyncio.Event()
+        self._recycle_done.set()
+        self._active_acquisitions = set()
+        self._page_to_admission = {}
+        self._recycle_task = None
+        self._background_tasks = set()
 
         # Stealth adapter for stealth mode
         self._stealth_adapter = None
@@ -772,17 +782,32 @@ class BrowserManager:
             from .browser_adapter import StealthAdapter
             self._stealth_adapter = StealthAdapter()
 
-        # Initialize ManagedBrowser if needed
+        # Initialize ManagedBrowser if needed.
         if self.config.use_managed_browser:
-            self.managed_browser = ManagedBrowser(
-                browser_type=self.config.browser_type,
-                user_data_dir=self.config.user_data_dir,
-                headless=self.config.headless,
-                logger=self.logger,
-                debugging_port=self.config.debugging_port,
-                cdp_url=self.config.cdp_url,
-                browser_config=self.config,
-            )
+            self.managed_browser = self._new_managed_browser()
+
+    def _new_managed_browser(self):
+        """Build the owned CDP process wrapper for an initial start or restart."""
+        return ManagedBrowser(
+            browser_type=self.config.browser_type,
+            user_data_dir=self.config.user_data_dir,
+            headless=self.config.headless,
+            logger=self.logger,
+            debugging_port=self.config.debugging_port,
+            cdp_url=self.config.cdp_url,
+            browser_config=self.config,
+        )
+
+    def _owns_browser_process(self) -> bool:
+        """An explicit CDP endpoint is owned by somebody else."""
+        return not self.config.cdp_url
+
+    async def _started_browser(self) -> None:
+        """Publish a successful owned-browser start to the recycle barrier."""
+        async with self._recycle_lock:
+            if not self._recycling:
+                self._closing = False
+                self._recycle_done.set()
 
     async def start(self):
         """
@@ -883,14 +908,15 @@ class BrowserManager:
 
             # Set the browser endpoint key for global page tracking
             self._browser_endpoint_key = self._compute_browser_endpoint_key()
-            if self._browser_endpoint_key not in BrowserManager._global_pages_in_use:
-                BrowserManager._global_pages_in_use[self._browser_endpoint_key] = set()
+            await self._started_browser()
             return
 
         if self.config.cdp_url or self.config.use_managed_browser:
             self.config.use_managed_browser = True
 
             if not self._using_cached_cdp:
+                if not self.config.cdp_url and self.managed_browser is None:
+                    self.managed_browser = self._new_managed_browser()
                 cdp_url = await self.managed_browser.start() if not self.config.cdp_url else self.config.cdp_url
 
                 # Add CDP endpoint verification before connecting
@@ -950,9 +976,7 @@ class BrowserManager:
 
         # Set the browser endpoint key for global page tracking
         self._browser_endpoint_key = self._compute_browser_endpoint_key()
-        # Initialize global tracking set for this endpoint if needed
-        if self._browser_endpoint_key not in BrowserManager._global_pages_in_use:
-            BrowserManager._global_pages_in_use[self._browser_endpoint_key] = set()
+        await self._started_browser()
 
     def _compute_browser_endpoint_key(self) -> str:
         """
@@ -1001,23 +1025,50 @@ class BrowserManager:
         return f"cdp:http://{host}:{port}"
 
     def _get_pages_in_use(self) -> set:
-        """Get the set of pages currently in use for this browser."""
-        if self._browser_endpoint_key and self._browser_endpoint_key in BrowserManager._global_pages_in_use:
-            return BrowserManager._global_pages_in_use[self._browser_endpoint_key]
-        # Fallback: shouldn't happen, but return empty set
+        """Get the endpoint's shared in-use set while holding the global lock."""
+        if self._browser_endpoint_key:
+            return BrowserManager._global_pages_in_use.get(
+                self._browser_endpoint_key, set()
+            )
         return set()
 
-    def _mark_page_in_use(self, page) -> None:
-        """Mark a page as in use."""
-        if self._browser_endpoint_key:
-            if self._browser_endpoint_key not in BrowserManager._global_pages_in_use:
-                BrowserManager._global_pages_in_use[self._browser_endpoint_key] = set()
-            BrowserManager._global_pages_in_use[self._browser_endpoint_key].add(page)
+    def _mark_page_in_use_locked(self, page) -> None:
+        """Record a page in the shared endpoint set and this manager's share."""
+        endpoint = self._browser_endpoint_key
+        if not endpoint:
+            return
+        BrowserManager._global_pages_in_use.setdefault(endpoint, set()).add(page)
+        self._owned_pages_in_use.setdefault(endpoint, set()).add(page)
 
-    def _release_page_from_use(self, page) -> None:
-        """Release a page from the in-use tracking."""
-        if self._browser_endpoint_key and self._browser_endpoint_key in BrowserManager._global_pages_in_use:
-            BrowserManager._global_pages_in_use[self._browser_endpoint_key].discard(page)
+    def _release_page_from_use_nowait(self, page) -> None:
+        """Remove one page from this manager's ownership without awaiting."""
+        for endpoint, owned_pages in list(self._owned_pages_in_use.items()):
+            if page not in owned_pages:
+                continue
+            owned_pages.discard(page)
+            pages = BrowserManager._global_pages_in_use.get(endpoint)
+            if pages is not None:
+                pages.discard(page)
+                if not pages:
+                    BrowserManager._global_pages_in_use.pop(endpoint, None)
+            if not owned_pages:
+                self._owned_pages_in_use.pop(endpoint, None)
+
+    async def _release_page_from_use(self, page) -> None:
+        """Release only this manager's contribution and prune empty endpoint keys."""
+        async with BrowserManager._get_global_lock():
+            self._release_page_from_use_nowait(page)
+
+    async def _release_all_pages_from_use(self) -> None:
+        """Remove this manager's residual pages without touching peer managers."""
+        async with BrowserManager._get_global_lock():
+            for endpoint, owned_pages in list(self._owned_pages_in_use.items()):
+                pages = BrowserManager._global_pages_in_use.get(endpoint)
+                if pages is not None:
+                    pages.difference_update(owned_pages)
+                    if not pages:
+                        BrowserManager._global_pages_in_use.pop(endpoint, None)
+            self._owned_pages_in_use.clear()
 
     async def _verify_cdp_ready(self, cdp_url: str) -> bool:
         """Verify CDP endpoint is ready with exponential backoff.
@@ -1445,9 +1496,6 @@ class BrowserManager:
         sig_dict["simulate_user"] = crawlerRunConfig.simulate_user
         sig_dict["magic"] = crawlerRunConfig.magic
 
-        # Browser version — bumped on recycle to force new browser instance
-        sig_dict["_browser_version"] = self._browser_version
-
         signature_json = json.dumps(sig_dict, sort_keys=True, default=str)
         return hashlib.sha256(signature_json.encode("utf-8")).hexdigest()
 
@@ -1554,420 +1602,425 @@ class BrowserManager:
                 )
             return None
 
+    def _track_background_task(self, task):
+        """Retain cleanup started after a caller was cancelled."""
+        self._background_tasks.add(task)
+
+        def done(completed):
+            self._background_tasks.discard(completed)
+            try:
+                completed.result()
+            except BaseException:
+                pass
+
+        task.add_done_callback(done)
+        return task
+
+    async def _await_task_despite_cancellation(self, task):
+        """Finish an allocation/cleanup task, then report a delivered cancel."""
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancelled
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancelled = True
+                current = asyncio.current_task()
+                uncancel = getattr(current, "uncancel", None)
+                if uncancel:
+                    uncancel()
+                if task.done():
+                    try:
+                        return task.result(), cancelled
+                    except BaseException:
+                        raise asyncio.CancelledError from None
+            except BaseException:
+                if cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+
+    async def _close_page_quietly(self, page) -> None:
+        try:
+            is_closed = getattr(page, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                return
+            await page.close()
+        except Exception:
+            pass
+
+    async def _close_context_quietly(self, context) -> None:
+        try:
+            await context.close()
+        except Exception:
+            pass
+
+    async def _run_cleanup(self, coroutine) -> bool:
+        """Keep cleanup alive if its caller receives another cancellation."""
+        task = self._track_background_task(asyncio.create_task(coroutine))
+        try:
+            _, cancelled = await self._await_task_despite_cancellation(task)
+            return cancelled
+        except BaseException:
+            return False
+
+    async def _new_page(self, context):
+        """Create a page without letting cancellation orphan Playwright's result."""
+        task = asyncio.create_task(context.new_page())
+        page, cancelled = await self._await_task_despite_cancellation(task)
+        return page, cancelled
+
+    async def _new_context(self, crawlerRunConfig):
+        """Create an isolated context and close it before re-raising cancellation."""
+        task = asyncio.create_task(self.create_browser_context(crawlerRunConfig))
+        context, cancelled = await self._await_task_despite_cancellation(task)
+        if cancelled:
+            await self._run_cleanup(self._close_context_quietly(context))
+            raise asyncio.CancelledError
+        return context
+
+    async def _decrement_context_refcount(self, signature) -> None:
+        if signature is None:
+            return
+        async with self._contexts_lock:
+            if signature in self._context_refcounts:
+                self._context_refcounts[signature] = max(
+                    0, self._context_refcounts[signature] - 1
+                )
+
+    async def _acquire_context(self, crawlerRunConfig):
+        """Acquire one context reference, closing partial contexts on failure."""
+        signature = self._make_config_signature(crawlerRunConfig)
+        context = None
+        unregistered_context = None
+        acquired = False
+        try:
+            async with self._contexts_lock:
+                context = self.contexts_by_config.get(signature)
+                if context is None:
+                    context = await self._new_context(crawlerRunConfig)
+                    unregistered_context = context
+                    await self.setup_context(context, crawlerRunConfig)
+                    self.contexts_by_config[signature] = context
+                    self._context_refcounts[signature] = 0
+                    unregistered_context = None
+                    to_close = self._evict_lru_context_locked()
+                else:
+                    to_close = None
+
+                self._context_refcounts[signature] = (
+                    self._context_refcounts.get(signature, 0) + 1
+                )
+                self._context_last_used[signature] = time.monotonic()
+                acquired = True
+
+            if to_close is not None:
+                if await self._run_cleanup(self._close_context_quietly(to_close)):
+                    raise asyncio.CancelledError
+            return context, signature
+        except BaseException:
+            if acquired:
+                await self._run_cleanup(self._decrement_context_refcount(signature))
+            if unregistered_context is not None:
+                await self._run_cleanup(
+                    self._close_context_quietly(unregistered_context)
+                )
+            raise
+
+    async def _admit_page_acquisition(self):
+        """Issue a drain token only while the browser admits new pages."""
+        while True:
+            await self._recycle_done.wait()
+            async with self._recycle_lock:
+                if self._closing:
+                    raise RuntimeError("Browser manager is closed")
+                if self._recycle_done.is_set():
+                    token = object()
+                    self._active_acquisitions.add(token)
+                    return token
+
+    def _close_admission_if_recycle_due_locked(self) -> None:
+        """Close admission before a due recycle can observe an empty drain set."""
+        if (
+            not self._recycle_due
+            or self.sessions
+            or self._closing
+            or not self._owns_browser_process()
+        ):
+            return
+        self._recycle_done.clear()
+        if self._active_acquisitions or self._recycling:
+            return
+        self._recycling = True
+        self._recycle_task = asyncio.create_task(self._recycle_browser())
+        self._recycle_task.add_done_callback(self._consume_recycle_result)
+
+    def _consume_recycle_result(self, task) -> None:
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    async def _finish_admission(self, token) -> None:
+        async with self._recycle_lock:
+            if token is not None:
+                self._active_acquisitions.discard(token)
+            self._close_admission_if_recycle_due_locked()
+
+    async def _note_page_served(self) -> None:
+        async with self._recycle_lock:
+            if self._closing:
+                raise RuntimeError("Browser manager is closed")
+            self._pages_served += 1
+            if not self._should_recycle():
+                return
+            self._recycle_due = True
+            if self.sessions:
+                # Sessions deliberately retain their browser. Keep admission open
+                # until the last one is killed or expires.
+                self._recycle_done.set()
+                return
+            self._close_admission_if_recycle_due_locked()
+
+    async def _restart_browser(self) -> bool:
+        await self.close(_for_recycle=True)
+        async with self._recycle_lock:
+            if self._closing:
+                return False
+        await self.start()
+        return True
+
+    async def _recycle_browser(self) -> None:
+        """Run the full close/start cycle outside request cancellation scopes."""
+        restarted = False
+        cancelled = False
+        restart = asyncio.create_task(self._restart_browser())
+        try:
+            restarted, cancelled = await self._await_task_despite_cancellation(restart)
+        except Exception as error:
+            if self.logger:
+                self.logger.error(
+                    message="Browser recycle failed: {error}",
+                    tag="BROWSER",
+                    params={"error": str(error)},
+                )
+        finally:
+            async with self._recycle_lock:
+                self._recycling = False
+                if restarted:
+                    self._pages_served = 0
+                else:
+                    self._closing = True
+                self._recycle_due = False
+                self._recycle_done.set()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _rollback_page_acquisition(
+        self,
+        token,
+        page=None,
+        signature=None,
+        page_marked=False,
+        close_page=False,
+    ) -> None:
+        async def cleanup():
+            if page is not None:
+                self._page_to_sig.pop(page, None)
+                self._page_to_admission.pop(page, None)
+            if page_marked and page is not None:
+                await self._release_page_from_use(page)
+            if signature is not None:
+                await self._decrement_context_refcount(signature)
+            if close_page and page is not None:
+                await self._close_page_quietly(page)
+            await self._finish_admission(token)
+
+        await self._run_cleanup(cleanup())
+
     async def get_page(self, crawlerRunConfig: CrawlerRunConfig):
-        """
-        Get a page for the given session ID, creating a new one if needed.
-
-        Args:
-            crawlerRunConfig (CrawlerRunConfig): Configuration object containing all browser settings
-
-        Returns:
-            (page, context): The Page and its BrowserContext
-        """
+        """Get a page, retaining every partial allocation until it is cleaned up."""
         self._cleanup_expired_sessions()
 
-        # If a session_id is provided and we already have it, reuse that page + context
-        if crawlerRunConfig.session_id and crawlerRunConfig.session_id in self.sessions:
-            context, page, _ = self.sessions[crawlerRunConfig.session_id]
-            # Update last-used timestamp
-            self.sessions[crawlerRunConfig.session_id] = (context, page, time.time())
+        session_id = crawlerRunConfig.session_id
+        if session_id and session_id in self.sessions:
+            async with self._recycle_lock:
+                if self._closing:
+                    raise RuntimeError("Browser manager is closed")
+            context, page, _ = self.sessions[session_id]
+            self.sessions[session_id] = (context, page, time.time())
+            try:
+                await page.evaluate("window.stop()")
+            except Exception:
+                pass
             return page, context
 
-        # If using a managed browser, just grab the shared default_context
-        if self.config.use_managed_browser:
-            # If create_isolated_context is True, create isolated contexts for concurrent crawls
-            # Uses the same caching mechanism as non-CDP mode: cache context by config signature,
-            # but always create a new page. This prevents navigation conflicts while allowing
-            # context reuse for multiple URLs with the same config (e.g., batch/deep crawls).
-            if self.config.create_isolated_context:
-                config_signature = self._make_config_signature(crawlerRunConfig)
-                to_close = None
-
-                async with self._contexts_lock:
-                    if config_signature in self.contexts_by_config:
-                        context = self.contexts_by_config[config_signature]
-                    else:
-                        context = await self.create_browser_context(crawlerRunConfig)
-                        await self.setup_context(context, crawlerRunConfig)
-                        self.contexts_by_config[config_signature] = context
-                        self._context_refcounts[config_signature] = 0
-                        to_close = self._evict_lru_context_locked()
-
-                    # Increment refcount INSIDE lock before releasing
-                    self._context_refcounts[config_signature] = (
-                        self._context_refcounts.get(config_signature, 0) + 1
-                    )
-                    self._context_last_used[config_signature] = time.monotonic()
-
-                # Close evicted context OUTSIDE lock
-                if to_close is not None:
-                    try:
-                        await to_close.close()
-                    except Exception:
-                        pass
-
-                # Always create a new page for each crawl (isolation for navigation)
-                try:
-                    page = await context.new_page()
-                except Exception:
-                    async with self._contexts_lock:
-                        if config_signature in self._context_refcounts:
-                            self._context_refcounts[config_signature] = max(
-                                0, self._context_refcounts[config_signature] - 1
-                            )
-                    raise
+        token = await self._admit_page_acquisition()
+        context = None
+        page = None
+        signature = None
+        page_marked = False
+        close_page = False
+        stored_session = False
+        try:
+            if (
+                not self.config.use_managed_browser
+                or self.config.create_isolated_context
+            ):
+                context, signature = await self._acquire_context(crawlerRunConfig)
+                page, cancelled = await self._new_page(context)
+                close_page = True
+                self._page_to_sig[page] = signature
+                self._page_to_admission[page] = token
+                if cancelled:
+                    raise asyncio.CancelledError
                 await self._apply_stealth_to_page(page)
-                self._page_to_sig[page] = config_signature
             elif self.config.storage_state:
-                tmp_context = await self.create_browser_context(crawlerRunConfig)
-                ctx = self.default_context        # default context, one window only
-                ctx = await clone_runtime_state(tmp_context, ctx, crawlerRunConfig, self.config)
-                # Close the temporary context — only needed as a clone source
-                try:
-                    await tmp_context.close()
-                except Exception:
-                    pass
-                context = ctx  # so (page, context) return value is correct
-                # Avoid concurrent new_page on shared persistent context
-                # See GH-1198: context.pages can be empty under races
+                context = self.default_context
                 async with self._page_lock:
-                    page = await ctx.new_page()
+                    page, cancelled = await self._new_page(context)
+                close_page = True
+                self._page_to_admission[page] = token
+                if cancelled:
+                    raise asyncio.CancelledError
+
+                tmp_context = None
+                try:
+                    tmp_context = await self._new_context(crawlerRunConfig)
+                    await clone_runtime_state(
+                        tmp_context,
+                        context,
+                        crawlerRunConfig,
+                        self.config,
+                    )
+                finally:
+                    if tmp_context is not None:
+                        await self._run_cleanup(
+                            self._close_context_quietly(tmp_context)
+                        )
                 await self._apply_stealth_to_page(page)
             else:
                 context = self.default_context
-
-                # Handle pre-existing target case (for reconnecting to specific CDP targets)
-                if self.config.browser_context_id and self.config.target_id:
-                    page = await self._get_page_by_target_id(context, self.config.target_id)
-                    if not page:
-                        async with self._page_lock:
-                            page = await context.new_page()
-                            self._mark_page_in_use(page)
-                        await self._apply_stealth_to_page(page)
+                async with BrowserManager._get_global_lock():
+                    page_created = False
+                    cancelled = False
+                    if self.config.browser_context_id and self.config.target_id:
+                        page = await self._get_page_by_target_id(
+                            context, self.config.target_id
+                        )
                     else:
-                        # Mark pre-existing target as in use
-                        self._mark_page_in_use(page)
-                else:
-                    # For CDP connections (external browser), multiple Playwright connections
-                    # create separate browser/context objects. Page reuse across connections
-                    # isn't reliable because each connection sees different page objects.
-                    # Always create new pages for CDP to avoid cross-connection race conditions.
-                    if self.config.cdp_url and not self.config.use_managed_browser:
-                        async with self._page_lock:
-                            page = await context.new_page()
-                            self._mark_page_in_use(page)
-                        await self._apply_stealth_to_page(page)
-                    else:
-                        # For managed browsers (single process), page reuse is safe.
-                        # Use lock to safely check for available pages and track usage.
-                        # This prevents race conditions when multiple crawls run concurrently.
-                        async with BrowserManager._get_global_lock():
-                            pages = context.pages
-                            pages_in_use = self._get_pages_in_use()
-                            # Find first available page (exists and not currently in use)
-                            available_page = next(
-                                (p for p in pages if p not in pages_in_use),
-                                None
-                            )
-                            if available_page:
-                                page = available_page
-                            else:
-                                # No available pages - create a new one
-                                page = await context.new_page()
-                                await self._apply_stealth_to_page(page)
-                            # Mark page as in use (global tracking)
-                            self._mark_page_in_use(page)
-        else:
-            # Otherwise, check if we have an existing context for this config
-            config_signature = self._make_config_signature(crawlerRunConfig)
-            to_close = None
+                        pages_in_use = self._get_pages_in_use()
+                        page = next(
+                            (page for page in context.pages if page not in pages_in_use),
+                            None,
+                        )
+                    if page is None:
+                        page, cancelled = await self._new_page(context)
+                        page_created = True
+                    self._mark_page_in_use_locked(page)
+                    page_marked = True
+                close_page = page_created
+                self._page_to_admission[page] = token
+                if cancelled:
+                    raise asyncio.CancelledError
+                await self._apply_stealth_to_page(page)
 
-            async with self._contexts_lock:
-                if config_signature in self.contexts_by_config:
-                    context = self.contexts_by_config[config_signature]
-                else:
-                    # Create and setup a new context
-                    context = await self.create_browser_context(crawlerRunConfig)
-                    await self.setup_context(context, crawlerRunConfig)
-                    self.contexts_by_config[config_signature] = context
-                    self._context_refcounts[config_signature] = 0
-                    to_close = self._evict_lru_context_locked()
-
-                # Increment refcount INSIDE lock before releasing
-                self._context_refcounts[config_signature] = (
-                    self._context_refcounts.get(config_signature, 0) + 1
-                )
-                self._context_last_used[config_signature] = time.monotonic()
-
-            # Close evicted context OUTSIDE lock
-            if to_close is not None:
+            if session_id:
+                self.sessions[session_id] = (context, page, time.time())
+                stored_session = True
                 try:
-                    await to_close.close()
+                    await page.evaluate("window.stop()")
                 except Exception:
                     pass
 
-            # Create a new page from the chosen context
-            try:
-                page = await context.new_page()
-            except Exception:
+            # This closes admission under the same lock that issues tokens, before
+            # this page is returned to its caller.
+            await self._note_page_served()
+            return page, context
+        except BaseException:
+            if (
+                stored_session
+                and self.sessions.get(session_id, (None, None, None))[1] is page
+            ):
+                self.sessions.pop(session_id, None)
+            await self._rollback_page_acquisition(
+                token,
+                page=page,
+                signature=signature,
+                page_marked=page_marked,
+                close_page=close_page or stored_session,
+            )
+            raise
+
+    async def _kill_session(self, session_id: str) -> None:
+        entry = self.sessions.pop(session_id, None)
+        if entry is None:
+            return
+        context, page, _ = entry
+        signature = self._page_to_sig.pop(page, None)
+        token = self._page_to_admission.pop(page, None)
+        should_close_context = False
+        try:
+            await self._release_page_from_use(page)
+            if signature is not None:
                 async with self._contexts_lock:
-                    if config_signature in self._context_refcounts:
-                        self._context_refcounts[config_signature] = max(
-                            0, self._context_refcounts[config_signature] - 1
+                    if signature in self._context_refcounts:
+                        self._context_refcounts[signature] = max(
+                            0, self._context_refcounts[signature] - 1
                         )
-                raise
-            await self._apply_stealth_to_page(page)
-            self._page_to_sig[page] = config_signature
-
-        # If a session_id is specified, store this session so we can reuse later
-        if crawlerRunConfig.session_id:
-            self.sessions[crawlerRunConfig.session_id] = (context, page, time.time())
-
-        self._pages_served += 1
-
-        # Check if browser recycle threshold is hit — bump version for next requests
-        # This happens AFTER incrementing counter so concurrent requests see correct count
-        await self._maybe_bump_browser_version()
-
-        return page, context
+                        if (
+                            not self.config.use_managed_browser
+                            and self._context_refcounts[signature] == 0
+                        ):
+                            self.contexts_by_config.pop(signature, None)
+                            self._context_refcounts.pop(signature, None)
+                            self._context_last_used.pop(signature, None)
+                            should_close_context = True
+            await self._close_page_quietly(page)
+            if should_close_context:
+                await self._close_context_quietly(context)
+        finally:
+            await self._finish_admission(token)
 
     async def kill_session(self, session_id: str):
-        """
-        Kill a browser session and clean up resources.
-
-        Args:
-            session_id (str): The session ID to kill.
-        """
-        if session_id in self.sessions:
-            context, page, _ = self.sessions[session_id]
-            self._release_page_from_use(page)
-            # Decrement context refcount for the session's page
-            should_close_context = False
-            async with self._contexts_lock:
-                sig = self._page_to_sig.pop(page, None)
-                if sig is not None and sig in self._context_refcounts:
-                    self._context_refcounts[sig] = max(
-                        0, self._context_refcounts[sig] - 1
-                    )
-                    # Only close the context if no other pages are using it
-                    # (refcount dropped to 0) AND we own the context (not managed)
-                    if not self.config.use_managed_browser:
-                        if self._context_refcounts.get(sig, 0) == 0:
-                            self.contexts_by_config.pop(sig, None)
-                            self._context_refcounts.pop(sig, None)
-                            self._context_last_used.pop(sig, None)
-                            should_close_context = True
-            await page.close()
-            if should_close_context:
-                await context.close()
-            del self.sessions[session_id]
+        """Kill a session without letting a cancelled caller strand its page."""
+        task = self._track_background_task(
+            asyncio.create_task(self._kill_session(session_id))
+        )
+        _, cancelled = await self._await_task_despite_cancellation(task)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def release_page(self, page):
-        """
-        Release a page from the in-use tracking set (global tracking).
-        Sync variant — does NOT decrement context refcount.
-        """
-        self._release_page_from_use(page)
+        """Release only global page ownership; use the async variant for refcounts."""
+        # Keep the historical synchronous API immediately observable.  The
+        # async path remains available to callers that need the lock.
+        self._release_page_from_use_nowait(page)
+
+    async def _release_page_with_context(self, page) -> None:
+        signature = self._page_to_sig.pop(page, None)
+        token = self._page_to_admission.pop(page, None)
+        await self._release_page_from_use(page)
+        await self._decrement_context_refcount(signature)
+        await self._finish_admission(token)
 
     async def release_page_with_context(self, page):
-        """
-        Release a page and decrement its context's refcount under the lock.
-
-        Should be called from the async crawl finally block instead of
-        release_page() so the context lifecycle is properly tracked.
-        """
-        self._release_page_from_use(page)
-        sig = None
-        refcount = -1
-        async with self._contexts_lock:
-            sig = self._page_to_sig.pop(page, None)
-            if sig is not None and sig in self._context_refcounts:
-                self._context_refcounts[sig] = max(
-                    0, self._context_refcounts[sig] - 1
-                )
-                refcount = self._context_refcounts[sig]
-
-        # Check if this signature belongs to an old browser waiting to be cleaned up
-        if sig is not None and refcount == 0:
-            await self._maybe_cleanup_old_browser(sig)
+        """Release a page and its drain token exactly once."""
+        task = self._track_background_task(
+            asyncio.create_task(self._release_page_with_context(page))
+        )
+        _, cancelled = await self._await_task_despite_cancellation(task)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _should_recycle(self) -> bool:
-        """Check if page threshold reached for browser recycling."""
+        """Only an owned browser process can honor process recycling."""
         limit = self.config.max_pages_before_recycle
-        if limit <= 0:
-            return False
-        return self._pages_served >= limit
-
-    async def _maybe_bump_browser_version(self):
-        """Bump browser version if threshold reached, moving old browser to pending cleanup.
-
-        New requests automatically get a new browser (via new signature).
-        Old browser drains naturally and gets cleaned up when refcount hits 0.
-        """
-        if not self._should_recycle():
-            return
-
-        # Safety cap: wait if too many old browsers are draining
-        while True:
-            async with self._pending_cleanup_lock:
-                # Re-check threshold under lock (another request may have bumped already)
-                if not self._should_recycle():
-                    return
-
-                # Check safety cap
-                if len(self._pending_cleanup) >= self._max_pending_browsers:
-                    if self.logger:
-                        self.logger.debug(
-                            message="Waiting for old browser to drain (pending: {count})",
-                            tag="BROWSER",
-                            params={"count": len(self._pending_cleanup)},
-                        )
-                    self._cleanup_slot_available.clear()
-                    # Release lock and wait
-                else:
-                    # We have a slot — do the bump inside this lock hold
-                    old_version = self._browser_version
-                    active_sigs = []
-                    idle_sigs = []
-                    async with self._contexts_lock:
-                        for sig in list(self._context_refcounts.keys()):
-                            if self._context_refcounts.get(sig, 0) > 0:
-                                active_sigs.append(sig)
-                            else:
-                                idle_sigs.append(sig)
-
-                    if self.logger:
-                        self.logger.info(
-                            message="Bumping browser version {old} -> {new} after {count} pages ({active} active, {idle} idle sigs)",
-                            tag="BROWSER",
-                            params={
-                                "old": old_version,
-                                "new": old_version + 1,
-                                "count": self._pages_served,
-                                "active": len(active_sigs),
-                                "idle": len(idle_sigs),
-                            },
-                        )
-
-                    # Only add sigs with active crawls to pending cleanup.
-                    # Sigs with refcount 0 are cleaned up immediately below
-                    # to avoid them being stuck in _pending_cleanup forever
-                    # (no future release would trigger their cleanup).
-                    done_event = asyncio.Event()
-                    for sig in active_sigs:
-                        self._pending_cleanup[sig] = {
-                            "version": old_version,
-                            "done": done_event,
-                        }
-
-                    # Bump version — new get_page() calls will create new contexts
-                    self._browser_version += 1
-                    self._pages_served = 0
-
-                    # Clean up idle sigs immediately (outside pending_cleanup_lock below)
-                    break  # exit while loop to do cleanup outside locks
-
-            # Safety cap path: wait for a cleanup slot, then retry.
-            # Timeout prevents permanent deadlock if stuck entries never drain.
-            try:
-                await asyncio.wait_for(
-                    self._cleanup_slot_available.wait(), timeout=30.0
-                )
-            except asyncio.TimeoutError:
-                # Force-clean any pending entries that have refcount 0
-                # (they're stuck and will never drain naturally)
-                async with self._pending_cleanup_lock:
-                    stuck_sigs = [
-                        s for s in list(self._pending_cleanup.keys())
-                        if self._context_refcounts.get(s, 0) == 0
-                    ]
-                    for sig in stuck_sigs:
-                        self._pending_cleanup.pop(sig, None)
-                    if stuck_sigs:
-                        if self.logger:
-                            self.logger.warning(
-                                message="Force-cleaned {count} stuck pending entries after timeout",
-                                tag="BROWSER",
-                                params={"count": len(stuck_sigs)},
-                            )
-                        # Clean up the stuck contexts
-                        for sig in stuck_sigs:
-                            async with self._contexts_lock:
-                                context = self.contexts_by_config.pop(sig, None)
-                                self._context_refcounts.pop(sig, None)
-                                self._context_last_used.pop(sig, None)
-                            if context is not None:
-                                try:
-                                    await context.close()
-                                except Exception:
-                                    pass
-                        if len(self._pending_cleanup) < self._max_pending_browsers:
-                            self._cleanup_slot_available.set()
-
-        # Reached via break — clean up idle sigs immediately (outside locks)
-        for sig in idle_sigs:
-            async with self._contexts_lock:
-                context = self.contexts_by_config.pop(sig, None)
-                self._context_refcounts.pop(sig, None)
-                self._context_last_used.pop(sig, None)
-            if context is not None:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
-        if idle_sigs and self.logger:
-            self.logger.debug(
-                message="Immediately cleaned up {count} idle contexts from version {version}",
-                tag="BROWSER",
-                params={"count": len(idle_sigs), "version": old_version},
-            )
-
-    async def _maybe_cleanup_old_browser(self, sig: str):
-        """Clean up an old browser's context if its refcount hit 0 and it's pending cleanup."""
-        async with self._pending_cleanup_lock:
-            if sig not in self._pending_cleanup:
-                return  # Not an old browser signature
-
-            cleanup_info = self._pending_cleanup.pop(sig)
-            old_version = cleanup_info["version"]
-
-            if self.logger:
-                self.logger.debug(
-                    message="Cleaning up context from browser version {version} (sig: {sig})",
-                    tag="BROWSER",
-                    params={"version": old_version, "sig": sig[:12]},
-                )
-
-            # Remove context from tracking
-            async with self._contexts_lock:
-                context = self.contexts_by_config.pop(sig, None)
-                self._context_refcounts.pop(sig, None)
-                self._context_last_used.pop(sig, None)
-
-            # Close context outside locks
-            if context is not None:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
-
-            # Check if any signatures from this old version remain
-            remaining_old = [
-                s for s, info in self._pending_cleanup.items()
-                if info["version"] == old_version
-            ]
-
-            if not remaining_old:
-                if self.logger:
-                    self.logger.info(
-                        message="All contexts from browser version {version} cleaned up",
-                        tag="BROWSER",
-                        params={"version": old_version},
-                    )
-
-            # Open a cleanup slot if we're below the cap
-            if len(self._pending_cleanup) < self._max_pending_browsers:
-                self._cleanup_slot_available.set()
+        return (
+            self._owns_browser_process()
+            and limit > 0
+            and self._pages_served >= limit
+        )
 
     def _cleanup_expired_sessions(self):
         """Clean up expired sessions based on TTL."""
@@ -1978,134 +2031,120 @@ class BrowserManager:
             if current_time - last_used > self.session_ttl
         ]
         for sid in expired_sessions:
-            asyncio.create_task(self.kill_session(sid))
+            self._track_background_task(asyncio.create_task(self._kill_session(sid)))
 
-    async def close(self):
-        """Close all browser resources and clean up."""
-        # Cached CDP path: only clean up this instance's sessions/contexts,
-        # then release the shared connection reference.
-        if self._using_cached_cdp:
-            session_ids = list(self.sessions.keys())
-            for session_id in session_ids:
-                await self.kill_session(session_id)
-            for ctx in list(self.contexts_by_config.values()):
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-            self.contexts_by_config.clear()
-            self._context_refcounts.clear()
-            self._context_last_used.clear()
-            self._page_to_sig.clear()
-            await _CDPConnectionCache.release(self.config.cdp_url)
-            self.browser = None
-            self.playwright = None
-            self._using_cached_cdp = False
-            return
-
-        if self.config.cdp_url:
-            # When using external CDP, we don't own the browser process.
-            # If cdp_cleanup_on_close is True, properly disconnect from the browser
-            # and clean up Playwright resources. This frees the browser for other clients.
-            if self.config.cdp_cleanup_on_close:
-                # First close all sessions (pages)
-                session_ids = list(self.sessions.keys())
-                for session_id in session_ids:
-                    await self.kill_session(session_id)
-
-                # Close all contexts we created
-                for ctx in list(self.contexts_by_config.values()):
-                    try:
-                        await ctx.close()
-                    except Exception:
-                        pass
-                self.contexts_by_config.clear()
-                self._context_refcounts.clear()
-                self._context_last_used.clear()
-                self._page_to_sig.clear()
-
-                # Disconnect from browser (doesn't terminate it, just releases connection)
-                if self.browser:
-                    try:
-                        await self.browser.close()
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.debug(
-                                message="Error disconnecting from CDP browser: {error}",
-                                tag="BROWSER",
-                                params={"error": str(e)}
-                            )
-                    self.browser = None
-                    # Allow time for CDP connection to fully release before another client connects
-                    if self.config.cdp_close_delay > 0:
-                        await asyncio.sleep(self.config.cdp_close_delay)
-
-                # Stop Playwright instance to prevent memory leaks
-                if self.playwright:
-                    await self.playwright.stop()
-                    self.playwright = None
-            return
-
-        # ── Persistent context launched via launch_persistent_context ──
-        if self._launched_persistent:
-            session_ids = list(self.sessions.keys())
-            for session_id in session_ids:
-                await self.kill_session(session_id)
-            for ctx in list(self.contexts_by_config.values()):
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-            self.contexts_by_config.clear()
-            self._context_refcounts.clear()
-            self._context_last_used.clear()
-            self._page_to_sig.clear()
-
-            # Closing the persistent context also terminates the browser
-            if self.default_context:
-                try:
-                    await self.default_context.close()
-                except Exception:
-                    pass
-                self.default_context = None
-
-            if self.playwright:
-                await self.playwright.stop()
-                self.playwright = None
-            self._launched_persistent = False
-            return
-
-        if self.config.sleep_on_close:
-            await asyncio.sleep(0.5)
-
-        session_ids = list(self.sessions.keys())
-        for session_id in session_ids:
-            await self.kill_session(session_id)
-
-        # Now close all contexts we created. This reclaims memory from ephemeral contexts.
-        for ctx in list(self.contexts_by_config.values()):
-            try:
-                await ctx.close()
-            except Exception as e:
-                self.logger.error(
-                    message="Error closing context: {error}",
-                    tag="ERROR",
-                    params={"error": str(e)}
-                )
+    async def _close_contexts(self) -> None:
+        contexts = list(self.contexts_by_config.values())
         self.contexts_by_config.clear()
         self._context_refcounts.clear()
         self._context_last_used.clear()
         self._page_to_sig.clear()
+        for context in contexts:
+            await self._close_context_quietly(context)
 
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
+    async def _close_sessions(self) -> None:
+        for session_id in list(self.sessions):
+            await self.kill_session(session_id)
 
-        if self.managed_browser:
-            await asyncio.sleep(0.5)
-            await self.managed_browser.cleanup()
-            self.managed_browser = None
-
+    async def _stop_playwright(self) -> None:
         if self.playwright:
             await self.playwright.stop()
-            self.playwright = None
+        self.playwright = None
+
+    async def _drain_background_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._background_tasks
+            if task is not current and not task.done()
+        ]
+        if tasks:
+            await self._await_task_despite_cancellation(
+                asyncio.gather(*tasks, return_exceptions=True)
+            )
+
+    async def _close_browser_quietly(self, browser) -> None:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    async def close(self, _for_recycle=False):
+        """Close resources, prune this manager's page marks, and settle waiters."""
+        if not _for_recycle:
+            async with self._recycle_lock:
+                self._closing = True
+                # Wake admission waiters so they fail instead of hanging after close.
+                self._recycle_done.set()
+                recycle_task = self._recycle_task
+            if recycle_task and recycle_task is not asyncio.current_task():
+                try:
+                    await asyncio.shield(recycle_task)
+                except BaseException:
+                    pass
+
+        try:
+            if self._using_cached_cdp:
+                await self._close_sessions()
+                await self._close_contexts()
+                await _CDPConnectionCache.release(self.config.cdp_url)
+                self.browser = None
+                self.playwright = None
+                self._using_cached_cdp = False
+                self.default_context = None
+                return
+
+            if self.config.cdp_url:
+                # An explicit CDP URL is externally owned. Do not recycle or
+                # terminate it; optional cleanup only disconnects this client.
+                if self.config.cdp_cleanup_on_close:
+                    await self._close_sessions()
+                    await self._close_contexts()
+                    if self.browser:
+                        await self._close_browser_quietly(self.browser)
+                    if self.config.cdp_close_delay > 0:
+                        await asyncio.sleep(self.config.cdp_close_delay)
+                    await self._stop_playwright()
+                    self.browser = None
+                    self.default_context = None
+                return
+
+            if self._launched_persistent:
+                await self._close_sessions()
+                await self._close_contexts()
+                if self.default_context:
+                    await self._close_context_quietly(self.default_context)
+                await self._stop_playwright()
+                self.default_context = None
+                self._launched_persistent = False
+                return
+
+            if self.config.sleep_on_close:
+                await asyncio.sleep(0.5)
+
+            await self._close_sessions()
+            await self._close_contexts()
+
+            if self.browser:
+                await self.browser.close()
+            self.browser = None
+            self.default_context = None
+
+            if self.managed_browser:
+                await asyncio.sleep(0.5)
+                await self.managed_browser.cleanup()
+            self.managed_browser = None
+
+            await self._stop_playwright()
+        finally:
+            await self._release_all_pages_from_use()
+            self._page_to_sig.clear()
+            self._page_to_admission.clear()
+            if not _for_recycle:
+                self.sessions.clear()
+                async with self._recycle_lock:
+                    self._active_acquisitions.clear()
+                    self._recycle_due = False
+                    self._recycling = False
+                    self._recycle_done.set()
+                await self._drain_background_tasks()

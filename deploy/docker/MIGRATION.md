@@ -150,9 +150,10 @@ To keep the previous behavior exactly, set the caps you don't want to `0`.
 
 A pooled browser that reports "busy" but that no request has touched for longer than
 `crawler.pool.stale_lease_s` seconds is treated as pinned by a leaked or hung request.
-The janitor force-closes it and logs `🚨 Leaked request counter ... force-closing` at
-ERROR level. That line means a request hung or leaked; it is cleanup working as
-intended, not a crash.
+The janitor returns that browser's outstanding admission permits exactly once,
+force-closes it, and logs `🚨 Leaked request counter ... force-closing` at ERROR
+level. That line means a request hung or leaked; it is cleanup working as intended,
+not a crash.
 
 The default `0` means automatic: `max(2 × wall_clock_s, 21600)` seconds. This repo
 ships `wall_clock_s: 0`, so the effective ceiling is the 6 h floor.

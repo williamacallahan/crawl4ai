@@ -583,18 +583,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             )
             self.browser_config.headers["sec-ch-ua"] = self.browser_config.browser_hint
 
-        # Get page for session
-        page, context = await self.browser_manager.get_page(crawlerRunConfig=config)
-
-        # When reusing a session page, abort any pending loads from the
-        # previous navigation to prevent timeouts on the next goto().
-        if config.session_id:
-            try:
-                await page.evaluate("window.stop()")
-            except Exception:
-                pass
-
+        page = None
+        context = None
         try:
+            page, context = await self.browser_manager.get_page(
+                crawlerRunConfig=config
+            )
+
             # Push updated UA + sec-ch-ua to the page so the server sees them
             if ua_changed:
                 combined_headers = {
@@ -1162,11 +1157,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 await asyncio.sleep(delay)
                 return await page.content()
 
-            # For undetected browsers, retrieve console messages before returning
-            if config.capture_console_messages and hasattr(self.adapter, 'retrieve_console_messages'):
-                final_messages = await self.adapter.retrieve_console_messages(page)
-                captured_console.extend(final_messages)
-
             ###
             # This ensures we capture the current page URL at the time we return the response,
             # which correctly reflects any JavaScript navigation that occurred.
@@ -1198,41 +1188,54 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 console_messages=captured_console if config.capture_console_messages else None,
             )
 
-        except Exception as e:
-            raise e
-
         finally:
-            # Always clean up event listeners to prevent accumulation
-            # across reuses (even for session pages).
-            try:
-                if config.capture_network_requests:
-                    page.remove_listener("request", handle_request_capture)
-                    page.remove_listener("response", handle_response_capture)
-                    page.remove_listener("requestfailed", handle_request_failed_capture)
-                if config.capture_console_messages:
-                    if hasattr(self.adapter, 'retrieve_console_messages'):
-                        final_messages = await self.adapter.retrieve_console_messages(page)
-                        captured_console.extend(final_messages)
-                    await self.adapter.cleanup_console_capture(page, handle_console, handle_error)
-            except Exception:
-                pass
-
-            if not config.session_id:
-                # ALWAYS decrement refcount first — must succeed even if
-                # the browser crashed or the page is in a bad state.
+            if page is not None:
+                cleanup_cancelled = False
+                # Always clean up event listeners to prevent accumulation across
+                # reuses (even for session pages).
                 try:
-                    await self.browser_manager.release_page_with_context(page)
+                    if config.capture_network_requests:
+                        page.remove_listener("request", handle_request_capture)
+                        page.remove_listener("response", handle_response_capture)
+                        page.remove_listener("requestfailed", handle_request_failed_capture)
+                    if config.capture_console_messages:
+                        final_messages = await self.adapter.cleanup_console_capture(
+                            page, handle_console, handle_error
+                        )
+                        captured_console.extend(final_messages or [])
+                except asyncio.CancelledError:
+                    cleanup_cancelled = True
                 except Exception:
                     pass
+                if not config.session_id:
+                    # ALWAYS decrement refcount first — must succeed even if the
+                    # browser crashed or cleanup itself was cancelled.
+                    try:
+                        await self.browser_manager.release_page_with_context(page)
+                    except asyncio.CancelledError:
+                        cleanup_cancelled = True
+                    except Exception:
+                        pass
 
-                # Close the page unless it's the last one in a headless/managed browser
-                try:
-                    all_contexts = page.context.browser.contexts
-                    total_pages = sum(len(context.pages) for context in all_contexts)
-                    if not (total_pages <= 1 and (self.browser_config.use_managed_browser or self.browser_config.headless)):
-                        await page.close()
-                except Exception:
-                    pass
+                    # Close the page unless it's the last one in a headless/managed browser.
+                    try:
+                        all_contexts = page.context.browser.contexts
+                        total_pages = sum(len(context.pages) for context in all_contexts)
+                        if not (
+                            total_pages <= 1
+                            and (
+                                self.browser_config.use_managed_browser
+                                or self.browser_config.headless
+                            )
+                        ):
+                            await page.close()
+                    except asyncio.CancelledError:
+                        cleanup_cancelled = True
+                    except Exception:
+                        pass
+
+                if cleanup_cancelled:
+                    raise asyncio.CancelledError
 
     # async def _handle_full_page_scan(self, page: Page, scroll_delay: float = 0.1):
     async def _handle_full_page_scan(self, page: Page, scroll_delay: float = 0.1, max_scroll_steps: Optional[int] = None):
