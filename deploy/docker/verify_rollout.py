@@ -16,7 +16,13 @@ from typing import Any
 import yaml
 
 REPLICAS = 3
-ELIGIBLE_NODES = frozenset({"haiku-4", "haiku-5", "haiku-9", "haiku-18"})
+# Every node carrying the crawl4ai-eligible label, drained ones included: the
+# inventory check compares labels, not readiness, so a node stays here until its
+# label is actually removed. haiku-6 joined 2026-09-04 while haiku-4 is drained
+# for hardware repair — start-first needs at least one eligible node beyond
+# REPLICAS, and without a replacement Swarm packs two tasks onto one node.
+# Remove haiku-6 here in the same change that removes its label.
+ELIGIBLE_NODES = frozenset({"haiku-4", "haiku-5", "haiku-6", "haiku-9", "haiku-18"})
 LLM_PROVIDER = "openai/qwen3.8-27b"
 LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 HEALTH_URLS = (

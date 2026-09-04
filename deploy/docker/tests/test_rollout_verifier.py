@@ -1146,15 +1146,19 @@ def _node_commands(nodes):
 
 
 def test_eligible_nodes_excludes_a_down_member_without_failing(monkeypatch):
-    # A down node is a capacity event: it leaves the result, not raises.
+    # A down node is a capacity event: it leaves the result, not raises. It keeps
+    # its label, so the inventory check still sees the full ELIGIBLE_NODES set.
     monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
         ("haiku-0", False, "ready", "active"),
-        ("haiku-4", True, "down", "active"),
+        ("haiku-4", True, "down", "drain"),
         ("haiku-5", True, "ready", "active"),
+        ("haiku-6", True, "ready", "active"),
         ("haiku-9", True, "ready", "active"),
         ("haiku-18", True, "ready", "active"),
     ]))
-    assert rollout._eligible_nodes() == frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    assert rollout._eligible_nodes() == frozenset(
+        {"haiku-5", "haiku-6", "haiku-9", "haiku-18"}
+    )
 
 
 def test_eligible_nodes_flags_membership_drift_even_when_ready(monkeypatch):
