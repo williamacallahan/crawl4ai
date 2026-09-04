@@ -531,3 +531,47 @@ async def test_monitor_retirement_actions_leave_the_lock_free_while_close_is_wed
 
     assert response["success"] is True
     assert sig not in crawler_pool.COLD_POOL
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_default_request_never_clones_the_permanent_browser(
+    monkeypatch,
+):
+    created = []
+
+    def factory(**_kwargs):
+        crawler = _PoolCrawler()
+        created.append(crawler)
+        return crawler
+
+    _configure_pool(monkeypatch, factory)
+    config = BrowserConfig()
+    sig = crawler_pool._sig(config)
+    stale = _BlockingCloseCrawler(connected=False)
+    crawler_pool.PERMANENT = stale
+    crawler_pool.DEFAULT_CONFIG_SIG = sig
+
+    first = asyncio.create_task(crawler_pool.get_crawler(config))
+    await stale.close_started.wait()
+
+    # PERMANENT is detached for the length of that close. A second request for
+    # the same config must still recognise the signature as the permanent
+    # browser's; treating it as an unknown config creates a pool browser under
+    # that signature, and the recreated permanent then wins every lookup while
+    # refreshing LAST_USED - so the clone is unreachable and the janitor's idle
+    # check never fires on it. One Chromium pinned for the container's life.
+    second = asyncio.create_task(crawler_pool.get_crawler(config))
+    await asyncio.sleep(0)
+
+    stale.continue_close.set()
+    one = await asyncio.wait_for(first, timeout=1)
+    two = await asyncio.wait_for(second, timeout=1)
+
+    assert one is two is crawler_pool.PERMANENT
+    assert created == [crawler_pool.PERMANENT]
+    assert not crawler_pool.COLD_POOL
+    assert not crawler_pool.HOT_POOL
+
+    await crawler_pool.release_crawler(one)
+    await crawler_pool.release_crawler(two)
+    await crawler_pool.close_all()

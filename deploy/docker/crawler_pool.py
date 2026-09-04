@@ -136,7 +136,10 @@ def _detach_permanent() -> Optional[AsyncWebCrawler]:
 
     sig = DEFAULT_CONFIG_SIG
     PERMANENT = None
-    DEFAULT_CONFIG_SIG = None
+    # DEFAULT_CONFIG_SIG deliberately survives: while PERMANENT is None the
+    # signature is how a concurrent request recognises that this config belongs
+    # to the permanent browser and must wait for its replacement instead of
+    # creating a pool browser under the same signature.
     if sig:
         LAST_USED.pop(sig, None)
         USAGE_COUNT.pop(sig, None)
@@ -308,8 +311,15 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         promoted = None
         async with LOCK:
             # Check permanent browser for default config
-            if PERMANENT and _is_default_config(sig):
-                if not _is_live(PERMANENT):
+            if _is_default_config(sig):
+                if PERMANENT is None:
+                    # A replacement is already in flight. Creating a pool
+                    # browser under the default signature here would leave a
+                    # clone nothing can reach - _get_admitted_crawler returns
+                    # PERMANENT first - and nothing can reclaim, because every
+                    # permanent hit refreshes LAST_USED for that same signature.
+                    replace_permanent = True
+                elif not _is_live(PERMANENT):
                     logger.warning("Permanent browser is unavailable; replacing it")
                     close_task = await _init_permanent_locked(cfg, force=True)
                     replace_permanent = close_task is not None
@@ -321,7 +331,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     return PERMANENT
 
             # Check hot pool
-            if close_task is None and sig in HOT_POOL:
+            if not replace_permanent and close_task is None and sig in HOT_POOL:
                 close_task = _discard_if_unavailable(HOT_POOL, sig, "Hot")
                 if close_task is None:
                     crawler = HOT_POOL[sig]
@@ -333,7 +343,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     return crawler
 
             # Check cold pool (promote to hot if used 3+ times)
-            if close_task is None and sig in COLD_POOL:
+            if not replace_permanent and close_task is None and sig in COLD_POOL:
                 close_task = _discard_if_unavailable(COLD_POOL, sig, "Cold")
                 if close_task is None:
                     LAST_USED[sig] = time.time()
@@ -349,7 +359,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                         logger.info(f"❄️  Using cold pool browser (sig={sig[:8]})")
                         return crawler
 
-            if close_task is None and promoted is None:
+            if not replace_permanent and close_task is None and promoted is None:
                 # Memory check before creating new
                 mem_pct = get_container_memory_percent()
                 if mem_pct >= MEM_LIMIT:
@@ -382,7 +392,8 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                 pass
             return crawler
 
-        await asyncio.shield(close_task)
+        if close_task is not None:
+            await asyncio.shield(close_task)
         if replace_permanent:
             await init_permanent(cfg)
 

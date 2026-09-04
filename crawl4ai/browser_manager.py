@@ -19,6 +19,19 @@ from .config import DOWNLOAD_PAGE_TIMEOUT
 from .js_snippet import load_js_script
 from .utils import get_chromium_path
 
+# A hung Playwright call must not make the awaits above it uncancellable: the
+# pool's 60s close cap is what SIGKILLs an abandoned Chromium, and it only
+# fires if its cancellation is actually delivered.
+CANCELLATION_GRACE_SECONDS = 20.0
+# A recycle that never finishes would hold admission closed forever, which
+# wedges the whole browser rather than degrading it.
+RECYCLE_CLOSE_SECONDS = 60.0
+RECYCLE_START_SECONDS = 120.0
+RECYCLE_WAIT_SECONDS = RECYCLE_CLOSE_SECONDS + RECYCLE_START_SECONDS + 30.0
+# Discarding one page must not outlast Playwright's own close, and must never
+# hold the request that is already rolling its allocation back.
+PAGE_CLOSE_SECONDS = 30.0
+
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
     "--disable-background-timer-throttling",
@@ -1616,16 +1629,40 @@ class BrowserManager:
         task.add_done_callback(done)
         return task
 
-    async def _await_task_despite_cancellation(self, task):
-        """Finish an allocation/cleanup task, then report a delivered cancel."""
+    async def _await_task_despite_cancellation(self, task, on_abandon=None):
+        """Finish an allocation/cleanup task, then report a delivered cancel.
+
+        Absorption is bounded. Without a deadline a hung Playwright call makes
+        every await above this one uncancellable, so crawler_pool's 60s close
+        cap never raises TimeoutError and the abandoned Chromium is never
+        SIGKILLed - the leak that cap exists to stop. Past the grace period the
+        task is abandoned to a background cleanup and the cancel is delivered.
+        """
         cancelled = False
+        deadline = None
         while True:
             try:
-                return await asyncio.shield(task), cancelled
+                if deadline is None:
+                    return await asyncio.shield(task), cancelled
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                return (
+                    await asyncio.wait_for(asyncio.shield(task), remaining),
+                    cancelled,
+                )
+            except asyncio.TimeoutError:
+                self._abandon_hung_task(task, on_abandon)
+                raise asyncio.CancelledError from None
             except asyncio.CancelledError:
                 if task.cancelled():
                     raise
                 cancelled = True
+                if deadline is None:
+                    deadline = (
+                        asyncio.get_running_loop().time()
+                        + CANCELLATION_GRACE_SECONDS
+                    )
                 current = asyncio.current_task()
                 uncancel = getattr(current, "uncancel", None)
                 if uncancel:
@@ -1639,6 +1676,26 @@ class BrowserManager:
                 if cancelled:
                     raise asyncio.CancelledError from None
                 raise
+
+    def _abandon_hung_task(self, task, on_abandon) -> None:
+        """Stop waiting on a task, but still close whatever it hands back."""
+        if isinstance(task, asyncio.Task):
+            self._track_background_task(task)
+        if on_abandon is None:
+            return
+
+        def _close_late_result(done) -> None:
+            if done.cancelled():
+                return
+            try:
+                value = done.result()
+            except BaseException:
+                return
+            if value is None:
+                return
+            self._track_background_task(asyncio.create_task(on_abandon(value)))
+
+        task.add_done_callback(_close_late_result)
 
     async def _close_page_quietly(self, page) -> None:
         try:
@@ -1667,13 +1724,17 @@ class BrowserManager:
     async def _new_page(self, context):
         """Create a page without letting cancellation orphan Playwright's result."""
         task = asyncio.create_task(context.new_page())
-        page, cancelled = await self._await_task_despite_cancellation(task)
+        page, cancelled = await self._await_task_despite_cancellation(
+            task, self._close_page_quietly
+        )
         return page, cancelled
 
     async def _new_context(self, crawlerRunConfig):
         """Create an isolated context and close it before re-raising cancellation."""
         task = asyncio.create_task(self.create_browser_context(crawlerRunConfig))
-        context, cancelled = await self._await_task_despite_cancellation(task)
+        context, cancelled = await self._await_task_despite_cancellation(
+            task, self._close_context_quietly
+        )
         if cancelled:
             await self._run_cleanup(self._close_context_quietly(context))
             raise asyncio.CancelledError
@@ -1730,7 +1791,17 @@ class BrowserManager:
     async def _admit_page_acquisition(self):
         """Issue a drain token only while the browser admits new pages."""
         while True:
-            await self._recycle_done.wait()
+            try:
+                await asyncio.wait_for(self._recycle_done.wait(), RECYCLE_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                # Fail the request rather than hold it: a caller that returns
+                # gives its pool permit back, and an unbounded wait here would
+                # block every request on this browser with nothing to reclaim
+                # it - PERMANENT has no janitor backstop.
+                raise RuntimeError(
+                    "Browser recycle did not finish within "
+                    f"{RECYCLE_WAIT_SECONDS:.0f}s"
+                ) from None
             async with self._recycle_lock:
                 if self._closing:
                     raise RuntimeError("Browser manager is closed")
@@ -1783,11 +1854,26 @@ class BrowserManager:
             self._close_admission_if_recycle_due_locked()
 
     async def _restart_browser(self) -> bool:
-        await self.close(_for_recycle=True)
+        try:
+            await asyncio.wait_for(
+                self.close(_for_recycle=True), RECYCLE_CLOSE_SECONDS
+            )
+        except asyncio.TimeoutError:
+            # The last resort crawler_pool already uses: stopping the driver
+            # transport makes its exit handler SIGKILL the whole Chromium
+            # group, so a wedged close neither holds the barrier nor leaves
+            # its process charged to the container.
+            try:
+                await asyncio.wait_for(self._stop_playwright(), timeout=5)
+            except BaseException:
+                pass
+            self.browser = None
+            self.managed_browser = None
+            self.default_context = None
         async with self._recycle_lock:
             if self._closing:
                 return False
-        await self.start()
+        await asyncio.wait_for(self.start(), RECYCLE_START_SECONDS)
         return True
 
     async def _recycle_browser(self) -> None:
@@ -1825,16 +1911,26 @@ class BrowserManager:
         close_page=False,
     ) -> None:
         async def cleanup():
-            if page is not None:
-                self._page_to_sig.pop(page, None)
-                self._page_to_admission.pop(page, None)
-            if page_marked and page is not None:
-                await self._release_page_from_use(page)
-            if signature is not None:
-                await self._decrement_context_refcount(signature)
+            try:
+                if page is not None:
+                    self._page_to_sig.pop(page, None)
+                    self._page_to_admission.pop(page, None)
+                if page_marked and page is not None:
+                    await self._release_page_from_use(page)
+                if signature is not None:
+                    await self._decrement_context_refcount(signature)
+            finally:
+                # Before the page close, never after: a close that hangs would
+                # strand this token in _active_acquisitions, and a due recycle
+                # that never sees an empty drain set closes admission for good.
+                await self._finish_admission(token)
             if close_page and page is not None:
-                await self._close_page_quietly(page)
-            await self._finish_admission(token)
+                try:
+                    await asyncio.wait_for(
+                        self._close_page_quietly(page), PAGE_CLOSE_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    pass
 
         await self._run_cleanup(cleanup())
 
@@ -2126,7 +2222,11 @@ class BrowserManager:
             await self._close_contexts()
 
             if self.browser:
-                await self.browser.close()
+                # Quietly: a concurrent close can already have torn down the
+                # connection, and raising here would skip managed_browser
+                # cleanup and playwright.stop() - the two steps that actually
+                # end the Chromium process group.
+                await self._close_browser_quietly(self.browser)
             self.browser = None
             self.default_context = None
 

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from crawl4ai import BrowserConfig, CrawlerRunConfig
+from crawl4ai import browser_manager as browser_manager_module
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.browser_manager import BrowserManager
 
@@ -399,3 +400,123 @@ def test_explicit_cdp_never_claims_process_recycling():
     )
     manager._pages_served = 1
     assert not manager._should_recycle()
+
+
+# ---------------------------------------------------------------------------
+# Bounds. Every wait below replaced an unbounded one; without them a single
+# wedged Playwright call takes the whole replica down instead of one request,
+# which is the 2026-09-03 outage shape rather than a fix for it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_recycle_that_never_finishes_fails_the_request(monkeypatch):
+    monkeypatch.setattr(browser_manager_module, "RECYCLE_WAIT_SECONDS", 0.05)
+    manager = _manager()
+    manager._recycle_done.clear()
+
+    # Not a hang: PERMANENT has no janitor backstop, so a request parked here
+    # would hold its pool permit until the container is restarted.
+    with pytest.raises(RuntimeError, match="did not finish"):
+        await manager._admit_page_acquisition()
+
+
+@pytest.mark.asyncio
+async def test_a_hung_allocation_stops_absorbing_its_caller_cancellation(monkeypatch):
+    monkeypatch.setattr(browser_manager_module, "CANCELLATION_GRACE_SECONDS", 0.05)
+    manager = _manager()
+    forever = asyncio.Event()
+
+    async def never_returns():
+        await forever.wait()
+
+    hung = asyncio.create_task(never_returns())
+    waiter = asyncio.create_task(manager._await_task_despite_cancellation(hung))
+    await asyncio.sleep(0)
+    waiter.cancel()
+
+    # The pool's 60s close cap only SIGKILLs an abandoned Chromium if its
+    # cancellation is actually delivered through here.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1)
+
+    forever.set()
+    hung.cancel()
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_page_is_closed_when_it_finally_arrives(monkeypatch):
+    monkeypatch.setattr(browser_manager_module, "CANCELLATION_GRACE_SECONDS", 0.05)
+    manager = _manager()
+    release = asyncio.Event()
+    context = _Context(new_page_release=release)
+
+    waiter = asyncio.create_task(manager._new_page(context))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1)
+
+    release.set()
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if context.pages and context.pages[0].closed:
+            break
+    assert context.pages, "the abandoned allocation never landed"
+    assert context.pages[0].closed, "the abandoned page was left open"
+
+
+@pytest.mark.asyncio
+async def test_a_hung_page_close_still_returns_its_admission_token(monkeypatch):
+    monkeypatch.setattr(browser_manager_module, "PAGE_CLOSE_SECONDS", 0.05)
+    manager = _manager()
+    token = await manager._admit_page_acquisition()
+    assert manager._active_acquisitions
+
+    hung = asyncio.Event()
+
+    async def never_closes(_page):
+        await hung.wait()
+
+    manager._close_page_quietly = never_closes
+    await manager._rollback_page_acquisition(
+        token, page=_Page(), close_page=True
+    )
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if not manager._active_acquisitions:
+            break
+    assert not manager._active_acquisitions, "a wedged close stranded the token"
+    hung.set()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_browser_close_still_ends_the_chromium_process():
+    manager = _manager()
+    cleaned = asyncio.Event()
+    stopped = asyncio.Event()
+
+    class _Browser:
+        async def close(self):
+            raise RuntimeError("connection already closed")
+
+    class _Managed:
+        async def cleanup(self):
+            cleaned.set()
+
+    class _Playwright:
+        async def stop(self):
+            stopped.set()
+
+    manager.browser = _Browser()
+    manager.managed_browser = _Managed()
+    manager.playwright = _Playwright()
+    manager.config.sleep_on_close = False
+
+    await manager.close()
+
+    # These two are what actually end the process group; a raising close() used
+    # to skip both and leave the Chromium charged to the container for life.
+    assert cleaned.is_set()
+    assert stopped.is_set()
