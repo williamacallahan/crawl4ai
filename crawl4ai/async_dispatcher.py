@@ -462,8 +462,18 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
             raise       
         
         finally:
-            # Clean up
+            # Cancel and await every task owned by this batch before returning.
+            # A caller that cancels us (wall-clock deadline, client disconnect)
+            # otherwise leaves these crawls running detached, each still holding
+            # a browser page and context that can never be reclaimed.
+            for task in active_tasks:
+                if not task.done():
+                    task.cancel()
+            if active_tasks:
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+
             memory_monitor.cancel()
+            await asyncio.gather(memory_monitor, return_exceptions=True)
             if self.monitor:
                 self.monitor.stop()
         return results
