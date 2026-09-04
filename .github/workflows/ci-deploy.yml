@@ -114,20 +114,17 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           reclaim_build_disk() {
-            # Emit IDs, not repo:tag. Each build leaves the previous run's image
-            # named but untagged; the reference filter still matches it, so the
-            # tag form pipes "<repo>:<none>" into docker rmi, which rejects it as
-            # an invalid reference and leaves ~4.9GB behind every run. The arm64
-            # runner's 51G root filesystem fills after a handful of builds.
-            docker images --filter=reference="${IMAGE}:*" --format '{{.ID}}' \
-              | xargs -r docker rmi || true
+            if [ "$ARCH" = arm64 ]; then
+              # The ARM64 runner's 51G root disk needs repo-image cleanup;
+              # X64 may be the Dokploy host and must retain its rollback source.
+              docker images --filter=reference="${IMAGE}:*" --format '{{.ID}}' \
+                | xargs -r docker rmi || true
+            fi
             docker builder prune -af --filter until=10m || true
             df -h /
           }
           trap reclaim_build_disk EXIT
-          # Long-lived runners can start a build with the prior run's image and
-          # cache still present. Reclaim this repo's old bytes before Chromium
-          # export needs the space; the EXIT trap performs the same cleanup after.
+          # Reclaim before Chromium export; the EXIT trap repeats after the build.
           reclaim_build_disk
 
           # Read the version from the package instead of hardcoding it. A literal

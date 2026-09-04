@@ -975,7 +975,7 @@ def test_container_contracts_use_app_readiness_and_compose_v5_shape():
     assert "await asyncio.to_thread(resolve_artifact, artifact_id)" in server
 
 
-def test_ci_build_reclaims_repo_disk_before_and_after_native_build():
+def test_ci_build_reclaims_repo_images_only_on_arm64():
     import yaml
 
     workflow = yaml.safe_load(
@@ -988,7 +988,14 @@ def test_ci_build_reclaims_repo_disk_before_and_after_native_build():
     )
 
     assert "reclaim_build_disk()" in build_script
-    assert "trap reclaim_build_disk EXIT" in build_script
+    arm64_guard = 'if [ "$ARCH" = arm64 ]; then'
+    arm64_cleanup = build_script.split(arm64_guard, maxsplit=1)[1]
+    arm64_cleanup = arm64_cleanup.split("\n  fi", maxsplit=1)[0]
+    assert build_script.count("trap reclaim_build_disk EXIT") == 1
+    assert build_script.count("reclaim_build_disk\n") == 1
+    assert build_script.count('docker images --filter=reference="${IMAGE}:*"') == 1
+    assert arm64_cleanup.count('docker images --filter=reference="${IMAGE}:*"') == 1
+    assert "docker builder prune" not in arm64_cleanup
     assert build_script.index("reclaim_build_disk\n") < build_script.index(
         "docker build --provenance"
     )
