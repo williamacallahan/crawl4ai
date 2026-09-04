@@ -834,8 +834,20 @@ def deploy() -> None:
     # Captured adjacent to its use: this snapshot decides which unconfirmable
     # predecessors the baseline may excuse.
     ready = _eligible_nodes()
-    if len(ready) < REPLICAS:
-        raise RuntimeError("not enough Ready eligible nodes to place every replica")
+    # start-first brings a replacement up before retiring its predecessor, so a
+    # rollout needs one eligible node beyond REPLICAS. At exactly REPLICAS the
+    # scheduler has no legal overlap slot, and because PLACEMENT carries no
+    # MaxReplicas cap to forbid it, Swarm satisfies start-first by packing two
+    # tasks onto one node rather than leaving one Pending. _verify_tasks then
+    # rejects the end state as a placement fault, which names the symptom and
+    # not the missing node (2026-09-04, haiku-4 drained). Fail here instead,
+    # before any write, naming the node that has to come back.
+    if len(ready) <= REPLICAS:
+        raise RuntimeError(
+            f"start-first needs a spare eligible node: {REPLICAS} replicas, "
+            f"{len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
+            f"not Ready: {', '.join(sorted(ELIGIBLE_NODES - ready)) or 'none'}"
+        )
     _verify_tasks(app_name, baseline, baseline_revision, ready, False)
     for url in HEALTH_URLS:
         if not _exact_health(_request_json(f"{url}?baseline={uuid.uuid4()}"), baseline_revision):

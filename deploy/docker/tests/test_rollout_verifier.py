@@ -1319,7 +1319,7 @@ def _deploy_env(monkeypatch):
     monkeypatch.setattr(rollout, "_ensure_rollback_source", lambda _image: None)
 
 
-def test_deploy_requires_ready_capacity_not_full_fleet(monkeypatch):
+def test_deploy_requires_a_spare_node_for_start_first(monkeypatch):
     _deploy_env(monkeypatch)
     monkeypatch.setattr(rollout, "_application", lambda *_args: application())
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
@@ -1328,9 +1328,13 @@ def test_deploy_requires_ready_capacity_not_full_fleet(monkeypatch):
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
 
-    # Three ready of four labeled nodes is enough capacity: the gate passes
-    # and evaluation reaches the baseline task census.
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"}))
+    # Four ready of five labeled nodes leaves start-first its overlap slot:
+    # the gate passes and evaluation reaches the baseline task census.
+    monkeypatch.setattr(
+        rollout,
+        "_eligible_nodes",
+        lambda: frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"}),
+    )
     monkeypatch.setattr(
         rollout,
         "_verify_tasks",
@@ -1339,10 +1343,21 @@ def test_deploy_requires_ready_capacity_not_full_fleet(monkeypatch):
     with pytest.raises(SystemExit, match="capacity gate passed"):
         rollout.deploy()
 
-    # Two ready nodes cannot place three replicas: fail before the census.
+    # Exactly REPLICAS ready is the case that used to pass and then packed two
+    # tasks onto one node. Fail before the census, and name the absent nodes
+    # rather than the placement they caused.
     monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: pytest.fail("census must not run"))
+    monkeypatch.setattr(
+        rollout, "_eligible_nodes", lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    )
+    with pytest.raises(RuntimeError, match="start-first needs a spare eligible node") as excess:
+        rollout.deploy()
+    assert "3 replicas, 3 Ready" in str(excess.value)
+    assert "not Ready: haiku-4, haiku-6" in str(excess.value)
+
+    # Below REPLICAS fails the same way; the count is not a second gate.
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-9", "haiku-18"}))
-    with pytest.raises(RuntimeError, match="not enough Ready eligible nodes"):
+    with pytest.raises(RuntimeError, match="start-first needs a spare eligible node"):
         rollout.deploy()
 
 
