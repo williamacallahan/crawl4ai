@@ -1247,7 +1247,21 @@ class BrowserProfiler:
                         await asyncio.sleep(0.5)
             except Exception as e:
                 self.logger.warning(f"Could not verify browser: {str(e)}", tag="BUILTIN")
-            
+
+            if config_json is None:
+                self.logger.error(
+                    "Builtin browser did not answer /json/version — launch failed.",
+                    tag="BUILTIN",
+                )
+                await managed_browser.cleanup()
+                return None
+            if browser_process.poll() is not None:
+                self.logger.error(
+                    "Builtin browser process exited during launch.", tag="BUILTIN"
+                )
+                await managed_browser.cleanup()
+                return None
+
             # Save browser info
             browser_info = {
                 'pid': browser_process.pid,
