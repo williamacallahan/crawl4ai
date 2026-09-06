@@ -368,6 +368,151 @@ class TestBFSResume:
         assert exported == last_state
 
 
+class TestBFSMaxPagesBoundaryState:
+    """Regression for the off-by-one resume state when a crawl stops at max_pages.
+
+    When a BFS crawl terminates because _pages_crawled reaches max_pages, the
+    boundary page (the one that trips the limit) must still fire on_state_change
+    and be reflected in export_state(). Otherwise resuming restores a stale
+    _pages_crawled and the crawl overshoots on resume. The batch-mode regression
+    was introduced by commit a7f3f4c; the stream-mode skip is pre-existing.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_pages", [1, 3])
+    async def test_callback_fires_for_boundary_page_batch(self, max_pages):
+        """on_state_change fires once per processed URL, including the boundary page (batch)."""
+        callback_count = 0
+        pages_crawled_sequence: List[int] = []
+
+        async def count_callbacks(state: Dict[str, Any]):
+            nonlocal callback_count
+            callback_count += 1
+            pages_crawled_sequence.append(state["pages_crawled"])
+
+        strategy = BFSDeepCrawlStrategy(
+            max_depth=2,
+            max_pages=max_pages,
+            on_state_change=count_callbacks,
+        )
+        mock_crawler = create_mock_crawler_with_links(num_links=2)
+        mock_config = create_mock_config()
+
+        await strategy._arun_batch("https://example.com", mock_crawler, mock_config)
+
+        # Callback fires once per processed URL, including the boundary page.
+        assert callback_count == strategy._pages_crawled == max_pages, (
+            f"batch max_pages={max_pages}: callback_count={callback_count}, "
+            f"_pages_crawled={strategy._pages_crawled}"
+        )
+        # pages_crawled increments by exactly 1 each callback (no gaps, no skips).
+        assert pages_crawled_sequence == list(range(1, max_pages + 1)), (
+            f"batch max_pages={max_pages}: pages_crawled sequence={pages_crawled_sequence}"
+        )
+        # export_state reflects the boundary page (not off-by-one, not None).
+        exported = strategy.export_state()
+        assert exported is not None, f"batch max_pages={max_pages}: export_state() is None"
+        assert exported["pages_crawled"] == max_pages, (
+            f"batch max_pages={max_pages}: export_state pages_crawled={exported['pages_crawled']}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_pages", [1, 3])
+    async def test_callback_fires_for_boundary_page_stream(self, max_pages):
+        """on_state_change fires once per processed URL, including the boundary page (stream)."""
+        callback_count = 0
+        pages_crawled_sequence: List[int] = []
+
+        async def count_callbacks(state: Dict[str, Any]):
+            nonlocal callback_count
+            callback_count += 1
+            pages_crawled_sequence.append(state["pages_crawled"])
+
+        strategy = BFSDeepCrawlStrategy(
+            max_depth=2,
+            max_pages=max_pages,
+            on_state_change=count_callbacks,
+        )
+        mock_crawler = create_mock_crawler_with_links(num_links=2)
+        mock_config = create_mock_config(stream=True)
+
+        async for _ in strategy._arun_stream("https://example.com", mock_crawler, mock_config):
+            pass
+
+        assert callback_count == strategy._pages_crawled == max_pages, (
+            f"stream max_pages={max_pages}: callback_count={callback_count}, "
+            f"_pages_crawled={strategy._pages_crawled}"
+        )
+        assert pages_crawled_sequence == list(range(1, max_pages + 1)), (
+            f"stream max_pages={max_pages}: pages_crawled sequence={pages_crawled_sequence}"
+        )
+        exported = strategy.export_state()
+        assert exported is not None, f"stream max_pages={max_pages}: export_state() is None"
+        assert exported["pages_crawled"] == max_pages, (
+            f"stream max_pages={max_pages}: export_state pages_crawled={exported['pages_crawled']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_from_max_pages_state_does_not_overshoot(self):
+        """Resuming from a max_pages-terminated state must not crawl extra pages.
+
+        End-to-end two-phase repro: phase 1 runs to the max_pages boundary and
+        exports state; phase 2 resumes from that state under the same max_pages
+        budget. With the off-by-one bug the exported pages_crawled is
+        max_pages - 1, so the resumed instance treats the budget as un-exhausted
+        and crawls one additional page (combined unique = max_pages + 1). With
+        a correct state (pages_crawled == max_pages) the resumed instance crawls
+        zero extra pages.
+        """
+        max_pages = 3
+
+        async def noop(state: Dict[str, Any]):
+            pass
+
+        strategy1 = BFSDeepCrawlStrategy(
+            max_depth=2,
+            max_pages=max_pages,
+            on_state_change=noop,
+        )
+        mock_crawler = create_mock_crawler_with_links(num_links=2)
+        mock_config = create_mock_config()
+
+        results1 = await strategy1._arun_batch("https://example.com", mock_crawler, mock_config)
+        phase1_urls = [r.url for r in results1]
+
+        exported = strategy1.export_state()
+        assert exported is not None, "phase 1: export_state() is None"
+        assert exported["pages_crawled"] == max_pages, (
+            f"phase 1: export_state pages_crawled={exported['pages_crawled']}, "
+            f"expected {max_pages}"
+        )
+
+        # Resume into a fresh strategy under the same max_pages budget.
+        strategy2 = BFSDeepCrawlStrategy(
+            max_depth=2,
+            max_pages=max_pages,
+            resume_state=exported,
+        )
+        phase2_crawled: List[str] = []
+        mock_crawler2 = create_mock_crawler_tracking(phase2_crawled, return_no_links=True)
+
+        results2 = await strategy2._arun_batch("https://example.com", mock_crawler2, mock_config)
+
+        # The resumed instance must not process any more pages.
+        assert strategy2._pages_crawled == max_pages, (
+            f"phase 2: _pages_crawled={strategy2._pages_crawled}, expected {max_pages}"
+        )
+        assert len(results2) == 0, (
+            f"phase 2: resume crawled extra pages: {[r.url for r in results2]}"
+        )
+        assert phase2_crawled == [], f"phase 2: resume re-crawled: {phase2_crawled}"
+
+        combined = set(phase1_urls) | set(r.url for r in results2)
+        assert len(combined) == max_pages, (
+            f"combined unique crawled={len(combined)} > max_pages={max_pages}: {combined}"
+        )
+
+
 class TestDFSResume:
     """DFS strategy resume tests."""
 
