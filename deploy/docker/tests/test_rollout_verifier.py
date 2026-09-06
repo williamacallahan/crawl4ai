@@ -3,6 +3,7 @@ import http.client
 import json
 import subprocess
 from dataclasses import fields
+from pathlib import Path
 from threading import Thread
 
 import pytest
@@ -1540,6 +1541,12 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
         for index in range(3)
     }
     monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: 4321)
+    namespace_probe = []
+    monkeypatch.setattr(
+        observer,
+        "_verify_ingress_namespace",
+        lambda pid: namespace_probe.append(pid),
+    )
     monkeypatch.setattr(observer.rollout, "_service_tasks", lambda _service: rows)
     monkeypatch.setattr(
         observer,
@@ -1591,6 +1598,7 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
     assert comparison is observer.NetworkDbFdbComparison.CONSISTENT
     assert len(direct_probe) == 3
     assert {namespace_pid for _url, namespace_pid in direct_probe} == {4321}
+    assert namespace_probe == [4321]
 
 
 def test_sample_rejects_a_task_census_change(monkeypatch):
@@ -1605,6 +1613,7 @@ def test_sample_rejects_a_task_census_change(monkeypatch):
     after = [{**before[0], "ID": "task-after"}]
     calls = iter((before, after))
     monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: None)
+    monkeypatch.setattr(observer, "_verify_ingress_namespace", lambda _pid: None)
     monkeypatch.setattr(
         observer.rollout, "_service_tasks", lambda _service: next(calls)
     )
@@ -1612,6 +1621,200 @@ def test_sample_rejects_a_task_census_change(monkeypatch):
 
     with pytest.raises(RuntimeError, match="task census changed"):
         observer.sample("crawl4ai")
+
+
+def test_verify_ingress_namespace_runs_a_bounded_nsenter_preflight(monkeypatch):
+    invocation = []
+
+    def run(command, **kwargs):
+        invocation.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(observer.subprocess, "run", run)
+
+    assert observer._verify_ingress_namespace(4321) is None
+    assert invocation == [
+        (
+            ["nsenter", "--net=/proc/4321/ns/net", "/bin/true"],
+            {"capture_output": True, "text": True, "timeout": 10},
+        )
+    ]
+
+
+def test_verify_ingress_namespace_raises_loudly_with_the_denial_reason(monkeypatch):
+    monkeypatch.setattr(
+        observer.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 1, "",
+            "nsenter: cannot open '/proc/4321/ns/net': Permission denied",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="cannot enter ingress network namespace") as error:
+        observer._verify_ingress_namespace(4321)
+    assert "Permission denied" in str(error.value)
+    assert "4321" in str(error.value)
+
+
+def test_sample_fails_loudly_when_it_cannot_enter_the_ingress_namespace(monkeypatch):
+    # Before the preflight, a systemic nsenter denial raised CurlError per task
+    # and was swallowed by the loop, so sample() returned 3/0/0 instead of
+    # raising. The preflight must surface the denial before any per-task probe.
+    monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: 4321)
+
+    def run(command, **_kwargs):
+        assert command == ["nsenter", "--net=/proc/4321/ns/net", "/bin/true"], command
+        return subprocess.CompletedProcess(
+            command, 1, "",
+            "nsenter: cannot open '/proc/4321/ns/net': Permission denied",
+        )
+
+    monkeypatch.setattr(observer.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="cannot enter ingress network namespace") as error:
+        observer.sample("crawl4ai")
+    assert "Permission denied" in str(error.value)
+
+
+def test_sampling_failure_does_not_report_bogus_zero_coverage_for_a_healthy_fleet(
+    monkeypatch, tmp_path, capsys
+):
+    # A healthy three-task fleet whose sampler cannot enter the ingress
+    # namespace must read as "sampling failed" (0/0/0), not the misleading
+    # authoritative=3/direct_healthy=0/public_covered=0 signature that pointed
+    # operators at Crawl4AI instead of the sampler in 2026-09-02.
+    rows = [
+        {
+            "ID": f"task-{index}",
+            "Node": f"node-{index}",
+            "DesiredState": "Running",
+            "CurrentState": "Running 1m",
+        }
+        for index in range(3)
+    ]
+    runtimes = {
+        f"task-{index}": {
+            "container": f"container-{index}",
+            "addresses": {f"10.0.1.{index + 10}"},
+            "labels": {"otel.service.version": REVISION},
+        }
+        for index in range(3)
+    }
+    monkeypatch.setenv("CRAWL4AI_SWARM_SERVICE", "crawl4ai")
+    monkeypatch.setenv("CRAWL4AI_OBSERVER_STATE_PATH", str(tmp_path / "state"))
+    monkeypatch.setenv("CRAWL4AI_OBSERVER_METRICS_PATH", str(tmp_path / "metrics"))
+    monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: 4321)
+    monkeypatch.setattr(observer.rollout, "_service_tasks", lambda _service: rows)
+    monkeypatch.setattr(
+        observer,
+        "_network_details",
+        lambda: {"Id": "network", "Services": {"crawl4ai": {"Tasks": []}}},
+    )
+    monkeypatch.setattr(
+        observer.rollout,
+        "_task_runtime",
+        lambda task_id, _network: runtimes[task_id],
+    )
+    monkeypatch.setattr(
+        observer.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 1, "",
+            "nsenter: cannot open '/proc/4321/ns/net': Permission denied",
+        ),
+    )
+    monkeypatch.setattr(observer, "_public_coverage", lambda _direct, _deadline: 0)
+    monkeypatch.setattr(
+        observer,
+        "_fdb_comparison",
+        lambda *_args: observer.NetworkDbFdbComparison.INCONCLUSIVE,
+    )
+
+    observer.write_sample()
+
+    out = capsys.readouterr().out
+    assert "crawl4ai coverage sampling failed: RuntimeError" in out
+    assert "authoritative_tasks=3" not in out
+    assert (tmp_path / "metrics").read_text() == (
+        "crawl4ai_authoritative_task_count 0\n"
+        "crawl4ai_direct_healthy_task_count 0\n"
+        "crawl4ai_public_covered_task_count 0\n"
+        "crawl4ai_coverage_complete 0\n"
+    )
+
+
+def test_sample_still_swallows_a_per_task_health_failure(monkeypatch):
+    # The preflight only fails loudly for a systemic namespace denial; one
+    # flaky task must still be swallowed so it cannot abort a whole sample.
+    rows = [
+        {
+            "ID": f"task-{index}",
+            "Node": f"node-{index}",
+            "DesiredState": "Running",
+            "CurrentState": "Running 1m",
+        }
+        for index in range(3)
+    ]
+    runtimes = {
+        f"task-{index}": {
+            "container": f"container-{index}",
+            "addresses": {f"10.0.1.{index + 10}"},
+            "labels": {"otel.service.version": REVISION},
+        }
+        for index in range(3)
+    }
+    monkeypatch.setattr(observer.rollout, "_verify_ingress_host", lambda: 4321)
+    monkeypatch.setattr(observer, "_verify_ingress_namespace", lambda _pid: None)
+    monkeypatch.setattr(observer.rollout, "_service_tasks", lambda _service: rows)
+    monkeypatch.setattr(
+        observer,
+        "_network_details",
+        lambda: {"Id": "network", "Services": {"crawl4ai": {"Tasks": []}}},
+    )
+    monkeypatch.setattr(
+        observer.rollout,
+        "_task_runtime",
+        lambda task_id, _network: runtimes[task_id],
+    )
+
+    def direct_health(url, *, network_namespace_pid):
+        if "10.0.1.10" in url:
+            raise rollout.CurlError(
+                "HTTP request failed: curl exit 7: Connection refused", 7
+            )
+        runtime = next(
+            r for r in runtimes.values() if next(iter(r["addresses"])) in url
+        )
+        return health(runtime["container"], revision=REVISION)
+
+    monkeypatch.setattr(observer.rollout, "_request_json", direct_health)
+    monkeypatch.setattr(observer, "_public_coverage", lambda _direct, _deadline: 2)
+    monkeypatch.setattr(
+        observer,
+        "_fdb_comparison",
+        lambda *_args: observer.NetworkDbFdbComparison.INCONCLUSIVE,
+    )
+
+    snapshot, comparison = observer.sample("crawl4ai")
+
+    assert snapshot == observer.CoverageSnapshot(3, 2, 2)
+    assert comparison is observer.NetworkDbFdbComparison.INCONCLUSIVE
+
+
+def test_sample_service_unit_grants_cap_sys_ptrace_for_nsenter():
+    # The direct probe opens /proc/<ingress-pid>/ns/net, a ptrace-read check.
+    # The sampler runs as root while dokploy-traefik runs non-root, so the
+    # uid-match fast path does not apply and CAP_SYS_PTRACE must stay in the
+    # unit's CapabilityBoundingSet. Pin it so a future edit cannot drop it and
+    # silently pin every coverage gauge at 0 again (2026-09-02, fcdc02d/f841897).
+    service = Path(__file__).resolve().parents[1] / "crawl4ai-swarm-observer-sample.service"
+    line = next(
+        line for line in service.read_text().splitlines()
+        if line.lstrip().startswith("CapabilityBoundingSet=")
+    )
+    capabilities = line.split("=", 1)[1].split()
+    assert "CAP_SYS_ADMIN" in capabilities
+    assert "CAP_SYS_PTRACE" in capabilities
 
 
 def test_public_coverage_accepts_each_task_revision_and_intersects_routes(monkeypatch):

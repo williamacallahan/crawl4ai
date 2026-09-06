@@ -295,10 +295,40 @@ def _public_coverage(direct_instance: dict[str, str], deadline: float) -> int:
     return len(set.intersection(*observed))
 
 
+def _verify_ingress_namespace(ingress_pid: int) -> None:
+    """Prove the sampler can open the ingress network namespace before the
+    per-task probe loop depends on it.
+
+    Opening /proc/<pid>/ns/net is a kernel ptrace-read check: it succeeds only
+    when the caller and target share uids, or the caller holds CAP_SYS_PTRACE.
+    The sampler's systemd unit runs as root while dokploy-traefik runs non-root,
+    so a CapabilityBoundingSet without CAP_SYS_PTRACE denies the open with
+    EACCES for every task (2026-09-02, fcdc02d routed every direct probe through
+    this namespace; f841897 granted the capability after coverage read
+    incomplete all morning). The per-task loop deliberately swallows one flaky
+    task, which would convert that systemic denial into a silent direct_healthy
+    of 0 — observer breakage misattributed as a fleet outage. Fail loudly here,
+    before any per-task probe, so write_sample() records a sampling failure
+    rather than bogus zero coverage for a healthy fleet.
+    """
+    result = subprocess.run(
+        ["nsenter", f"--net=/proc/{ingress_pid}/ns/net", "/bin/true"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"cannot enter ingress network namespace for pid {ingress_pid}: "
+            f"{(result.stderr or '').strip()[:200]}"
+        )
+
+
 def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]:
     """Reuse the rollout verifier's task and health owners for one stable sample."""
     deadline = time.monotonic() + SAMPLE_DEADLINE_SECONDS
     ingress_pid = rollout._verify_ingress_host()
+    _verify_ingress_namespace(ingress_pid)
     before = rollout._service_tasks(service_name)
     current = [
         row for row in before if str(row.get("DesiredState", "")).lower() == "running"
