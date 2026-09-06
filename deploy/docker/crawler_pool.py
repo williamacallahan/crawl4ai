@@ -148,9 +148,18 @@ def _detach_permanent() -> Optional[AsyncWebCrawler]:
 
 
 def _is_live(crawler: AsyncWebCrawler) -> bool:
-    """Return whether the crawler still owns a usable Playwright browser."""
+    """Return whether the crawler still owns a usable Playwright browser.
+
+    An in-place recycle (``_recycling`` set, ``_closing`` clear) temporarily
+    nulls ``browser``/``default_context`` while bringing the Chromium process
+    back; treat that manager as live so the pool blocks on the library's
+    restart via ``BrowserManager._admit_page_acquisition`` instead of
+    force-replacing a healthy-but-reloading browser.
+    """
     try:
         manager = crawler.crawler_strategy.browser_manager
+        if getattr(manager, "_recycling", False):
+            return True
         if manager.browser is not None:
             return manager.browser.is_connected()
         return (
