@@ -132,9 +132,26 @@ def _visible_text_len(html: str) -> Optional[int]:
     (visibility:visible inside visibility:hidden) is still excluded, and
     stylesheet/class-based hiding and opacity are out of scope. Upgrade path:
     computed styles via a real renderer, if FPs ever matter here.
+
+    The substring is scoped to the ``<body`` open tag BEFORE parsing so that
+    lxml's HTML5 foster-parenting cannot relocate stray text outside ``<body>``
+    (text before ``<body>``, raw text in ``<head>``, text between ``</head>``
+    and ``<body>``) into the ``body`` subtree and inflate the visible-text
+    count. Without this, a soft-200 block page whose block message lives
+    outside ``<body>`` but whose ``<body>`` has a content element bypasses the
+    ``minimal_text`` signal (the structural tier's catch-all for malformed
+    silent blocks).
     """
+    # `_BODY_RE` presence is already guaranteed on the normal call path:
+    # `_structural_integrity_check` returns True on `not _BODY_RE.search(html)`
+    # before reaching `_visible_text_len`. Returning None here only routes
+    # unparseable fragments through the existing regex fallback.
+    open_match = _BODY_RE.search(html)
+    if not open_match:
+        return None
+    frag = '<html>' + html[open_match.start():] + '</html>'
     try:
-        body = lxml_html.document_fromstring(html).body
+        body = lxml_html.document_fromstring(frag).body
         if body is None:
             return None
     except Exception:

@@ -226,6 +226,43 @@ check("Structural: unclosed hidden element still stripped",
         '<div style="display:none">' + ('pad text ' * 12) + '</body></html>'),
     True, "minimal_text")
 
+# --- Structural bypass via foster-parented stray text outside <body> ---
+# HTTP 200 silent block whose block message lives physically OUTSIDE <body>
+# (text before <body>, raw text in <head>, or text between </head> and <body>)
+# while the <body> itself holds a content element (<p>/<a>/...). lxml's HTML5
+# parser foster-parents that stray text into the <body> subtree, so the
+# pre-fix _visible_text_len counted it as visible body content, inflated past
+# 50 chars, and suppressed the minimal_text signal — letting a soft-200 block
+# page through as a successful crawl. Each body here has a <p> so the
+# no_content_elements signal does NOT fire; minimal_text is the only catch.
+_FOSTER = ' filler ' * 120
+
+check("Structural: foster-parented stray text before <body> (with </body>)",
+    is_blocked(200, '<html>' + _FOSTER + '<body><p>nice content</p></body></html>'),
+    True, "minimal_text")
+
+check("Structural: foster-parented raw text in <head> (with </body>)",
+    is_blocked(200, '<html><head>' + _FOSTER + '</head><body><p>x</p></body></html>'),
+    True, "minimal_text")
+
+check("Structural: foster-parented text between </head> and <body>",
+    is_blocked(200, '<html><head></head>' + _FOSTER + '<body><p>ok</p></body></html>'),
+    True, "minimal_text")
+
+# No-</body> variant: the strict </body>-substring fallback would wrongly
+# return None and re-inflate via the regex fallback; scoping to the <body
+# open tag onward (lxml closes implicitly) handles both closed and unclosed.
+check("Structural: foster-parented stray text before <body> (no </body>)",
+    is_blocked(200, '<html>' + _FOSTER + '<body><p>ok</p>'),
+    True, "minimal_text")
+
+# Headline repro from the report: a full block sentence + padding before <body>.
+check("Structural: full block sentence before <body> bypasses minimal_text",
+    is_blocked(200,
+        '<html>Blocked - automated traffic detected. Please contact the site administrator.'
+        + _FOSTER + '<body><p>ok</p></body></html>'),
+    True, "minimal_text")
+
 # Adversarial input that made the earlier regex approach backtrack
 # quadratically (~8s at 44KB). The parser path is linear; the loose wall-clock
 # bound only trips on a reintroduced blow-up, not normal machine variance.
@@ -454,3 +491,76 @@ if FAIL > 0:
     sys.exit(1)
 else:
     print("ALL TESTS PASSED!")
+
+
+# =========================================================================
+# pytest-style regression tests for the foster-parenting fix.
+#
+# The script harness above is this file's existing convention. These
+# functions add unit-level coverage of `_visible_text_len` (the helper that
+# regressed) so the file is also collectable under the repo's documented
+# runner (`pytest`) — without them `pytest <file>` reports "no tests ran".
+# The `is_blocked`-level shapes are already covered by the `check()` cases
+# above, so the functions below focus on the helper's own contract and the
+# two guards that are not otherwise exercised here.
+# =========================================================================
+from crawl4ai.antibot_detector import _visible_text_len
+
+_FOSTER_PAD = ' filler ' * 120
+
+
+def test_visible_text_len_excludes_foster_parented_stray_text_outside_body():
+    # lxml's HTML5 parser relocates stray text outside <body> into the body
+    # subtree; the helper must scope to the <body open tag onward before
+    # parsing so that text cannot inflate the count. Three foster-parenting
+    # shapes (text before <body>, raw text in <head>, text between </head>
+    # and <body>) plus the no-</body> edge case.
+    assert _visible_text_len(
+        '<html>' + _FOSTER_PAD + '<body><p>nice content</p></body></html>') == 12
+    assert _visible_text_len(
+        '<html><head>' + _FOSTER_PAD + '</head><body><p>x</p></body></html>') == 1
+    assert _visible_text_len(
+        '<html><head></head>' + _FOSTER_PAD + '<body><p>ok</p></body></html>') == 2
+    # No </body> close: strict </body>-substring scoping would wrongly return
+    # None and re-inflate via the regex fallback; the <body-open-onward scope
+    # (lxml closes implicitly) handles it.
+    assert _visible_text_len(
+        '<html>' + _FOSTER_PAD + '<body><p>ok</p>') == 2
+
+
+def test_visible_text_len_excludes_head_title_from_body_count():
+    # <title> lives in <head>, before <body>; it must not be counted as body
+    # text. A body with real prose must report its own length only.
+    html = ('<html><head><title>This title is long and must not be body text'
+            '</title></head><body><p>real body prose here</p></body></html>')
+    assert _visible_text_len(html) == len("real body prose here")
+
+
+def test_visible_text_len_returns_none_when_no_body_open_tag():
+    # No <body open tag: returns None so the caller falls back to the regex
+    # pipeline rather than guessing (unreachable on the normal Tier-3 path,
+    # where Signal 1 already returns on a missing <body>, but it is the
+    # helper's own contract).
+    assert _visible_text_len('not html at all') is None
+    assert _visible_text_len('<html><head><title>x</title></head></html>') is None
+
+
+def test_content_less_foster_parented_body_still_blocked_via_no_content_elements():
+    # When the body has NO content element, the no_content_elements signal
+    # catches the page regardless; the foster-parenting fix must not regress
+    # the content-less variant.
+    html = '<html><head>' + _FOSTER_PAD + '</head><body>x</body></html>'
+    blocked, reason = is_blocked(200, html)
+    assert blocked is True
+    assert "no_content_elements" in reason
+
+
+def test_legit_page_with_head_title_no_false_positive():
+    # A page whose real content lives inside <body> (with a <head><title>) must
+    # not be flagged; the foster-parenting scope must not perturb normal pages.
+    html = ('<html><head><title>How to Detect Bots</title></head><body>'
+            '<h1>How to Detect Bots</h1>'
+            '<p>Anti-bot solutions help detect and block bot traffic.</p>'
+            + ('<p>More article content. </p>' * 50) + '</body></html>')
+    assert _visible_text_len(html) > 50
+    assert is_blocked(200, html) == (False, "")
