@@ -539,7 +539,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         return subprocess.CompletedProcess(command, 0, json.dumps(network), "")
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
-    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: None)
+    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: 4321)
     monkeypatch.setattr(
         rollout,
         "_task_state",
@@ -552,16 +552,116 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
     monkeypatch.setattr(
         rollout, "_task_runtime", lambda task, _network: runtimes[task]
     )
-    monkeypatch.setattr(
-        rollout,
-        "_request_json",
-        lambda url, *_args: health(
+    direct_probe = []
+
+    def direct_health(url, *, network_namespace_pid):
+        direct_probe.append((url, network_namespace_pid))
+        return health(
             next(runtime["container"] for runtime in runtimes.values() if next(iter(runtime["addresses"])) in url)
-        ),
-    )
+        )
+
+    monkeypatch.setattr(rollout, "_request_json", direct_health)
     proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES)
     assert proof["nodes"] == ["haiku-5", "haiku-6", "haiku-9"]
     assert len(proof["instances"]) == 3
+    assert len(direct_probe) == rollout.REPLICAS
+    assert {namespace_pid for _url, namespace_pid in direct_probe} == {4321}
+
+
+def test_verify_tasks_probes_overlay_from_ingress_namespace(monkeypatch):
+    """The verifier runs in the host init namespace, which cannot route to
+    dokploy-network overlay task IPs, so each per-replica health probe must run
+    inside the Traefik network namespace. _verify_tasks must capture the
+    ingress PID from _verify_ingress_host and forward it to _request_json,
+    matching the swarm_observer.sample pattern added by commit fcdc02d. Before
+    that commit wired one caller and left this one bare, the probe ran in the
+    host namespace and timed out with curl exit 6/28."""
+    rows = [
+        {
+            "ID": f"task{index}",
+            "Name": f"crawl4ai.{index}",
+            "Node": node,
+            "DesiredState": "Running",
+            "CurrentState": "Running 1m",
+        }
+        for index, node in enumerate(("haiku-5", "haiku-6", "haiku-9"), 1)
+    ]
+    rows += [
+        {
+            "ID": f"old{index}",
+            "Name": f"crawl4ai.{index}",
+            "Node": node,
+            "DesiredState": "Shutdown",
+            "CurrentState": "Shutdown 1m",
+        }
+        for index, node in enumerate(("haiku-6", "haiku-9", "haiku-18"), 1)
+    ]
+    runtimes = {
+        f"task{index}": {
+            "container": f"container{index}",
+            "labels": rollout._labels(REVISION),
+            "image": CANDIDATE,
+            "addresses": {f"10.0.1.{index}"},
+        }
+        for index in range(1, 4)
+    }
+    network = [{
+        "Id": "network",
+        "Services": {
+            "crawl4ai": {
+                "Tasks": [
+                    {
+                        "Name": f"{row['Name']}.{row['ID']}",
+                        "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
+                    }
+                    for row in rows[:3]
+                ]
+            }
+        },
+    }]
+
+    def run(command, **_kwargs):
+        if command[1:3] == ["service", "ps"]:
+            return subprocess.CompletedProcess(
+                command, 0, "\n".join(json.dumps(row) for row in rows), ""
+            )
+        return subprocess.CompletedProcess(command, 0, json.dumps(network), "")
+
+    ingress_calls = []
+    monkeypatch.setattr(
+        rollout, "_verify_ingress_host", lambda: ingress_calls.append(None) or 4321
+    )
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    monkeypatch.setattr(
+        rollout,
+        "_task_state",
+        lambda task: (
+            ("running", "running")
+            if task.startswith("task")
+            else ("shutdown", "shutdown")
+        ),
+    )
+    monkeypatch.setattr(
+        rollout, "_task_runtime", lambda task, _network: runtimes[task]
+    )
+    direct_probe = []
+
+    def direct_health(url, *, network_namespace_pid):
+        direct_probe.append((url, network_namespace_pid))
+        return health(
+            next(runtime["container"] for runtime in runtimes.values() if next(iter(runtime["addresses"])) in url)
+        )
+
+    monkeypatch.setattr(rollout, "_request_json", direct_health)
+    rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES)
+    # The ingress namespace is resolved once and reused for every overlay probe
+    # rather than re-resolved per task (which would race with a Traefik restart).
+    assert len(ingress_calls) == 1
+    # Every per-replica probe runs inside the captured ingress namespace; a
+    # bare host-namespace probe (network_namespace_pid omitted or None) is the
+    # bug this pins.
+    assert len(direct_probe) == rollout.REPLICAS
+    assert {namespace_pid for _url, namespace_pid in direct_probe} == {4321}
 
 
 @pytest.mark.parametrize("drift", ["missing", "extra"])
@@ -1257,7 +1357,7 @@ def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
         return subprocess.CompletedProcess(command, 0, json.dumps(network), "")
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
-    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: None)
+    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: 4321)
     monkeypatch.setattr(
         rollout,
         "_task_state",
@@ -1272,7 +1372,7 @@ def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
     monkeypatch.setattr(
         rollout,
         "_request_json",
-        lambda url, *_args: health(
+        lambda url, *_args, network_namespace_pid: health(
             next(r["container"] for r in runtimes.values() if next(iter(r["addresses"])) in url),
             revision=revision,
         ),
