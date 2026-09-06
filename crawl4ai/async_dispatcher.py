@@ -475,6 +475,18 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
             if active_tasks:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
 
+            # Discard URLs that were queued by this batch but never started.
+            # self.task_queue persists across run_urls calls (created once in
+            # __init__), so without this drain any URLs left queued when a
+            # batch ends abnormally would be crawled by the next run_urls call
+            # on the same dispatcher instance. run_urls_stream already drains
+            # for the same reason; this mirrors it.
+            while True:
+                try:
+                    self.task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
             memory_monitor.cancel()
             await asyncio.gather(memory_monitor, return_exceptions=True)
             if self.monitor:
