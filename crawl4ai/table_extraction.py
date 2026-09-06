@@ -244,7 +244,7 @@ class DefaultTableExtraction(TableExtractionStrategy):
             # mixing <th> (row label) with <td> data must stay data, otherwise
             # the short th-derived header list truncates every data row.
             first_row = table.xpath(".//tr[1]")
-            if first_row and not first_row[0].xpath(".//td"):
+            if first_row and not first_row[0].xpath("./td"):
                 for cell in first_row[0].xpath(".//th"):
                     text = cell.text_content().strip()
                     colspan = int(cell.get("colspan", 1))
