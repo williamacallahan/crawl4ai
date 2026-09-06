@@ -554,3 +554,208 @@ async def test_a_wedged_driver_does_not_deadlock_the_restart(monkeypatch):
     assert await asyncio.wait_for(manager._restart_browser(), timeout=3)
     assert started.is_set()
     wedged.set()
+
+
+# ---------------------------------------------------------------------------
+# Console-message capture regression coverage for `_crawl_web`.
+#
+# `UndetectedAdapter` does not push console events into `captured_console`
+# during the crawl; it buffers them in-page and surfaces them only via
+# `retrieve_console_messages`. The response is built with
+# `console_messages=captured_console` and `AsyncCrawlResponse` is a Pydantic
+# v2 model that copies its list at construction. If the in-page messages are
+# only retrieved in the `finally` block (after `return` constructs the
+# response), the response is silently empty. The fakes below model both the
+# buffering adapter (UndetectedAdapter) and the event-based adapter
+# (PlaywrightAdapter/StealthAdapter) without launching a real browser.
+# ---------------------------------------------------------------------------
+
+
+def _mock_crawl_page(url="https://example.test/"):
+    """A MagicMock page wired so `AsyncPlaywrightCrawlerStrategy._crawl_web`
+    completes a minimal happy path: `goto` returns no response (skipping the
+    redirect walk), body visibility succeeds, `page.content()` returns HTML,
+    and the finally-block page-close guard sees an empty context list."""
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=None)
+    page.url = url
+    page.content = AsyncMock(return_value="<html><body></body></html>")
+    page.wait_for_selector = AsyncMock(return_value=True)
+    page.context.browser.contexts = []
+    return page
+
+
+def _mock_strategy(adapter):
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True, text_mode=True),
+        browser_adapter=adapter,
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(_mock_crawl_page(), MagicMock())
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    # Hand the caller the page that get_page returns so assertions can pin it.
+    page = strategy.browser_manager.get_page.return_value[0]
+    return strategy, page
+
+
+class _BufferingConsoleAdapter:
+    """Models `UndetectedAdapter`: console messages buffer in-page and are
+    only surfaced by `retrieve_console_messages`. No `page.on(...)` handler
+    is registered, so `captured_console` stays empty during the crawl."""
+
+    def __init__(self, pre_return_messages, straggler_messages):
+        self.pre_return_messages = pre_return_messages
+        self.straggler_messages = straggler_messages
+        self.retrieve_calls = 0
+        self.cleanup_calls = 0
+
+    async def evaluate(self, page, expression, arg=None):
+        # `csp_compliant_wait` probes body visibility via evaluate; succeed.
+        return True
+
+    async def setup_console_capture(self, page, captured_console):
+        # No event handler — messages are NOT pushed during the crawl.
+        return None
+
+    async def setup_error_capture(self, page, captured_console):
+        return None
+
+    async def retrieve_console_messages(self, page):
+        self.retrieve_calls += 1
+        return [dict(m) for m in self.pre_return_messages]
+
+    async def cleanup_console_capture(self, page, handle_console, handle_error):
+        self.cleanup_calls += 1
+        return [dict(m) for m in self.straggler_messages]
+
+
+class _EventBasedConsoleAdapter:
+    """Models `PlaywrightAdapter`/`StealthAdapter`: messages are pushed into
+    `captured_console` during `setup_console_capture` (event-style), and
+    `retrieve_console_messages` is a no-op returning `[]`."""
+
+    def __init__(self, messages):
+        self.messages = messages
+        self.retrieve_calls = 0
+
+    async def evaluate(self, page, expression, arg=None):
+        return True
+
+    async def setup_console_capture(self, page, captured_console):
+        for m in self.messages:
+            captured_console.append(m)
+        return None
+
+    async def setup_error_capture(self, page, captured_console):
+        return None
+
+    async def retrieve_console_messages(self, page):
+        self.retrieve_calls += 1
+        return []
+
+    async def cleanup_console_capture(self, page, handle_console, handle_error):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_buffering_adapter_console_messages_reach_response():
+    """Regression for the silent data loss introduced by bdccf62: a
+    buffering adapter (UndetectedAdapter) must surface its in-page console
+    messages on the returned `AsyncCrawlResponse`, not an empty list.
+
+    Before the fix, the only retrieval ran in the `finally` block after the
+    Pydantic-copied list was already snapshotted, so the response was `[]`."""
+    pre_return = [
+        {"type": "log", "text": "log-1", "timestamp": 1.0},
+        {"type": "error", "text": "error-1", "stack": "ReferenceError", "timestamp": 1.0},
+    ]
+    stragglers = [{"type": "error", "text": "straggler", "timestamp": 2.0}]
+    adapter = _BufferingConsoleAdapter(pre_return, stragglers)
+    strategy, page = _mock_strategy(adapter)
+
+    result = await strategy._crawl_web(
+        "https://example.test/",
+        CrawlerRunConfig(capture_console_messages=True),
+    )
+
+    # The pre-return retrieval must run before the response is built.
+    assert adapter.retrieve_calls == 1
+    # The finally-block teardown still runs exactly once.
+    assert adapter.cleanup_calls == 1
+    # The response carries the buffered messages (empty `[]` without the fix).
+    assert result.console_messages is not None
+    assert [m["text"] for m in result.console_messages] == ["log-1", "error-1"]
+    # Pre-existing straggler-window: messages surfaced only in `finally` run
+    # after Pydantic copied the list, so they do not reach the response.
+    assert "straggler" not in [m["text"] for m in result.console_messages]
+    # The page is still released exactly once.
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_event_based_adapter_console_messages_still_reach_response():
+    """The pre-return `retrieve_console_messages` call is a no-op for
+    event-based adapters (PlaywrightAdapter/StealthAdapter), so the
+    already-populated `captured_console` must still reach the response
+    unchanged — guarding against a regression on the default adapter path."""
+    event_messages = [{"type": "log", "text": "event-log", "timestamp": 1.0}]
+    adapter = _EventBasedConsoleAdapter(event_messages)
+    strategy, page = _mock_strategy(adapter)
+
+    result = await strategy._crawl_web(
+        "https://example.test/",
+        CrawlerRunConfig(capture_console_messages=True),
+    )
+
+    # The no-op pre-return retrieval is invoked (safe for all adapter types).
+    assert adapter.retrieve_calls == 1
+    assert result.console_messages is not None
+    assert [m["text"] for m in result.console_messages] == ["event-log"]
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_console_capture_disabled_returns_none_and_skips_retrieval():
+    """When `capture_console_messages` is False, no retrieval runs and the
+    response field is `None` — the pre-return call must be guarded by the
+    capture flag so disabled crawls stay zero-cost on the adapter surface."""
+    adapter = _BufferingConsoleAdapter(
+        [{"type": "log", "text": "should-not-appear"}], []
+    )
+    strategy, page = _mock_strategy(adapter)
+
+    result = await strategy._crawl_web(
+        "https://example.test/",
+        CrawlerRunConfig(capture_console_messages=False),
+    )
+
+    assert adapter.retrieve_calls == 0
+    assert result.console_messages is None
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_buffering_adapter_release_page_even_if_cleanup_raises():
+    """A buffering adapter whose `retrieve_console_messages` raises during
+    the pre-return retrieval must not strand the page: `_crawl_web` still
+    releases it via the `finally` block (the lifecycle invariant pinned by
+    `test_repeated_cancellation_during_console_cleanup_still_releases_page`,
+    extended here to the pre-return retrieval path)."""
+    class _RaisingRetrieve(_BufferingConsoleAdapter):
+        async def retrieve_console_messages(self, page):
+            self.retrieve_calls += 1
+            raise RuntimeError("page is gone")
+
+    adapter = _RaisingRetrieve([], [])
+    strategy, page = _mock_strategy(adapter)
+
+    with pytest.raises(RuntimeError, match="page is gone"):
+        await strategy._crawl_web(
+            "https://example.test/",
+            CrawlerRunConfig(capture_console_messages=True),
+        )
+
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(page)

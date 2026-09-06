@@ -1166,7 +1166,19 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             is_local_content = url.startswith("file://") or url.startswith("raw://") or url.startswith("raw:")
             if not is_local_content:
                 redirected_url = page.url  # Use current page URL to capture JS redirects
-            
+
+            # For adapters that buffer console messages in-page (e.g.
+            # UndetectedAdapter), surface them BEFORE building the response.
+            # AsyncCrawlResponse is a Pydantic v2 model that copies its
+            # console_messages list at construction, so the finally-block
+            # retrieval alone would never reach the returned response. For
+            # event-based adapters (PlaywrightAdapter/StealthAdapter),
+            # retrieve_console_messages is a no-op, so this is safe for all
+            # adapter types.
+            if config.capture_console_messages:
+                final_messages = await self.adapter.retrieve_console_messages(page)
+                captured_console.extend(final_messages or [])
+
             # Return complete response
             return AsyncCrawlResponse(
                 html=html,
