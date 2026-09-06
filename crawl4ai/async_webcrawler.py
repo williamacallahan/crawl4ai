@@ -174,6 +174,7 @@ class AsyncWebCrawler:
         
         self.url_seeder: Optional[AsyncUrlSeeder] = None
         self._domain_mapper: Optional[DomainMapper] = None
+        self._domain_mapper_lock = asyncio.Lock()
 
     async def start(self):
         """
@@ -1294,14 +1295,17 @@ class AsyncWebCrawler:
         Returns:
             List of discovered URL dicts with metadata.
         """
-        if not self._domain_mapper:
-            self._domain_mapper = DomainMapper(
-                logger=self.logger,
-                base_directory=self.crawl4ai_folder,
+        async with self._domain_mapper_lock:
+            if not self._domain_mapper:
+                self._domain_mapper = DomainMapper(
+                    logger=self.logger,
+                    base_directory=self.crawl4ai_folder,
+                )
+
+            mapper_config = (
+                config.clone(**kwargs)
+                if config and kwargs
+                else (config or DomainMapperConfig(**kwargs) if kwargs else DomainMapperConfig())
             )
 
-        mapper_config = config.clone(**kwargs) if config and kwargs else (
-            config or DomainMapperConfig(**kwargs) if kwargs else DomainMapperConfig()
-        )
-
-        return await self._domain_mapper.scan(domain, mapper_config)
+            return await self._domain_mapper.scan(domain, mapper_config)
