@@ -724,7 +724,45 @@ class EmbeddingStrategy(CrawlStrategy):
             self._kb_embeddings_hash = kb_hash
             
         return self._distance_matrix_cache
-        
+
+    @staticmethod
+    def _extract_query_variations(variations: Any) -> List[str]:
+        """Normalize an LLM query-variation response into a list of strings.
+
+        ``map_query_semantic_space`` asks for ``{"queries": [...]}`` and requests
+        ``response_format={"type": "json_object"}``, but neither pins the shape at
+        runtime: providers that drop ``response_format`` may return a bare JSON
+        array (the literal prompt body), and providers that honor it may wrap the
+        array under any key. This helper accepts every legal shape and raises a
+        clear ``ValueError`` for anything else, so callers never see a raw
+        ``TypeError``/``KeyError`` from the model choosing a different shape.
+        """
+        if isinstance(variations, list):
+            raw = variations
+        elif isinstance(variations, dict):
+            if isinstance(variations.get("queries"), list):
+                raw = variations["queries"]
+            else:
+                list_values = [v for v in variations.values() if isinstance(v, list)]
+                if not list_values:
+                    raise ValueError(
+                        "LLM query-variation response was a JSON object but "
+                        f"contained no list of strings (keys: {list(variations.keys())})."
+                    )
+                if len(list_values) == 1:
+                    raw = list_values[0]
+                else:
+                    string_lists = [
+                        v for v in list_values if all(isinstance(item, str) for item in v)
+                    ]
+                    raw = string_lists[0] if len(string_lists) == 1 else max(list_values, key=len)
+        else:
+            raise ValueError(
+                "LLM query-variation response was neither a JSON array nor a JSON "
+                f"object (got {type(variations).__name__})."
+            )
+        return [str(q).strip() for q in raw if q is not None and str(q).strip()]
+
     async def map_query_semantic_space(self, query: str, n_synthetic: int = 10) -> Any:
         """Generate a point cloud representing the semantic neighborhood of the query"""
         from .utils import perform_completion_with_backoff
@@ -734,11 +772,11 @@ class EmbeddingStrategy(CrawlStrategy):
         
         # Generate variations using LLM
         prompt = f"""Generate {n_total} variations of this query that explore different aspects: '{query}'
-        
+
         These should be queries a user might ask when looking for similar information.
         Include different phrasings, related concepts, and specific aspects.
-        
-        Return as a JSON array of strings."""
+
+        Return as a JSON object with a "queries" key containing an array of strings, e.g. {{"queries": ["variation 1", "variation 2"]}}."""
         
         # Use a chat completion model for query generation
         llm_config_dict = self._get_query_llm_config_dict()
@@ -763,35 +801,16 @@ class EmbeddingStrategy(CrawlStrategy):
             finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
             raise ValueError(f"LLM returned no content (finish_reason: {finish_reason})")
         variations = json.loads(content)
-        
-        
-        # # Mock data with more variations for split
-        # variations ={'queries': ['what are the best vegetables to use in fried rice?', 'how do I make vegetable fried rice from scratch?', 'can you provide a quick recipe for vegetable fried rice?', 'what cooking techniques are essential for perfect fried rice with vegetables?', 'how to add flavor to vegetable fried rice?', 'are there any tips for making healthy fried rice with vegetables?']}
-        
-        
-        # variations = {'queries': [
-        #     'How do async and await work with coroutines in Python?',
-        #     'What is the role of event loops in asynchronous programming?',
-        #     'Can you explain the differences between async/await and traditional callback methods?',
-        #     'How do coroutines interact with event loops in JavaScript?',
-        #     'What are the benefits of using async await over promises in Node.js?',
-        #     'How to manage multiple coroutines with an event loop?',
-        #     'What are some common pitfalls when using async await with coroutines?',
-        #     'How do different programming languages implement async await and event loops?',
-        #     'What happens when an async function is called without await?',
-        #     'How does the event loop handle blocking operations?',
-        #     'Can you nest async functions and how does that affect the event loop?',
-        #     'What is the performance impact of using async/await?'
-        # ]}
-        
-        # Split into train and validation
-        # all_queries = [query] + variations['queries']
-        
+        query_variations = self._extract_query_variations(variations)
+
+        if not query_variations:
+            raise ValueError("LLM returned no query variations.")
+
         # Randomly shuffle for proper train/val split (keeping original query in training)
         import random
-        
+
         # Keep original query always in training
-        other_queries = variations['queries'].copy()
+        other_queries = list(query_variations)
         random.shuffle(other_queries)
         
         # Split: 80% for training, 20% for validation
