@@ -250,14 +250,42 @@ class DefaultTableExtraction(TableExtractionStrategy):
                     colspan = int(cell.get("colspan", 1))
                     headers.extend([text] * colspan)
         
-        # Extract rows with colspan handling
+        # Extract rows honoring both colspan and rowspan (HTML table model).
+        # A cell with rowspan="N" is duplicated down into the N-1 continuation
+        # rows it occupies via a per-column pending carry-down buffer.
         rows = []
+        pending = {}  # col_index -> (value, rows_remaining)
         for row in table.xpath(".//tr[not(ancestor::thead)]"):
             row_data = []
+            col = 0
             for cell in row.xpath(".//td"):
+                # Fill columns still occupied by an earlier rowspan before
+                # consuming this row's own cell.
+                while col in pending:
+                    val, left = pending[col]
+                    row_data.append(val)
+                    if left - 1 <= 0:
+                        pending.pop(col, None)
+                    else:
+                        pending[col] = (val, left - 1)
+                    col += 1
                 text = cell.text_content().strip()
                 colspan = int(cell.get("colspan", 1))
-                row_data.extend([text] * colspan)
+                rowspan = int(cell.get("rowspan", 1))
+                for _ in range(colspan):
+                    row_data.append(text)
+                    if rowspan > 1:
+                        pending[col] = (text, rowspan - 1)
+                    col += 1
+            # Flush any pending spans that extend past this row's own cells.
+            while col in pending:
+                val, left = pending[col]
+                row_data.append(val)
+                if left - 1 <= 0:
+                    pending.pop(col, None)
+                else:
+                    pending[col] = (val, left - 1)
+                col += 1
             if row_data:
                 rows.append(row_data)
         
