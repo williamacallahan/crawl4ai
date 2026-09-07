@@ -125,6 +125,19 @@ class CrawlJobWorker:
                 timeout=self.queue.settings.max_attempt_seconds,
             )
             if not done:
+                # Cancel the crawl before releasing the attempt: otherwise the
+                # crawl can dispatch its own competing terminal write (complete or
+                # mark_retry) during _release_stalled_attempt's Redis await, racing
+                # the release's write and dropping the webhook when the crawl's
+                # write wins. The finally block still guards both tasks, but it ran
+                # too late to prevent the race because the release awaited Redis
+                # first.
+                if not operation_task.done():
+                    operation_task.cancel()
+                if not heartbeat_task.done():
+                    heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await operation_task
                 return await self._release_stalled_attempt(entry, payload, attempt)
             if operation_task in done:
                 return operation_task.result()
