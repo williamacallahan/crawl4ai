@@ -8,18 +8,14 @@ import pathlib
 import re
 from typing import Union, List, Optional
 
-# JSON_SCHEMA_BUILDER is still used elsewhere,
-# but we now also need the new script-builder prompt.
 from ..prompts import GENERATE_JS_SCRIPT_PROMPT, GENERATE_SCRIPT_PROMPT
-import logging
-import re
 
 from .c4a_result import (
-    CompilationResult, ValidationResult, ErrorDetail, WarningDetail,
+    CompilationResult, ValidationResult, ErrorDetail,
     ErrorType, Severity, Suggestion
 )
 from .c4ai_script import Compiler
-from lark.exceptions import UnexpectedToken, UnexpectedCharacters, VisitError
+from lark.exceptions import UnexpectedToken, UnexpectedCharacters
 from ..async_configs import LLMConfig
 from ..utils import perform_completion_with_backoff
 
@@ -35,7 +31,6 @@ class C4ACompiler:
         "missing_endproc": "E004",
         "undefined_proc": "E005",
         "missing_backticks": "E006",
-        "invalid_command": "E007",
         "syntax_error": "E999"
     }
     
@@ -73,9 +68,6 @@ class C4ACompiler:
                     "statementCount": len(js_code)
                 }
             )
-            
-            # Add any warnings (future feature)
-            # result.warnings = cls._check_warnings(script_text)
             
             return result
             
