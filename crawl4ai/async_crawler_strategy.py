@@ -943,7 +943,9 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     # )
 
                     target_width = self.browser_config.viewport_width
-                    target_height = int(target_width * page_width / page_height * 0.95)
+                    target_height = int(target_width * page_height / page_width)
+                    if target_height < page_height:
+                        target_height = page_height
                     await page.set_viewport_size(
                         {"width": target_width, "height": target_height}
                     )
