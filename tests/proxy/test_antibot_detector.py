@@ -444,6 +444,50 @@ check("visibility:visible is not treated as hidden",
 
 
 # =========================================================================
+# css_selector fragment regressions
+# =========================================================================
+# When a css_selector is set, the captured HTML is wrapped in
+# "<div class='crawl4ai-result'>...</div>" (a <div>-prefixed fragment), not an
+# <html>-rooted document. The bug-report fix ensures 403/503 block pages
+# captured this way are still flagged as blocked, while legitimate 200
+# content fragments and XML feed responses remain exempt.
+print("\n=== css_selector FRAGMENT REGRESSIONS ===\n")
+
+check("403 css_selector empty fragment is blocked",
+    is_blocked(403, "<div class='crawl4ai-result'>\n\n</div>"),
+    True, "403")
+
+check("503 css_selector empty fragment is blocked",
+    is_blocked(503, "<div class='crawl4ai-result'>\n\n</div>"),
+    True, "503")
+
+check("403 <body>-prefixed fragment is blocked",
+    is_blocked(403, "<body><h1>Forbidden</h1>nginx</body>"),
+    True, "403")
+
+# Legitimate content captured via css_selector on HTTP 200 must NOT be flagged
+# (guards the Tier 3 "no <body>" signal suppression for fragments).
+_substantial_fragment = (
+    "<div class='crawl4ai-result'>"
+    + '<div class="product"><a href="/p/1">Wireless Mouse</a>'
+    + '<p>Ergonomic wireless mouse with precision tracking</p></div>' * 5
+    + "</div>"
+)
+check("200 substantial css_selector fragment is not blocked",
+    is_blocked(200, _substantial_fragment),
+    False)
+
+# Declaration-less XML feed roots on 403 must remain exempt (no over-blocking
+# of the data responses crawl4ai fetches for sitemap/RSS/Atom discovery).
+check("403 XML feed (rss) is not blocked (data exemption)",
+    is_blocked(403, '<rss version="2.0"><channel><item>x</item></channel></rss>'),
+    False)
+check("403 XML feed (urlset) is not blocked (data exemption)",
+    is_blocked(403, '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>'),
+    False)
+
+
+# =========================================================================
 # SUMMARY
 # =========================================================================
 print(f"\n{'=' * 60}")

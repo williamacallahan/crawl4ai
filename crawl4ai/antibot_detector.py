@@ -157,6 +157,14 @@ def _visible_text_len(html: str) -> Optional[int]:
 _BLOCK_PAGE_MAX_SIZE = 5000   # 403 + short page = likely block
 _EMPTY_CONTENT_THRESHOLD = 100  # 200 + near-empty = JS-blocked render
 
+# Declaration-less XML feed roots and XML prologs that are genuine data
+# responses. Matched by name so HTML fragments (e.g. a css_selector-wrapped
+# block page whose body starts with <div>) are NOT exempted from the
+# 403/503 / structural checks.
+_XML_DATA_ROOTS = (
+    '<?xml', '<rss', '<urlset', '<sitemapindex', '<feed', '<rdf',
+)
+
 
 def _looks_like_data(html: str) -> bool:
     """Check if content looks like a JSON/XML API response (not an HTML block page)."""
@@ -171,8 +179,9 @@ def _looks_like_data(html: str) -> bool:
         if re.search(r'<body[^>]*>\s*<pre[^>]*>\s*[{\[]', stripped[:500], re.IGNORECASE):
             return True
         return False
-    # Other XML-like content
-    return stripped[0] == '<'
+    # Declaration-less XML feed roots / prologs only; any other < prefixed
+    # content (e.g. a css_selector fragment of a block page) is HTML.
+    return stripped[0] == '<' and stripped[:14].lower().startswith(_XML_DATA_ROOTS)
 
 
 def _structural_integrity_check(html: str) -> Tuple[bool, str]:
@@ -193,8 +202,14 @@ def _structural_integrity_check(html: str) -> Tuple[bool, str]:
 
     signals = []
 
-    # Signal 1: No <body> tag — definitive structural failure
-    if not _BODY_RE.search(html):
+    # Signal 1: No <body> tag — definitive structural failure.
+    # Only meaningful for full HTML documents (<html>/<!) and plain text. An
+    # HTML fragment (e.g. a css_selector-wrapped result starting with <div)
+    # legitimately has no <body> tag, so its absence is not a structural
+    # failure there — the remaining content/text signals handle fragments.
+    _head = html.lstrip()[:10].lower()
+    _is_fragment = _head.startswith("<") and not _head.startswith(("<html", "<!"))
+    if not _is_fragment and not _BODY_RE.search(html):
         return True, f"Structural: no <body> tag ({html_len} bytes)"
 
     # Signal 2: Minimal visible text after stripping scripts/styles/tags and
