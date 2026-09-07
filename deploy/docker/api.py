@@ -1367,7 +1367,7 @@ async def handle_stream_crawl_request(
                 recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
                 rate_limiter=RateLimiter(
                     base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-                )
+                ) if config["crawler"]["rate_limiter"]["enabled"] else None
             )
             results_gen = await _await_before_deadline(
                 crawler.arun_many(
