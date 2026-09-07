@@ -10,10 +10,13 @@ ignored again. No browser, network, or Redis required.
 """
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
+import pytest_asyncio
 
 # deploy/docker holds ``schemas`` (imported as a bare module by the server
 # tests); put it on sys.path so we can cross-validate the client payload
@@ -22,7 +25,11 @@ _DEPLOY_DOCKER = Path(__file__).resolve().parents[2] / "deploy" / "docker"
 if str(_DEPLOY_DOCKER) not in sys.path:
     sys.path.insert(0, str(_DEPLOY_DOCKER))
 
-from crawl4ai.docker_client import Crawl4aiDockerClient  # noqa: E402
+from crawl4ai.docker_client import (  # noqa: E402
+    Crawl4aiDockerClient,
+    RequestError,
+)
+from crawl4ai.async_configs import CrawlerRunConfig  # noqa: E402
 from schemas import HookConfig  # noqa: E402
 
 
@@ -189,3 +196,159 @@ def test_api_token_sets_bearer_header():
         assert c._http_client.headers["Authorization"] == "Bearer static-token"
     finally:
         asyncio.run(c.close())
+
+
+# --- streaming crawl() error contract ---
+# crawl()'s docstring promises that a server-side rejection such as the
+# hooks-disabled 403 is "raised here as RequestError", unqualified by mode.
+# The non-streaming path honours this via _request(); these tests pin the
+# streaming path to the same contract so httpx.HTTPStatusError never leaks
+# (regression coverage for the bug introduced in commit 392c9239, where the
+# streaming refactor dropped the surrounding try/except). The responses are
+# served by an in-process ASGI app via httpx.ASGITransport, mirroring how
+# FastAPI's http_exception_handler emits a JSON 403/400 before any stream body
+# starts — so no docker server, browser, or Redis is required.
+
+def _asgi_json_error(status_code: int, detail: str):
+    async def app(scope, receive, send):
+        body = json.dumps({"detail": detail}).encode()
+        await send({"type": "http.response.start", "status": status_code,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+    return app
+
+
+def _asgi_non_json_error(status_code: int, body: bytes, content_type="text/html"):
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": status_code,
+                    "headers": [(b"content-type", content_type.encode())]})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+    return app
+
+
+def _asgi_ndjson(lines):
+    async def app(scope, receive, send):
+        body = ("".join(line + "\n" for line in lines)).encode()
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"application/x-ndjson")]})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+    return app
+
+
+@pytest_asyncio.fixture
+async def streaming_client(monkeypatch):
+    """A client whose transport is swapped per-test with an in-process ASGI app.
+
+    ``_check_server`` is a no-op so the client never reaches ``/health``. The
+    default ``_http_client`` from ``__init__`` is closed up front (it is never
+    used) and whatever client is installed at teardown is closed in the same
+    event loop, so no ``httpx.AsyncClient`` leaks regardless of which path the
+    test took.
+    """
+    async def fake_check_server(_self):
+        return None
+
+    monkeypatch.setattr(Crawl4aiDockerClient, "_check_server", fake_check_server)
+    c = Crawl4aiDockerClient(base_url="http://test", verbose=False)
+    await c._http_client.aclose()
+    try:
+        yield c
+    finally:
+        if c._http_client is not None and not c._http_client.is_closed:
+            await c._http_client.aclose()
+
+
+def _install_asgi(client, app):
+    client._http_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_raises_request_error_on_403_hooks_rejection(streaming_client):
+    """The documented 403 hooks-disabled rejection surfaces as RequestError.
+
+    This is the exact case the crawl() docstring promises ("raised here as
+    RequestError"); before the fix the streaming branch leaked
+    httpx.HTTPStatusError instead. The message must carry the JSON ``detail``
+    verbatim, proving the body was read inside the stream context (the naive
+    port of _request() -- catching outside the async with -- would yield
+    ``httpx.StreamClosed`` and lose the body).
+    """
+    _install_asgi(streaming_client, _asgi_json_error(
+        403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable."))
+    cfg = CrawlerRunConfig(stream=True)
+
+    with pytest.raises(RequestError) as exc_info:
+        gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+        async for _ in gen:
+            pass
+
+    assert not isinstance(exc_info.value, httpx.HTTPStatusError)
+    assert str(exc_info.value) == (
+        "Server error 403: Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_non_json_body_falls_back_to_str(streaming_client):
+    """A non-JSON body (e.g. text/html 502 from a proxy) falls back to str(e).
+
+    Mirrors _request()'s content-type branch so the streaming path never
+    attempts ``response.json()`` on a non-JSON body and crash with a second
+    unhandled exception.
+    """
+    _install_asgi(streaming_client, _asgi_non_json_error(502, b"<html>Bad Gateway</html>"))
+    cfg = CrawlerRunConfig(stream=True)
+
+    with pytest.raises(RequestError, match=r"Server error 502: ") as exc_info:
+        gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+        async for _ in gen:
+            pass
+
+    assert "Bad Gateway" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_2xx_still_streams_results(streaming_client):
+    """Happy path regression: a 200 NDJSON stream still yields CrawlResult objects.
+
+    The error-handling fix must not change the 2xx behaviour. Also exercises the
+    per-URL ``error`` line (logged + skipped) and the ``status == "completed"``
+    line (skipped) so those branches are not regressed by the new try/except.
+    """
+    lines = [
+        json.dumps({"url": "https://done.example.com", "html": "", "success": True,
+                    "status": "completed"}),
+        json.dumps({"error": "boom", "url": "https://failed.example.com"}),
+        json.dumps({"url": "https://ok.example.org", "html": "<p>hi</p>", "success": True}),
+    ]
+    _install_asgi(streaming_client, _asgi_ndjson(lines))
+    cfg = CrawlerRunConfig(stream=True)
+
+    gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+    yielded = [r.url async for r in gen]
+
+    assert yielded == ["https://ok.example.org"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_error_does_not_leave_body_unread(streaming_client):
+    """The response body is fully read before the stream context closes.
+
+    Guards against the naive refactor the bug report warned about: catching
+    HTTPStatusError *outside* the ``async with`` would read the body after
+    stream close. Here we assert the consumed body is reflected in the error
+    message, which is only possible if ``aread()`` ran inside the context.
+    """
+    long_detail = "x" * 500
+    _install_asgi(streaming_client, _asgi_json_error(403, long_detail))
+    cfg = CrawlerRunConfig(stream=True)
+
+    with pytest.raises(RequestError) as exc_info:
+        gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+        async for _ in gen:
+            pass
+
+    assert long_detail in str(exc_info.value)
+
