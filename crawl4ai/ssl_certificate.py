@@ -73,9 +73,13 @@ class SSLCertificate(dict):
             parsed = urlparse(url)
             if parsed.scheme.lower() != "https":
                 return None
-            hostname = parsed.netloc
-            if ":" in hostname:
-                hostname = hostname.split(":")[0]
+            # Use urlparse's hostname accessor: it correctly strips RFC 3986
+            # brackets from IPv6 literals (e.g. '[2001:db8::1]' -> '2001:db8::1'),
+            # drops userinfo, and lowercases the host -- exactly what
+            # socket.create_connection and the TLS SNI server_hostname expect.
+            # The previous manual `netloc.split(':')[0]` split broke IPv6
+            # literals (and userinfo) by splitting inside the address.
+            hostname = parsed.hostname
 
             context = ssl.create_default_context()
             # Set check_hostname to False and verify_mode to CERT_NONE temporarily

@@ -70,11 +70,16 @@ def test_from_url_attempts_tls_socket_for_https():
 
 
 def test_from_url_https_uppercase_scheme_attempts_socket():
-    """``HTTPS://`` (mixed case) must be treated as HTTPS and fetch."""
+    """``HTTPS://`` (mixed case) must be treated as HTTPS and fetch.
+
+    ``urlparse(...).hostname`` lowercases the host, which is the correct form
+    for TLS SNI (RFC 6066 specifies the DNS hostname, which is case-insensitive)
+    and for DNS resolution, so the socket call receives the lowercased host.
+    """
     with patch("crawl4ai.ssl_certificate.socket.create_connection") as mock_sock:
         SSLCertificate.from_url("HTTPS://Example.com", timeout=1)
 
-    mock_sock.assert_called_once_with(("Example.com", 443), timeout=1)
+    mock_sock.assert_called_once_with(("example.com", 443), timeout=1)
 
 
 # ---------------------------------------------------------------------------
