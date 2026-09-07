@@ -722,13 +722,21 @@ class BrowserManager:
     # This ensures multiple BrowserManager instances connecting to the same browser
     # share the same page tracking, preventing race conditions.
     _global_pages_in_use: dict = {}  # endpoint_key -> set of pages
-    _global_pages_lock: asyncio.Lock = None  # Initialized lazily
+    _global_pages_lock: Optional[asyncio.Lock] = None  # lazy-init to avoid event loop issues
+    _global_pages_lock_loop: Optional[asyncio.AbstractEventLoop] = None
 
     @classmethod
     def _get_global_lock(cls) -> asyncio.Lock:
-        """Get or create the global pages lock (lazy initialization for async context)."""
-        if cls._global_pages_lock is None:
+        """Get or create the global pages lock (lazy initialization for async context).
+
+        Recreate the lock when the running event loop changes, so the class-level
+        lock stays valid across separate ``asyncio.run`` calls (each of which makes
+        a fresh, independent loop). Mirrors ``_CDPConnectionCache._get_lock``.
+        """
+        loop = asyncio.get_running_loop()
+        if cls._global_pages_lock is None or cls._global_pages_lock_loop is not loop:
             cls._global_pages_lock = asyncio.Lock()
+            cls._global_pages_lock_loop = loop
         return cls._global_pages_lock
 
     @classmethod

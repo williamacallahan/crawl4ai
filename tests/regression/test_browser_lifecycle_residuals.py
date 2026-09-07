@@ -91,9 +91,11 @@ def _manager(config=None):
 def reset_global_pages():
     BrowserManager._global_pages_in_use.clear()
     BrowserManager._global_pages_lock = None
+    BrowserManager._global_pages_lock_loop = None
     yield
     BrowserManager._global_pages_in_use.clear()
     BrowserManager._global_pages_lock = None
+    BrowserManager._global_pages_lock_loop = None
 
 
 @pytest.mark.asyncio
@@ -554,3 +556,142 @@ async def test_a_wedged_driver_does_not_deadlock_the_restart(monkeypatch):
     assert await asyncio.wait_for(manager._restart_browser(), timeout=3)
     assert started.is_set()
     wedged.set()
+
+
+# ---------------------------------------------------------------------------
+# Cross-event-loop reuse of the class-level _global_pages_lock.
+#
+# Each asyncio.run makes a fresh, independent event loop, but BrowserManager
+# class state (including _global_pages_lock) persists across runs. Before the
+# loop-tracking fix, the lock was bound to the first loop on its first
+# contended acquire (a waiter parked on it while get_page held it across
+# `await _new_page`), and a later contended acquire on a new loop raised:
+#   RuntimeError: <asyncio.locks.Lock ...> is bound to a different event loop
+#
+# These tests are synchronous (no @pytest.mark.asyncio) on purpose: under
+# pytest-asyncio strict mode each @pytest.mark.asyncio test gets a single
+# event loop of its own, so to reproduce reuse across two loops they must call
+# asyncio.run themselves. The reset_global_pages autouse fixture clears the
+# class state before/after each test, so each test starts from a clean lock.
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_lock_recreates_on_event_loop_change():
+    """_get_global_lock tracks the running loop and recreates the lock when it
+    changes, mirroring _CDPConnectionCache._get_lock. No contention needed:
+    pre-fix the helper returned the same lock object forever, so a second
+    asyncio.run (new loop) reused the loop-1-bound lock instead of making a
+    fresh one.
+    """
+
+    async def capture_lock():
+        loop = asyncio.get_running_loop()
+        lock = BrowserManager._get_global_lock()
+        assert BrowserManager._global_pages_lock is lock
+        assert BrowserManager._global_pages_lock_loop is loop
+        return lock
+
+    lock1 = asyncio.run(capture_lock())
+    # The class-level lock survives loop 1's close (the bug is precisely that
+    # nothing resets it between runs).
+    assert BrowserManager._global_pages_lock is lock1
+    lock2 = asyncio.run(capture_lock())
+    # A new running loop must yield a new lock bound to that loop. Pre-fix
+    # lock2 was lock1 (still bound to the now-closed loop 1).
+    assert lock2 is not lock1
+    assert BrowserManager._global_pages_lock is lock2
+    assert BrowserManager._global_pages_lock_loop is not None
+
+
+def test_get_global_lock_survives_contended_reuse_across_event_loops():
+    """The actual bug shape: a *contended* acquire of a loop-1-bound lock on a
+    fresh loop 2 raised RuntimeError. Bind the class lock to loop 1 via a
+    parked waiter (the path that calls asyncio.Lock._get_loop and binds the
+    lock to its event loop), close loop 1, then contended-acquire on loop 2.
+    """
+
+    async def bind_lock_to_this_loop():
+        lock = BrowserManager._get_global_lock()
+        async with lock:
+            parked = asyncio.Event()
+
+            async def waiter():
+                async with lock:
+                    parked.set()
+
+            task = asyncio.create_task(waiter())
+            # Let the waiter run and park on the contended lock. This parking
+            # is what calls asyncio.Lock._get_loop and binds the lock to this
+            # event loop; if the waiter finished instead it never contended.
+            await asyncio.sleep(0.05)
+            assert not task.done(), "waiter did not park on the held lock"
+            assert not parked.is_set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def acquire_contended_on_new_loop():
+        # Pre-fix: the waiter's contended acquire raised
+        #   RuntimeError: <Lock ...> is bound to a different event loop
+        # because _get_global_lock returned the loop-1-bound lock.
+        lock = BrowserManager._get_global_lock()
+        async with lock:
+            acquired = asyncio.Event()
+
+            async def waiter():
+                async with lock:
+                    acquired.set()
+
+            task = asyncio.create_task(waiter())
+            await asyncio.sleep(0.05)
+            if task.done():
+                # Surface the actual failure (RuntimeError) instead of a
+                # generic assertion so the failure mode is the bug's message.
+                task.result()
+            assert not task.done(), "contended waiter crashed instead of parking"
+            assert not acquired.is_set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(bind_lock_to_this_loop())
+    assert BrowserManager._global_pages_lock is not None  # survived loop 1
+    asyncio.run(acquire_contended_on_new_loop())  # pre-fix: raises here
+
+
+def test_get_page_third_branch_survives_concurrent_reuse_across_event_loops():
+    """End-to-end regression for get_page's third branch (managed browser,
+    default config) — the exact line in the bug's traceback. Two concurrent
+    get_page calls park a waiter on _get_global_lock (binding it to the loop),
+    exactly as arun_many's default 5-wide dispatcher does; a second asyncio.run
+    with a fresh BrowserManager but the same class-level lock must not crash.
+    """
+
+    async def run_two_concurrent_get_page_calls():
+        manager = _manager(BrowserConfig(use_managed_browser=True, headless=True))
+        release = asyncio.Event()
+        started = asyncio.Event()
+        manager.default_context = _Context(
+            new_page_started=started,
+            new_page_release=release,
+        )
+
+        first = asyncio.create_task(manager.get_page(CrawlerRunConfig()))
+        await started.wait()  # first is inside _new_page, holding _get_global_lock
+        second = asyncio.create_task(manager.get_page(CrawlerRunConfig()))
+        # Let second reach _get_global_lock and park on it (or raise pre-fix).
+        await asyncio.sleep(0.05)
+        release.set()  # unblock first; it releases the lock; second acquires
+        page_a, _ = await first
+        page_b, _ = await second  # pre-fix: RuntimeError; post-fix: succeeds
+        assert page_a is not page_b
+        await manager.release_page_with_context(page_a)
+        await manager.release_page_with_context(page_b)
+
+    asyncio.run(run_two_concurrent_get_page_calls())  # loop 1: bind lock
+    assert BrowserManager._global_pages_lock is not None
+    asyncio.run(run_two_concurrent_get_page_calls())  # loop 2: must not crash
