@@ -183,7 +183,6 @@ def merge_chunks(
     """
     # Pre-tokenize all docs and store token counts
     splitter = splitter or str.split
-    token_counts = array('I')
     all_tokens: List[List[str]] = []
     total_tokens = 0
     
@@ -191,34 +190,29 @@ def merge_chunks(
         tokens = splitter(doc)
         count = int(len(tokens) * word_token_ratio)
         if count:  # Skip empty docs
-            token_counts.append(count)
             all_tokens.append(tokens)
             total_tokens += count
     
     if not total_tokens:
         return []
 
-    # Pre-allocate chunks
-    num_chunks = max(1, (total_tokens + target_size - 1) // target_size)
-    chunks: List[List[str]] = [[] for _ in range(num_chunks)]
-    
-    curr_chunk = 0
-    curr_size = 0
-    
     # Distribute tokens
+    chunks: List[List[str]] = [[]]
+    curr_size = 0.0
+
     for tokens in chain.from_iterable(all_tokens):
-        if curr_size >= target_size and curr_chunk < num_chunks - 1:
+        if chunks[-1] and curr_size + word_token_ratio > target_size:
             if overlap > 0:
-                overlap_tokens = chunks[curr_chunk][-overlap:]
-                curr_chunk += 1
-                chunks[curr_chunk].extend(overlap_tokens)
-                curr_size = len(overlap_tokens)
+                overlap_tokens = chunks[-1][-overlap:]
+                chunks.append([])
+                chunks[-1].extend(overlap_tokens)
+                curr_size = len(overlap_tokens) * word_token_ratio
             else:
-                curr_chunk += 1
-                curr_size = 0
-                
-        chunks[curr_chunk].append(tokens)
-        curr_size += 1
+                chunks.append([])
+                curr_size = 0.0
+
+        chunks[-1].append(tokens)
+        curr_size += word_token_ratio
 
     # Return only non-empty chunks
     return [' '.join(chunk) for chunk in chunks if chunk]
