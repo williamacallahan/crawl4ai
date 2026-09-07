@@ -1279,7 +1279,8 @@ async def handle_stream_crawl_request(
     browser_config: dict,
     crawler_config: dict,
     config: dict,
-    hooks_config: Optional[dict] = None
+    hooks_config: Optional[dict] = None,
+    crawler_configs: Optional[List[dict]] = None,
 ) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict], str]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
@@ -1369,10 +1370,31 @@ async def handle_stream_crawl_request(
                     base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
                 )
             )
+            if crawler_configs and len(urls) > 1:
+                # Per-URL config list: deserialize each and apply the same
+                # streaming-path post-processing applied to the shared config
+                # above, so a per-URL config behaves like the shared config on
+                # the streaming path (server defaults, deep-crawl clamp, the
+                # canonical scraping strategy, and stream=True). select_config
+                # then routes each URL to its matching config; a URL no
+                # url_matcher covers yields a failed CrawlResult (parity with
+                # the non-stream handle_crawl_request path) rather than a
+                # silently wrong-config success.
+                effective_config = [
+                    CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED)
+                    for cc in crawler_configs
+                ]
+                for cfg, request_config in zip(effective_config, crawler_configs):
+                    apply_server_crawler_defaults(cfg, request_config, config)
+                    clamp_deep_crawl(cfg)
+                    cfg.scraping_strategy = LXMLWebScrapingStrategy()
+                    cfg.stream = True
+            else:
+                effective_config = loaded_crawler_config
             results_gen = await _await_before_deadline(
                 crawler.arun_many(
                     urls=urls,
-                    config=loaded_crawler_config,
+                    config=effective_config,
                     dispatcher=dispatcher,
                 ),
                 deadline_at,
