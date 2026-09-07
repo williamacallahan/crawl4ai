@@ -837,3 +837,311 @@ class TestAPICompatibility:
         BFSDeepCrawlStrategy(max_depth=2)
         DFSDeepCrawlStrategy(max_depth=2)
         BestFirstCrawlingStrategy(max_depth=2)
+
+
+# ============================================================================
+# TEST SUITE 3: max_pages boundary resume (stale-checkpoint regression)
+# ============================================================================
+
+def _make_tree_crawler(tree: Dict[str, List[str]], fetch_log: List[str]):
+    """Mock crawler where each URL's children come from ``tree``; records fetches.
+
+    Each call records the requested URLs into ``fetch_log`` (in order) and
+    returns one successful result per URL whose ``links`` are the children
+    listed in ``tree`` for that URL. Honours both batch (``stream=False``)
+    and streaming (``stream=True``) configs.
+    """
+
+    async def mock_arun_many(urls, config):
+        fetch_log.extend(urls)
+        results = []
+        for url in urls:
+            result = MagicMock()
+            result.url = url
+            result.success = True
+            result.metadata = {}
+            result.links = {
+                "internal": [{"href": child} for child in tree.get(url, [])],
+                "external": [],
+            }
+            results.append(result)
+        if config.stream:
+            async def gen():
+                for r in results:
+                    yield r
+            return gen()
+        return results
+
+    crawler = MagicMock()
+    crawler.arun_many = mock_arun_many
+    return crawler
+
+
+def _stream_config():
+    """A mock config whose clone honours the requested stream flag (BestFirst
+    always clones with stream=True; BFS/DFS clone per mode)."""
+    config = create_mock_config()
+    config.clone = lambda **kw: create_mock_config(stream=kw.get("stream", False))
+    return config
+
+
+class TestMaxPagesBoundaryResumeNoDuplicate:
+    """Resuming from a checkpoint captured at the max_pages boundary must NOT
+    re-fetch the boundary URL.
+
+    Regression for the stale-checkpoint-at-boundary bug: the max_pages break
+    used to fire *before* the ``on_state_change`` checkpoint capture, so the
+    last checkpoint reflected the previous page (boundary still on the
+    stack/pending/queue, ``pages_crawled`` one short). Resuming from that
+    checkpoint re-fetched the boundary URL — ``max_pages + 1`` fetches for
+    ``max_pages`` unique pages.
+
+    The fix moves link discovery and the state capture to run *before* the
+    max_pages break so the boundary page is fully reflected in the checkpoint.
+    """
+
+    _TREE = {
+        "https://a.example.com": [
+            "https://b.example.com/",
+            "https://c.example.com/",
+            "https://d.example.com/",
+        ],
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_pages", [1, 2, 3])
+    @pytest.mark.parametrize(
+        ("strategy_class", "mode"),
+        [
+            (BFSDeepCrawlStrategy, "batch"),
+            (BFSDeepCrawlStrategy, "stream"),
+            (DFSDeepCrawlStrategy, "batch"),
+            (DFSDeepCrawlStrategy, "stream"),
+        ],
+        ids=["bfs-batch", "bfs-stream", "dfs-batch", "dfs-stream"],
+    )
+    async def test_boundary_resume_no_duplicate(self, strategy_class, mode, max_pages):
+        captured: List[Dict[str, Any]] = []
+
+        async def capture(state):
+            captured.append(state)
+
+        config = _stream_config()
+
+        phase1: List[str] = []
+        strategy1 = strategy_class(
+            max_depth=5, max_pages=max_pages, on_state_change=capture
+        )
+        crawler1 = _make_tree_crawler(self._TREE, phase1)
+        if mode == "batch":
+            await strategy1._arun_batch("https://a.example.com", crawler1, config)
+        else:
+            async for _ in strategy1._arun_stream("https://a.example.com", crawler1, config):
+                pass
+
+        # Phase 1 must hit the boundary exactly with no overshoot.
+        assert strategy1._pages_crawled == max_pages
+        assert len(phase1) == max_pages, (
+            f"Phase-1 fetched {len(phase1)} URLs, expected exactly {max_pages}: {phase1}"
+        )
+        # A checkpoint must be captured for EVERY successful page, including
+        # the boundary. Before the fix the boundary page captured nothing.
+        assert len(captured) == max_pages, (
+            f"State captured {len(captured)} times, expected {max_pages} (one per "
+            "successful page, including the boundary)"
+        )
+        last = captured[-1]
+        # FRESH checkpoint: pages_crawled reflects the boundary page, not the
+        # previous one. Before the fix this was max_pages - 1.
+        assert last["pages_crawled"] == max_pages, (
+            f"Stale checkpoint: last pages_crawled={last['pages_crawled']}, "
+            f"expected {max_pages}"
+        )
+
+        # Phase 2: resume from the boundary checkpoint with the SAME max_pages.
+        phase2: List[str] = []
+        strategy2 = strategy_class(
+            max_depth=5, max_pages=max_pages, resume_state=last
+        )
+        crawler2 = _make_tree_crawler(self._TREE, phase2)
+        if mode == "batch":
+            await strategy2._arun_batch("https://a.example.com", crawler2, config)
+        else:
+            async for _ in strategy2._arun_stream("https://a.example.com", crawler2, config):
+                pass
+
+        # Core guarantee: resume must NOT re-fetch any URL. The boundary is
+        # already reflected in pages_crawled, so the top-of-loop guard stops
+        # immediately and no URL is popped for crawling.
+        assert phase2 == [], (
+            f"Resume re-fetched {len(phase2)} URL(s): {phase2}"
+        )
+        assert strategy2._pages_crawled == max_pages
+        # No duplicate fetches across the two invocations, and the combined
+        # run yields exactly max_pages unique pages.
+        combined = phase1 + phase2
+        assert len(set(combined)) == len(combined), (
+            f"Duplicate fetches across phase 1 + phase 2: {combined}"
+        )
+        assert len(set(combined)) == max_pages, (
+            f"Combined unique fetches = {len(set(combined))}, expected {max_pages}"
+        )
+        # The boundary URL (last fetched in phase 1) must not be re-fetched.
+        assert phase1[-1] not in phase2, (
+            f"Boundary URL {phase1[-1]} was re-fetched on resume"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+    async def test_dfs_boundary_with_children_resume_no_duplicate(self, stream):
+        """DFS where the boundary page itself has children (report scenario).
+
+        Tree A -> B -> (C, D) with max_pages=2: B is the boundary page and it
+        has children C, D. Before the fix the checkpoint captured after A had
+        B still on the stack and pages_crawled=1, so resume re-fetched B.
+        """
+        tree = {
+            "https://a.example.com": ["https://b.example.com/"],
+            "https://b.example.com/": [
+                "https://c.example.com/",
+                "https://d.example.com/",
+            ],
+        }
+
+        captured: List[Dict[str, Any]] = []
+
+        async def capture(state):
+            captured.append(state)
+
+        config = _stream_config()
+
+        phase1: List[str] = []
+        strategy1 = DFSDeepCrawlStrategy(
+            max_depth=5, max_pages=2, on_state_change=capture
+        )
+        crawler1 = _make_tree_crawler(tree, phase1)
+        if stream:
+            async for _ in strategy1._arun_stream("https://a.example.com", crawler1, config):
+                pass
+        else:
+            await strategy1._arun_batch("https://a.example.com", crawler1, config)
+
+        assert strategy1._pages_crawled == 2
+        assert phase1 == ["https://a.example.com", "https://b.example.com/"]
+        assert len(captured) == 2, (
+            "Checkpoint must be captured for the boundary page B, not just A"
+        )
+        last = captured[-1]
+        assert last["pages_crawled"] == 2, (
+            f"Boundary checkpoint stale: pages_crawled={last['pages_crawled']}"
+        )
+        # B has been popped and crawled; it must be in visited and not on the
+        # stack in the boundary checkpoint.
+        assert "https://b.example.com/" in last["visited"], (
+            "Boundary URL B must be in visited in the boundary checkpoint"
+        )
+        stack_urls = [item["url"] for item in last["stack"]]
+        assert "https://b.example.com/" not in stack_urls, (
+            f"Boundary URL B must not still be on the stack: {stack_urls}"
+        )
+
+        # Resume from the boundary checkpoint.
+        phase2: List[str] = []
+        strategy2 = DFSDeepCrawlStrategy(
+            max_depth=5, max_pages=2, resume_state=last
+        )
+        crawler2 = _make_tree_crawler(tree, phase2)
+        if stream:
+            async for _ in strategy2._arun_stream("https://a.example.com", crawler2, config):
+                pass
+        else:
+            await strategy2._arun_batch("https://a.example.com", crawler2, config)
+
+        assert phase2 == [], (
+            f"Resume re-fetched boundary URL B: {phase2}"
+        )
+        combined = ["https://a.example.com", "https://b.example.com/"] + phase2
+        assert len(set(combined)) == 2, (
+            f"Combined run must yield 2 unique pages, got {combined}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+    async def test_bfs_boundary_resume_no_duplicate(self, stream):
+        """BFS where the boundary page is reached mid-level (report scenario).
+
+        Tree A -> [B, C, D] with max_pages=2: A is page 1, B is the boundary
+        (page 2). Before the fix the checkpoint captured after A had B in
+        pending and pages_crawled=1, so resume re-fetched B.
+        """
+        tree = {
+            "https://a.example.com": [
+                "https://b.example.com/",
+                "https://c.example.com/",
+                "https://d.example.com/",
+            ],
+        }
+
+        captured: List[Dict[str, Any]] = []
+
+        async def capture(state):
+            captured.append(state)
+
+        config = _stream_config()
+
+        phase1: List[str] = []
+        strategy1 = BFSDeepCrawlStrategy(
+            max_depth=5, max_pages=2, on_state_change=capture
+        )
+        crawler1 = _make_tree_crawler(tree, phase1)
+        if stream:
+            async for _ in strategy1._arun_stream("https://a.example.com", crawler1, config):
+                pass
+        else:
+            await strategy1._arun_batch("https://a.example.com", crawler1, config)
+
+        assert strategy1._pages_crawled == 2
+        assert phase1 == ["https://a.example.com", "https://b.example.com/"]
+        assert len(captured) == 2, (
+            "Checkpoint must be captured for the boundary page B, not just A"
+        )
+        last = captured[-1]
+        assert last["pages_crawled"] == 2, (
+            f"Boundary checkpoint stale: pages_crawled={last['pages_crawled']}"
+        )
+        pending_urls = [item["url"] for item in last["pending"]]
+        assert "https://b.example.com/" not in pending_urls, (
+            f"Boundary URL B must not still be in pending: {pending_urls}"
+        )
+
+        phase2: List[str] = []
+        strategy2 = BFSDeepCrawlStrategy(
+            max_depth=5, max_pages=2, resume_state=last
+        )
+        crawler2 = _make_tree_crawler(tree, phase2)
+        if stream:
+            async for _ in strategy2._arun_stream("https://a.example.com", crawler2, config):
+                pass
+        else:
+            await strategy2._arun_batch("https://a.example.com", crawler2, config)
+
+        assert phase2 == [], (
+            f"Resume re-fetched boundary URL B: {phase2}"
+        )
+        combined = ["https://a.example.com", "https://b.example.com/"] + phase2
+        assert len(set(combined)) == 2, (
+            f"Combined run must yield 2 unique pages, got {combined}"
+        )
+
+
+# ============================================================================
+# BestFirst note (out of scope for this fix)
+# ---------------------------------------------------------------------------
+# BestFirstCrawlingStrategy shares the literal ``break``-before-state-capture
+# pattern, but it ALSO has a separate, pre-existing overshoot bug: its batch
+# pop loop uses ``BATCH_SIZE`` instead of the computed ``batch_size``, so it
+# can pop and fetch more URLs than ``remaining`` allows in a single batch.
+# That confounds the boundary-resume scenario (extra URLs are fetched but not
+# counted) and is orthogonal to the stale-checkpoint defect fixed here. It is
+# tracked separately and intentionally not asserted in this suite.
+# ============================================================================
