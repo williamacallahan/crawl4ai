@@ -280,7 +280,15 @@ class CosineStrategy(ExtractionStrategy):
         self, documents: List[str], semantic_filter: str, at_least_k: int = 20
     ) -> List[str]:
         """
-        Filter and sort documents based on the cosine similarity of their embeddings with the semantic_filter embedding.
+        Filter documents by semantic similarity to ``semantic_filter``.
+
+        Documents whose embedding similarity meets ``self.sim_threshold`` are
+        kept in their original input order. If fewer than ``at_least_k`` clear
+        the threshold, the result is padded with the highest-similarity
+        below-threshold documents (in descending similarity order) until
+        ``at_least_k`` is reached or the corpus is exhausted. ``at_least_k`` is
+        a floor, not a cap: when more than ``at_least_k`` documents clear the
+        threshold, all of them are returned.
 
         Args:
             documents (List[str]): A list of document texts.
@@ -288,7 +296,9 @@ class CosineStrategy(ExtractionStrategy):
             at_least_k (int): The minimum number of documents to return.
 
         Returns:
-            List[str]: A list of filtered and sorted document texts.
+            List[str]: Filtered document texts (above-threshold docs in input
+            order, followed by any below-threshold padding in similarity
+            order).
         """
 
         if not semantic_filter:
@@ -330,7 +340,7 @@ class CosineStrategy(ExtractionStrategy):
         # Extract the document texts from the tuples
         filtered_docs = [doc for doc, _ in filtered_docs]
 
-        return filtered_docs[:at_least_k]
+        return filtered_docs
 
     def get_embeddings(
         self, sentences: List[str], batch_size=None, bypass_buffer=False
