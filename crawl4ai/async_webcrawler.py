@@ -344,7 +344,7 @@ class AsyncWebCrawler:
 
                     self.logger.url_status(
                         url=cache_context.display_url,
-                        success=cached_result.success,
+                        success=bool(html),
                         timing=time.perf_counter() - start_time,
                         tag="FETCH",
                     )
