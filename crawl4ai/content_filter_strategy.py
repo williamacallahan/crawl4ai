@@ -648,6 +648,8 @@ class PruningContentFilter(RelevantContentFilter):
         Args:
             html (str): HTML content to be filtered.
             min_word_threshold (int): Minimum word threshold for filtering (optional).
+                When provided, overrides the constructor's ``min_word_threshold`` for
+                this call only.
 
         Returns:
             List[str]: List of filtered text chunks.
@@ -663,9 +665,16 @@ class PruningContentFilter(RelevantContentFilter):
         self._remove_comments(soup)
         self._remove_unwanted_tags(soup)
 
+        # A per-call min_word_threshold takes precedence over the constructor value
+        effective_threshold = (
+            min_word_threshold
+            if min_word_threshold is not None
+            else self.min_word_threshold
+        )
+
         # Prune tree starting from body
         body = soup.find("body")
-        self._prune_tree(body)
+        self._prune_tree(body, min_word_threshold=effective_threshold)
 
         # Extract remaining content as list of HTML strings
         content_blocks = []
@@ -698,12 +707,15 @@ class PruningContentFilter(RelevantContentFilter):
                 return True
         return False
 
-    def _prune_tree(self, node, preserved_ancestors=None):
+    def _prune_tree(self, node, preserved_ancestors=None, min_word_threshold=None):
         """
         Prunes the tree starting from the given node.
 
         Args:
             node (Tag): The node from which the pruning starts.
+            min_word_threshold (int): Effective minimum word threshold for this
+                pruning pass. Nodes whose text falls below this word count are
+                guaranteed removal. ``None`` disables the word-count gate.
         """
         if not node or not hasattr(node, "name") or node.name is None:
             return
@@ -738,7 +750,9 @@ class PruningContentFilter(RelevantContentFilter):
             "link_text_len": link_text_len,
         }
 
-        score = self._compute_composite_score(metrics, text_len, tag_len, link_text_len)
+        score = self._compute_composite_score(
+            metrics, text_len, tag_len, link_text_len, min_word_threshold=min_word_threshold
+        )
 
         if self.threshold_type == "fixed":
             should_remove = score < self.threshold
@@ -765,15 +779,17 @@ class PruningContentFilter(RelevantContentFilter):
         else:
             children = [child for child in node.children if hasattr(child, "name")]
             for child in children:
-                self._prune_tree(child, preserved_ancestors)
+                self._prune_tree(child, preserved_ancestors, min_word_threshold=min_word_threshold)
 
-    def _compute_composite_score(self, metrics, text_len, tag_len, link_text_len):
+    def _compute_composite_score(
+        self, metrics, text_len, tag_len, link_text_len, min_word_threshold=None
+    ):
         """Computes the composite score"""
-        if self.min_word_threshold:
+        if min_word_threshold:
             # Get raw text from metrics node - avoid extra processing
             text = metrics["node"].get_text(strip=True)
             word_count = len(text.split())
-            if word_count < self.min_word_threshold:
+            if word_count < min_word_threshold:
                 return -1.0  # Guaranteed removal
         score = 0.0
         total_weight = 0.0
