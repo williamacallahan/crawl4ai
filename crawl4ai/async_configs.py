@@ -510,6 +510,27 @@ def _clamp_untrusted(type_name: str, params: dict) -> dict:
             params["virtual_scroll_config"] = _enforce_untrusted(
                 "VirtualScrollConfig", virtual_scroll
             )
+        # Sibling nested-object fields whose __init__ has no dict->object
+        # conversion and whose type hints do not include dict. The allowlist
+        # permits these fields, so a bare dict is accepted by the filter and
+        # would be stored verbatim by __init__ — then crash downstream with
+        # AttributeError (geo.latitude / table_extraction.logger /
+        # scraping_strategy.logger) and surface as HTTP 502. Reject the bare
+        # dict shape at the gate so it routes through the
+        # UntrustedConfigError -> 400 channel. The supported wire form is the
+        # typed {"type": "<ClassName>", "params": {...}} envelope, which
+        # from_serializable_dict already deserialized into a typed instance
+        # before this branch runs, so legitimate typed inputs never match.
+        for _field, _expected in (
+            ("geolocation", "GeolocationConfig"),
+            ("table_extraction", "DefaultTableExtraction"),
+            ("scraping_strategy", "ContentScrapingStrategy"),
+        ):
+            if isinstance(params.get(_field), dict):
+                raise UntrustedConfigError(
+                    f"field '{_field}' from an untrusted request must be a "
+                    f"{_expected} instance, not a bare dict"
+                )
     elif type_name == "BrowserConfig":
         _bounded_viewport(params)
     elif type_name == "GeolocationConfig":
