@@ -612,11 +612,20 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                     
                     for completed_task in done:
                         result = await completed_task
-                        
-                        # Only count as completed if it wasn't requeued
-                        if "requeued" not in result.error_message:
-                            completed_count += 1
-                            yield result
+
+                        # Only count as completed if it wasn't requeued.
+                        # Detect requeues via the structured metadata marker
+                        # (crawl_url sets metadata={"status": "requeued"}); a
+                        # substring check on error_message is fragile, and the
+                        # prior "requeued" not in "Requeued..." check never
+                        # matched because Python str.__contains__ is
+                        # case-sensitive, which inflated completed_count with
+                        # sentinels and caused the loop to exit before the
+                        # re-enqueued retries could run.
+                        if (result.result.metadata or {}).get("status") == "requeued":
+                            continue
+                        completed_count += 1
+                        yield result
                         
                     # Update active tasks list
                     active_tasks = list(pending)
