@@ -25,6 +25,15 @@ from .browser_manager import ManagedBrowser
 from .async_logger import AsyncLogger, AsyncLoggerBase, LogColor
 from .utils import get_home_folder
 
+# psutil is a declared dependency (pyproject.toml). Importing it
+# defensively lets us degrade to existence-only PID checks if it is somehow
+# unavailable in a stripped-down environment, rather than raising at module
+# import time.
+try:
+    import psutil
+except ImportError:  # pragma: no cover - exercised via monkeypatch in tests
+    psutil = None
+
 
 class ShrinkLevel(str, Enum):
     """Profile shrink aggressiveness levels."""
@@ -1193,7 +1202,7 @@ class BrowserProfiler:
         """
         # Check if there's an existing browser still running
         browser_info = self.get_builtin_browser_info()
-        if browser_info and self._is_browser_running(browser_info.get('pid')):
+        if browser_info and self._is_browser_running(browser_info.get('pid'), browser_info):
             self.logger.info("Builtin browser is already running", tag="BUILTIN")
             return browser_info.get('cdp_url')
         
@@ -1290,9 +1299,18 @@ class BrowserProfiler:
             with open(self.builtin_config_file, 'r') as f:
                 browser_info = json.load(f)
                 
-            # Check if the browser is still running
-            if not self._is_browser_running(browser_info.get('pid')):
+            # Check if the recorded browser is still running AND still the
+            # process we launched. Passing `browser_info` makes
+            # `_is_browser_running` verify the live process's cmdline
+            # contains the recorded `--remote-debugging-port` and
+            # `--user-data-dir` flags, so a PID that the kernel has reused
+            # for an unrelated process is rejected here.
+            if not self._is_browser_running(browser_info.get('pid'), browser_info):
                 self.logger.warning("Builtin browser is not running", tag="BUILTIN")
+                # Remove the stale config so a later PID reuse cannot cause
+                # the profiler (or `crwl browser stop`/`restart`) to signal
+                # whatever process now owns the recorded PID.
+                self._unlink_stale_builtin_config()
                 return None
                 
             return browser_info
@@ -1300,23 +1318,114 @@ class BrowserProfiler:
             self.logger.error(f"Error reading builtin browser config: {str(e)}", tag="BUILTIN")
             return None
             
-    def _is_browser_running(self, pid: Optional[int]) -> bool:
-        """Check if a process with the given PID is running"""
+    def _unlink_stale_builtin_config(self) -> None:
+        """Remove the builtin browser config file if it exists.
+
+        Called when the recorded PID is gone or no longer matches the
+        browser we launched, so a subsequent PID reuse by the kernel
+        cannot trick the profiler into signaling an unrelated process.
+        Errors are logged and swallowed: a unlink failure must not turn
+        a "no browser running" path into a hard error.
+        """
+        try:
+            if os.path.exists(self.builtin_config_file):
+                os.unlink(self.builtin_config_file)
+        except OSError as e:
+            self.logger.warning(
+                f"Could not remove stale builtin browser config: {str(e)}",
+                tag="BUILTIN",
+            )
+
+    def _verify_browser_identity(
+        self, pid: int, browser_info: Dict[str, Any]
+    ) -> bool:
+        """Verify that the live process at `pid` is the browser we launched.
+
+        Confirms the process cmdline contains both the recorded
+        `--remote-debugging-port` and `--user-data-dir` flags, so a
+        recycled PID now owned by an unrelated process is rejected. This
+        is the same identity-check pattern already used on Windows by
+        `ManagedBrowser.start` (browser_manager.py).
+
+        Args:
+            pid: The PID to verify.
+            browser_info: The dict persisted in `browser_config.json`,
+                expected to contain `debugging_port` and `user_data_dir`.
+
+        Returns:
+            True if the cmdline identity matches; False if it does not,
+            if the process cannot be inspected, or if the recorded
+            identifying fields are missing. If psutil is unavailable the
+            method returns True so callers degrade to the previous
+            existence-only behavior instead of failing hard.
+        """
+        if psutil is None:
+            # Without psutil we cannot inspect cmdline; preserve the
+            # previously documented behavior (existence-only).
+            return True
+
+        debugging_port = browser_info.get('debugging_port')
+        user_data_dir = browser_info.get('user_data_dir')
+        if not debugging_port or not user_data_dir:
+            # Old config written before cmdline identity was tracked.
+            # Without the identifying fields we cannot verify, so treat
+            # it as a match rather than blocking the kill path.
+            return True
+
+        try:
+            proc = psutil.Process(pid)
+            cmdline = " ".join(proc.cmdline() or [])
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            return False
+
+        port_token = f"--remote-debugging-port={debugging_port}"
+        dir_token = f"--user-data-dir={user_data_dir}"
+        return port_token in cmdline and dir_token in cmdline
+
+    def _is_browser_running(
+        self,
+        pid: Optional[int],
+        browser_info: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Check if the recorded browser process is still running.
+
+        If `browser_info` is provided, additionally verifies that the
+        live process at `pid` is the browser we launched (its cmdline
+        contains the recorded `--remote-debugging-port` and
+        `--user-data-dir` flags), so a PID the kernel has reused for an
+        unrelated process is rejected as "not running".
+
+        Args:
+            pid: PID to check.
+            browser_info: Optional persisted browser info dict; when
+                given, cmdline identity is verified in addition to
+                existence.
+
+        Returns:
+            True if a process with `pid` exists and, when
+            `browser_info` is given, its cmdline matches the recorded
+            browser; False otherwise.
+        """
         if not pid:
             return False
-            
+
         try:
-            # Check if the process exists
+            # Check if the process exists.
             if sys.platform == "win32":
-                process = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], 
+                process = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
                                          capture_output=True, text=True)
-                return str(pid) in process.stdout
+                if str(pid) not in process.stdout:
+                    return False
             else:
                 # Unix-like systems
                 os.kill(pid, 0)  # This doesn't actually kill the process, just checks if it exists
-            return True
         except (ProcessLookupError, PermissionError, OSError):
             return False
+
+        if browser_info is None:
+            return True
+
+        return self._verify_browser_identity(pid, browser_info)
             
     async def kill_builtin_browser(self) -> bool:
         """
@@ -1333,20 +1442,38 @@ class BrowserProfiler:
         pid = browser_info.get('pid')
         if not pid:
             return False
+
+        # Re-verify identity immediately before signaling. The PID may
+        # have been recycled in the window between
+        # `get_builtin_browser_info()` and the `os.kill()`/`taskkill`
+        # below; never signal an unrelated process.
+        if not self._is_browser_running(pid, browser_info):
+            self.logger.warning(
+                "Builtin browser is not running (stale config removed)",
+                tag="BUILTIN",
+            )
+            self._unlink_stale_builtin_config()
+            return False
             
         try:
             if sys.platform == "win32":
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=True)
             else:
                 os.kill(pid, signal.SIGTERM)
-                # Wait for termination
+                # Wait for termination. Use identity checking during the
+                # poll so a PID recycled while we wait does not lead us
+                # to escalate against an unrelated process.
                 for _ in range(5):
-                    if not self._is_browser_running(pid):
+                    if not self._is_browser_running(pid, browser_info):
                         break
                     await asyncio.sleep(0.5)
                 else:
-                    # Force kill if still running
-                    os.kill(pid, signal.SIGKILL)
+                    # The recorded browser is still alive after SIGTERM;
+                    # escalate to SIGKILL only after a final identity
+                    # re-check, to defend against a PID recycled in the
+                    # gap between the last poll and now.
+                    if self._is_browser_running(pid, browser_info):
+                        os.kill(pid, signal.SIGKILL)
                     
             # Remove config file
             if os.path.exists(self.builtin_config_file):
