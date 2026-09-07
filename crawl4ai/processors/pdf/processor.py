@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
 from time import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union
 import base64
 import tempfile
@@ -452,36 +452,3 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             )
         except:
             return None
-
-# Usage example
-if __name__ == "__main__":
-    import json
-    from pathlib import Path
-    
-    try:
-        # Import pypdf only when running the file directly
-        import pypdf
-        from pypdf import PdfReader
-    except ImportError:
-        print("pypdf is required for PDF processing. Install with 'pip install crawl4ai[pdf]'")
-        exit(1)
-        
-    current_dir = Path(__file__).resolve().parent
-    pdf_path = f'{current_dir}/test.pdf'
-    
-    strategy = NaivePDFProcessorStrategy()
-    result = strategy.process(Path(pdf_path))
-    
-    # Convert to JSON
-    json_output = asdict(result)
-    print(json.dumps(json_output, indent=2, default=str))
-    
-    with open(f'{current_dir}/test.html', 'w') as f:
-        for page in result.pages:
-            f.write(f'<h1>Page {page["page_number"]}</h1>')
-            f.write(page['html'])
-    with open(f'{current_dir}/test.md', 'w') as f:
-        for page in result.pages:
-            f.write(f'# Page {page["page_number"]}\n\n')
-            f.write(clean_pdf_text(page["page_number"], page['raw_text']))
-            f.write('\n\n')
