@@ -174,6 +174,7 @@ class AsyncWebCrawler:
         
         self.url_seeder: Optional[AsyncUrlSeeder] = None
         self._domain_mapper: Optional[DomainMapper] = None
+        self._domain_mapper_lock = asyncio.Lock()
 
     async def start(self):
         """
@@ -344,7 +345,7 @@ class AsyncWebCrawler:
 
                     self.logger.url_status(
                         url=cache_context.display_url,
-                        success=cached_result.success,
+                        success=bool(html),
                         timing=time.perf_counter() - start_time,
                         tag="FETCH",
                     )
@@ -1033,18 +1034,6 @@ class AsyncWebCrawler:
         urls: List[str],
         config: Optional[Union[CrawlerRunConfig, List[CrawlerRunConfig]]] = None,
         dispatcher: Optional[BaseDispatcher] = None,
-        # Legacy parameters maintained for backwards compatibility
-        # word_count_threshold=MIN_WORD_THRESHOLD,
-        # extraction_strategy: ExtractionStrategy = None,
-        # chunking_strategy: ChunkingStrategy = RegexChunking(),
-        # content_filter: RelevantContentFilter = None,
-        # cache_mode: Optional[CacheMode] = None,
-        # bypass_cache: bool = False,
-        # css_selector: str = None,
-        # screenshot: bool = False,
-        # pdf: bool = False,
-        # user_agent: str = None,
-        # verbose=True,
         **kwargs,
     ) -> RunManyReturn:
         """
@@ -1294,14 +1283,17 @@ class AsyncWebCrawler:
         Returns:
             List of discovered URL dicts with metadata.
         """
-        if not self._domain_mapper:
-            self._domain_mapper = DomainMapper(
-                logger=self.logger,
-                base_directory=self.crawl4ai_folder,
+        async with self._domain_mapper_lock:
+            if not self._domain_mapper:
+                self._domain_mapper = DomainMapper(
+                    logger=self.logger,
+                    base_directory=self.crawl4ai_folder,
+                )
+
+            mapper_config = (
+                config.clone(**kwargs)
+                if config and kwargs
+                else (config or DomainMapperConfig(**kwargs))
             )
 
-        mapper_config = config.clone(**kwargs) if config and kwargs else (
-            config or DomainMapperConfig(**kwargs) if kwargs else DomainMapperConfig()
-        )
-
-        return await self._domain_mapper.scan(domain, mapper_config)
+            return await self._domain_mapper.scan(domain, mapper_config)
