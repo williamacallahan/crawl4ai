@@ -25,6 +25,18 @@ class RequestError(Crawl4aiClientError):
     pass
 
 
+def _http_error_detail(response: httpx.Response, error: httpx.HTTPStatusError) -> Any:
+    """Return an object-shaped JSON detail or the HTTPX error text."""
+    fallback = str(error)
+    if "application/json" not in response.headers.get("content-type", ""):
+        return fallback
+    try:
+        payload = response.json()
+    except ValueError:
+        return fallback
+    return payload.get("detail", fallback) if isinstance(payload, dict) else fallback
+
+
 class Crawl4aiDockerClient:
     """Client for interacting with Crawl4AI Docker server with token authentication."""
     
@@ -168,9 +180,7 @@ class Crawl4aiDockerClient:
         except httpx.RequestError as e:
             raise ConnectionError(f"Failed to connect: {str(e)}")
         except httpx.HTTPStatusError as e:
-            error_msg = (e.response.json().get("detail", str(e)) 
-                        if "application/json" in e.response.headers.get("content-type", "") 
-                        else str(e))
+            error_msg = _http_error_detail(e.response, e)
             raise RequestError(f"Server error {e.response.status_code}: {error_msg}")
 
     async def crawl(
@@ -237,7 +247,12 @@ class Crawl4aiDockerClient:
         if is_streaming:
             async def stream_results() -> AsyncGenerator[CrawlResult, None]:
                 async with self._http_client.stream("POST", f"{self.base_url}/crawl/stream", json=data) as response:
-                    response.raise_for_status()
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        await e.response.aread()
+                        error_msg = _http_error_detail(e.response, e)
+                        raise RequestError(f"Server error {e.response.status_code}: {error_msg}")
                     async for line in response.aiter_lines():
                         if line.strip():
                             result = json.loads(line)
