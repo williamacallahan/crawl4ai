@@ -124,3 +124,9 @@ server = [
     "websockets>=15.0.1",
     "httpx[http2]>=0.27.2",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "browser: requires the built image and its installed Chromium",
+    "network: requires external network services",
+]

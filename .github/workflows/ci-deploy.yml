@@ -58,10 +58,15 @@ jobs:
           # "not network" skips tests marked as hitting real external URLs.
           REDIS_URL=redis://127.0.0.1:6379/0 \
           PYTHONPATH="$PWD:$PWD/deploy/docker" .venv/bin/python -m pytest -q --no-header \
-            -m "not network" \
+            -m "not network and not browser" \
             deploy/docker/tests/ \
             tests/regression/ \
             tests/deep_crwaling/ \
+            tests/deep_crawling/test_deep_crawl_resume.py \
+            tests/deep_crawling/test_bfs_start_url_dedup.py \
+            tests/unit/test_domain_mapper_concurrency.py \
+            tests/proxy/test_antibot_detector.py \
+            tests/test_pruning_per_call_min_word_threshold.py \
             --ignore=deploy/docker/tests/test_1_basic.py \
             --ignore=deploy/docker/tests/test_2_memory.py \
             --ignore=deploy/docker/tests/test_3_pool.py \
@@ -139,6 +144,19 @@ jobs:
             --build-arg INSTALL_TYPE=default \
             --build-arg ENABLE_GPU=false \
             -t "${IMAGE}:${GIT_SHA}-${ARCH}" .
+          # Exercise browser regressions against the image on each architecture.
+          docker run --rm --entrypoint /bin/sh \
+            --workdir /tmp/project \
+            -e UV_PROJECT_ENVIRONMENT=/tmp/browser-test-env \
+            -e PYTHONPATH=/app \
+            "${IMAGE}:${GIT_SHA}-${ARCH}" -ec '
+              uv venv --system-site-packages /tmp/browser-test-env
+              uv export --locked --only-group test --no-hashes > /tmp/browser-test-requirements.txt
+              uv pip install --python /tmp/browser-test-env/bin/python -r /tmp/browser-test-requirements.txt
+              /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m browser \
+                deploy/docker/tests/test_real_browser_recycle_window.py \
+                tests/regression/test_adjust_viewport_screenshot_formula.py
+            '
           # Docker owns layer-transfer retries; surface its terminal failure.
           docker push "${IMAGE}:${GIT_SHA}-${ARCH}"
 
