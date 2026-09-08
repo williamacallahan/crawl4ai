@@ -5,7 +5,7 @@ import socket
 import base64
 import json
 from typing import Dict, Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 import OpenSSL.crypto
 from pathlib import Path
 
@@ -73,9 +73,19 @@ class SSLCertificate(dict):
             parsed = urlparse(url)
             if parsed.scheme.lower() != "https":
                 return None
-            hostname = parsed.netloc
+            # Use urlparse's hostname accessor: it correctly strips RFC 3986
+            # brackets from IPv6 literals (e.g. '[2001:db8::1]' -> '2001:db8::1'),
+            # drops userinfo, and lowercases the host. Scoped IPv6 literals keep
+            # an RFC 6874-encoded zone delimiter until it is decoded below.
+            # The previous manual `netloc.split(':')[0]` split broke IPv6
+            # literals (and userinfo) by splitting inside the address.
+            hostname = parsed.hostname
+            if hostname is None:
+                return None
             if ":" in hostname:
-                hostname = hostname.split(":")[0]
+                hostname = unquote(hostname)
+            port = 443 if parsed.port is None else parsed.port
+            tls_hostname = hostname.split("%", 1)[0] if ":" in hostname else hostname
 
             context = ssl.create_default_context()
             # Set check_hostname to False and verify_mode to CERT_NONE temporarily
@@ -83,8 +93,8 @@ class SSLCertificate(dict):
             # context.check_hostname = False
             # context.verify_mode = ssl.CERT_NONE
 
-            with socket.create_connection((hostname, 443), timeout=timeout) as sock:
-                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+            with socket.create_connection((hostname, port), timeout=timeout) as sock:
+                with context.wrap_socket(sock, server_hostname=tls_hostname) as ssock:
                     cert_binary = ssock.getpeercert(binary_form=True)
                     if not cert_binary:
                          print(f"Warning: No certificate returned for {hostname}")
