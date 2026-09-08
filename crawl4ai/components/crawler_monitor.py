@@ -1,5 +1,4 @@
 import time
-import uuid
 import threading
 import psutil
 from datetime import datetime, timedelta
@@ -737,24 +736,6 @@ class CrawlerMonitor:
                 "requeued_count": self.requeued_count
             }
     
-    def render(self):
-        """
-        Render the terminal UI.
-        
-        This is the main UI rendering loop that:
-        1. Updates all statistics
-        2. Formats the display
-        3. Renders the ASCII interface
-        4. Handles keyboard input
-        
-        Note: The actual rendering is handled by the TerminalUI class
-        which uses the rich library's Live display.
-        """
-        if self.enable_ui and self.terminal_ui:
-            # Force an update of the UI
-            if hasattr(self.terminal_ui, '_update_display'):
-                self.terminal_ui._update_display()
-    
     def _format_time(self, seconds: float) -> str:
         """
         Format time in hours:minutes:seconds.
@@ -783,87 +764,3 @@ class CrawlerMonitor:
         """
         summary = self.get_summary()
         return summary.get("estimated_completion_time", "N/A")
-
-
-# Example code for testing
-if __name__ == "__main__":
-    # Initialize the monitor
-    monitor = CrawlerMonitor(urls_total=100)
-    
-    # Start monitoring
-    monitor.start()
-    
-    try:
-        # Simulate some tasks
-        for i in range(20):
-            task_id = str(uuid.uuid4())
-            url = f"https://example.com/page{i}"
-            monitor.add_task(task_id, url)
-            
-            # Simulate 20% of tasks are already running
-            if i < 4:
-                monitor.update_task(
-                    task_id=task_id,
-                    status=CrawlStatus.IN_PROGRESS,
-                    start_time=time.time() - 30,  # Started 30 seconds ago
-                    memory_usage=10.5
-                )
-                
-            # Simulate 10% of tasks are completed
-            if i >= 4 and i < 6:
-                start_time = time.time() - 60
-                end_time = time.time() - 15
-                monitor.update_task(
-                    task_id=task_id,
-                    status=CrawlStatus.IN_PROGRESS,
-                    start_time=start_time,
-                    memory_usage=8.2
-                )
-                monitor.update_task(
-                    task_id=task_id,
-                    status=CrawlStatus.COMPLETED,
-                    end_time=end_time,
-                    memory_usage=0,
-                    peak_memory=15.7
-                )
-                
-            # Simulate 5% of tasks fail
-            if i >= 6 and i < 7:
-                start_time = time.time() - 45
-                end_time = time.time() - 20
-                monitor.update_task(
-                    task_id=task_id,
-                    status=CrawlStatus.IN_PROGRESS,
-                    start_time=start_time,
-                    memory_usage=12.3
-                )
-                monitor.update_task(
-                    task_id=task_id,
-                    status=CrawlStatus.FAILED,
-                    end_time=end_time,
-                    memory_usage=0,
-                    peak_memory=18.2,
-                    error_message="Connection timeout"
-                )
-        
-        # Simulate memory pressure
-        monitor.update_memory_status("PRESSURE")
-        
-        # Simulate queue statistics
-        monitor.update_queue_statistics(
-            total_queued=16,  # 20 - 4 (in progress)
-            highest_wait_time=120.5,
-            avg_wait_time=60.2
-        )
-        
-        # Keep the monitor running for a demonstration
-        print("Crawler Monitor is running. Press 'q' to exit.")
-        while monitor.is_running:
-            time.sleep(0.1)
-            
-    except KeyboardInterrupt:
-        print("\nExiting crawler monitor...")
-    finally:
-        # Stop the monitor
-        monitor.stop()
-        print("Crawler monitor exited successfully.")
