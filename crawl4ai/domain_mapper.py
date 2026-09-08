@@ -17,17 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
-import pathlib
 import re
-import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -47,7 +44,6 @@ from .async_logger import AsyncLoggerBase, AsyncLogger
 from .async_url_seeder import AsyncUrlSeeder, _parse_head
 from .utils import (
     normalize_url,
-    get_base_domain,
     is_external_url,
     quick_extract_links,
 )
@@ -117,6 +113,89 @@ class Soft404Fingerprint:
     body_hash: str
 
 
+# ────────────────────────────────────────────────────────────────────────
+#  Bounded client wrapper
+# ─────────────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def _bounded_stream(real_cm: Any, sem: Optional[asyncio.Semaphore]):
+    """Hold the request permit until the response stream closes."""
+    async with sem if sem is not None else nullcontext():
+        async with real_cm as response:
+            yield response
+
+
+class _BoundedClient:
+    """httpx.AsyncClient wrapper that bounds in-flight HTTP requests via an
+    asyncio.Semaphore.
+
+    Every request-issuing method (get/head/post/put/patch/delete/options/
+    request/stream) acquires the semaphore before delegating to the real
+    client, so *all* call sites — DomainMapper's own fetchers, ``_validate_hosts``,
+    and the ``AsyncUrlSeeder`` it shares the client with — honour
+    ``DomainMapperConfig.concurrency`` ("Max concurrent requests across all
+    hosts") across every phase of a scan, not just Phase 3.
+
+    The semaphore is configured per-scan via ``set_concurrency``; when unset
+    (or ``concurrency <= 0``) requests pass through unbounded. Non-HTTP
+    attributes (``headers``, ``base_url``, ``aclose``, ``is_closed`` …) are
+    proxied to the underlying client.
+    """
+
+    def __init__(self, real: httpx.AsyncClient):
+        self._real = real
+        self._sem: Optional[asyncio.Semaphore] = None
+
+    def set_concurrency(self, concurrency: int) -> None:
+        """Set the per-scan in-flight request cap. ``concurrency <= 0`` is
+        treated as unbounded."""
+        self._sem = (
+            asyncio.Semaphore(concurrency)
+            if concurrency and concurrency > 0
+            else None
+        )
+
+    async def _bounded(self, name: str, *args: Any, **kwargs: Any):
+        fn = getattr(self._real, name)
+        if self._sem is None:
+            return await fn(*args, **kwargs)
+        async with self._sem:
+            return await fn(*args, **kwargs)
+
+    async def get(self, *args: Any, **kwargs: Any):
+        return await self._bounded("get", *args, **kwargs)
+
+    async def head(self, *args: Any, **kwargs: Any):
+        return await self._bounded("head", *args, **kwargs)
+
+    async def post(self, *args: Any, **kwargs: Any):
+        return await self._bounded("post", *args, **kwargs)
+
+    async def put(self, *args: Any, **kwargs: Any):
+        return await self._bounded("put", *args, **kwargs)
+
+    async def patch(self, *args: Any, **kwargs: Any):
+        return await self._bounded("patch", *args, **kwargs)
+
+    async def delete(self, *args: Any, **kwargs: Any):
+        return await self._bounded("delete", *args, **kwargs)
+
+    async def options(self, *args: Any, **kwargs: Any):
+        return await self._bounded("options", *args, **kwargs)
+
+    async def request(self, *args: Any, **kwargs: Any):
+        return await self._bounded("request", *args, **kwargs)
+
+    def stream(self, method: str, url: str, **kwargs: Any):
+        return _bounded_stream(self._real.stream(method, url, **kwargs), self._sem)
+
+    def __getattr__(self, name: str):
+        # Delegate any non-HTTP attribute (headers, base_url, aclose, …)
+        # to the underlying client. Only called when normal attribute
+        # lookup fails, so ``_real``/``_sem`` set in __init__ short-circuit.
+        return getattr(self._real, name)
+
+
 # ──────────────────────────────────────────────────────────────── class
 
 class DomainMapper:
@@ -143,7 +222,7 @@ class DomainMapper:
         base_directory: Optional[Union[str, Path]] = None,
     ):
         self._owns_client = client is None
-        self.client = client or httpx.AsyncClient(
+        real_client = client or httpx.AsyncClient(
             http2=True,
             timeout=15,
             headers={
@@ -154,12 +233,17 @@ class DomainMapper:
                 ),
             },
         )
+        # Wrap the client so every get/head/stream acquires the per-scan
+        # concurrency semaphore (configured in scan()), honouring
+        # DomainMapperConfig.concurrency — "Max concurrent requests across
+        # all hosts" — across ALL phases, not just Phase 3 head extraction.
+        # The same wrapper is shared with AsyncUrlSeeder (see _get_seeder),
+        # so its sitemap/head fetches are bounded too.
+        self.client = _BoundedClient(real_client)
         self.logger = logger or AsyncLogger(verbose=False)
         self.base_directory = Path(
             base_directory or os.getenv("CRAWL4_AI_BASE_DIRECTORY", Path.home())
         )
-        self.cache_dir = self.base_directory / ".crawl4ai" / "domain_mapper_cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._seeder: Optional[AsyncUrlSeeder] = None
         self._rate_sem: Optional[asyncio.Semaphore] = None
@@ -240,6 +324,13 @@ class DomainMapper:
             self._rate_sem = asyncio.Semaphore(config.hits_per_sec)
         else:
             self._rate_sem = None
+
+        # Concurrency cap — configure the _BoundedClient wrapper so every
+        # get/head/stream issued during host discovery, per-host scanning
+        # AND head extraction acquires this semaphore. This honours the
+        # documented "Max concurrent requests across all hosts" contract
+        # across all phases, not just Phase 3.
+        self.client.set_concurrency(config.concurrency)
 
         # Normalize domain
         base_domain = re.sub(r"^https?://", "", domain).strip("/").lower()
@@ -1028,17 +1119,18 @@ class DomainMapper:
     ) -> List[Dict[str, Any]]:
         """Extract <head> metadata for all valid URLs."""
         seeder = await self._get_seeder()
-        sem = asyncio.Semaphore(config.concurrency)
+        # In-flight concurrency is bounded by the _BoundedClient semaphore
+        # configured in scan() — _do_fetch_head -> seeder._fetch_head ->
+        # client.stream acquires it — so no local semaphore is needed here.
 
         async def fetch_one(r: Dict[str, Any]):
             if r.get("head_data"):
                 return  # Already has head data
-            async with sem:
-                if self._rate_sem:
-                    async with self._rate_sem:
-                        await self._do_fetch_head(r, seeder, config)
-                else:
+            if self._rate_sem:
+                async with self._rate_sem:
                     await self._do_fetch_head(r, seeder, config)
+            else:
+                await self._do_fetch_head(r, seeder, config)
 
         await asyncio.gather(*[fetch_one(r) for r in results], return_exceptions=True)
         return results
@@ -1092,50 +1184,3 @@ class DomainMapper:
         # Sort by relevance
         results.sort(key=lambda x: x.get("relevance_score", 0.0), reverse=True)
         return results
-
-    # ════════════════════════════════════════════════════════════════════════
-    #  CACHING
-    # ════════════════════════════════════════════════════════════════════════
-
-    def _cache_key(self, domain: str, config: "DomainMapperConfig") -> str:
-        """Generate cache key from domain + config."""
-        config_str = f"{config.source}:{config.filter_nonsense_urls}:{config.soft_404_detection}"
-        h = hashlib.md5(config_str.encode()).hexdigest()[:8]
-        safe_domain = re.sub(r"[/?#]+", "_", domain)
-        return f"scan_{safe_domain}_{h}.json"
-
-    def _read_scan_cache(self, domain: str, config: "DomainMapperConfig") -> Optional[List[Dict]]:
-        """Read cached scan results if valid."""
-        if config.force:
-            return None
-        path = self.cache_dir / self._cache_key(domain, config)
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text())
-            if data.get("version") != 1:
-                return None
-            created = datetime.fromisoformat(data["created_at"].replace("Z", "+00:00"))
-            age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
-            if age_hours > config.cache_ttl_hours:
-                return None
-            return data.get("results", [])
-        except Exception:
-            return None
-
-    def _write_scan_cache(
-        self, domain: str, config: "DomainMapperConfig", results: List[Dict]
-    ):
-        """Write scan results to cache."""
-        path = self.cache_dir / self._cache_key(domain, config)
-        try:
-            data = {
-                "version": 1,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "domain": domain,
-                "result_count": len(results),
-                "results": results,
-            }
-            path.write_text(json.dumps(data, default=str))
-        except Exception:
-            pass
