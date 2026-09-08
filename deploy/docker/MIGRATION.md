@@ -6,7 +6,7 @@ out-of-the-box deployment is safe. The core pip library (SDK / in-process use)
 is **unchanged** — these notes apply only to the self-hosted HTTP server.
 
 How much you have to do scales with how much you drove through the API. A plain
-"crawl these URLs with a normal config" user only does the two steps in
+"crawl these URLs with a normal config" user only does the required steps in
 **Everyone**. The rest applies only if you used that specific feature.
 
 > Upgrading from a self-hosted server? Read this first, then roll out behind a
@@ -141,7 +141,7 @@ limits:
   queue:
     maxsize: 1000            # background job queue (503 when full); 0 = unbounded
     workers: 4
-    per_principal: 0         # max concurrent jobs per caller (429); 0 = unlimited
+    per_principal: 100       # max concurrent jobs per caller (429); 0 = unlimited
 ```
 
 To keep the previous behavior exactly, set the caps you don't want to `0`.
@@ -166,9 +166,10 @@ close a browser mid-crawl once it passes the ceiling.
 
 ### Error responses are generic
 
-5xx responses return `{"error": "Internal server error", "correlation_id": "…"}`.
-Match the correlation id in the server logs for detail. Developer-facing 4xx
-messages are unchanged.
+500 responses return `{"error": "Internal server error", "correlation_id": "…"}`.
+Match the correlation id in the server logs for detail. Other 5xx responses
+carry their reason in `detail` (e.g. 502 for an upstream crawl failure).
+Developer-facing 4xx messages are unchanged.
 
 ---
 
