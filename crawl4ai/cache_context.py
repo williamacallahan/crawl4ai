@@ -90,28 +90,3 @@ class CacheContext:
     def display_url(self) -> str:
         """Returns the URL in display format."""
         return self._url_display
-
-
-def _legacy_to_cache_mode(
-    disable_cache: bool = False,
-    bypass_cache: bool = False,
-    no_cache_read: bool = False,
-    no_cache_write: bool = False,
-) -> CacheMode:
-    """
-    Converts legacy cache parameters to the new CacheMode enum.
-
-    This is an internal function to help transition from the old boolean flags
-    to the new CacheMode system.
-    """
-    if disable_cache:
-        return CacheMode.DISABLED
-    if bypass_cache:
-        return CacheMode.BYPASS
-    if no_cache_read and no_cache_write:
-        return CacheMode.DISABLED
-    if no_cache_read:
-        return CacheMode.WRITE_ONLY
-    if no_cache_write:
-        return CacheMode.READ_ONLY
-    return CacheMode.ENABLED
