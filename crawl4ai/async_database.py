@@ -587,57 +587,6 @@ class AsyncDatabaseManager:
                 params={"error": str(e)},
             )
 
-    async def aget_total_count(self) -> int:
-        """Get total number of cached URLs"""
-
-        async def _count(db):
-            async with db.execute("SELECT COUNT(*) FROM crawled_data") as cursor:
-                result = await cursor.fetchone()
-                return result[0] if result else 0
-
-        try:
-            return await self.execute_with_retry(_count)
-        except Exception as e:
-            self.logger.error(
-                message="Error getting total count: {error}",
-                tag="ERROR",
-                force_verbose=True,
-                params={"error": str(e)},
-            )
-            return 0
-
-    async def aclear_db(self):
-        """Clear all data from the database"""
-
-        async def _clear(db):
-            await db.execute("DELETE FROM crawled_data")
-
-        try:
-            await self.execute_with_retry(_clear)
-        except Exception as e:
-            self.logger.error(
-                message="Error clearing database: {error}",
-                tag="ERROR",
-                force_verbose=True,
-                params={"error": str(e)},
-            )
-
-    async def aflush_db(self):
-        """Drop the entire table"""
-
-        async def _flush(db):
-            await db.execute("DROP TABLE IF EXISTS crawled_data")
-
-        try:
-            await self.execute_with_retry(_flush)
-        except Exception as e:
-            self.logger.error(
-                message="Error flushing database: {error}",
-                tag="ERROR",
-                force_verbose=True,
-                params={"error": str(e)},
-            )
-
     async def _store_content(self, content: str, content_type: str) -> str:
         """Store content in filesystem and return hash"""
         if not content:
