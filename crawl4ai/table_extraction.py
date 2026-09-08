@@ -86,6 +86,24 @@ class DefaultTableExtraction(TableExtractionStrategy):
         self.table_score_threshold = kwargs.get("table_score_threshold", 7)
         self.min_rows = kwargs.get("min_rows", 0)
         self.min_cols = kwargs.get("min_cols", 0)
+
+    @staticmethod
+    def _cell_span(cell: etree.Element, attribute: str) -> int:
+        """Parse an HTML span without allocating beyond browser span limits."""
+        match = re.match(r"[ \t\n\r\f]*\+?([0-9]+)", cell.get(attribute, "1"))
+        if match is None:
+            return 1
+        digits = match.group(1).lstrip("0") or "0"
+        limit = 1000 if attribute == "colspan" else 65534
+        value = limit if len(digits) > 5 else min(int(digits), limit)
+        return max(1, value) if attribute == "colspan" else value
+
+    @staticmethod
+    def _cell_text(cell: etree.Element, table_depth: int) -> str:
+        """Return text owned by the table currently being extracted."""
+        return "".join(
+            cell.xpath(f".//text()[count(ancestor::table) = {table_depth}]")
+        ).strip()
     
     def extract_tables(self, element: etree.Element, **kwargs) -> List[Dict[str, Any]]:
         """
@@ -142,19 +160,24 @@ class DefaultTableExtraction(TableExtractionStrategy):
         """
         score = 0
         
+        # Only score rows and cells owned by this table. Descendants of a nested
+        # subtable belong to that subtable's own extraction.
+        rows = table.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr")
+        table_depth = len(table.xpath("ancestor::table")) + 1
+
         # Check for thead and tbody
-        has_thead = len(table.xpath(".//thead")) > 0
-        has_tbody = len(table.xpath(".//tbody")) > 0
+        has_thead = bool(table.xpath("./thead"))
+        has_tbody = bool(table.xpath("./tbody"))
         if has_thead:
             score += 2
         if has_tbody:
             score += 1
         
         # Check for th elements
-        th_count = len(table.xpath(".//th"))
+        th_count = sum(len(row.xpath("./th")) for row in rows)
         if th_count > 0:
             score += 2
-            if has_thead or table.xpath(".//tr[1]/th"):
+            if has_thead or (rows and rows[0].xpath("./th")):
                 score += 1
         
         # Check for nested tables (negative indicator)
@@ -167,11 +190,10 @@ class DefaultTableExtraction(TableExtractionStrategy):
             score -= 3
         
         # Column consistency
-        rows = table.xpath(".//tr")
         if not rows:
             return False
         
-        col_counts = [len(row.xpath(".//td|.//th")) for row in rows]
+        col_counts = [len(row.xpath("./td|./th")) for row in rows]
         if col_counts:
             avg_cols = sum(col_counts) / len(col_counts)
             variance = sum((c - avg_cols)**2 for c in col_counts) / len(col_counts)
@@ -186,9 +208,9 @@ class DefaultTableExtraction(TableExtractionStrategy):
         
         # Text density
         total_text = sum(
-            len(''.join(cell.itertext()).strip()) 
+            len(self._cell_text(cell, table_depth))
             for row in rows 
-            for cell in row.xpath(".//td|.//th")
+            for cell in row.xpath("./td|./th")
         )
         total_tags = sum(1 for _ in table.iterdescendants())
         text_ratio = total_text / (total_tags + 1e-5)
@@ -226,38 +248,84 @@ class DefaultTableExtraction(TableExtractionStrategy):
                 - metadata: Additional metadata about the table
         """
         # Extract caption and summary
-        caption = table.xpath(".//caption/text()")
+        caption = table.xpath("./caption/text()")
         caption = caption[0].strip() if caption else ""
         summary = table.get("summary", "").strip()
+        table_depth = len(table.xpath("ancestor::table")) + 1
         
         # Extract headers with colspan handling
         headers = []
-        thead_rows = table.xpath(".//thead/tr")
+        thead_rows = table.xpath("./thead/tr")
         if thead_rows:
-            header_cells = thead_rows[0].xpath(".//th")
+            header_cells = thead_rows[0].xpath("./th")
             for cell in header_cells:
-                text = cell.text_content().strip()
-                colspan = int(cell.get("colspan", 1))
+                text = self._cell_text(cell, table_depth)
+                colspan = self._cell_span(cell, "colspan")
                 headers.extend([text] * colspan)
         else:
             # Only adopt the first row as headers when it is all <th>; a row
             # mixing <th> (row label) with <td> data must stay data, otherwise
             # the short th-derived header list truncates every data row.
-            first_row = table.xpath(".//tr[1]")
-            if first_row and not first_row[0].xpath(".//td"):
-                for cell in first_row[0].xpath(".//th"):
-                    text = cell.text_content().strip()
-                    colspan = int(cell.get("colspan", 1))
+            first_row = table.xpath("./tr | ./tbody/tr | ./tfoot/tr")
+            if first_row and not first_row[0].xpath("./td"):
+                for cell in first_row[0].xpath("./th"):
+                    text = self._cell_text(cell, table_depth)
+                    colspan = self._cell_span(cell, "colspan")
                     headers.extend([text] * colspan)
         
-        # Extract rows with colspan handling
+        # Extract rows honoring both colspan and rowspan (HTML table model).
+        # A cell with rowspan="N" is duplicated down into the N-1 continuation
+        # rows it occupies within its row group.
         rows = []
-        for row in table.xpath(".//tr[not(ancestor::thead)]"):
+        pending = {}  # col_index -> (value, rows_remaining)
+        current_group = None
+        for row in table.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr"):
+            row_group = row.getparent()
+            if row_group is not current_group:
+                pending.clear()
+                current_group = row_group
+            if row_group.tag == "thead":
+                continue
             row_data = []
-            for cell in row.xpath(".//td"):
-                text = cell.text_content().strip()
-                colspan = int(cell.get("colspan", 1))
-                row_data.extend([text] * colspan)
+            col = 0
+
+            def append_pending():
+                nonlocal col
+                value, remaining = pending[col]
+                row_data.append(value)
+                if remaining == 1:
+                    pending.pop(col)
+                else:
+                    pending[col] = (value, remaining - 1)
+                col += 1
+
+            for cell in row.xpath("./td"):
+                # Fill columns still occupied by an earlier rowspan before
+                # consuming this row's own cell.
+                while col in pending:
+                    append_pending()
+                text = self._cell_text(cell, table_depth)
+                colspan = self._cell_span(cell, "colspan")
+                rowspan = self._cell_span(cell, "rowspan")
+                if rowspan == 0:
+                    rowspan = len(row.xpath("following-sibling::tr")) + 1
+                for _ in range(colspan):
+                    row_data.append(text)
+                    if rowspan > 1:
+                        pending[col] = (text, rowspan - 1)
+                    col += 1
+            # A blank continuation row still consumes a pending span. Fill
+            # holes before a later pending column, but never consume a span
+            # created by the current row.
+            last_pending_col = max(
+                (index for index in pending if index >= col), default=-1
+            )
+            while col <= last_pending_col:
+                if col in pending:
+                    append_pending()
+                else:
+                    row_data.append("")
+                    col += 1
             if row_data:
                 rows.append(row_data)
         

@@ -5,7 +5,6 @@ duplicated in both ``headers`` and ``rows`` — a regression introduced in 9d69f
 They run on real lxml-parsed HTML and need no browser or network.
 """
 
-import pytest
 from lxml import html
 
 from crawl4ai.table_extraction import DefaultTableExtraction
@@ -134,3 +133,87 @@ def test_extract_tables_no_thead_no_duplication():
     ]
     assert data["headers"] == ["Column 1", "Column 2", "Column 3"]
     assert data["rows"][0] != data["headers"]
+
+
+def _nested_in_th_table_html():
+    return (
+        '<table border="1" summary="Quarterly sales summary across all regions" '
+        'data-report="sales" data-fiscal="2024">'
+        "<caption>Quarterly sales summary across all regions including revenue "
+        "breakdown and growth indicators</caption>"
+        "<tr>"
+        "<th>Region Name Descriptor</th>"
+        "<th>Performance Breakdown Measurement"
+        "<table><tr><td>sparkline one</td><td>sparkline two</td>"
+        "<td>sparkline three</td><td>sparkline four</td></tr></table>"
+        "</th>"
+        "<th>Total Revenue in dollars</th>"
+        "<th>Growth Percentage year over year</th>"
+        "</tr>"
+        "<tr><td>North America Region eastern territory</td>"
+        "<td>one hundred to two hundred dollars range</td>"
+        "<td>three hundred forty five dollars total</td>"
+        "<td>twenty five percent growth measured</td></tr>"
+        "<tr><td>South America Region western territory</td>"
+        "<td>fifty to one hundred fifty dollars range</td>"
+        "<td>two hundred twelve dollars total</td>"
+        "<td>fifteen percent growth measured</td></tr>"
+        "<tr><td>Europe Region central territory</td>"
+        "<td>two hundred to four hundred dollars range</td>"
+        "<td>five hundred ten dollars total</td>"
+        "<td>thirty two percent growth measured</td></tr>"
+        "</table>"
+    )
+
+
+def test_nested_subtable_does_not_contaminate_outer_headers_or_rows():
+    is_data_table, data = _extract(_nested_in_th_table_html())
+
+    assert is_data_table is True
+    assert data["metadata"]["has_headers"] is True
+    assert data["headers"] == [
+        "Region Name Descriptor",
+        "Performance Breakdown Measurement",
+        "Total Revenue in dollars",
+        "Growth Percentage year over year",
+    ]
+    assert data["rows"] == [
+        [
+            "North America Region eastern territory",
+            "one hundred to two hundred dollars range",
+            "three hundred forty five dollars total",
+            "twenty five percent growth measured",
+        ],
+        [
+            "South America Region western territory",
+            "fifty to one hundred fifty dollars range",
+            "two hundred twelve dollars total",
+            "fifteen percent growth measured",
+        ],
+        [
+            "Europe Region central territory",
+            "two hundred to four hundred dollars range",
+            "five hundred ten dollars total",
+            "thirty two percent growth measured",
+        ],
+    ]
+
+
+def test_no_thead_all_td_first_row_with_nested_table_still_rejected():
+    # Control for the fix: a first row whose direct children are <td> (data
+    # row) must STILL be rejected even when a nested <table> lives inside one
+    # of those <td>. The child-axis (./td) guard must find the direct <td>
+    # children and fall back to generic headers + has_headers=False.
+    table = (
+        "<table><caption>c</caption>"
+        "<tr><td>Outer A"
+        "<table><tr><td>inner one</td><td>inner two</td></tr></table>"
+        "</td><td>Outer B</td></tr>"
+        "<tr><td>r2a</td><td>r2b</td></tr>"
+        "</table>"
+    )
+    _, data = _extract(table)
+
+    assert data["metadata"]["has_headers"] is False
+    assert data["headers"] == ["Column 1", "Column 2"]
+    assert data["rows"] == [["Outer A", "Outer B"], ["r2a", "r2b"]]
