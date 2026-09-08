@@ -93,21 +93,19 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                 # Count only successful crawls toward max_pages limit
                 if result.success:
                     self._pages_crawled += 1
-                    # Check if we've reached the limit during batch processing
-                    if self._pages_crawled >= self.max_pages:
-                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
-                        break  # Exit the generator
-                    
+
                     # Only discover links from successful crawls
                     new_links: List[Tuple[str, Optional[str]]] = []
                     await self.link_discovery(result, url, depth, visited, new_links, depths)
-                    
+
                     # Push new links in reverse order so the first discovered is processed next.
                     for new_url, new_parent in reversed(new_links):
                         new_depth = depths.get(new_url, depth + 1)
                         stack.append((new_url, new_parent, new_depth))
 
-                    # Capture state after each URL processed (if callback set)
+                    # Capture state after each URL processed (if callback set).
+                    # Must run before the max_pages break so the boundary page
+                    # is in the checkpoint and resume does not re-fetch it.
                     if self._on_state_change:
                         state = {
                             "strategy_type": "dfs",
@@ -123,6 +121,11 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                         }
                         self._last_state = state
                         await self._on_state_change(state)
+
+                    # Check if we've reached the limit during batch processing
+                    if self._pages_crawled >= self.max_pages:
+                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                        break  # Exit the generator
 
         # Final state update if cancelled
         if self._cancel_event.is_set() and self._on_state_change:
@@ -200,24 +203,20 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                 result.metadata["parent_url"] = parent
                 if self.url_scorer:
                     result.metadata["score"] = self.url_scorer.score(url)
-                yield result
-
                 # Only count successful crawls toward max_pages limit
                 # and only discover links from successful crawls
                 if result.success:
                     self._pages_crawled += 1
-                    # Check if we've reached the limit during batch processing
-                    if self._pages_crawled >= self.max_pages:
-                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
-                        break  # Exit the generator
-                    
+
                     new_links: List[Tuple[str, Optional[str]]] = []
                     await self.link_discovery(result, url, depth, visited, new_links, depths)
                     for new_url, new_parent in reversed(new_links):
                         new_depth = depths.get(new_url, depth + 1)
                         stack.append((new_url, new_parent, new_depth))
 
-                    # Capture state after each URL processed (if callback set)
+                    # Capture state after each URL processed (if callback set).
+                    # Must run before the max_pages break so the boundary page
+                    # is in the checkpoint and resume does not re-fetch it.
                     if self._on_state_change:
                         state = {
                             "strategy_type": "dfs",
@@ -233,6 +232,14 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                         }
                         self._last_state = state
                         await self._on_state_change(state)
+
+                yield result
+
+                if result.success:
+                    # Check if we've reached the limit during batch processing
+                    if self._pages_crawled >= self.max_pages:
+                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                        break  # Exit the generator
 
         # Final state update if cancelled
         if self._cancel_event.is_set() and self._on_state_change:

@@ -248,6 +248,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
             next_level: List[Tuple[str, Optional[str]]] = []
             urls = [url for url, _ in current_level]
+            visited.update(urls)
 
             # Clone the config to disable deep crawling recursion and enforce batch mode.
             batch_config = config.clone(deep_crawl_strategy=None, stream=False)
@@ -267,16 +268,12 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                     # Increment pages crawled per URL for accurate state tracking
                     self._pages_crawled += 1
 
-                    # Stop once the boundary page has been appended so the crawl
-                    # does not overshoot the max_pages limit mid-level.
-                    if self._pages_crawled >= self.max_pages:
-                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
-                        break
-
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
 
-                    # Capture state after EACH URL processed (if callback set)
+                    # Capture state after EACH URL processed (if callback set).
+                    # Must run before the max_pages break so the boundary page
+                    # is in the checkpoint and resume does not re-fetch it.
                     if self._on_state_change:
                         state = {
                             "strategy_type": "bfs",
@@ -288,6 +285,12 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                         }
                         self._last_state = state
                         await self._on_state_change(state)
+
+                    # Stop once the boundary page has been appended so the crawl
+                    # does not overshoot the max_pages limit mid-level.
+                    if self._pages_crawled >= self.max_pages:
+                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                        break
 
             current_level = next_level
 
@@ -363,21 +366,16 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 result.metadata["parent_url"] = parent_url
                 
                 results_count += 1
-                yield result
-
                 # Only count successful crawls toward max_pages limit
                 if result.success:
                     self._pages_crawled += 1
-                    # Stop once the boundary page has been yielded so the crawl
-                    # does not overshoot the max_pages limit on the next level.
-                    if self._pages_crawled >= self.max_pages:
-                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
-                        break  # Exit the generator
 
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
 
-                    # Capture state after EACH URL processed (if callback set)
+                    # Capture state after EACH URL processed (if callback set).
+                    # Must run before the max_pages break so the boundary page
+                    # is in the checkpoint and resume does not re-fetch it.
                     if self._on_state_change:
                         state = {
                             "strategy_type": "bfs",
@@ -389,6 +387,15 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                         }
                         self._last_state = state
                         await self._on_state_change(state)
+
+                yield result
+
+                if result.success:
+                    # Stop once the boundary page has been yielded so the crawl
+                    # does not overshoot the max_pages limit on the next level.
+                    if self._pages_crawled >= self.max_pages:
+                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                        break  # Exit the generator
 
             # If we didn't get results back (e.g. due to errors), avoid getting stuck in an infinite loop
             # by considering these URLs as visited but not counting them toward the max_pages limit
