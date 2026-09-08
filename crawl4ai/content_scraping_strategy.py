@@ -2,9 +2,7 @@ import re
 from itertools import chain
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
-from bs4 import BeautifulSoup
 import asyncio
-import requests
 from .config import (
     MIN_WORD_THRESHOLD,
     IMAGE_DESCRIPTION_MIN_WORD_THRESHOLD,
@@ -13,12 +11,7 @@ from .config import (
     IMPORTANT_ATTRS,
     SOCIAL_MEDIA_DOMAINS,
 )
-from bs4 import NavigableString, Comment
-from bs4 import PageElement, Tag
-from urllib.parse import urljoin
-from requests.exceptions import InvalidSchema
 from .utils import (
-    extract_metadata,
     normalize_url,
     is_external_url,
     get_base_domain,
@@ -31,11 +24,6 @@ from lxml import html as lhtml
 from typing import List
 from .models import ScrapingResult, MediaItem, Link, Media, Links
 import copy
-
-# Pre-compile regular expressions for Open Graph and Twitter metadata
-OG_REGEX = re.compile(r"^og:")
-TWITTER_REGEX = re.compile(r"^twitter:")
-DIMENSION_REGEX = re.compile(r"(\d+)(\D*)")
 
 
 # Function to parse srcset
@@ -57,35 +45,6 @@ def parse_srcset(s: str) -> List[Dict]:
             )
             variants.append({"url": url, "width": width})
     return variants
-
-
-# Function to parse image height/width value and units
-def parse_dimension(dimension):
-    if dimension:
-        # match = re.match(r"(\d+)(\D*)", dimension)
-        match = DIMENSION_REGEX.match(dimension)
-        if match:
-            number = int(match.group(1))
-            unit = match.group(2) or "px"  # Default unit is 'px' if not specified
-            return number, unit
-    return None, None
-
-
-# Fetch image file metadata to extract size and extension
-def fetch_image_file_size(img, base_url):
-    # If src is relative path construct full URL, if not it may be CDN URL
-    img_url = urljoin(base_url, img.get("src"))
-    try:
-        response = requests.head(img_url)
-        if response.status_code == 200:
-            return response.headers.get("Content-Length", None)
-        else:
-            print(f"Failed to retrieve file size for {img_url}")
-            return None
-    except InvalidSchema:
-        return None
-    finally:
-        return
 
 
 class ContentScrapingStrategy(ABC):
@@ -197,36 +156,6 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             ScrapingResult: A structured result containing the scraped content.
         """
         return await asyncio.to_thread(self.scrap, url, html, **kwargs)
-
-    def process_element(self, url, element: lhtml.HtmlElement, **kwargs) -> Dict[str, Any]:
-        """
-        Process an HTML element.
-
-        How it works:
-        1. Check if the element is an image, video, or audio.
-        2. Extract the element's attributes and content.
-        3. Process the element based on its type.
-        4. Return the processed element information.
-
-        Args:
-            url (str): The URL of the page containing the element.
-            element (lhtml.HtmlElement): The HTML element to process.
-            **kwargs: Additional keyword arguments.
-
-        Returns:
-            dict: A dictionary containing the processed element information.
-        """
-        media = {"images": [], "videos": [], "audios": [], "tables": []}
-        internal_links_dict = {}
-        external_links_dict = {}
-        self._process_element(
-            url, element, media, internal_links_dict, external_links_dict, **kwargs
-        )
-        return {
-            "media": media,
-            "internal_links_dict": internal_links_dict,
-            "external_links_dict": external_links_dict,
-        }
 
     def _process_element(
         self,
@@ -393,19 +322,6 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 return current.text_content().strip()
             current = current.getparent()
         return None
-
-    def flatten_nested_elements(self, element: lhtml.HtmlElement) -> lhtml.HtmlElement:
-        """Flatten nested elements of the same type in LXML tree"""
-        if len(element) == 1 and element.tag == element[0].tag:
-            return self.flatten_nested_elements(element[0])
-
-        for child in element:
-            child_idx = element.index(child)
-            flattened_child = self.flatten_nested_elements(child)
-            if flattened_child is not child:  # Only replace if actually flattened
-                element[child_idx] = flattened_child
-
-        return element
 
     def process_image(
         self, img: lhtml.HtmlElement, url: str, index: int, total_images: int, **kwargs
