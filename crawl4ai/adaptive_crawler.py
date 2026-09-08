@@ -425,7 +425,6 @@ class StatisticalStrategy(CrawlStrategy):
             relevance = self._calculate_relevance(link, state)
             novelty = self._calculate_novelty(link, state)
             authority = 1.0
-            # authority = self._calculate_authority(link)
             
             # Combined score
             score = (config.relevance_weight * relevance +
@@ -496,35 +495,6 @@ class StatisticalStrategy(CrawlStrategy):
         novelty = len(new_terms) / len(link_terms) if link_terms else 0.0
         
         return novelty
-    
-    def _calculate_authority(self, link: Link) -> float:
-        """Simple authority score based on URL structure and link attributes"""
-        score = 0.5  # Base score
-        
-        if not link.href:
-            return 0.0
-            
-        url = link.href.lower()
-        
-        # Positive indicators
-        if '/docs/' in url or '/documentation/' in url:
-            score += 0.2
-        if '/api/' in url or '/reference/' in url:
-            score += 0.2
-        if '/guide/' in url or '/tutorial/' in url:
-            score += 0.1
-            
-        # Check for file extensions
-        if url.endswith('.pdf'):
-            score += 0.1
-        elif url.endswith(('.jpg', '.png', '.gif')):
-            score -= 0.3  # Reduce score for images
-            
-        # Use intrinsic score if available
-        if link.intrinsic_score is not None:
-            score = 0.7 * score + 0.3 * link.intrinsic_score
-            
-        return min(score, 1.0)
     
     async def should_stop(self, state: CrawlState, config: AdaptiveConfig) -> bool:
         """Determine if crawling should stop"""
@@ -724,7 +694,45 @@ class EmbeddingStrategy(CrawlStrategy):
             self._kb_embeddings_hash = kb_hash
             
         return self._distance_matrix_cache
-        
+
+    @staticmethod
+    def _extract_query_variations(variations: Any) -> List[str]:
+        """Normalize an LLM query-variation response into a list of strings.
+
+        ``map_query_semantic_space`` asks for ``{"queries": [...]}`` and requests
+        ``response_format={"type": "json_object"}``, but neither pins the shape at
+        runtime: providers that drop ``response_format`` may return a bare JSON
+        array (the literal prompt body), and providers that honor it may wrap the
+        array under any key. This helper accepts every legal shape and raises a
+        clear ``ValueError`` for anything else, so callers never see a raw
+        ``TypeError``/``KeyError`` from the model choosing a different shape.
+        """
+        if isinstance(variations, list):
+            raw = variations
+        elif isinstance(variations, dict):
+            if isinstance(variations.get("queries"), list):
+                raw = variations["queries"]
+            else:
+                list_values = [v for v in variations.values() if isinstance(v, list)]
+                if not list_values:
+                    raise ValueError(
+                        "LLM query-variation response was a JSON object but "
+                        f"contained no list of strings (keys: {list(variations.keys())})."
+                    )
+                if len(list_values) == 1:
+                    raw = list_values[0]
+                else:
+                    string_lists = [
+                        v for v in list_values if all(isinstance(item, str) for item in v)
+                    ]
+                    raw = string_lists[0] if len(string_lists) == 1 else max(list_values, key=len)
+        else:
+            raise ValueError(
+                "LLM query-variation response was neither a JSON array nor a JSON "
+                f"object (got {type(variations).__name__})."
+            )
+        return [str(q).strip() for q in raw if q is not None and str(q).strip()]
+
     async def map_query_semantic_space(self, query: str, n_synthetic: int = 10) -> Any:
         """Generate a point cloud representing the semantic neighborhood of the query"""
         from .utils import perform_completion_with_backoff
@@ -734,11 +742,11 @@ class EmbeddingStrategy(CrawlStrategy):
         
         # Generate variations using LLM
         prompt = f"""Generate {n_total} variations of this query that explore different aspects: '{query}'
-        
+
         These should be queries a user might ask when looking for similar information.
         Include different phrasings, related concepts, and specific aspects.
-        
-        Return as a JSON array of strings."""
+
+        Return as a JSON object with a "queries" key containing an array of strings, e.g. {{"queries": ["variation 1", "variation 2"]}}."""
         
         # Use a chat completion model for query generation
         llm_config_dict = self._get_query_llm_config_dict()
@@ -763,35 +771,16 @@ class EmbeddingStrategy(CrawlStrategy):
             finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
             raise ValueError(f"LLM returned no content (finish_reason: {finish_reason})")
         variations = json.loads(content)
-        
-        
-        # # Mock data with more variations for split
-        # variations ={'queries': ['what are the best vegetables to use in fried rice?', 'how do I make vegetable fried rice from scratch?', 'can you provide a quick recipe for vegetable fried rice?', 'what cooking techniques are essential for perfect fried rice with vegetables?', 'how to add flavor to vegetable fried rice?', 'are there any tips for making healthy fried rice with vegetables?']}
-        
-        
-        # variations = {'queries': [
-        #     'How do async and await work with coroutines in Python?',
-        #     'What is the role of event loops in asynchronous programming?',
-        #     'Can you explain the differences between async/await and traditional callback methods?',
-        #     'How do coroutines interact with event loops in JavaScript?',
-        #     'What are the benefits of using async await over promises in Node.js?',
-        #     'How to manage multiple coroutines with an event loop?',
-        #     'What are some common pitfalls when using async await with coroutines?',
-        #     'How do different programming languages implement async await and event loops?',
-        #     'What happens when an async function is called without await?',
-        #     'How does the event loop handle blocking operations?',
-        #     'Can you nest async functions and how does that affect the event loop?',
-        #     'What is the performance impact of using async/await?'
-        # ]}
-        
-        # Split into train and validation
-        # all_queries = [query] + variations['queries']
-        
+        query_variations = self._extract_query_variations(variations)
+
+        if not query_variations:
+            raise ValueError("LLM returned no query variations.")
+
         # Randomly shuffle for proper train/val split (keeping original query in training)
         import random
-        
+
         # Keep original query always in training
-        other_queries = variations['queries'].copy()
+        other_queries = query_variations
         random.shuffle(other_queries)
         
         # Split: 80% for training, 20% for validation
@@ -832,18 +821,6 @@ class EmbeddingStrategy(CrawlStrategy):
             # Fallback if computation fails
             return None
     
-    def _sample_boundary_points(self, shape, n_samples: int = 20) -> List[Any]:
-        """Sample points from the boundary of a shape"""
-        
-        
-        # Simplified implementation - in practice would sample from actual shape boundary
-        # For now, return empty list if shape is None
-        if shape is None:
-            return []
-        
-        # This is a placeholder - actual implementation would depend on shape type
-        return []
-        
     def find_coverage_gaps(self, kb_embeddings: Any, query_embeddings: Any) -> List[Tuple[Any, float]]:
         """Calculate gap distances for all query variations using vectorized operations"""
         
@@ -1018,79 +995,7 @@ class EmbeddingStrategy(CrawlStrategy):
         state.metrics['median_best_similarity'] = float(np.median(best))
 
         return score
-
-
     
-    # async def calculate_confidence(self, state: CrawlState) -> float:
-    #     """Calculate learning score for adaptive crawling (used for stopping)"""
-    #     
-        
-    #     if state.kb_embeddings is None or state.query_embeddings is None:
-    #         return 0.0
-        
-    #     if len(state.kb_embeddings) == 0:
-    #         return 0.0
-            
-    #     # Get cached distance matrix
-    #     distance_matrix = self._get_cached_distance_matrix(state.query_embeddings, state.kb_embeddings)
-        
-    #     if distance_matrix is None:
-    #         return 0.0
-            
-    #     # Vectorized analysis for all queries at once
-    #     all_query_metrics = []
-        
-    #     for i in range(len(state.query_embeddings)):
-    #         # Get distances for this query
-    #         distances = distance_matrix[i]
-    #         sorted_distances = np.sort(distances)
-            
-    #         # Store metrics for this query
-    #         query_metric = {
-    #             'min_distance': sorted_distances[0],
-    #             'top_3_distances': sorted_distances[:3],
-    #             'top_5_distances': sorted_distances[:5],
-    #             'close_neighbors': np.sum(distances < 0.3),
-    #             'very_close_neighbors': np.sum(distances < 0.2),
-    #             'all_distances': distances
-    #         }
-    #         all_query_metrics.append(query_metric)
-        
-    #     # Hybrid approach with density (exponential base)
-    #     k_exp = self.config.embedding_k_exp if hasattr(self, 'config') else 1.0
-    #     coverage_scores_hybrid_exp = []
-        
-    #     for metric in all_query_metrics:
-    #         # Base score from nearest neighbor
-    #         nearest_score = np.exp(-k_exp * metric['min_distance'])
-            
-    #         # Top-k average (top 3)
-    #         top_k = min(3, len(metric['all_distances']))
-    #         top_k_avg = np.mean([np.exp(-k_exp * d) for d in metric['top_3_distances'][:top_k]])
-            
-    #         # Combine using configured weights
-    #         nearest_weight = self.config.embedding_nearest_weight if hasattr(self, 'config') else 0.7
-    #         top_k_weight = self.config.embedding_top_k_weight if hasattr(self, 'config') else 0.3
-    #         hybrid_score = nearest_weight * nearest_score + top_k_weight * top_k_avg
-    #         coverage_scores_hybrid_exp.append(hybrid_score)
-        
-    #     learning_score = np.mean(coverage_scores_hybrid_exp)
-        
-    #     # Store as learning score
-    #     state.metrics['learning_score'] = learning_score
-        
-    #     # Store embedding-specific metrics
-    #     state.metrics['avg_min_distance'] = np.mean([m['min_distance'] for m in all_query_metrics])
-    #     state.metrics['avg_close_neighbors'] = np.mean([m['close_neighbors'] for m in all_query_metrics])
-    #     state.metrics['avg_very_close_neighbors'] = np.mean([m['very_close_neighbors'] for m in all_query_metrics])
-    #     state.metrics['total_kb_docs'] = len(state.kb_embeddings)
-        
-    #     # Store query-level metrics for detailed analysis
-    #     self._query_metrics = all_query_metrics
-        
-    #     # For stopping criteria, return learning score
-    #     return float(learning_score)
-        
     async def rank_links(self, state: CrawlState, config: AdaptiveConfig) -> List[Tuple[Link, float]]:
         """Main entry point for link ranking"""
         # Store config for use in other methods
