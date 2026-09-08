@@ -295,10 +295,26 @@ def _public_coverage(direct_instance: dict[str, str], deadline: float) -> int:
     return len(set.intersection(*observed))
 
 
+def _verify_ingress_namespace(ingress_pid: int) -> None:
+    """Fail before task probes when the ingress namespace is inaccessible."""
+    result = subprocess.run(
+        ["nsenter", f"--net=/proc/{ingress_pid}/ns/net", "/bin/true"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"cannot enter ingress network namespace for pid {ingress_pid}: "
+            f"{(result.stderr or '').strip()[:200]}"
+        )
+
+
 def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]:
     """Reuse the rollout verifier's task and health owners for one stable sample."""
     deadline = time.monotonic() + SAMPLE_DEADLINE_SECONDS
     ingress_pid = rollout._verify_ingress_host()
+    _verify_ingress_namespace(ingress_pid)
     before = rollout._service_tasks(service_name)
     current = [
         row for row in before if str(row.get("DesiredState", "")).lower() == "running"

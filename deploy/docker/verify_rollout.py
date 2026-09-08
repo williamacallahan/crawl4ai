@@ -667,7 +667,7 @@ def _verify_ingress_host() -> int:
 def _verify_tasks(
     app_name: str, image: str, revision: str, ready: frozenset[str], converged: bool = True
 ) -> dict[str, Any]:
-    _verify_ingress_host()
+    ingress_pid = _verify_ingress_host()
     rows = _service_tasks(app_name)
     current = [
         row for row in rows
@@ -739,7 +739,10 @@ def _verify_tasks(
             or runtime["addresses"] != {vip_by_task[task_id].get("EndpointIP")}
         ):
             raise RuntimeError("Crawl4AI task identity drifted")
-        health = _request_json(f"http://{next(iter(runtime['addresses']))}:11235/health")
+        health = _request_json(
+            f"http://{next(iter(runtime['addresses']))}:11235/health",
+            network_namespace_pid=ingress_pid,
+        )
         if not _exact_health(health, revision) or health["instance"] != runtime["container"]:
             raise RuntimeError("Crawl4AI task failed direct overlay readiness")
         instances.add(runtime["container"])
