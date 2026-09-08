@@ -16,7 +16,6 @@ import base64
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 from typing import Callable
-import requests
 import os
 from pathlib import Path
 from .utils import *
@@ -55,25 +54,6 @@ class CrawlerStrategy(ABC):
     @abstractmethod
     def set_hook(self, hook_type: str, hook: Callable):
         pass
-
-
-class CloudCrawlerStrategy(CrawlerStrategy):
-    def __init__(self, use_cached_html=False):
-        super().__init__()
-        self.use_cached_html = use_cached_html
-
-    def crawl(self, url: str) -> str:
-        data = {
-            "urls": [url],
-            "include_raw_html": True,
-            "forced": True,
-            "extract_blocks": False,
-        }
-
-        response = requests.post("http://crawl4ai.uccode.io/crawl", json=data)
-        response = response.json()
-        html = response["results"][0]["html"]
-        return sanitize_input_encode(html)
 
 
 class LocalSeleniumCrawlerStrategy(CrawlerStrategy):
