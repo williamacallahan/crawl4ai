@@ -226,6 +226,43 @@ check("Structural: unclosed hidden element still stripped",
         '<div style="display:none">' + ('pad text ' * 12) + '</body></html>'),
     True, "minimal_text")
 
+# --- Structural bypass via foster-parented stray text outside <body> ---
+# HTTP 200 silent block whose block message lives physically OUTSIDE <body>
+# (text before <body>, raw text in <head>, or text between </head> and <body>)
+# while the <body> itself holds a content element (<p>/<a>/...). lxml's HTML5
+# parser foster-parents that stray text into the <body> subtree, so the
+# pre-fix _visible_text_len counted it as visible body content, inflated past
+# 50 chars, and suppressed the minimal_text signal — letting a soft-200 block
+# page through as a successful crawl. Each body here has a <p> so the
+# no_content_elements signal does NOT fire; minimal_text is the only catch.
+_FOSTER = ' filler ' * 120
+
+check("Structural: foster-parented stray text before <body> (with </body>)",
+    is_blocked(200, '<html>' + _FOSTER + '<body><p>nice content</p></body></html>'),
+    True, "minimal_text")
+
+check("Structural: foster-parented raw text in <head> (with </body>)",
+    is_blocked(200, '<html><head>' + _FOSTER + '</head><body><p>x</p></body></html>'),
+    True, "minimal_text")
+
+check("Structural: foster-parented text between </head> and <body>",
+    is_blocked(200, '<html><head></head>' + _FOSTER + '<body><p>ok</p></body></html>'),
+    True, "minimal_text")
+
+# No-</body> variant: the strict </body>-substring fallback would wrongly
+# return None and re-inflate via the regex fallback; scoping to the <body
+# open tag onward (lxml closes implicitly) handles both closed and unclosed.
+check("Structural: foster-parented stray text before <body> (no </body>)",
+    is_blocked(200, '<html>' + _FOSTER + '<body><p>ok</p>'),
+    True, "minimal_text")
+
+# Headline repro from the report: a full block sentence + padding before <body>.
+check("Structural: full block sentence before <body> bypasses minimal_text",
+    is_blocked(200,
+        '<html>Blocked - automated traffic detected. Please contact the site administrator.'
+        + _FOSTER + '<body><p>ok</p></body></html>'),
+    True, "minimal_text")
+
 # Adversarial input that made the earlier regex approach backtrack
 # quadratically (~8s at 44KB). The parser path is linear; the loose wall-clock
 # bound only trips on a reintroduced blow-up, not normal machine variance.
@@ -444,6 +481,66 @@ check("visibility:visible is not treated as hidden",
 
 
 # =========================================================================
+# css_selector fragment regressions
+# =========================================================================
+# When a css_selector is set, the captured HTML is wrapped in
+# "<div class='crawl4ai-result'>...</div>" (a <div>-prefixed fragment), not an
+# <html>-rooted document. The bug-report fix ensures 403/503 block pages
+# captured this way are still flagged as blocked, while legitimate 200
+# content fragments and XML feed responses remain exempt.
+print("\n=== css_selector FRAGMENT REGRESSIONS ===\n")
+
+check("403 css_selector empty fragment is blocked",
+    is_blocked(403, "<div class='crawl4ai-result'>\n\n</div>"),
+    True, "403")
+
+check("503 css_selector empty fragment is blocked",
+    is_blocked(503, "<div class='crawl4ai-result'>\n\n</div>"),
+    True, "503")
+
+check("403 <body>-prefixed fragment is blocked",
+    is_blocked(403, "<body><h1>Forbidden</h1>nginx</body>"),
+    True, "403")
+
+# Legitimate content captured via css_selector on HTTP 200 must NOT be flagged
+# (guards the Tier 3 "no <body>" signal suppression for fragments).
+_substantial_fragment = (
+    "<div class='crawl4ai-result'>"
+    + '<div class="product"><a href="/p/1">Wireless Mouse</a>'
+    + '<p>Ergonomic wireless mouse with precision tracking</p></div>' * 5
+    + "</div>"
+)
+check("200 substantial css_selector fragment is not blocked",
+    is_blocked(200, _substantial_fragment),
+    False)
+
+# XML feed and sitemap roots on 403 must remain exempt (no over-blocking of the
+# data responses crawl4ai fetches for sitemap/RSS/Atom discovery).
+check("403 XML feed (rss) is not blocked (data exemption)",
+    is_blocked(403, '<rss version="2.0"><channel><item>x</item></channel></rss>'),
+    False)
+check("403 XML feed (urlset) is not blocked (data exemption)",
+    is_blocked(403, '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>'),
+    False)
+check("403 XML feed (Atom) is not blocked (data exemption)",
+    is_blocked(403, '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>'),
+    False)
+check("403 XML sitemap index is not blocked (data exemption)",
+    is_blocked(403, '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/>'),
+    False)
+check("403 namespaced RDF is not blocked (data exemption)",
+    is_blocked(403, '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>'),
+    False)
+
+check("403 feedback-panel lookalike is blocked",
+    is_blocked(403, '<feedback-panel>Temporarily unavailable</feedback-panel>'),
+    True)
+check("503 rss-widget lookalike is blocked",
+    is_blocked(503, '<rss-widget>Temporarily unavailable</rss-widget>'),
+    True)
+
+
+# =========================================================================
 # SUMMARY
 # =========================================================================
 print(f"\n{'=' * 60}")
@@ -454,3 +551,96 @@ if FAIL > 0:
     sys.exit(1)
 else:
     print("ALL TESTS PASSED!")
+
+
+# =========================================================================
+# pytest-style regression tests for the foster-parenting fix.
+#
+# The script harness above is this file's existing convention. These
+# functions add unit-level coverage of `_visible_text_len` (the helper that
+# regressed) so the file is also collectable under the repo's documented
+# runner (`pytest`) — without them `pytest <file>` reports "no tests ran".
+# The `is_blocked`-level shapes are already covered by the `check()` cases
+# above, so the functions below focus on the helper's own contract and the
+# two guards that are not otherwise exercised here.
+# =========================================================================
+from crawl4ai.antibot_detector import _body_start, _visible_text_len
+
+
+
+def test_visible_text_len_excludes_foster_parented_stray_text_outside_body():
+    # lxml's HTML5 parser relocates stray text outside <body> into the body
+    # subtree; the helper must scope to the <body open tag onward before
+    # parsing so that text cannot inflate the count. Three foster-parenting
+    # shapes (text before <body>, raw text in <head>, text between </head>
+    # and <body>) plus the no-</body> edge case.
+    assert _visible_text_len(
+        '<html>' + _FOSTER + '<body><p>nice content</p></body></html>') == 12
+    assert _visible_text_len(
+        '<html><head>' + _FOSTER + '</head><body><p>x</p></body></html>') == 1
+    assert _visible_text_len(
+        '<html><head></head>' + _FOSTER + '<body><p>ok</p></body></html>') == 2
+    # No </body> close: strict </body>-substring scoping would wrongly return
+    # None and re-inflate via the regex fallback; the <body-open-onward scope
+    # (lxml closes implicitly) handles it.
+    assert _visible_text_len(
+        '<html>' + _FOSTER + '<body><p>ok</p>') == 2
+
+
+def test_visible_text_len_excludes_head_title_from_body_count():
+    # <title> lives in <head>, before <body>; it must not be counted as body
+    # text. A body with real prose must report its own length only.
+    html = ('<html><head><title>This title is long and must not be body text'
+            '</title></head><body><p>real body prose here</p></body></html>')
+    assert _visible_text_len(html) == len("real body prose here")
+
+
+def test_visible_text_len_parses_fragments_with_hidden_subtree_removal():
+    html = '<div><p hidden>' + ('padding ' * 100) + '</p><div></div></div>'
+
+    assert _visible_text_len(html) == 0
+    assert is_blocked(200, html)[0] is True
+
+
+def test_comment_body_token_does_not_bypass_minimal_text():
+    html = (
+        '<html><head><!-- <body>'
+        + ('padding ' * 100)
+        + '--></head><body><p></p></body></html>'
+    )
+
+    assert _visible_text_len(html) == 0
+    assert is_blocked(200, html)[0] is True
+
+
+def test_body_start_handles_carriage_returns_before_a_newline():
+    html = (
+        '<html><head>prefix\r'
+        + ('padding ' * 100)
+        + '</head>\n<body><p></p></body></html>'
+    )
+
+    assert _body_start(html) == html.index('<body>')
+    assert _visible_text_len(html) == 0
+    assert is_blocked(200, html)[0] is True
+
+
+def test_content_less_foster_parented_body_still_blocked_via_no_content_elements():
+    # When the body has NO content element, the no_content_elements signal
+    # catches the page regardless; the foster-parenting fix must not regress
+    # the content-less variant.
+    html = '<html><head>' + _FOSTER + '</head><body>x</body></html>'
+    blocked, reason = is_blocked(200, html)
+    assert blocked is True
+    assert "no_content_elements" in reason
+
+
+def test_legit_page_with_head_title_no_false_positive():
+    # A page whose real content lives inside <body> (with a <head><title>) must
+    # not be flagged; the foster-parenting scope must not perturb normal pages.
+    html = ('<html><head><title>How to Detect Bots</title></head><body>'
+            '<h1>How to Detect Bots</h1>'
+            '<p>Anti-bot solutions help detect and block bot traffic.</p>'
+            + ('<p>More article content. </p>' * 50) + '</body></html>')
+    assert _visible_text_len(html) > 50
+    assert is_blocked(200, html) == (False, "")

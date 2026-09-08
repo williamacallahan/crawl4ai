@@ -16,6 +16,7 @@ Detection is layered:
 """
 
 import re
+from html.parser import HTMLParser
 from typing import Optional, Tuple
 
 from lxml import html as lxml_html
@@ -111,7 +112,6 @@ _SCRIPT_TAG_RE = re.compile(r'<script\b', re.IGNORECASE)
 _STYLE_TAG_RE = re.compile(r'<style\b[\s\S]*?</style>', re.IGNORECASE)
 _SCRIPT_BLOCK_RE = re.compile(r'<script\b[\s\S]*?</script>', re.IGNORECASE)
 _TAG_RE = re.compile(r'<[^>]+>')
-_BODY_RE = re.compile(r'<body\b', re.IGNORECASE)
 
 # Inline-CSS declarations that hide an element. Hidden-subtree removal is
 # parser-based (lxml) rather than regex: a regex cannot pair nested tags
@@ -122,7 +122,31 @@ _INLINE_HIDDEN_RE = re.compile(
 )
 
 
-def _visible_text_len(html: str) -> Optional[int]:
+class _BodyStartFinder(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.position = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "body" and self.position is None:
+            self.position = self.getpos()
+
+
+def _body_start(html: str) -> Optional[int]:
+    parser = _BodyStartFinder()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return None
+    if parser.position is None:
+        return None
+    line, column = parser.position
+    line_start = sum(len(part) + 1 for part in html.split("\n")[: line - 1])
+    return line_start + column
+
+
+def _visible_text_len(html: str, body_start: Optional[int] = None) -> Optional[int]:
     """Length of body text, excluding scripts, styles, elements with the
     HTML5 ``hidden`` attribute, and inline-CSS-hidden subtrees.
 
@@ -132,9 +156,21 @@ def _visible_text_len(html: str) -> Optional[int]:
     (visibility:visible inside visibility:hidden) is still excluded, and
     stylesheet/class-based hiding and opacity are out of scope. Upgrade path:
     computed styles via a real renderer, if FPs ever matter here.
+
+    Full documents are scoped from an actual ``<body>`` start tag before lxml
+    parses them, so text outside the body cannot be foster-parented into it.
+    Fragments have no body tag and are parsed whole through the same hidden
+    subtree removal path.
     """
     try:
-        body = lxml_html.document_fromstring(html).body
+        if body_start is None:
+            body_start = _body_start(html)
+        source = (
+            html
+            if body_start is None
+            else '<html>' + html[body_start:] + '</html>'
+        )
+        body = lxml_html.document_fromstring(source).body
         if body is None:
             return None
     except Exception:
@@ -157,6 +193,14 @@ def _visible_text_len(html: str) -> Optional[int]:
 _BLOCK_PAGE_MAX_SIZE = 5000   # 403 + short page = likely block
 _EMPTY_CONTENT_THRESHOLD = 100  # 200 + near-empty = JS-blocked render
 
+# XML roots that are genuine feed or sitemap responses. A namespace prefix and
+# XML declaration are optional, and the root's local name must be complete.
+_XML_DATA_ROOT_RE = re.compile(
+    r'^(?:<\?xml\b[^>]*\?>\s*)?'
+    r'<(?:[a-z_][\w.-]*:)?(?:rss|urlset|sitemapindex|feed|rdf)(?=[\s/>])',
+    re.IGNORECASE,
+)
+
 
 def _looks_like_data(html: str) -> bool:
     """Check if content looks like a JSON/XML API response (not an HTML block page)."""
@@ -171,8 +215,8 @@ def _looks_like_data(html: str) -> bool:
         if re.search(r'<body[^>]*>\s*<pre[^>]*>\s*[{\[]', stripped[:500], re.IGNORECASE):
             return True
         return False
-    # Other XML-like content
-    return stripped[0] == '<'
+    # Feed and sitemap XML only; other < prefixed content is HTML.
+    return stripped[0] == '<' and bool(_XML_DATA_ROOT_RE.match(stripped))
 
 
 def _structural_integrity_check(html: str) -> Tuple[bool, str]:
@@ -193,14 +237,21 @@ def _structural_integrity_check(html: str) -> Tuple[bool, str]:
 
     signals = []
 
-    # Signal 1: No <body> tag — definitive structural failure
-    if not _BODY_RE.search(html):
+    # Signal 1: No <body> tag — definitive structural failure.
+    # Only meaningful for full HTML documents (<html>/<!) and plain text. An
+    # HTML fragment (e.g. a css_selector-wrapped result starting with <div)
+    # legitimately has no <body> tag, so its absence is not a structural
+    # failure there — the remaining content/text signals handle fragments.
+    _head = html.lstrip()[:10].lower()
+    _is_fragment = _head.startswith("<") and not _head.startswith(("<html", "<!"))
+    body_start = _body_start(html)
+    if not _is_fragment and body_start is None:
         return True, f"Structural: no <body> tag ({html_len} bytes)"
 
     # Signal 2: Minimal visible text after stripping scripts/styles/tags and
     # hidden subtrees. Otherwise a block page can pad with CSS-hidden text to
     # bypass the minimal_text signal.
-    visible_len = _visible_text_len(html)
+    visible_len = _visible_text_len(html, body_start)
     if visible_len is None:
         # Unparseable markup: regex fallback without hidden-element exclusion.
         body_match = re.search(r'<body\b[^>]*>([\s\S]*)</body>', html, re.IGNORECASE)
