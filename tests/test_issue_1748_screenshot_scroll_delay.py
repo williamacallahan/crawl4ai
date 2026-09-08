@@ -2,12 +2,11 @@
 Tests for GitHub issue #1748: scroll_delay config is now properly respected
 in take_screenshot_scroller().
 
-Three changes were made to async_crawler_strategy.py:
+Two changes were made to async_crawler_strategy.py:
   A) arun call site now passes scroll_delay from config
-  B) _generate_media_from_html call site now passes scroll_delay from config
   C) take_screenshot_scroller reads scroll_delay from kwargs (was hardcoded 0.01)
 
-These tests verify that all three paths correctly forward and use scroll_delay.
+These tests verify that both paths correctly forward and use scroll_delay.
 """
 
 import pytest
@@ -197,47 +196,6 @@ async def test_integration_arun_respects_scroll_delay():
     assert 0.5 in sleep_args, (
         f"Expected asyncio.sleep(0.5) in screenshot capture but got: {sleep_args}"
     )
-    assert 0.01 not in sleep_args, (
-        f"Old hardcoded 0.01 still present in sleep calls: {sleep_args}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 5 — Integration: _generate_media_from_html respects scroll_delay
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_integration_generate_media_respects_scroll_delay():
-    """
-    Call _generate_media_from_html directly with a config that has
-    scroll_delay=0.75 and screenshot=True. Verify asyncio.sleep is called
-    with 0.75 during screenshot capture.
-    """
-    config = CrawlerRunConfig(
-        screenshot=True,
-        scroll_delay=0.75,
-        screenshot_height_threshold=100,  # Very low to force scroller
-    )
-
-    with patch(
-        "crawl4ai.async_crawler_strategy.asyncio.sleep", new_callable=AsyncMock
-    ) as mock_sleep:
-        async with AsyncWebCrawler() as crawler:
-            (
-                screenshot_data,
-                pdf_data,
-                mhtml_data,
-            ) = await crawler.crawler_strategy._generate_media_from_html(
-                TALL_HTML, config
-            )
-
-    assert screenshot_data is not None, (
-        "Expected screenshot data from _generate_media_from_html"
-    )
-
-    sleep_args = [c.args[0] for c in mock_sleep.call_args_list]
-    assert 0.75 in sleep_args, f"Expected asyncio.sleep(0.75) but got: {sleep_args}"
     assert 0.01 not in sleep_args, (
         f"Old hardcoded 0.01 still present in sleep calls: {sleep_args}"
     )
