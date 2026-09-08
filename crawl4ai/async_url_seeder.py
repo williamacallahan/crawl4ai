@@ -1333,25 +1333,6 @@ class AsyncUrlSeeder:
             await self._cache_set(cache_kind, url, entry)
         res_list.append(entry)
 
-    async def _head_ok(self, url: str, timeout: int) -> bool:
-        try:
-            r = await self.client.head(url, timeout=timeout,
-                                       headers={"Range": "bytes=0-0", "Accept-Encoding": "identity"})
-            r.raise_for_status()  # Raise for bad status codes (4xx, 5xx)
-            return True
-        except httpx.RequestError as e:
-            self._log("debug", "HEAD check network error for {url}: {error}",
-                      params={"url": url, "error": str(e)}, tag="URL_SEED")
-            return False
-        except httpx.HTTPStatusError as e:
-            self._log("debug", "HEAD check HTTP status error for {url}: {status_code}",
-                      params={"url": url, "status_code": e.response.status_code}, tag="URL_SEED")
-            return False
-        except Exception as e:
-            self._log("error", "Unexpected error during HEAD check for {url}: {error}",
-                      params={"url": url, "error": str(e)}, tag="URL_SEED")
-            return False
-
     async def _fetch_head(
         self,
         url: str,
