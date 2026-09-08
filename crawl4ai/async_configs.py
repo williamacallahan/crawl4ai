@@ -510,6 +510,25 @@ def _clamp_untrusted(type_name: str, params: dict) -> dict:
             params["virtual_scroll_config"] = _enforce_untrusted(
                 "VirtualScrollConfig", virtual_scroll
             )
+        elif virtual_scroll is not None and not isinstance(virtual_scroll, VirtualScrollConfig):
+            raise UntrustedConfigError(
+                "field 'virtual_scroll_config' must be a VirtualScrollConfig instance or dict"
+            )
+        # Typed envelopes have already been deserialized before this clamp.
+        for field, expected in (
+            ("extraction_strategy", ExtractionStrategy),
+            ("markdown_generator", MarkdownGenerationStrategy),
+            ("geolocation", GeolocationConfig),
+            ("table_extraction", TableExtractionStrategy),
+            ("scraping_strategy", ContentScrapingStrategy),
+        ):
+            value = params.get(field)
+            if value is not None and not isinstance(value, expected):
+                received = "a bare dict" if isinstance(value, dict) else type(value).__name__
+                raise UntrustedConfigError(
+                    f"field '{field}' from an untrusted request must be a "
+                    f"{expected.__name__} instance, not {received}"
+                )
     elif type_name == "BrowserConfig":
         _bounded_viewport(params)
     elif type_name == "GeolocationConfig":
@@ -752,6 +771,12 @@ def from_serializable_dict(data: Any, provenance: "Provenance" = None) -> Any:
                 }
                 if provenance == Provenance.UNTRUSTED:
                     constructor_args = _clamp_untrusted(type_name, constructor_args)
+                    try:
+                        return cls(**constructor_args)
+                    except (TypeError, ValueError) as error:
+                        raise UntrustedConfigError(
+                            f"invalid parameters for untrusted type '{type_name}'"
+                        ) from error
                 return cls(**constructor_args)
 
     # Handle lists
