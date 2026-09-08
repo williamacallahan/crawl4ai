@@ -48,11 +48,6 @@ class BrowserAdapter(ABC):
     async def cleanup_console_capture(self, page: Page, handle_console: Optional[Callable], handle_error: Optional[Callable]):
         """Clean up console event listeners"""
         pass
-    
-    @abstractmethod
-    def get_imports(self) -> tuple:
-        """Get the appropriate imports for this adapter"""
-        pass
 
 
 class PlaywrightAdapter(BrowserAdapter):
@@ -140,12 +135,6 @@ class PlaywrightAdapter(BrowserAdapter):
             page.remove_listener("console", handle_console)
         if handle_error:
             page.remove_listener("pageerror", handle_error)
-    
-    def get_imports(self) -> tuple:
-        """Return Playwright imports"""
-        from playwright.async_api import Page, Error
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-        return Page, Error, PlaywrightTimeoutError
 
 
 class StealthAdapter(BrowserAdapter):
@@ -260,12 +249,6 @@ class StealthAdapter(BrowserAdapter):
             page.remove_listener("console", handle_console)
         if handle_error:
             page.remove_listener("pageerror", handle_error)
-
-    def get_imports(self) -> tuple:
-        """Return Playwright imports"""
-        from playwright.async_api import Page, Error
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-        return Page, Error, PlaywrightTimeoutError
 
 
 class UndetectedAdapter(BrowserAdapter):
@@ -405,9 +388,3 @@ class UndetectedAdapter(BrowserAdapter):
         # but we should retrieve any final messages
         final_messages = await self.retrieve_console_messages(page)
         return final_messages
-    
-    def get_imports(self) -> tuple:
-        """Return undetected browser imports"""
-        from patchright.async_api import Page, Error
-        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
-        return Page, Error, PlaywrightTimeoutError
