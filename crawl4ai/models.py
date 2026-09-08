@@ -7,7 +7,6 @@ from enum import Enum
 from dataclasses import dataclass
 from .ssl_certificate import SSLCertificate
 from datetime import datetime
-from datetime import timedelta
 
 
 ###############################
@@ -42,39 +41,6 @@ class CrawlStatus(Enum):
     IN_PROGRESS = "IN_PROGRESS"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
-
-@dataclass
-class CrawlStats:
-    task_id: str
-    url: str
-    status: CrawlStatus
-    start_time: Optional[Union[datetime, float]] = None
-    end_time: Optional[Union[datetime, float]] = None
-    memory_usage: float = 0.0
-    peak_memory: float = 0.0
-    error_message: str = ""
-    wait_time: float = 0.0
-    retry_count: int = 0
-    counted_requeue: bool = False
-
-    @property
-    def duration(self) -> str:
-        if not self.start_time:
-            return "0:00"
-            
-        # Convert start_time to datetime if it's a float
-        start = self.start_time
-        if isinstance(start, float):
-            start = datetime.fromtimestamp(start)
-            
-        # Get end time or use current time
-        end = self.end_time or datetime.now()
-        # Convert end_time to datetime if it's a float
-        if isinstance(end, float):
-            end = datetime.fromtimestamp(end)
-            
-        duration = end - start
-        return str(timedelta(seconds=int(duration.total_seconds())))
 
 class DisplayMode(Enum):
     DETAILED = "DETAILED"
