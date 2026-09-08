@@ -7,7 +7,6 @@ import logging
 import os
 import socket
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from typing import Any
 
 from crawl_job_queue import (
@@ -118,6 +117,13 @@ class CrawlJobWorker:
     ) -> tuple[str, dict | None, str | None] | None:
         operation_task = asyncio.create_task(self._process_attempt(entry, payload, attempt))
         heartbeat_task = asyncio.create_task(self._heartbeat(entry, payload, attempt))
+
+        async def stop_attempt() -> None:
+            for task in (operation_task, heartbeat_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(operation_task, heartbeat_task, return_exceptions=True)
+
         try:
             done, _pending = await asyncio.wait(
                 {operation_task, heartbeat_task},
@@ -125,6 +131,8 @@ class CrawlJobWorker:
                 timeout=self.queue.settings.max_attempt_seconds,
             )
             if not done:
+                # No attempt-owned write may race the timeout release.
+                await stop_attempt()
                 return await self._release_stalled_attempt(entry, payload, attempt)
             if operation_task in done:
                 return operation_task.result()
@@ -132,14 +140,7 @@ class CrawlJobWorker:
             heartbeat_task.result()
             raise CrawlJobLeaseLost(f"heartbeat stopped for {entry.task_id}")
         finally:
-            if not operation_task.done():
-                operation_task.cancel()
-            if not heartbeat_task.done():
-                heartbeat_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await operation_task
-            with suppress(asyncio.CancelledError, Exception):
-                await heartbeat_task
+            await stop_attempt()
 
     async def _release_stalled_attempt(
         self,
