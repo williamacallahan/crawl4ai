@@ -13,11 +13,12 @@ import datetime
 import uuid
 import shutil
 import json
-import subprocess
 import time
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Set
+
+import psutil
 from rich.console import Console
 
 from .async_configs import BrowserConfig
@@ -1193,7 +1194,7 @@ class BrowserProfiler:
         """
         # Check if there's an existing browser still running
         browser_info = self.get_builtin_browser_info()
-        if browser_info and self._is_browser_running(browser_info.get('pid')):
+        if browser_info and self._is_browser_running(browser_info.get('pid'), browser_info):
             self.logger.info("Builtin browser is already running", tag="BUILTIN")
             return browser_info.get('cdp_url')
         
@@ -1247,7 +1248,26 @@ class BrowserProfiler:
                         await asyncio.sleep(0.5)
             except Exception as e:
                 self.logger.warning(f"Could not verify browser: {str(e)}", tag="BUILTIN")
-            
+
+            websocket_url = (
+                config_json.get("webSocketDebuggerUrl")
+                if isinstance(config_json, dict)
+                else None
+            )
+            if not isinstance(websocket_url, str) or not websocket_url:
+                self.logger.error(
+                    "Builtin browser did not provide a CDP /json/version response.",
+                    tag="BUILTIN",
+                )
+                await managed_browser.cleanup()
+                return None
+            if browser_process.poll() is not None:
+                self.logger.error(
+                    "Builtin browser process exited during launch.", tag="BUILTIN"
+                )
+                await managed_browser.cleanup()
+                return None
+
             # Save browser info
             browser_info = {
                 'pid': browser_process.pid,
@@ -1290,9 +1310,18 @@ class BrowserProfiler:
             with open(self.builtin_config_file, 'r') as f:
                 browser_info = json.load(f)
                 
-            # Check if the browser is still running
-            if not self._is_browser_running(browser_info.get('pid')):
+            # Check if the recorded browser is still running AND still the
+            # process we launched. Passing `browser_info` makes
+            # `_is_browser_running` verify the live process's cmdline
+            # contains the recorded `--remote-debugging-port` and
+            # `--user-data-dir` flags, so a PID that the kernel has reused
+            # for an unrelated process is rejected here.
+            if not self._is_browser_running(browser_info.get('pid'), browser_info):
                 self.logger.warning("Builtin browser is not running", tag="BUILTIN")
+                # Remove the stale config so a later PID reuse cannot cause
+                # the profiler (or `crwl browser stop`/`restart`) to signal
+                # whatever process now owns the recorded PID.
+                self._unlink_stale_builtin_config()
                 return None
                 
             return browser_info
@@ -1300,22 +1329,84 @@ class BrowserProfiler:
             self.logger.error(f"Error reading builtin browser config: {str(e)}", tag="BUILTIN")
             return None
             
-    def _is_browser_running(self, pid: Optional[int]) -> bool:
-        """Check if a process with the given PID is running"""
+    def _unlink_stale_builtin_config(self) -> None:
+        """Remove the builtin browser config file if it exists.
+
+        Called when the recorded PID is gone or no longer matches the
+        browser we launched, so a subsequent PID reuse by the kernel
+        cannot trick the profiler into signaling an unrelated process.
+        Errors are logged and swallowed: a unlink failure must not turn
+        a "no browser running" path into a hard error.
+        """
+        try:
+            Path(self.builtin_config_file).unlink(missing_ok=True)
+        except OSError as e:
+            self.logger.warning(
+                f"Could not remove stale builtin browser config: {str(e)}",
+                tag="BUILTIN",
+            )
+
+    def _get_verified_browser_process(
+        self, pid: Optional[int], browser_info: Dict[str, Any]
+    ) -> Optional[psutil.Process]:
+        """Return the recorded browser process only when its argv matches."""
+        debugging_port = browser_info.get("debugging_port")
+        user_data_dir = browser_info.get("user_data_dir")
+        browser_type = browser_info.get("browser_type")
+        if not pid or debugging_port is None or not user_data_dir:
+            return None
+
+        try:
+            process = psutil.Process(pid)
+            cmdline = list(process.cmdline() or [])
+        except (psutil.Error, OSError):
+            return None
+
+        if browser_type == "chromium":
+            expected_args = {
+                f"--remote-debugging-port={debugging_port}",
+                f"--user-data-dir={user_data_dir}",
+            }
+            return process if expected_args.issubset(cmdline) else None
+
+        if browser_type == "firefox":
+            has_port = ("--remote-debugging-port", str(debugging_port)) in zip(cmdline, cmdline[1:])
+            has_profile = ("--profile", user_data_dir) in zip(cmdline, cmdline[1:])
+            return process if has_port and has_profile else None
+
+        return None
+
+    def _is_browser_running(
+        self,
+        pid: Optional[int],
+        browser_info: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Check if the recorded browser process is still running.
+
+        If `browser_info` is provided, additionally verifies that the live
+        process has the recorded browser launch arguments, so a PID the kernel
+        has reused for an unrelated process is rejected as "not running".
+
+        Args:
+            pid: PID to check.
+            browser_info: Optional persisted browser info dict; when
+                given, cmdline identity is verified in addition to
+                existence.
+
+        Returns:
+            True if a process with `pid` exists and, when
+            `browser_info` is given, its cmdline matches the recorded
+            browser; False otherwise.
+        """
         if not pid:
             return False
-            
+
+        if browser_info is not None:
+            return self._get_verified_browser_process(pid, browser_info) is not None
+
         try:
-            # Check if the process exists
-            if sys.platform == "win32":
-                process = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], 
-                                         capture_output=True, text=True)
-                return str(pid) in process.stdout
-            else:
-                # Unix-like systems
-                os.kill(pid, 0)  # This doesn't actually kill the process, just checks if it exists
-            return True
-        except (ProcessLookupError, PermissionError, OSError):
+            return psutil.Process(pid).is_running()
+        except (psutil.Error, OSError):
             return False
             
     async def kill_builtin_browser(self) -> bool:
@@ -1333,20 +1424,27 @@ class BrowserProfiler:
         pid = browser_info.get('pid')
         if not pid:
             return False
-            
+
+        # Retain psutil's PID-plus-creation-time identity through the signal
+        # path so a recycled PID cannot be targeted after verification.
+        process = self._get_verified_browser_process(pid, browser_info)
+        if process is None:
+            self.logger.warning(
+                "Builtin browser is not running (stale config removed)",
+                tag="BUILTIN",
+            )
+            self._unlink_stale_builtin_config()
+            return False
+
         try:
-            if sys.platform == "win32":
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=True)
+            process.terminate()
+            for _ in range(5):
+                if not process.is_running():
+                    break
+                await asyncio.sleep(0.5)
             else:
-                os.kill(pid, signal.SIGTERM)
-                # Wait for termination
-                for _ in range(5):
-                    if not self._is_browser_running(pid):
-                        break
-                    await asyncio.sleep(0.5)
-                else:
-                    # Force kill if still running
-                    os.kill(pid, signal.SIGKILL)
+                if process.is_running():
+                    process.kill()
                     
             # Remove config file
             if os.path.exists(self.builtin_config_file):
@@ -1354,6 +1452,12 @@ class BrowserProfiler:
                 
             self.logger.success("Builtin browser terminated", tag="BUILTIN")
             return True
+        except (psutil.Error, OSError) as e:
+            self.logger.warning(
+                f"Builtin browser is no longer available: {str(e)}", tag="BUILTIN"
+            )
+            self._unlink_stale_builtin_config()
+            return False
         except Exception as e:
             self.logger.error(f"Error killing builtin browser: {str(e)}", tag="BUILTIN")
             return False
@@ -1379,31 +1483,3 @@ class BrowserProfiler:
             'cdp_url': browser_info.get('cdp_url'),
             'info': browser_info
         }
-
-
-if __name__ == "__main__":
-    # Example usage
-    profiler = BrowserProfiler()
-    
-    # Create a new profile
-    import os
-    from pathlib import Path
-    home_dir = Path.home()
-    profile_path = asyncio.run(profiler.create_profile( str(home_dir / ".crawl4ai/profiles/test-profile")))
-
-        
-            
-    # Launch a standalone browser
-    asyncio.run(profiler.launch_standalone_browser())
-    
-    # List profiles
-    profiles = profiler.list_profiles()
-    for profile in profiles:
-        print(f"Profile: {profile['name']}, Path: {profile['path']}")
-    
-    # Delete a profile
-    success = profiler.delete_profile("my-profile")
-    if success:
-        print("Profile deleted successfully")
-    else:
-        print("Failed to delete profile")
