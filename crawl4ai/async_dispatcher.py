@@ -448,7 +448,8 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                     # Process completed tasks
                     for completed_task in done:
                         result = await completed_task
-                        results.append(result)
+                        if (result.result.metadata or {}).get("status") != "requeued":
+                            results.append(result)
                         
                     # Update active tasks list
                     active_tasks = list(pending)
@@ -474,6 +475,9 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                     task.cancel()
             if active_tasks:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
+
+            # A reused dispatcher must not carry this batch into the next one.
+            self._clear_task_queue()
 
             memory_monitor.cancel()
             await asyncio.gather(memory_monitor, return_exceptions=True)
@@ -540,6 +544,13 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         # Refill the queue with updated priorities
         for item in temp_items:
             await self.task_queue.put(item)
+
+    def _clear_task_queue(self) -> None:
+        while True:
+            try:
+                self.task_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
                 
     async def run_urls_stream(
         self,
@@ -612,11 +623,12 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                     
                     for completed_task in done:
                         result = await completed_task
-                        
-                        # Only count as completed if it wasn't requeued
-                        if "requeued" not in result.error_message:
-                            completed_count += 1
-                            yield result
+
+                        # Requeued sentinels do not complete or leave the stream.
+                        if (result.result.metadata or {}).get("status") == "requeued":
+                            continue
+                        completed_count += 1
+                        yield result
                         
                     # Update active tasks list
                     active_tasks = list(pending)
@@ -637,12 +649,7 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
             if active_tasks:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
 
-            # Discard URLs that were queued by this stream but never started.
-            while True:
-                try:
-                    self.task_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            self._clear_task_queue()
 
             memory_monitor.cancel()
             await asyncio.gather(memory_monitor, return_exceptions=True)

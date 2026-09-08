@@ -1,6 +1,5 @@
 import asyncio
 import time
-from types import SimpleNamespace
 
 import pytest
 from crawl4ai import (
@@ -14,6 +13,7 @@ from crawl4ai import (
     DisplayMode,
     CacheMode,
 )
+from crawl4ai.models import CrawlResult
 
 
 @pytest.fixture
@@ -70,10 +70,8 @@ class TestDispatchStrategies:
         class BlockingCrawler:
             async def arun(self, url, config=None, session_id=None):
                 if url == "fast":
-                    return SimpleNamespace(
-                        success=True,
-                        status_code=200,
-                        error_message="",
+                    return CrawlResult(
+                        url=url, html="", success=True, status_code=200
                     )
                 await asyncio.Event().wait()
 
