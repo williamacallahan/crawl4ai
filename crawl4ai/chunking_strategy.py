@@ -1,7 +1,5 @@
 from abc import ABC, abstractmethod
 import re
-from collections import Counter
-import string
 from .model_loader import load_nltk_punkt
 
 # Define the abstract base class for chunking strategies
@@ -114,32 +112,6 @@ class TopicSegmentationChunking(ChunkingStrategy):
         # Use the TextTilingTokenizer to segment the text
         segmented_topics = self.tokenizer.tokenize(text)
         return segmented_topics
-
-    def extract_keywords(self, text: str) -> list:
-        # Tokenize and remove stopwords and punctuation
-        import nltk as nl
-
-        tokens = nl.toknize.word_tokenize(text)
-        tokens = [
-            token.lower()
-            for token in tokens
-            if token not in nl.corpus.stopwords.words("english")
-            and token not in string.punctuation
-        ]
-
-        # Calculate frequency distribution
-        freq_dist = Counter(tokens)
-        keywords = [word for word, freq in freq_dist.most_common(self.num_keywords)]
-        return keywords
-
-    def chunk_with_topics(self, text: str) -> list:
-        # Segment the text into topics
-        segments = self.chunk(text)
-        # Extract keywords for each topic segment
-        segments_with_topics = [
-            (segment, self.extract_keywords(segment)) for segment in segments
-        ]
-        return segments_with_topics
 
 
 # Fixed-length word chunks
