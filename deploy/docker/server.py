@@ -1055,8 +1055,7 @@ async def crawl_stream(
     return await stream_process(crawl_request=crawl_request)
 
 async def stream_process(crawl_request: CrawlRequestWithHooks):
-    
-    # Prepare hooks config if provided# Prepare hooks config if provided
+    # Prepare hooks config if provided.
     hooks_config = None
     if crawl_request.hooks and crawl_request.hooks.hooks:
         hooks_config = {'hooks': crawl_request.hooks.hooks}
@@ -1066,7 +1065,8 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         browser_config=crawl_request.browser_config,
         crawler_config=crawl_request.crawler_config,
         config=config,
-        hooks_config=hooks_config
+        hooks_config=hooks_config,
+        crawler_configs=crawl_request.crawler_configs,
     )
     
     # Add hooks info to response headers if available

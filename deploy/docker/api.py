@@ -229,6 +229,21 @@ def server_crawler_config(config, **kwargs):
     return apply_server_crawler_defaults(CrawlerRunConfig(**kwargs), {}, config)
 
 
+def _memory_dispatcher(config):
+    """Build the shared dispatcher policy for both crawl response modes."""
+    rate_config = config["crawler"]["rate_limiter"]
+    return MemoryAdaptiveDispatcher(
+        max_session_permit=config["crawler"]["pool"]["max_pages"],
+        memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+        recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
+        rate_limiter=(
+            RateLimiter(base_delay=tuple(rate_config["base_delay"]))
+            if rate_config["enabled"]
+            else None
+        ),
+    )
+
+
 def _project_crawl_result(result, result_fields):
     """Narrow a crawl result to the caller's requested fields.
 
@@ -1078,14 +1093,7 @@ async def handle_crawl_request(
         from governor import clamp_deep_crawl
         clamp_deep_crawl(loaded_crawler_config)
 
-        dispatcher = MemoryAdaptiveDispatcher(
-            max_session_permit=config["crawler"]["pool"]["max_pages"],
-            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
-            recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
-            rate_limiter=RateLimiter(
-                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-            ) if config["crawler"]["rate_limiter"]["enabled"] else None
-        )
+        dispatcher = _memory_dispatcher(config)
         
         from crawler_pool import get_crawler
 
@@ -1279,7 +1287,8 @@ async def handle_stream_crawl_request(
     browser_config: dict,
     crawler_config: dict,
     config: dict,
-    hooks_config: Optional[dict] = None
+    hooks_config: Optional[dict] = None,
+    crawler_configs: Optional[List[dict]] = None,
 ) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict], str]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
@@ -1361,18 +1370,24 @@ async def handle_stream_crawl_request(
             )
         else:
             # Default multi-URL streaming via arun_many
-            dispatcher = MemoryAdaptiveDispatcher(
-                max_session_permit=config["crawler"]["pool"]["max_pages"],
-                memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
-                recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
-                rate_limiter=RateLimiter(
-                    base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-                )
-            )
+            dispatcher = _memory_dispatcher(config)
+            if crawler_configs and len(urls) > 1:
+                # Match the shared streaming config's policy for every URL.
+                effective_config = [
+                    CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED)
+                    for cc in crawler_configs
+                ]
+                for cfg, request_config in zip(effective_config, crawler_configs):
+                    apply_server_crawler_defaults(cfg, request_config, config)
+                    clamp_deep_crawl(cfg)
+                    cfg.scraping_strategy = LXMLWebScrapingStrategy()
+                    cfg.stream = True
+            else:
+                effective_config = loaded_crawler_config
             results_gen = await _await_before_deadline(
                 crawler.arun_many(
                     urls=urls,
-                    config=loaded_crawler_config,
+                    config=effective_config,
                     dispatcher=dispatcher,
                 ),
                 deadline_at,
