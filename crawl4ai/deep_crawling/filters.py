@@ -218,9 +218,16 @@ class URLPatternFilter(URLFilter):
     def apply(self, url: str) -> bool:
         url_path = urlparse(url).path
 
-        # Quick suffix check (*.html)
+        # Quick suffix check (*.html). Compare the filename's dotted tail
+        # against each stored suffix so multi-part extensions such as
+        # "tar.gz" (stored from "*.tar.gz") match, not just the last
+        # dot-segment of the filename.
         if self._simple_suffixes:
-            if url_path.split("/")[-1].split(".")[-1] in self._simple_suffixes:
+            filename = url_path.split("/")[-1]
+            if any(
+                filename.endswith("." + suffix) or filename == suffix
+                for suffix in self._simple_suffixes
+            ):
                 result = True
                 self._update_stats(result)
                 return not result if self._reverse else result

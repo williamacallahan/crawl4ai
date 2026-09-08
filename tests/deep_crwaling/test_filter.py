@@ -1,7 +1,7 @@
 # // File: tests/deep_crawling/test_filters.py
 import pytest
 from urllib.parse import urlparse
-from crawl4ai import ContentTypeFilter, URLFilter 
+from crawl4ai import ContentTypeFilter, URLPatternFilter, URLFilter
 
 # Minimal URLFilter base class stub if not already importable directly for tests
 # In a real scenario, this would be imported from the library
@@ -82,3 +82,26 @@ class TestContentTypeFilter:
     def test_extract_extension(self, url, expected_extension):
         # Test the static method directly
         assert ContentTypeFilter._extract_extension(url) == expected_extension
+
+
+class TestURLPatternFilter:
+    @pytest.mark.parametrize(
+        "pattern, url, expected",
+        [
+            # Multi-part suffix patterns (the regression: a stored suffix that
+            # itself contains a dot must match the filename's dotted tail, not
+            # only its last dot-segment).
+            ("*.tar.gz", "https://example.com/archive.tar.gz", True),
+            ("*.tar.gz", "https://example.com/docs/backup.tar.gz", True),
+            ("*.tar.bz2", "https://example.com/a.tar.bz2", True),
+            ("*.tar.gz", "https://example.com/a.tgz", False),  # not a .tar.gz
+            # Single-part suffix patterns must keep working.
+            ("*.pdf", "https://example.com/report.pdf", True),
+            ("*.pdf", "https://example.com/page.html", False),
+        ],
+    )
+    def test_suffix_matching(self, pattern, url, expected):
+        # apply() is @lru_cache'd, so a fresh instance per case avoids stale
+        # results across parametrized runs.
+        f = URLPatternFilter(patterns=[pattern])
+        assert f.apply(url) is expected
