@@ -680,6 +680,9 @@ class _StubMonitor:
     def get_timeline_data(self, metric, window):
         return []
 
+    def get_endpoint_stats_summary(self):
+        return {}
+
     def get_janitor_log(self, limit=10):
         return []
 
