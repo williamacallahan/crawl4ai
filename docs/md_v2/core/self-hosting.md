@@ -2234,6 +2234,7 @@ asyncio.run(monitor_server())
     "requests": { /* Request rate */ },
     "browsers": { /* Pool composition */ }
   },
+  "endpoint_stats": { /* Per-endpoint performance stats */ },
   "janitor": [ /* Last 10 cleanup events */ ],
   "errors": [ /* Last 10 errors */ ]
 }
