@@ -19,6 +19,7 @@ from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.lowlevel.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
+from mcp.shared.message import SessionMessage
 from pydantic import AnyUrl, BaseModel
 from starlette.routing import Mount, Route
 
@@ -251,7 +252,9 @@ def attach_mcp(
             first = True 
             try:
                 async for msg in s2c_recv:
-                    await ws.send_json(msg.model_dump())
+                    await ws.send_json(
+                        msg.message.model_dump(by_alias=True, mode="json", exclude_none=True)
+                    )
                     if first:
                         init_done.set()
                         first = False
@@ -265,11 +268,11 @@ def attach_mcp(
             try:
                 # 1st frame is always "initialize"
                 first = adapter.validate_python(await ws.receive_json())
-                await c2s_send.send(first)
+                await c2s_send.send(SessionMessage(first))
                 await init_done.wait()          # block until server ready
                 while True:
                     data = await ws.receive_json()
-                    await c2s_send.send(adapter.validate_python(data))
+                    await c2s_send.send(SessionMessage(adapter.validate_python(data)))
             except WebSocketDisconnect:
                 await c2s_send.aclose()
 
