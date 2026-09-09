@@ -36,6 +36,17 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from crawl4ai.cache_context import CacheMode
 
 
+@pytest.fixture
+def server_browser_config():
+    from api import _apply_server_browser_policy
+    from utils import load_config
+
+    return _apply_server_browser_policy(
+        BrowserConfig(headless=True, verbose=False, viewport_width=1080, viewport_height=600),
+        load_config(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # HTML fixtures
 # ---------------------------------------------------------------------------
@@ -102,7 +113,7 @@ def _decode_png_size(b64: str):
 
 @pytest.mark.browser
 @pytest.mark.asyncio
-async def test_adjust_viewport_to_content_screenshot_covers_page():
+async def test_adjust_viewport_to_content_screenshot_covers_page(server_browser_config):
     """scan_full_page=False (the default dispatch path): the screenshot PNG
     must cover the full content height of a tall static page.
 
@@ -112,10 +123,6 @@ async def test_adjust_viewport_to_content_screenshot_covers_page():
     html = _tall_stripped_html(page_height=8000, page_width=1080)
     url, path = _write_temp_html(html)
     try:
-        browser_config = BrowserConfig(
-            headless=True, verbose=False,
-            viewport_width=1080, viewport_height=600,
-        )
         run_config = CrawlerRunConfig(
             screenshot=True,
             adjust_viewport_to_content=True,
@@ -125,7 +132,7 @@ async def test_adjust_viewport_to_content_screenshot_covers_page():
             exclude_external_links=True,
             verbose=False,
         )
-        async with AsyncWebCrawler(config=browser_config) as crawler:
+        async with AsyncWebCrawler(config=server_browser_config) as crawler:
             result = await crawler.arun(url=url, config=run_config)
         assert result.success, f"Crawl failed: {result.error_message}"
         assert result.screenshot, "Screenshot should be captured"
@@ -142,7 +149,7 @@ async def test_adjust_viewport_to_content_screenshot_covers_page():
 
 @pytest.mark.browser
 @pytest.mark.asyncio
-async def test_adjust_viewport_to_content_screenshot_scan_full_page_true():
+async def test_adjust_viewport_to_content_screenshot_scan_full_page_true(server_browser_config):
     """scan_full_page=True: the assertion encodes the user-visible coverage
     contract (the screenshot must cover the full static page), stable across
     Playwright versions. The mechanism that produces the capture may differ
@@ -155,10 +162,6 @@ async def test_adjust_viewport_to_content_screenshot_scan_full_page_true():
     html = _tall_stripped_html(page_height=8000, page_width=1080)
     url, path = _write_temp_html(html)
     try:
-        browser_config = BrowserConfig(
-            headless=True, verbose=False,
-            viewport_width=1080, viewport_height=600,
-        )
         run_config = CrawlerRunConfig(
             screenshot=True,
             adjust_viewport_to_content=True,
@@ -169,7 +172,7 @@ async def test_adjust_viewport_to_content_screenshot_scan_full_page_true():
             exclude_external_links=True,
             verbose=False,
         )
-        async with AsyncWebCrawler(config=browser_config) as crawler:
+        async with AsyncWebCrawler(config=server_browser_config) as crawler:
             result = await crawler.arun(url=url, config=run_config)
         assert result.success, f"Crawl failed: {result.error_message}"
         assert result.screenshot, "Screenshot should be captured"
