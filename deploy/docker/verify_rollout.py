@@ -710,9 +710,14 @@ def _verify_tasks(
             # withdrawals happen on ready nodes and stay fully confirmed.
             continue
         predecessor_desired, predecessor_state = _task_state(str(predecessor["ID"])[:12])
+        allowed_predecessor_states = {"shutdown", "complete"}
+        if not converged and predecessor.get("Node") in ELIGIBLE_NODES:
+            # A recovered baseline may follow a terminal task failure from an
+            # earlier outage. This deploy's own withdrawal proof stays strict.
+            allowed_predecessor_states.add("failed")
         if (
             predecessor_desired != "shutdown"
-            or predecessor_state not in {"shutdown", "complete"}
+            or predecessor_state not in allowed_predecessor_states
         ):
             raise RuntimeError("Swarm task history contradicts the start-first rollout")
     network = subprocess.run(

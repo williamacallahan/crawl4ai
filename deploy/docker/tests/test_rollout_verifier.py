@@ -2068,3 +2068,17 @@ def test_heal_refuses_a_mutable_running_artifact(monkeypatch):
     with pytest.raises(ValueError, match="no immutable artifact"):
         rollout._heal_stranded_record("https://dokploy", "key", "app", "svc", record)
     assert posts == []
+
+
+def test_baseline_accepts_terminal_failed_predecessor_but_rollout_does_not(monkeypatch):
+    rows, runtimes = _healed_baseline_rows()
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    monkeypatch.setattr(rollout, "_task_state", lambda task: (
+        ("running", "running") if task.startswith("task")
+        else ("shutdown", "failed") if task.startswith("ghost")
+        else ("shutdown", "shutdown")
+    ))
+    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", rollout.ELIGIBLE_NODES, False)
+    assert len(proof["instances"]) == rollout.REPLICAS
+    with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", rollout.ELIGIBLE_NODES)
