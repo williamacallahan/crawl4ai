@@ -150,7 +150,9 @@ def get_container_memory_percent() -> float:
     try:
         # Try cgroup v2 first
         current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
-        max_mem = int(Path("/sys/fs/cgroup/memory.max").read_text().strip())
+        max_raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        # "max" (unlimited) → measure against host total
+        max_mem = psutil.virtual_memory().total if max_raw == "max" else int(max_raw)
         return (current / max_mem) * 100
     except:
         # Fallback to cgroup v1
