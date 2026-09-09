@@ -429,12 +429,126 @@ def test_wait_deployment_accepts_one_exact_new_row(monkeypatch):
     assert result["deploymentId"] == "new"
 
 
+def test_wait_deployment_resets_processing_deadline_after_admission(monkeypatch, capsys):
+    matching = {
+        "deploymentId": "new",
+        "title": "title",
+        "description": "description",
+    }
+    deployments = iter(
+        [
+            [{"deploymentId": "old", "status": "done"}],
+            [{**matching, "status": "running"}],
+            [{**matching, "status": "running"}],
+            [{**matching, "status": "running"}],
+            [{**matching, "status": "done"}],
+        ]
+    )
+    clock = [0]
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(rollout, "TIMEOUT_SECONDS", 20)
+    monkeypatch.setattr(rollout, "_deployments", lambda *_args: next(deployments))
+    monkeypatch.setattr(rollout.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(rollout.time, "sleep", advance)
+
+    result = rollout._wait_deployment(
+        "https://dokploy", "key", "app", {"old"}, "title", "description"
+    )
+
+    assert result["status"] == "done"
+    assert clock[0] == 20
+    assert capsys.readouterr().out == (
+        "stock Dokploy deployment was admitted; waiting for processing\n"
+    )
+
+
+def test_wait_deployment_times_out_while_queued(monkeypatch):
+    clock = [0]
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(rollout, "TIMEOUT_SECONDS", 10)
+    monkeypatch.setattr(
+        rollout,
+        "_deployments",
+        lambda *_args: [{"deploymentId": "old", "status": "done"}],
+    )
+    monkeypatch.setattr(rollout.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(rollout.time, "sleep", advance)
+
+    with pytest.raises(TimeoutError, match="was not admitted from the queue"):
+        rollout._wait_deployment(
+            "https://dokploy", "key", "app", {"old"}, "title", "description"
+        )
+
+
+def test_wait_deployment_times_out_after_single_admission_deadline(monkeypatch, capsys):
+    clock = [0]
+
+    def advance(seconds):
+        clock[0] += seconds
+        if clock[0] > 10:
+            raise AssertionError("processing deadline was reset repeatedly")
+
+    monkeypatch.setattr(rollout, "TIMEOUT_SECONDS", 10)
+    monkeypatch.setattr(
+        rollout,
+        "_deployments",
+        lambda *_args: [
+            {
+                "deploymentId": "new",
+                "title": "title",
+                "description": "description",
+                "status": "running",
+            }
+        ],
+    )
+    monkeypatch.setattr(rollout.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(rollout.time, "sleep", advance)
+
+    with pytest.raises(TimeoutError, match="did not finish after queue admission"):
+        rollout._wait_deployment(
+            "https://dokploy", "key", "app", set(), "title", "description"
+        )
+
+    assert clock[0] == 10
+    assert capsys.readouterr().out == (
+        "stock Dokploy deployment was admitted; waiting for processing\n"
+    )
+
+
 def test_wait_deployment_fails_closed_on_foreign_row(monkeypatch):
     monkeypatch.setattr(
         rollout,
         "_deployments",
         lambda *_args: [{"deploymentId": "foreign", "title": "other"}],
     )
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        rollout._wait_deployment(
+            "https://dokploy", "key", "app", set(), "title", "description"
+        )
+
+
+def test_wait_deployment_fails_closed_on_conflicting_row_after_admission(monkeypatch):
+    matching = {
+        "deploymentId": "new",
+        "title": "title",
+        "description": "description",
+        "status": "running",
+    }
+    deployments = iter(
+        [
+            [matching],
+            [matching, {"deploymentId": "foreign", "title": "other"}],
+        ]
+    )
+    monkeypatch.setattr(rollout, "_deployments", lambda *_args: next(deployments))
+    monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+
     with pytest.raises(RuntimeError, match="ambiguous"):
         rollout._wait_deployment(
             "https://dokploy", "key", "app", set(), "title", "description"

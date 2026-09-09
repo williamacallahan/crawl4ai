@@ -611,6 +611,7 @@ def _wait_deployment(
     description: str,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + TIMEOUT_SECONDS
+    admitted = False
     while time.monotonic() < deadline:
         new = [
             row
@@ -626,13 +627,19 @@ def _wait_deployment(
             raise RuntimeError("deployment submission is ambiguous; no recovery write is allowed")
         if matching:
             owned = matching[0]
+            if not admitted:
+                admitted = True
+                deadline = time.monotonic() + TIMEOUT_SECONDS
+                print("stock Dokploy deployment was admitted; waiting for processing", flush=True)
             status = owned.get("status")
             if status == "done":
                 return owned
             if status in {"error", "cancelled"}:
                 raise RuntimeError(f"stock Dokploy deployment ended in {status}")
         time.sleep(5)
-    raise TimeoutError("stock Dokploy deployment did not finish")
+    if admitted:
+        raise TimeoutError("stock Dokploy deployment did not finish after queue admission")
+    raise TimeoutError("stock Dokploy deployment was not admitted from the queue")
 
 
 def _exact_health(health: Any, revision: str | None = None) -> bool:
