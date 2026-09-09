@@ -132,10 +132,11 @@ def _rollout_policy(failure_action: str) -> dict[str, Any]:
 
 
 class CurlError(RuntimeError):
-    """curl exited non-zero; curl_exit carries the code for triage.
+    """A bounded HTTP transport exited non-zero; curl_exit carries its code.
 
-    22 means the service answered badly (--fail on a 4xx/5xx); 7/28/35/52/56
-    point at transport between the runner and the host, not the service.
+    For curl, 22 means the service answered badly (--fail on a 4xx/5xx);
+    7/28/35/52/56 point at transport between the runner and the host, not the
+    service.
     """
 
     def __init__(self, message: str, curl_exit: int):
@@ -148,28 +149,51 @@ def _request_json(
     api_key: str | None = None,
     *,
     network_namespace_pid: int | None = None,
+    ingress_container: str | None = None,
 ) -> Any:
     config = ""
-    if api_key:
-        escaped = api_key.replace("\\", "\\\\").replace('"', '\\"')
-        config = f'header = "x-api-key: {escaped}"\n'
-    command = [
-        "curl", "--silent", "--show-error", "--fail",
-        "--connect-timeout", "5", "--max-time", "15",
-        "--max-filesize", "65536", "--config", "-", url,
-    ]
-    if network_namespace_pid is not None:
+    if ingress_container is not None:
         if (
-            isinstance(network_namespace_pid, bool)
-            or not isinstance(network_namespace_pid, int)
-            or network_namespace_pid <= 0
+            api_key is not None
+            or network_namespace_pid is not None
+            or not isinstance(ingress_container, str)
+            or re.fullmatch(r"[0-9a-f]{64}", ingress_container) is None
         ):
-            raise ValueError("network namespace PID must be a positive integer")
+            raise ValueError(
+                "ingress container must be a full hexadecimal Docker ID without "
+                "API key or namespace PID"
+            )
         command = [
-            "nsenter",
-            f"--net=/proc/{network_namespace_pid}/ns/net",
-            *command,
+            "docker",
+            "exec",
+            ingress_container,
+            "sh",
+            "-c",
+            'set -o pipefail; wget -q -T 15 -O - "$1" | head -c 65537',
+            "sh",
+            url,
         ]
+    else:
+        if api_key:
+            escaped = api_key.replace("\\", "\\\\").replace('"', '\\"')
+            config = f'header = "x-api-key: {escaped}"\n'
+        command = [
+            "curl", "--silent", "--show-error", "--fail",
+            "--connect-timeout", "5", "--max-time", "15",
+            "--max-filesize", "65536", "--config", "-", url,
+        ]
+        if network_namespace_pid is not None:
+            if (
+                isinstance(network_namespace_pid, bool)
+                or not isinstance(network_namespace_pid, int)
+                or network_namespace_pid <= 0
+            ):
+                raise ValueError("network namespace PID must be a positive integer")
+            command = [
+                "nsenter",
+                f"--net=/proc/{network_namespace_pid}/ns/net",
+                *command,
+            ]
     response = subprocess.run(
         command,
         input=config,
@@ -181,11 +205,14 @@ def _request_json(
         # Carry curl's own diagnosis: a bare "HTTP request failed" made the
         # 2026-08-31 single-sample monitor failure unattributable (connection
         # reset vs TLS vs 5xx), leaving the gate's verdict unactionable.
+        transport = "docker exec" if ingress_container is not None else "curl"
         raise CurlError(
-            f"HTTP request failed: curl exit {response.returncode}: "
+            f"HTTP request failed: {transport} exit {response.returncode}: "
             f"{(response.stderr or '').strip()[:200]}",
             response.returncode,
         )
+    if ingress_container is not None and len(response.stdout.encode()) > 65536:
+        raise ValueError("ingress health response exceeds 65536 bytes")
     return json.loads(response.stdout) if response.stdout else None
 
 
@@ -629,7 +656,7 @@ def _service_tasks(app_name: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in listed.stdout.splitlines() if line]
 
 
-def _verify_ingress_host() -> int:
+def _verify_ingress_container() -> str:
     ingress = subprocess.run(
         [
             "docker",
@@ -649,8 +676,13 @@ def _verify_ingress_host() -> int:
     container = ingress.stdout.splitlines()
     if len(container) != 1:
         raise RuntimeError("rollout verifier is not running on the public ingress host")
+    return container[0]
+
+
+def _verify_ingress_host() -> int:
+    container = _verify_ingress_container()
     inspected = subprocess.run(
-        ["docker", "inspect", container[0], "--format", "{{.State.Pid}}"],
+        ["docker", "inspect", container, "--format", "{{.State.Pid}}"],
         check=True,
         capture_output=True,
         text=True,
@@ -667,7 +699,7 @@ def _verify_ingress_host() -> int:
 def _verify_tasks(
     app_name: str, image: str, revision: str, ready: frozenset[str], converged: bool = True
 ) -> dict[str, Any]:
-    ingress_pid = _verify_ingress_host()
+    ingress_container = _verify_ingress_container()
     rows = _service_tasks(app_name)
     current = [
         row for row in rows
@@ -745,13 +777,7 @@ def _verify_tasks(
         ):
             raise RuntimeError("Crawl4AI task identity drifted")
         health_url = f"http://{next(iter(runtime['addresses']))}:11235/health"
-        try:
-            health = _request_json(health_url, network_namespace_pid=ingress_pid)
-        except CurlError as error:
-            if "nsenter" not in str(error) or "ns/net" not in str(error):
-                raise
-            ingress_pid = _verify_ingress_host()
-            health = _request_json(health_url, network_namespace_pid=ingress_pid)
+        health = _request_json(health_url, ingress_container=ingress_container)
         if not _exact_health(health, revision) or health["instance"] != runtime["container"]:
             raise RuntimeError("Crawl4AI task failed direct overlay readiness")
         instances.add(runtime["container"])

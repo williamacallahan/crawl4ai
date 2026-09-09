@@ -541,7 +541,9 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
     ingress_calls = []
-    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: ingress_calls.append(None) or 4321)
+    monkeypatch.setattr(
+        rollout, "_verify_ingress_container", lambda: ingress_calls.append(None) or "a" * 64
+    )
     monkeypatch.setattr(
         rollout,
         "_task_state",
@@ -556,8 +558,8 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
     )
     direct_probe = []
 
-    def direct_health(url, *, network_namespace_pid):
-        direct_probe.append((url, network_namespace_pid))
+    def direct_health(url, *, ingress_container):
+        direct_probe.append((url, ingress_container))
         return health(
             next(runtime["container"] for runtime in runtimes.values() if next(iter(runtime["addresses"])) in url)
         )
@@ -566,9 +568,12 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
     proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES)
     assert proof["nodes"] == ["haiku-5", "haiku-6", "haiku-9"]
     assert len(proof["instances"]) == 3
-    assert len(ingress_calls) == 1
+    assert ingress_calls == [None]
     assert len(direct_probe) == rollout.REPLICAS
-    assert {namespace_pid for _url, namespace_pid in direct_probe} == {4321}
+    assert {url for url, _container in direct_probe} == {
+        f"http://10.0.1.{index}:11235/health" for index in range(1, 4)
+    }
+    assert {container for _url, container in direct_probe} == {"a" * 64}
 
 
 
@@ -1093,6 +1098,92 @@ def test_request_json_uses_namespace_argv_and_existing_bounds(monkeypatch):
     ]
 
 
+def test_request_json_uses_ingress_container_exec_argv_and_bounds(monkeypatch):
+    invocation = []
+    container = "a" * 64
+    url = "http://10.0.1.38:11235/health"
+
+    def run(command, **kwargs):
+        invocation.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, json.dumps(health("one")), "")
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+
+    assert rollout._request_json(url, ingress_container=container) == health("one")
+    assert invocation == [
+        (
+            [
+                "docker",
+                "exec",
+                container,
+                "sh",
+                "-c",
+                'set -o pipefail; wget -q -T 15 -O - "$1" | head -c 65537',
+                "sh",
+                url,
+            ],
+            {"input": "", "text": True, "capture_output": True, "timeout": 20},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ingress_container", "api_key", "network_namespace_pid"),
+    [
+        ("short", None, None),
+        ("g" * 64, None, None),
+        ("a" * 64, "key", None),
+        ("a" * 64, None, 4321),
+    ],
+)
+def test_request_json_rejects_invalid_or_ambiguous_ingress_transport(
+    monkeypatch, ingress_container, api_key, network_namespace_pid
+):
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("invalid ingress transport must not execute a command"),
+    )
+
+    with pytest.raises(ValueError, match="ingress container"):
+        rollout._request_json(
+            "http://10.0.1.38:11235/health",
+            api_key,
+            network_namespace_pid=network_namespace_pid,
+            ingress_container=ingress_container,
+        )
+
+
+def test_request_json_reports_ingress_exec_failure(monkeypatch):
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 1, "", "wget: connection refused"
+        ),
+    )
+
+    with pytest.raises(rollout.CurlError) as error:
+        rollout._request_json("http://10.0.1.38:11235/health", ingress_container="a" * 64)
+
+    assert error.value.curl_exit == 1
+    assert "docker exec exit 1" in str(error.value)
+    assert "connection refused" in str(error.value)
+
+
+def test_request_json_rejects_an_oversized_ingress_response(monkeypatch):
+    oversized = json.dumps({"value": "€" * 21_846}, ensure_ascii=False)
+    assert len(oversized) < 65536 < len(oversized.encode())
+    monkeypatch.setattr(
+        rollout.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, oversized, ""),
+    )
+
+    with pytest.raises(ValueError, match="exceeds 65536 bytes"):
+        rollout._request_json("http://10.0.1.38:11235/health", ingress_container="a" * 64)
+
+
 @pytest.mark.parametrize("network_namespace_pid", [True, 1.5, 0])
 def test_request_json_rejects_an_invalid_network_namespace_pid(
     monkeypatch, network_namespace_pid
@@ -1266,7 +1357,7 @@ def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
         return subprocess.CompletedProcess(command, 0, json.dumps(network), "")
 
     monkeypatch.setattr(rollout.subprocess, "run", run)
-    monkeypatch.setattr(rollout, "_verify_ingress_host", lambda: 4321)
+    monkeypatch.setattr(rollout, "_verify_ingress_container", lambda: "a" * 64)
     monkeypatch.setattr(
         rollout,
         "_task_state",
@@ -1281,7 +1372,7 @@ def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):
     monkeypatch.setattr(
         rollout,
         "_request_json",
-        lambda url, *_args, network_namespace_pid: health(
+        lambda url, *_args, ingress_container: health(
             next(r["container"] for r in runtimes.values() if next(iter(r["addresses"])) in url),
             revision=revision,
         ),
@@ -1311,6 +1402,34 @@ def test_baseline_tolerates_healed_colocation_but_converged_does_not(monkeypatch
     assert sorted(proof["nodes"]) == ["haiku-5", "haiku-9"]
     with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
         rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready)
+
+
+def test_verify_tasks_does_not_retry_an_ingress_exec_failure(monkeypatch):
+    rows, runtimes = _healed_baseline_rows()
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    ingress_calls = []
+    monkeypatch.setattr(
+        rollout, "_verify_ingress_container", lambda: ingress_calls.append(None) or "a" * 64
+    )
+    probes = []
+
+    def fail(url, *, ingress_container):
+        probes.append((url, ingress_container))
+        raise rollout.CurlError("HTTP request failed: docker exec exit 1: refused", 1)
+
+    monkeypatch.setattr(rollout, "_request_json", fail)
+
+    with pytest.raises(rollout.CurlError, match="docker exec exit 1"):
+        rollout._verify_tasks(
+            "crawl4ai",
+            BASELINE,
+            "baseline",
+            frozenset({"haiku-5", "haiku-9", "haiku-18"}),
+            False,
+        )
+
+    assert ingress_calls == [None]
+    assert probes == [("http://10.0.1.1:11235/health", "a" * 64)]
 
 
 def _deploy_env(monkeypatch):
