@@ -486,8 +486,15 @@
                 if (data.janitor) {
                     updateJanitorDisplay(data.janitor);
                 }
-                if (data.errors && data.errors.length > 0) {
+                if (data.errors) {
                     updateErrorsDisplay(data.errors);
+                }
+                if (data.endpoint_stats) {
+                    updateEndpointStatsDisplay(data.endpoint_stats);
+                }
+                if (data.timeline) {
+                    const metric = document.getElementById('timeline-metric').value;
+                    drawTimeline(data.timeline[metric], metric);
                 }
             } catch (e) {
                 console.error('Error updating dashboard:', e);
@@ -899,31 +906,28 @@
             }
         }
 
+        function updateEndpointStatsDisplay(data) {
+            const tbody = document.getElementById('endpoints-table-body');
+            if (!tbody) return;
+            const endpoints = Object.entries(data || {});
+            if (endpoints.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-secondary">No data</td></tr>';
+                return;
+            }
+            tbody.innerHTML = endpoints.map(([endpoint, stats]) => `
+                <tr class="border-t border-border">
+                    <td class="py-2 pr-4 text-primary">${escapeHtml(endpoint)}</td>
+                    <td class="py-2 pr-4 text-right">${stats.count}</td>
+                    <td class="py-2 pr-4 text-right">${stats.avg_latency_ms}ms</td>
+                    <td class="py-2 pr-4 text-right">${stats.success_rate_percent.toFixed(1)}%</td>
+                    <td class="py-2 pr-4 text-right">${stats.pool_hit_rate_percent.toFixed(1)}%</td>
+                </tr>`).join('');
+        }
+
         async function fetchEndpointStats() {
             try {
                 const res = await authFetch('/monitor/endpoints/stats');
-                const data = await res.json();
-
-                const tbody = document.getElementById('endpoints-table-body');
-                const endpoints = Object.entries(data);
-
-                if (endpoints.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-secondary">No data</td></tr>';
-                } else {
-                    tbody.innerHTML = endpoints.map(([endpoint, stats]) => `
-                        <tr class="border-t border-border">
-                            <td class="py-2 pr-4 text-primary">${endpoint}</td>
-                            <td class="py-2 pr-4 text-right">${stats.count}</td>
-                            <td class="py-2 pr-4 text-right">${stats.avg_latency_ms}ms</td>
-                            <td class="py-2 pr-4 text-right ${stats.success_rate_percent >= 99 ? 'text-green-500' : 'text-yellow-500'}">
-                                ${stats.success_rate_percent.toFixed(1)}%
-                            </td>
-                            <td class="py-2 pr-4 text-right ${stats.pool_hit_rate_percent >= 90 ? 'text-green-500' : 'text-yellow-500'}">
-                                ${stats.pool_hit_rate_percent.toFixed(1)}%
-                            </td>
-                        </tr>
-                    `).join('');
-                }
+                updateEndpointStatsDisplay(await res.json());
             } catch (e) {
                 console.error('Failed to fetch endpoint stats:', e);
             }
