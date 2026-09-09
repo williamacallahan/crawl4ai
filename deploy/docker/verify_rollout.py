@@ -744,10 +744,14 @@ def _verify_tasks(
             or runtime["addresses"] != {vip_by_task[task_id].get("EndpointIP")}
         ):
             raise RuntimeError("Crawl4AI task identity drifted")
-        health = _request_json(
-            f"http://{next(iter(runtime['addresses']))}:11235/health",
-            network_namespace_pid=ingress_pid,
-        )
+        health_url = f"http://{next(iter(runtime['addresses']))}:11235/health"
+        try:
+            health = _request_json(health_url, network_namespace_pid=ingress_pid)
+        except CurlError as error:
+            if "nsenter" not in str(error) or "ns/net" not in str(error):
+                raise
+            ingress_pid = _verify_ingress_host()
+            health = _request_json(health_url, network_namespace_pid=ingress_pid)
         if not _exact_health(health, revision) or health["instance"] != runtime["container"]:
             raise RuntimeError("Crawl4AI task failed direct overlay readiness")
         instances.add(runtime["container"])
