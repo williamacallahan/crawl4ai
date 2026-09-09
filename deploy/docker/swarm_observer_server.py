@@ -19,6 +19,7 @@ METRIC_NAME = (
     "crawl4ai_direct_healthy_task_count",
     "crawl4ai_public_covered_task_count",
     "crawl4ai_coverage_complete",
+    "crawl4ai_coverage_sample_timestamp_seconds",
 )
 
 

@@ -240,11 +240,15 @@ jobs:
           IMAGE_DIGEST: ${{ needs.merge.outputs.image_digest }}
         run: |
           set -euo pipefail
-          export ROLLOUT_MONITOR_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.jsonl"
-          export ROLLOUT_MONITOR_ARMED_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.armed"
-          export ROLLOUT_MONITOR_STOP_PATH="$RUNNER_TEMP/crawl4ai-rollout-monitor.stop"
+          umask 077
+          printf '::add-mask::%s\n' "$IMAGE" "$APPLICATION_ID" "$IMAGE_DIGEST"
+          evidence_dir="$HOME/.local/state/crawl4ai-rollouts/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$evidence_dir"
+          export ROLLOUT_MONITOR_PATH="$evidence_dir/monitor.jsonl"
+          export ROLLOUT_MONITOR_ARMED_PATH="$evidence_dir/monitor.armed"
+          export ROLLOUT_MONITOR_STOP_PATH="$evidence_dir/monitor.stop"
           rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
-          .venv/bin/python deploy/docker/verify_rollout.py monitor &
+          .venv/bin/python deploy/docker/verify_rollout.py monitor >"$evidence_dir/monitor.log" 2>&1 &
           monitor_pid=$!
           trap 'touch "$ROLLOUT_MONITOR_STOP_PATH"; wait "$monitor_pid" || true' EXIT
           for _ in {1..30}; do
@@ -254,19 +258,19 @@ jobs:
           done
           test -f "$ROLLOUT_MONITOR_ARMED_PATH"
 
-          .venv/bin/python deploy/docker/verify_rollout.py deploy
+          if ! .venv/bin/python deploy/docker/verify_rollout.py deploy >"$evidence_dir/deploy.log" 2>&1; then
+            grep -E '^TimeoutError: stock Dokploy deployment (was not admitted from the queue|did not finish after queue admission)$' "$evidence_dir/deploy.log" || true
+            echo 'Deployment verification failed; full diagnostics retained privately on the runner.'
+            exit 1
+          fi
           touch "$ROLLOUT_MONITOR_STOP_PATH"
           wait "$monitor_pid"
           trap - EXIT
-          .venv/bin/python deploy/docker/verify_rollout.py evidence
-
-      - name: Preserve rollout evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: crawl4ai-rollout-${{ github.sha }}
-          path: ${{ runner.temp }}/crawl4ai-rollout-monitor.jsonl
-          if-no-files-found: warn
+          if ! .venv/bin/python deploy/docker/verify_rollout.py evidence >"$evidence_dir/evidence.log" 2>&1; then
+            echo 'Final rollout evidence failed; full diagnostics retained privately on the runner.'
+            exit 1
+          fi
+          echo 'Deployment and final replica verification passed; full diagnostics retained privately on the runner.'
 
       # Same reason as build and merge: an authenticated session otherwise
       # stays in ~/.docker/config.json for whatever job lands here next.

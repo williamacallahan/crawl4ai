@@ -1714,15 +1714,16 @@ def test_coverage_metrics_are_fixed_unlabeled_and_zero_is_incomplete():
     snapshot = observer.CoverageSnapshot(3, 2, 1)
 
     assert snapshot.complete == 0
-    assert snapshot.metrics_text() == (
+    assert snapshot.metrics_text(1789000000.125) == (
         "crawl4ai_authoritative_task_count 3\n"
         "crawl4ai_direct_healthy_task_count 2\n"
         "crawl4ai_public_covered_task_count 1\n"
         "crawl4ai_coverage_complete 0\n"
+        "crawl4ai_coverage_sample_timestamp_seconds 1789000000.125\n"
     )
     empty = observer.CoverageSnapshot(0, 0, 0)
     assert empty.complete == 0
-    assert empty.metrics_text().endswith("crawl4ai_coverage_complete 0\n")
+    assert "crawl4ai_coverage_complete 0\n" in empty.metrics_text(1789000000.125)
     two_surviving_tasks = observer.CoverageSnapshot(2, 2, 2)
     assert two_surviving_tasks.complete == 0
     with pytest.raises(ValueError, match="exceeds direct_healthy_count"):
@@ -1969,6 +1970,7 @@ def test_sampling_failure_does_not_report_bogus_zero_coverage_for_a_healthy_flee
         lambda *_args: observer.NetworkDbFdbComparison.INCONCLUSIVE,
     )
 
+    monkeypatch.setattr(observer.time, "time", lambda: 1789000000.125)
     observer.write_sample()
 
     out = capsys.readouterr().out
@@ -1979,6 +1981,7 @@ def test_sampling_failure_does_not_report_bogus_zero_coverage_for_a_healthy_flee
         "crawl4ai_direct_healthy_task_count 0\n"
         "crawl4ai_public_covered_task_count 0\n"
         "crawl4ai_coverage_complete 0\n"
+        "crawl4ai_coverage_sample_timestamp_seconds 1789000000.125\n"
     )
 
 
@@ -2144,15 +2147,22 @@ def test_sampling_failure_replaces_a_stale_healthy_sample(monkeypatch, tmp_path)
         lambda _service: (_ for _ in ()).throw(RuntimeError("private detail")),
     )
 
+    monkeypatch.setattr(observer.time, "time", lambda: 1789000000.125)
     observer.write_sample()
 
-    assert metrics_path.read_text().endswith("crawl4ai_coverage_complete 0\n")
+    assert metrics_path.read_text() == (
+        "crawl4ai_authoritative_task_count 0\n"
+        "crawl4ai_direct_healthy_task_count 0\n"
+        "crawl4ai_public_covered_task_count 0\n"
+        "crawl4ai_coverage_complete 0\n"
+        "crawl4ai_coverage_sample_timestamp_seconds 1789000000.125\n"
+    )
     assert state_path.read_bytes() == b"open\n"
 
 
 def test_metrics_endpoint_exposes_only_the_fixed_contract(tmp_path):
     path = tmp_path / "metrics"
-    path.write_text(OBSERVER_COMPLETE.metrics_text())
+    path.write_text(OBSERVER_COMPLETE.metrics_text(1789000000.125))
     metrics = observer_server.MetricsFile(path, 60)
     server = observer_server.http.server.ThreadingHTTPServer(
         ("127.0.0.1", 0), observer_server.handler(metrics)
@@ -2164,7 +2174,7 @@ def test_metrics_endpoint_exposes_only_the_fixed_contract(tmp_path):
         connection.request("GET", "/metrics")
         response = connection.getresponse()
         assert response.status == 200
-        assert response.read().decode() == OBSERVER_COMPLETE.metrics_text()
+        assert response.read().decode() == OBSERVER_COMPLETE.metrics_text(1789000000.125)
         connection.request("GET", "/tasks")
         assert connection.getresponse().status == 404
         connection.request("POST", "/metrics")
@@ -2177,7 +2187,7 @@ def test_metrics_endpoint_exposes_only_the_fixed_contract(tmp_path):
 
 def test_metrics_endpoint_fails_closed_when_the_sampler_is_stale(monkeypatch, tmp_path):
     path = tmp_path / "metrics"
-    path.write_text(OBSERVER_COMPLETE.metrics_text())
+    path.write_text(OBSERVER_COMPLETE.metrics_text(1789000000.125))
     monkeypatch.setattr(observer_server.time, "time", lambda: path.stat().st_mtime + 61)
 
     with pytest.raises(TimeoutError, match="stale"):

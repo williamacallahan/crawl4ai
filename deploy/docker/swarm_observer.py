@@ -87,13 +87,14 @@ class CoverageSnapshot:
             == self.public_covered_count
         )
 
-    def metrics_text(self) -> str:
-        """Return the four fixed, unlabeled Prometheus samples."""
+    def metrics_text(self, sampled_at: float) -> str:
+        """Return the fixed, unlabeled Prometheus samples for one producer run."""
         return (
             f"crawl4ai_authoritative_task_count {self.authoritative_task_count}\n"
             f"crawl4ai_direct_healthy_task_count {self.direct_healthy_count}\n"
             f"crawl4ai_public_covered_task_count {self.public_covered_count}\n"
             f"crawl4ai_coverage_complete {self.complete}\n"
+            f"crawl4ai_coverage_sample_timestamp_seconds {sampled_at}\n"
         )
 
 
@@ -400,7 +401,7 @@ def write_sample() -> None:
         latch.acknowledge()
     _write_metrics(
         os.environ.get("CRAWL4AI_OBSERVER_METRICS_PATH", DEFAULT_METRICS_PATH),
-        snapshot.metrics_text(),
+        snapshot.metrics_text(time.time()),
     )
 
 
