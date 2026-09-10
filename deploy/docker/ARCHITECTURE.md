@@ -500,6 +500,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "requests": monitor.get_timeline_data("requests", "5m"),
                         "browsers": monitor.get_timeline_data("browsers", "5m")
                     },
+                    "endpoint_stats": monitor.get_endpoint_stats_summary(),
                     "janitor": monitor.get_janitor_log(limit=10),
                     "errors": monitor.get_errors_log(limit=10)
                 }
