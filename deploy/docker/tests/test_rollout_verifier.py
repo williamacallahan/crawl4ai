@@ -119,7 +119,7 @@ def route(
                     "service": "missing@internal" if wrong_router else "one",
                 },
                 "two": {
-                    "rule": "Host(`crawl4ai.popos-sf0.com`)",
+                    "rule": "Host(`crawl4ai.iocloudhost.net`)",
                     "service": "two",
                 },
             },

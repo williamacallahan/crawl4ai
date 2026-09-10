@@ -24,7 +24,7 @@ LLM_PROVIDER = "openai/qwen3.8-27b"
 LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 HEALTH_URLS = (
     "https://crawl4ai.haiku.host/health",
-    "https://crawl4ai.popos-sf0.com/health",
+    "https://crawl4ai.iocloudhost.net/health",
 )
 HEALTHCHECK = {
     "Test": ["CMD", "curl", "-f", "http://localhost:11235/health"],
