@@ -278,6 +278,7 @@ async def websocket_endpoint(websocket: WebSocket):
     - Active/completed requests
     - Browser pool status
     - Timeline data
+    - Endpoint statistics
     """
     # Auth is enforced by the AuthGateMiddleware (outermost ASGI layer), which
     # validates Authorization or the browser WebSocket bearer subprotocol and
