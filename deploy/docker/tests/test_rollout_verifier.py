@@ -1602,6 +1602,26 @@ def test_deploy_requires_a_spare_node_for_start_first(monkeypatch):
         rollout.deploy()
 
 
+def test_deploy_treats_an_absent_update_status_as_terminal(monkeypatch):
+    # Docker reports no UpdateStatus for a service that was never updated or
+    # was recreated. Refusing there strands every later deploy.
+    _deploy_env(monkeypatch)
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application())
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(
+        rollout, "_verify_redis", lambda: (_ for _ in ()).throw(SystemExit("gate passed"))
+    )
+
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "")
+    with pytest.raises(SystemExit, match="gate passed"):
+        rollout.deploy()
+
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "updating")
+    with pytest.raises(RuntimeError, match="nonterminal Swarm update"):
+        rollout.deploy()
+
+
 def test_deploy_rejects_a_reintroduced_cap_once_the_record_converged(monkeypatch):
     # Record already migrated to the capless shape; a capped LIVE spec is
     # drift, not transition residue.

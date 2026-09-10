@@ -857,7 +857,9 @@ def deploy() -> None:
     if not isinstance(baseline_revision, str) or not baseline_revision:
         raise ValueError("stock Dokploy baseline has no revision")
     app_name = str(application["appName"])
-    if _update_state(app_name) != "completed":
+    # A never-updated or recreated service reports no UpdateStatus at all, which
+    # is nothing in flight rather than an update still running.
+    if _update_state(app_name) not in {"", "completed"}:
         raise RuntimeError("Crawl4AI already has a nonterminal Swarm update")
     # Nothing is in flight now, so a record that disagrees with the service is a
     # previous run's stranded candidate, not a live deploy. Repair it here.
