@@ -1653,6 +1653,36 @@ def test_deploy_tolerates_legacy_live_spec_only_while_record_is_legacy(monkeypat
         rollout.deploy()
 
 
+def test_baseline_looks_past_a_rejection_on_an_eligible_node(monkeypatch):
+    # A node that refuses a task leaves an attempt that never started, so it
+    # withdrew nothing. The real predecessor behind it still has to confirm.
+    rows, runtimes = _healed_baseline_rows()
+    rows.insert(3, {"ID": "reject2", "Name": "crawl4ai.2", "Node": "haiku-18",
+                    "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"})
+    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+
+    # The deploy's own census never looks past its own withdrawals.
+    with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, True)
+
+
+def test_baseline_accepts_a_slot_placed_only_by_scheduler_recovery(monkeypatch):
+    # Every attempt in the slot was refused before one finally ran, so there is
+    # no earlier rollout whose withdrawal could be proved.
+    rows, runtimes = _healed_baseline_rows()
+    rows[3] = {"ID": "reject2", "Name": "crawl4ai.2", "Node": "haiku-18",
+               "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"}
+    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+
+    # The deploy's own census still demands the withdrawal it just performed.
+    with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, True)
+
+
 def test_baseline_keeps_unassigned_attempts_strict(monkeypatch):
     # A rejected scheduling attempt has no node; it is not a stranded ghost
     # and must not excuse the withdrawal proof.

@@ -738,16 +738,32 @@ def _verify_tasks(
     for row in rows:
         by_slot.setdefault(str(row.get("Name")), []).append(row)
     for candidate in current:
-        history = by_slot[str(candidate.get("Name"))]
-        predecessor = next(
-            (row for row in history[1:] if str(row.get("DesiredState", "")).lower() == "shutdown"),
-            None,
-        )
-        if predecessor is None:
-            raise RuntimeError("Crawl4AI task has no predecessor withdrawal evidence")
         desired, state = _task_state(str(candidate["ID"])[:12])
         if desired != "running" or state != "running":
             raise RuntimeError("Swarm task history contradicts the start-first rollout")
+        history = by_slot[str(candidate.get("Name"))]
+        withdrawn = [
+            row for row in history[1:]
+            if str(row.get("DesiredState", "")).lower() == "shutdown"
+        ]
+        if not converged:
+            # A task an eligible node refused never started, so it withdrew
+            # nothing and is not this slot's predecessor; a slot holding only
+            # those was placed by scheduler recovery and has no earlier rollout
+            # to prove. An unassigned or foreign-node attempt is still not
+            # withdrawal evidence, and the deploy's own census stays strict.
+            withdrawn = [
+                row for row in withdrawn
+                if not (
+                    str(row.get("CurrentState", "")).startswith("Rejected")
+                    and row.get("Node") in ELIGIBLE_NODES
+                )
+            ]
+            if not withdrawn:
+                continue
+        if not withdrawn:
+            raise RuntimeError("Crawl4AI task has no predecessor withdrawal evidence")
+        predecessor = withdrawn[0]
         stranded = predecessor.get("Node") in ELIGIBLE_NODES - ready
         if not converged and stranded:
             # A predecessor stranded on a down eligible node can never confirm
