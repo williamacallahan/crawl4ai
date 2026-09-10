@@ -974,6 +974,56 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
         rollout.deploy()
 
 
+def test_deploy_proves_an_already_deployed_candidate_without_resubmitting(
+    monkeypatch, tmp_path, capsys
+):
+    # Dokploy makes no spec change for an image the record already carries, so
+    # it opens no deployment row: a rerun that resubmits waits out the whole
+    # admission timeout on a row that never appears.
+    candidate = "registry.example/crawl4ai@sha256:candidate"
+    state = application(image=candidate, revision=REVISION)
+    _deploy_env(monkeypatch)
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(
+        rollout, "_deployments", lambda *_args: [{"deploymentId": "old", "status": "done"}]
+    )
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(
+        rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
+    )
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: {
+            "tasks": ["1", "2", "3"],
+            "nodes": ["haiku-5", "haiku-6", "haiku-9"],
+            "instances": ["a", "b", "c"],
+        },
+    )
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: instances for url in rollout.HEALTH_URLS},
+    )
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: health(revision=REVISION))
+
+    rollout.deploy()
+
+    receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert receipt["deploymentId"] is None
+    assert receipt["image"] == candidate
+    assert receipt["revision"] == REVISION
+    assert receipt["publicInstances"] == {
+        url: ["a", "b", "c"] for url in rollout.HEALTH_URLS
+    }
+
+
 @pytest.mark.parametrize("fail_on", [1, 2])
 def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")

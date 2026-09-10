@@ -936,45 +936,56 @@ def deploy() -> None:
         for row in prior_deployments
     ):
         raise RuntimeError("Crawl4AI already has a nonterminal Dokploy deployment")
-    prior_ids = {str(row.get("deploymentId")) for row in prior_deployments}
-    title = f"crawl4ai-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{revision}"
-    description = f"candidate={candidate};baseline={baseline}"
-    current = _application(base, api_key, application_id)
-    _policy(current)
-    if current.get("dockerImage") != baseline or current.get("labelsSwarm") != baseline_labels:
-        raise RuntimeError("baseline metadata changed before submission")
-    verify_route(base, api_key, application_id, app_name)
-    _post_json(
-        f"{base.rstrip('/')}/api/application.update",
-        api_key,
-        {
-            "applicationId": application_id,
-            "dockerImage": candidate,
-            "labelsSwarm": _labels(revision),
-            "placementSwarm": PLACEMENT,
-        },
-    )
-    updated = _application(base, api_key, application_id)
-    _policy(updated)
-    if not _record_converged(updated, candidate, revision):
-        raise RuntimeError("candidate metadata did not converge; no deploy was submitted")
-    verify_route(base, api_key, application_id, app_name)
-    _post_json(
-        f"{base.rstrip('/')}/api/application.deploy",
-        api_key,
-        {"applicationId": application_id, "title": title, "description": description},
-    )
-    deployment = _wait_deployment(base, api_key, application_id, prior_ids, title, description)
-    deadline = time.monotonic() + TIMEOUT_SECONDS
-    while True:
-        state = _update_state(app_name)
-        if state == "completed":
-            break
-        if state in {"paused", "rollback_paused", "rollback_completed"}:
-            raise RuntimeError(f"Swarm update ended in {state}; manual reconciliation required")
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Swarm update did not reach completed")
-        time.sleep(5)
+    # A rerun of an already-deployed revision has nothing to submit: Dokploy
+    # makes no spec change for an image the record already carries, so it opens
+    # no deployment row and the wait below would time out on a row that never
+    # appears. The baseline proof above already ran against this same candidate,
+    # so the proof below is the whole remaining job.
+    deployment_id = None
+    if _record_converged(application, candidate, revision):
+        print("candidate is already deployed; proving it in place", flush=True)
+    else:
+        prior_ids = {str(row.get("deploymentId")) for row in prior_deployments}
+        title = f"crawl4ai-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{revision}"
+        description = f"candidate={candidate};baseline={baseline}"
+        current = _application(base, api_key, application_id)
+        _policy(current)
+        if current.get("dockerImage") != baseline or current.get("labelsSwarm") != baseline_labels:
+            raise RuntimeError("baseline metadata changed before submission")
+        verify_route(base, api_key, application_id, app_name)
+        _post_json(
+            f"{base.rstrip('/')}/api/application.update",
+            api_key,
+            {
+                "applicationId": application_id,
+                "dockerImage": candidate,
+                "labelsSwarm": _labels(revision),
+                "placementSwarm": PLACEMENT,
+            },
+        )
+        updated = _application(base, api_key, application_id)
+        _policy(updated)
+        if not _record_converged(updated, candidate, revision):
+            raise RuntimeError("candidate metadata did not converge; no deploy was submitted")
+        verify_route(base, api_key, application_id, app_name)
+        _post_json(
+            f"{base.rstrip('/')}/api/application.deploy",
+            api_key,
+            {"applicationId": application_id, "title": title, "description": description},
+        )
+        deployment_id = _wait_deployment(
+            base, api_key, application_id, prior_ids, title, description
+        )["deploymentId"]
+        deadline = time.monotonic() + TIMEOUT_SECONDS
+        while True:
+            state = _update_state(app_name)
+            if state == "completed":
+                break
+            if state in {"paused", "rollback_paused", "rollback_completed"}:
+                raise RuntimeError(f"Swarm update ended in {state}; manual reconciliation required")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Swarm update did not reach completed")
+            time.sleep(5)
     final = _application(base, api_key, application_id)
     _policy(final)
     if not _record_converged(final, candidate, revision):
@@ -1009,7 +1020,7 @@ def deploy() -> None:
     print(
         json.dumps(
             {
-                "deploymentId": deployment["deploymentId"],
+                "deploymentId": deployment_id,
                 **proof,
             },
             separators=(",", ":"),
