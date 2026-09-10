@@ -622,9 +622,18 @@ def _wait_deployment(
     deadline = time.monotonic() + TIMEOUT_SECONDS
     admitted = False
     while time.monotonic() < deadline:
+        try:
+            rows = _deployments(base, api_key, application_id)
+        except CurlError:
+            # The control plane returns 502 under load, and outlasting the
+            # short read retry used to abandon a deployment that was already
+            # running. The deadline above still bounds this wait, and an
+            # unreadable deployment stays unproven either way.
+            time.sleep(5)
+            continue
         new = [
             row
-            for row in _deployments(base, api_key, application_id)
+            for row in rows
             if row.get("deploymentId") not in prior_ids
         ]
         matching = [

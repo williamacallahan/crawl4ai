@@ -486,6 +486,46 @@ def test_wait_deployment_times_out_while_queued(monkeypatch):
         )
 
 
+def test_wait_deployment_survives_a_transient_control_plane_failure(monkeypatch):
+    # A 502 while polling must not abandon a deployment that is already
+    # running; the deadline is what bounds the wait.
+    clock = [0]
+    reads = [0]
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    def deployments(*_args):
+        reads[0] += 1
+        if reads[0] <= 3:
+            raise rollout.CurlError("HTTP request failed: curl exit 22", 22)
+        return [{"deploymentId": "new", "status": "done",
+                 "title": "title", "description": "description"}]
+
+    monkeypatch.setattr(rollout, "TIMEOUT_SECONDS", 100)
+    monkeypatch.setattr(rollout, "_deployments", deployments)
+    monkeypatch.setattr(rollout.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(rollout.time, "sleep", advance)
+
+    owned = rollout._wait_deployment(
+        "https://dokploy", "key", "app", {"old"}, "title", "description"
+    )
+    assert owned["deploymentId"] == "new"
+
+    # Reads that never recover still end at the bounded deadline.
+    reads[0] = 0
+    clock[0] = 0
+    monkeypatch.setattr(
+        rollout,
+        "_deployments",
+        lambda *_args: (_ for _ in ()).throw(rollout.CurlError("502", 22)),
+    )
+    with pytest.raises(TimeoutError, match="was not admitted from the queue"):
+        rollout._wait_deployment(
+            "https://dokploy", "key", "app", {"old"}, "title", "description"
+        )
+
+
 def test_wait_deployment_times_out_after_single_admission_deadline(monkeypatch, capsys):
     clock = [0]
 
