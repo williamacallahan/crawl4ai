@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import re
 import time
 from pathlib import Path
@@ -680,6 +681,16 @@ class _StubMonitor:
     def get_timeline_data(self, metric, window):
         return []
 
+    def get_endpoint_stats_summary(self):
+        return {
+            "/crawl": {
+                "count": 1,
+                "avg_latency_ms": 12.5,
+                "success_rate_percent": 100.0,
+                "pool_hit_rate_percent": 100.0,
+            }
+        }
+
     def get_janitor_log(self, limit=10):
         return []
 
@@ -693,6 +704,7 @@ class _StubWebSocket:
 
         self.application_state = state
         self.sends = 0
+        self.payloads = []
         self._connected = WebSocketState.CONNECTED
 
     async def accept(self):
@@ -700,6 +712,7 @@ class _StubWebSocket:
 
     async def send_json(self, data):
         self.sends += 1
+        self.payloads.append(data)
         # Exactly what Starlette raises once the socket has been closed.
         raise RuntimeError(
             "Unexpected ASGI message 'websocket.send', after sending 'websocket.close'."
@@ -731,6 +744,20 @@ async def test_monitor_websocket_stops_instead_of_looping_on_a_closed_socket(
     assert live.sends == 1
 
 
+@pytest.mark.asyncio
+async def test_monitor_websocket_includes_endpoint_and_timeline_data(monkeypatch):
+    import monitor_routes
+    from starlette.websockets import WebSocketState
+
+    monkeypatch.setattr(monitor_routes, "get_monitor", lambda: _StubMonitor())
+    socket = _StubWebSocket(WebSocketState.DISCONNECTED)
+
+    await asyncio.wait_for(monitor_routes.websocket_endpoint(socket), timeout=5)
+
+    assert socket.payloads[0]["endpoint_stats"]["/crawl"]["count"] == 1
+    assert set(socket.payloads[0]["timeline"]) == {"memory", "requests", "browsers"}
+
+
 def _extract_js_function(source: str, signature: str) -> str:
     """Slice one brace-balanced function out of a single-file HTML page."""
     start = source.index(signature)
@@ -742,6 +769,22 @@ def _extract_js_function(source: str, signature: str) -> str:
     raise AssertionError(f"unbalanced braces after {signature!r}")
 
 
+def _run_node_json(script: str):
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    assert node, "node is required (the workflow's JS actions already need it)"
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 def test_playground_api_error_message_survives_every_fastapi_error_shape():
     """Runs the real function; the other UI checks only read source text.
 
@@ -750,14 +793,6 @@ def test_playground_api_error_message_survives_every_fastapi_error_shape():
     "[object Object]" (2026-08-31 dogfood ISSUE-005), and a naive rewrite throws
     on a null entry or prints "undefined".
     """
-    import json
-    import shutil
-    import subprocess
-    import tempfile
-
-    node = shutil.which("node")
-    assert node, "node is required (the workflow's JS actions already need it)"
-
     playground = (DOCKER_DIR / "static" / "playground" / "index.html").read_text()
     fn = _extract_js_function(playground, "function apiErrorMessage(body)")
 
@@ -793,14 +828,119 @@ def test_playground_api_error_message_survives_every_fastapi_error_shape():
         )
     script.append("console.log(JSON.stringify(out));")
 
-    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as handle:
-        handle.write("\n".join(script))
-        path = handle.name
-    result = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stderr
-
-    actual = json.loads(result.stdout)
+    actual = _run_node_json("\n".join(script))
     assert actual == {name: expected for name, (_, expected) in cases.items()}
+
+
+def test_monitor_live_payload_updates_empty_states_timeline_and_endpoints():
+    monitor = (DOCKER_DIR / "static" / "monitor" / "index.html").read_text()
+    functions = [
+        _extract_js_function(monitor, "function updateDashboard(data)"),
+        _extract_js_function(monitor, "function updateErrorsDisplay(errors)"),
+        _extract_js_function(monitor, "function updateEndpointStatsDisplay(data)"),
+    ]
+    script = "\n".join([
+        "const elements = {",
+        "  'errors-log': {innerHTML: 'stale error'},",
+        "  'endpoints-table-body': {innerHTML: 'stale endpoint'},",
+        "  'timeline-metric': {value: 'requests'},",
+        "};",
+        "const document = {getElementById: id => elements[id]};",
+        "function escapeHtml(value) { return String(value); }",
+        "function updateHealthDisplay() {}",
+        "function updateRequestsDisplay() {}",
+        "function updateBrowsersDisplay() {}",
+        "function updateJanitorDisplay() {}",
+        "let drawn = null;",
+        "function drawTimeline(data, metric) { drawn = {data, metric}; }",
+        *functions,
+        "updateDashboard({",
+        "  errors: [],",
+        "  endpoint_stats: {'/crawl': {count: 2, avg_latency_ms: 12.5, success_rate_percent: 100, pool_hit_rate_percent: 50}},",
+        "  timeline: {requests: {values: [1, 2]}},",
+        "});",
+        "const populated = elements['endpoints-table-body'].innerHTML;",
+        "updateDashboard({endpoint_stats: {}});",
+        "console.log(JSON.stringify({",
+        "  errorsCleared: elements['errors-log'].innerHTML.includes('No errors'),",
+        "  endpointRendered: populated.includes('/crawl') && populated.includes('2'),",
+        "  endpointsCleared: elements['endpoints-table-body'].innerHTML.includes('No data'),",
+        "  timelineMetric: drawn.metric,",
+        "  timelineValues: drawn.data.values,",
+        "}));",
+    ])
+
+    assert _run_node_json(script) == {
+        "errorsCleared": True,
+        "endpointRendered": True,
+        "endpointsCleared": True,
+        "timelineMetric": "requests",
+        "timelineValues": [1, 2],
+    }
+
+
+def test_monitor_auto_refresh_owns_exactly_one_update_transport():
+    monitor = (DOCKER_DIR / "static" / "monitor" / "index.html").read_text()
+    functions = [
+        _extract_js_function(monitor, "function setAutoRefresh(enabled)"),
+        _extract_js_function(monitor, "function startAutoRefresh()"),
+        _extract_js_function(monitor, "function stopAutoRefresh()"),
+    ]
+    script = "\n".join([
+        "let autoRefresh = true;",
+        "let refreshInterval = 41;",
+        "let websocket = null;",
+        "let wsReconnectAttempts = 3;",
+        "const REFRESH_RATE = 1000;",
+        "let socketStops = 0, socketStarts = 0, intervalStarts = 0, intervalStops = 0, fetches = 0, status = '';",
+        "function stopWebSocket() { socketStops++; websocket = null; }",
+        "function connectWebSocket() { socketStarts++; websocket = {}; }",
+        "function updateConnectionStatus(_state, message) { status = message; }",
+        "function fetchAll() { fetches++; }",
+        "function setInterval() { intervalStarts++; return 42; }",
+        "function clearInterval() { intervalStops++; }",
+        *functions,
+        "setAutoRefresh(false);",
+        "const paused = {autoRefresh, refreshInterval, socketStops, socketStarts, intervalStops, status};",
+        "setAutoRefresh(true);",
+        "startAutoRefresh();",
+        "const live = {intervalStarts, fetches};",
+        "websocket = null;",
+        "startAutoRefresh();",
+        "startAutoRefresh();",
+        "const resumed = {autoRefresh, refreshInterval, socketStops, socketStarts, intervalStarts, fetches, wsReconnectAttempts};",
+        "stopAutoRefresh();",
+        "autoRefresh = false;",
+        "startAutoRefresh();",
+        "console.log(JSON.stringify({paused, live, resumed, final: {refreshInterval, intervalStarts, intervalStops, fetches}}));",
+    ])
+
+    assert _run_node_json(script) == {
+        "paused": {
+            "autoRefresh": False,
+            "refreshInterval": None,
+            "socketStops": 1,
+            "socketStarts": 0,
+            "intervalStops": 1,
+            "status": "Paused",
+        },
+        "live": {"intervalStarts": 0, "fetches": 0},
+        "resumed": {
+            "autoRefresh": True,
+            "refreshInterval": 42,
+            "socketStops": 2,
+            "socketStarts": 1,
+            "intervalStarts": 1,
+            "fetches": 1,
+            "wsReconnectAttempts": 0,
+        },
+        "final": {
+            "refreshInterval": None,
+            "intervalStarts": 1,
+            "intervalStops": 2,
+            "fetches": 1,
+        },
+    }
 
 
 def test_response_pane_never_parses_crawled_markup_into_the_document():

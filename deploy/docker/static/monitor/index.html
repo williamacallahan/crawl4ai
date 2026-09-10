@@ -338,10 +338,7 @@
                 status.textContent = 'Token active for this page';
                 status.className = 'text-xs text-green-400';
                 setTimeout(() => { status.textContent = ''; }, 2000);
-                stopWebSocket();
-                wsReconnectAttempts = 0;
-                stopAutoRefresh();
-                connectWebSocket();
+                setAutoRefresh(autoRefresh);
             }
 
             document.getElementById('token-save').addEventListener('click', applyToken);
@@ -407,6 +404,7 @@
         }
 
         function connectWebSocket() {
+            if (!autoRefresh) return;
             const token = getToken();
             if (!token) {
                 updateConnectionStatus('disconnected', 'Token required');
@@ -436,7 +434,7 @@
             };
 
             socket.onmessage = (event) => {
-                if (websocket !== socket) return;
+                if (websocket !== socket || !autoRefresh) return;
                 const data = JSON.parse(event.data);
                 updateDashboard(data);
             };
@@ -450,6 +448,10 @@
                 if (websocket !== socket) return;
                 websocket = null;
                 console.log('WebSocket closed');
+                if (!autoRefresh) {
+                    updateConnectionStatus('disconnected', 'Paused');
+                    return;
+                }
                 updateConnectionStatus('disconnected', 'Reconnecting...');
 
                 reconnectTimeout = setTimeout(() => {
@@ -494,7 +496,7 @@
                 }
                 if (data.timeline) {
                     const metric = document.getElementById('timeline-metric').value;
-                    drawTimeline(data.timeline[metric], metric);
+                    drawTimeline(data.timeline[metric] || {values: []}, metric);
                 }
             } catch (e) {
                 console.error('Error updating dashboard:', e);
@@ -683,27 +685,38 @@
 
         // ========== Auto-refresh Toggle ==========
         document.getElementById('auto-refresh-toggle').addEventListener('click', function() {
-            autoRefresh = !autoRefresh;
+            setAutoRefresh(!autoRefresh);
             this.textContent = autoRefresh ? 'ON ⚡1s' : 'OFF';
             this.classList.toggle('bg-primary');
             this.classList.toggle('bg-dark');
             this.classList.toggle('text-dark');
             this.classList.toggle('text-light');
 
-            if (autoRefresh) {
-                startAutoRefresh();
-            } else {
-                stopAutoRefresh();
-            }
         });
 
+        function setAutoRefresh(enabled) {
+            autoRefresh = enabled;
+            stopWebSocket();
+            stopAutoRefresh();
+            if (!autoRefresh) {
+                updateConnectionStatus('disconnected', 'Paused');
+                return;
+            }
+            wsReconnectAttempts = 0;
+            connectWebSocket();
+        }
+
         function startAutoRefresh() {
+            if (!autoRefresh || websocket || refreshInterval) return;
             fetchAll();
             refreshInterval = setInterval(fetchAll, REFRESH_RATE);
         }
 
         function stopAutoRefresh() {
-            if (refreshInterval) clearInterval(refreshInterval);
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+                refreshInterval = null;
+            }
         }
 
         // ========== Data Fetching ==========
@@ -919,8 +932,8 @@
                     <td class="py-2 pr-4 text-primary">${escapeHtml(endpoint)}</td>
                     <td class="py-2 pr-4 text-right">${stats.count}</td>
                     <td class="py-2 pr-4 text-right">${stats.avg_latency_ms}ms</td>
-                    <td class="py-2 pr-4 text-right">${stats.success_rate_percent.toFixed(1)}%</td>
-                    <td class="py-2 pr-4 text-right">${stats.pool_hit_rate_percent.toFixed(1)}%</td>
+                    <td class="py-2 pr-4 text-right ${stats.success_rate_percent >= 99 ? 'text-green-500' : 'text-yellow-500'}">${stats.success_rate_percent.toFixed(1)}%</td>
+                    <td class="py-2 pr-4 text-right ${stats.pool_hit_rate_percent >= 90 ? 'text-green-500' : 'text-yellow-500'}">${stats.pool_hit_rate_percent.toFixed(1)}%</td>
                 </tr>`).join('');
         }
 
