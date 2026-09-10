@@ -596,7 +596,16 @@ def _application(base: str, api_key: str, application_id: str) -> dict[str, Any]
 
 
 def _deployments(base: str, api_key: str, application_id: str) -> list[dict[str, Any]]:
-    deployments = _request_json(_url(base, "deployment.all", applicationId=application_id), api_key)
+    for attempt in range(3):
+        try:
+            deployments = _request_json(
+                _url(base, "deployment.all", applicationId=application_id), api_key
+            )
+            break
+        except CurlError:
+            if attempt == 2:
+                raise
+            time.sleep(2**attempt)
     if not isinstance(deployments, list):
         raise ValueError("invalid deployment response")
     return deployments
