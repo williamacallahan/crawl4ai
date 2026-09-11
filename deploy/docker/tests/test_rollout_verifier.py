@@ -1024,6 +1024,106 @@ def test_deploy_proves_an_already_deployed_candidate_without_resubmitting(
     }
 
 
+@pytest.mark.parametrize("down_node", ["haiku-9", "haiku-6"])
+def test_deploy_proves_an_already_deployed_candidate_with_a_non_redis_spare_down(
+    monkeypatch, tmp_path, capsys, down_node
+):
+    # A rerun of a revision that is already live performs no start-first
+    # rollout: it submits no update, starts no replacement, and retires no
+    # predecessor, so it needs no spare overlap slot. With exactly REPLICAS
+    # Ready eligible nodes and the absent node a non-Redis spare (so Redis on
+    # haiku-18 still passes), the no-op rerun must prove it in place rather
+    # than abort under the start-first spare gate. Regression for the no-op
+    # rerun path added in f43ef89, whose spare gate ran above the branch.
+    candidate = "registry.example/crawl4ai@sha256:candidate"
+    state = application(image=candidate, revision=REVISION)
+    ready = frozenset(rollout.ELIGIBLE_NODES - {down_node})
+    _deploy_env(monkeypatch)
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(
+        rollout, "_deployments", lambda *_args: [{"deploymentId": "old", "status": "done"}]
+    )
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(
+        rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
+    )
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: ready)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: {
+            "tasks": ["1", "2", "3"],
+            "nodes": sorted(ready),
+            "instances": ["a", "b", "c"],
+        },
+    )
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: instances for url in rollout.HEALTH_URLS},
+    )
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: health(revision=REVISION))
+
+    rollout.deploy()
+
+    assert len(ready) == rollout.REPLICAS
+    assert rollout.REDIS_NODE in ready
+    receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert receipt["deploymentId"] is None
+    assert receipt["image"] == candidate
+    assert receipt["revision"] == REVISION
+    assert receipt["publicInstances"] == {
+        url: ["a", "b", "c"] for url in rollout.HEALTH_URLS
+    }
+
+
+def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(monkeypatch, tmp_path):
+    # Exempting the no-op rerun from the start-first spare gate does not exempt
+    # it from capacity: with fewer than REPLICAS Ready eligible nodes it cannot
+    # place every replica, so the post-rollout < REPLICAS bar must still fire.
+    candidate = "registry.example/crawl4ai@sha256:candidate"
+    state = application(image=candidate, revision=REVISION)
+    ready = frozenset({"haiku-5", "haiku-18"})
+    _deploy_env(monkeypatch)
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(
+        rollout, "_deployments", lambda *_args: [{"deploymentId": "old", "status": "done"}]
+    )
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(
+        rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
+    )
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: ready)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_tasks",
+        lambda *_args: {
+            "tasks": ["1", "2", "3"],
+            "nodes": sorted(ready),
+            "instances": ["a", "b", "c"],
+        },
+    )
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: instances for url in rollout.HEALTH_URLS},
+    )
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: health(revision=REVISION))
+
+    with pytest.raises(RuntimeError, match="not enough Ready eligible nodes to place every replica"):
+        rollout.deploy()
+
+
 @pytest.mark.parametrize("fail_on", [1, 2])
 def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
