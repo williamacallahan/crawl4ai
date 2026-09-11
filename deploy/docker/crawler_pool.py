@@ -167,6 +167,35 @@ def _is_live(crawler: AsyncWebCrawler) -> bool:
         return False
 
 
+def _is_recycling(crawler: AsyncWebCrawler) -> bool:
+    """Return whether the crawler's browser manager is mid-recycle.
+
+    Mirrors the recycler invariant the admission path (``_is_live``) honors: a
+    recycling manager is live while its browser references are temporarily
+    clear and ``start()`` races against the ``_closing`` TOCTOU. The janitor's
+    eviction loop must skip a recycling manager too, or - with the manager lying
+    fallow at ``active_requests==0`` while its shielded ``_recycle_browser`` runs
+    ``close(_for_recycle=True)`` -> ``start()`` - the janitor's 60s close cap
+    cancels ``close()`` at the shielded recycle await, and the keeps-running
+    recycle's ``start()`` finishes a fresh driver + Chromium on an already
+    detached manager with ``_closing=True`` and no future cleanup path: a
+    monotonic Chromium process leak. ``_recycle_browser``'s ``finally``
+    clears ``_recycling`` within ``RECYCLE_CLOSE_SECONDS + RECYCLE_START_SECONDS``
+    (= 180s) of the bounded wait caps ``browser_manager.py`` defines, so this
+    gate only delays eviction by a bounded one-shot, never forever - the next
+    pass re-evaluates and evicts normally.
+
+    Gating on ``_recycling`` (not ``_is_live``) is intentional: ``_is_live``
+    returns True for any connected idle browser, which would disable the
+    janitor's primary purpose of idle eviction past TTL.
+    """
+    try:
+        manager = crawler.crawler_strategy.browser_manager
+        return bool(getattr(manager, "_recycling", False))
+    except Exception:
+        return False
+
+
 def _discard_if_unavailable(
     pool: Dict[str, AsyncWebCrawler], sig: str, tier: str
 ) -> Optional[asyncio.Task]:
@@ -584,6 +613,21 @@ async def _janitor_pass():
                 crawler = pool[sig]
                 idle_time = now - LAST_USED[sig]
                 active = getattr(crawler, 'active_requests', 0)
+
+                # Mirror the admission path (_is_live): a browser mid-recycle
+                # lies fallow at active_requests==0 while close(_for_recycle=True)
+                # -> start() runs in a shielded background task. Evicting it now
+                # cancels close() at the shielded recycle await, but the recycle
+                # keeps running and start() finishes a fresh driver+Chromium on
+                # an already-detached manager with _closing=True stuck - nothing
+                # will close it again (a monotonic process leak, the exact class
+                # bdccf62/d0f57c0 were written to stop). _recycle_browser's
+                # finally clears _recycling within the close/start wait caps
+                # (<= 180s), so the next pass re-evaluates and evicts normally.
+                if _is_recycling(crawler):
+                    LAST_USED[sig] = now
+                    continue
+
                 if active > 0:
                     if idle_time <= STALE_CEILING:
                         continue  # still serving requests, skip
