@@ -912,15 +912,20 @@ def deploy() -> None:
     # Captured adjacent to its use: this snapshot decides which unconfirmable
     # predecessors the baseline may excuse.
     ready = _eligible_nodes()
-    # start-first brings a replacement up before retiring its predecessor, so a
-    # rollout needs one eligible node beyond REPLICAS. At exactly REPLICAS the
-    # scheduler has no legal overlap slot, and because PLACEMENT carries no
-    # MaxReplicas cap to forbid it, Swarm satisfies start-first by packing two
-    # tasks onto one node rather than leaving one Pending. _verify_tasks then
-    # rejects the end state as a placement fault, which names the symptom and
-    # not the missing node. Fail here instead,
-    # before any write, naming the node that has to come back.
-    if len(ready) <= REPLICAS:
+    # The no-op rerun below performs no start-first placement: it submits no
+    # update, starts no replacement, and retires no predecessor, so the
+    # post-rollout < REPLICAS capacity bar is its only node requirement. The
+    # spare gate is a rollout-only requirement: start-first brings a
+    # replacement up before retiring its predecessor, so a rollout needs one
+    # eligible node beyond REPLICAS. At exactly REPLICAS the scheduler has no
+    # legal overlap slot, and because PLACEMENT carries no MaxReplicas cap to
+    # forbid it, Swarm satisfies start-first by packing two tasks onto one node
+    # rather than leaving one Pending. _verify_tasks then rejects the end state
+    # as a placement fault, which names the symptom and not the missing node.
+    # Fail here instead, before any write, naming the node that has to come
+    # back.
+    already_deployed = _record_converged(application, candidate, revision)
+    if not already_deployed and len(ready) <= REPLICAS:
         raise RuntimeError(
             f"start-first needs a spare eligible node: {REPLICAS} replicas, "
             f"{len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
@@ -942,7 +947,7 @@ def deploy() -> None:
     # appears. The baseline proof above already ran against this same candidate,
     # so the proof below is the whole remaining job.
     deployment_id = None
-    if _record_converged(application, candidate, revision):
+    if already_deployed:
         print("candidate is already deployed; proving it in place", flush=True)
     else:
         prior_ids = {str(row.get("deploymentId")) for row in prior_deployments}
