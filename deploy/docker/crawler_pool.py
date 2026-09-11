@@ -224,11 +224,17 @@ def _make_browser_capacity() -> Optional[asyncio.Task]:
         if not task.done():
             return task
 
+    # A mid-recycle entry lies fallow at active_requests == 0 and - because
+    # its recycle fires at the end of an aged crawl - is typically the oldest
+    # LAST_USED candidate, so without this filter min() picks exactly it;
+    # evicting it orphans Chromium (see _is_recycling). Skipping it can only
+    # surface as the capacity RuntimeError below until the bounded recycle
+    # window clears; the janitor's next pass then evicts it normally.
     idle_browser = [
         (LAST_USED.get(sig, 0), sig, pool)
         for pool in (COLD_POOL, HOT_POOL)
         for sig, crawler in pool.items()
-        if _active_requests(crawler) == 0
+        if _active_requests(crawler) == 0 and not _is_recycling(crawler)
     ]
     if idle_browser:
         _, idle_sig, idle_pool = min(idle_browser, key=lambda candidate: candidate[0])
