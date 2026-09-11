@@ -343,6 +343,9 @@ class AsyncWebCrawler:
                     if config.pdf and not pdf_data:
                         cached_result = None
 
+                    if cached_result is None:
+                        extracted_content = None
+
                     self.logger.url_status(
                         url=cache_context.display_url,
                         success=bool(html),
