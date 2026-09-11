@@ -155,7 +155,8 @@ jobs:
               uv pip install --python /tmp/browser-test-env/bin/python -r /tmp/browser-test-requirements.txt
               /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m browser \
                 deploy/docker/tests/test_real_browser_recycle_window.py \
-                tests/regression/test_adjust_viewport_screenshot_formula.py
+                tests/regression/test_adjust_viewport_screenshot_formula.py \
+                tests/regression/test_e2e_stale_extraction_fallthrough.py
             '
           # Docker owns layer-transfer retries; surface its terminal failure.
           docker push "${IMAGE}:${GIT_SHA}-${ARCH}"
