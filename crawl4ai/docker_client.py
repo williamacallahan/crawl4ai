@@ -246,24 +246,29 @@ class Crawl4aiDockerClient:
 
         if is_streaming:
             async def stream_results() -> AsyncGenerator[CrawlResult, None]:
-                async with self._http_client.stream("POST", f"{self.base_url}/crawl/stream", json=data) as response:
-                    try:
-                        response.raise_for_status()
-                    except httpx.HTTPStatusError as e:
-                        await e.response.aread()
-                        error_msg = _http_error_detail(e.response, e)
-                        raise RequestError(f"Server error {e.response.status_code}: {error_msg}")
-                    async for line in response.aiter_lines():
-                        if line.strip():
-                            result = json.loads(line)
-                            if "error" in result:
-                                self.logger.error_status(url=result.get("url", "unknown"), error=result["error"])
-                                continue
-                            self.logger.url_status(url=result.get("url", "unknown"), success=True, timing=result.get("timing", 0.0))
-                            if result.get("status") == "completed":
-                                continue
-                            else:
-                                yield CrawlResult(**result)
+                try:
+                    async with self._http_client.stream("POST", f"{self.base_url}/crawl/stream", json=data) as response:
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as e:
+                            await e.response.aread()
+                            error_msg = _http_error_detail(e.response, e)
+                            raise RequestError(f"Server error {e.response.status_code}: {error_msg}")
+                        async for line in response.aiter_lines():
+                            if line.strip():
+                                result = json.loads(line)
+                                if "error" in result:
+                                    self.logger.error_status(url=result.get("url", "unknown"), error=result["error"])
+                                    continue
+                                self.logger.url_status(url=result.get("url", "unknown"), success=True, timing=result.get("timing", 0.0))
+                                if result.get("status") == "completed":
+                                    continue
+                                else:
+                                    yield CrawlResult(**result)
+                except httpx.TimeoutException as e:
+                    raise ConnectionError(f"Request timed out: {str(e)}")
+                except httpx.RequestError as e:
+                    raise ConnectionError(f"Failed to connect: {str(e)}")
             return stream_results()
 
         response = await self._request("POST", "/crawl", json=data, timeout=hooks_timeout)
