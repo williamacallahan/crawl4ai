@@ -54,7 +54,11 @@ async def test_e2e_pdf_fallthrough_reruns_extraction_and_persists_fresh(local_se
     url = f"{local_server}/?e2e_stale={uuid.uuid4().hex}"
 
     async with AsyncWebCrawler(
-        config=BrowserConfig(headless=True, verbose=False)
+        # The CI browser-gate container runs as appuser on a kernel without
+        # unprivileged user namespaces, so the sandboxed Chromium zygote dies
+        # ("No usable sandbox!"). extra_args mirrors the operator policy
+        # test_real_browser_recycle_window.py applies for the same container.
+        config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])
     ) as crawler:
         # Crawl #1: seed cache with strategy output {call: 1}.
         r1 = await crawler.arun(
