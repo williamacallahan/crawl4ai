@@ -212,7 +212,9 @@ class DefaultTableExtraction(TableExtractionStrategy):
             for row in rows 
             for cell in row.xpath("./td|./th")
         )
-        total_tags = sum(1 for _ in table.iterdescendants())
+        total_tags = len(table.xpath(
+            f".//*[count(ancestor::table) = {table_depth}]"
+        ))
         text_ratio = total_text / (total_tags + 1e-5)
         if text_ratio > 20:
             score += 3
