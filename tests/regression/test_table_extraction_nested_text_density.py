@@ -40,6 +40,22 @@ def _extract_all(table_html, table_score_threshold=7):
     return strategy.extract_tables(root)
 
 
+def _denominator_counts(table_html):
+    """(scoped, unscoped) tag counts for the first table in a fragment.
+
+    The scoped count mirrors the production XPath
+    ``.//*[count(ancestor::table) = table_depth]``; the unscoped count mirrors
+    the pre-fix ``iterdescendants()`` total (which also yields comment nodes).
+    Both are derived here independently so the tests cross-check the two
+    definitions against each other.
+    """
+    root = html.fromstring("<html><body>" + table_html + "</body></html>")
+    table = root.xpath(".//table")[0]
+    table_depth = len(table.xpath("ancestor::table")) + 1
+    scoped = len(table.xpath(f".//*[count(ancestor::table) = {table_depth}]"))
+    return scoped, sum(1 for _ in table.iterdescendants())
+
+
 def _browser_base5_table(own_len):
     """A browser-serialized shape: <tbody> present, <thead>/<caption> absent,
     first <tbody> row uses <th>, one cell embeds a 2x5 (10-cell) nested
@@ -94,12 +110,7 @@ def test_scoped_denominator_excludes_nested_subtable_descendants():
         "<tr><td>z</td><td>w</td></tr></table> tail</td><td>d0</td></tr>"
         "</tbody></table>"
     )
-    root = html.fromstring("<html><body>" + nested + "</body></html>")
-    outer = root.xpath(".//table")[0]
-    table_depth = len(outer.xpath("ancestor::table")) + 1
-
-    scoped = len(outer.xpath(f".//*[count(ancestor::table) = {table_depth}]"))
-    everything = sum(1 for _ in outer.iterdescendants())
+    scoped, everything = _denominator_counts(nested)
 
     assert scoped < everything
     # excluded = the nested subtable's 2 <tr> + 4 <td> descendants (6 tags).
@@ -109,23 +120,33 @@ def test_scoped_denominator_excludes_nested_subtable_descendants():
 def test_scoped_denominator_matches_unscoped_without_nested_subtable():
     # When no nested <table> exists, the depth-scoped XPath
     # `.//*[count(ancestor::table) = table_depth]` matches every
-    # element descendant exactly like iterdescendants(). The fix is
-    # therefore a no-op on non-nested tables: their text_ratio and score
-    # are unchanged.
+    # element descendant. iterdescendants() additionally yields comment
+    # nodes, so on comment-bearing non-nested tables the scoped
+    # denominator is smaller by the comment count - a slight loosening
+    # toward admission, never a rejection. On comment-free non-nested
+    # tables the fix is a no-op: text_ratio and score are unchanged.
     non_nested = (
         "<table><tbody>"
         "<tr><th>H0</th><th>H1</th></tr>"
         "<tr><td>a</td><td>b</td></tr>"
         "</tbody></table>"
     )
-    root = html.fromstring("<html><body>" + non_nested + "</body></html>")
-    table = root.xpath(".//table")[0]
-    table_depth = len(table.xpath("ancestor::table")) + 1
-
-    scoped = len(table.xpath(f".//*[count(ancestor::table) = {table_depth}]"))
-    everything = sum(1 for _ in table.iterdescendants())
+    scoped, everything = _denominator_counts(non_nested)
 
     assert scoped == everything
+
+    # One in-table comment node: iterdescendants() counts it, the XPath
+    # does not, so the scoped denominator is exactly one smaller. Pinned
+    # so the divergence is known behavior, not an accident.
+    commented = (
+        "<table><tbody>"
+        "<tr><th>H0</th><!-- c --><th>H1</th></tr>"
+        "<tr><td>a</td><td>b</td></tr>"
+        "</tbody></table>"
+    )
+    scoped, everything = _denominator_counts(commented)
+
+    assert scoped == everything - 1
 
 
 def test_low_text_density_nested_table_still_rejected():
