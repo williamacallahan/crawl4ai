@@ -109,6 +109,9 @@ async def test_browser_pool_evicts_least_recent_idle_browser(monkeypatch):
     oldest.close = AsyncMock()
     active = MagicMock(active_requests=1)
     active.close = AsyncMock()
+    # _make_browser_capacity now skips mid-recycle victims; a bare MagicMock
+    # would auto-generate a truthy ``_recycling`` and read as mid-recycle.
+    oldest.crawler_strategy.browser_manager._recycling = False
 
     monkeypatch.setattr(crawler_pool, "MAX_BROWSER_INSTANCES", 3)
     monkeypatch.setattr(crawler_pool, "PERMANENT", MagicMock())

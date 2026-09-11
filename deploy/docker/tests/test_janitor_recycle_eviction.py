@@ -663,3 +663,77 @@ async def test_close_during_straddling_start_orphans_driver():
             await manager._recycle_task
         with suppress(Exception):
             await manager.close()
+
+
+# ─── capacity eviction (_make_browser_capacity) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_make_browser_capacity_skips_mid_recycle_victim(monkeypatch):
+    """Capacity eviction must not pick a mid-recycle entry as its victim.
+
+    A mid-recycle browser is idle (active_requests == 0) and - because its
+    recycle fires at the end of an aged crawl - typically the oldest
+    LAST_USED candidate, so pre-fix it is exactly the entry min() picks.
+    Detaching it cancels its shielded close() at the 60s cap and orphans
+    the fresh driver + Chromium the recycle installs (the janitor case's
+    mechanism, reached from the automatic admission path). The eviction
+    must fall through to the younger non-recycling idle entry instead.
+    """
+    old_manager = _manager(
+        BrowserConfig(
+            use_managed_browser=True, headless=True, max_pages_before_recycle=1
+        )
+    )
+    permit_restart = asyncio.Event()
+    await _drive_to_mid_recycle(old_manager, permit_restart)
+
+    try:
+        monkeypatch.setattr(crawler_pool, "MAX_BROWSER_INSTANCES", 2)
+        old_sig, fresh_sig = "sig:old", "sig:fresh"
+        crawler_pool.COLD_POOL[old_sig] = _crawler_with_manager(old_manager)
+        crawler_pool.LAST_USED[old_sig] = _stale_last_used(600)
+        crawler_pool.COLD_POOL[fresh_sig] = _crawler_with_manager(_manager())
+        crawler_pool.LAST_USED[fresh_sig] = _stale_last_used(10)
+
+        close_task = crawler_pool._make_browser_capacity()
+
+        assert close_task is not None
+        assert old_sig in crawler_pool.COLD_POOL  # recycling victim skipped
+        assert fresh_sig not in crawler_pool.COLD_POOL  # next-oldest evicted
+        await _drain_close_tasks()
+    finally:
+        permit_restart.set()
+        await old_manager._recycle_task
+
+
+@pytest.mark.asyncio
+async def test_make_browser_capacity_fails_closed_when_all_idle_recycling(monkeypatch):
+    """Only-idle-recycling capacity: reject the request, don't orphan.
+
+    With every idle candidate mid-recycle, eviction must fail closed with
+    the existing capacity RuntimeError rather than detach a recycling
+    browser. _recycle_browser's finally clears _recycling within <= 180s
+    and the janitor then evicts it, so the rejection window is bounded.
+    """
+    manager = _manager(
+        BrowserConfig(
+            use_managed_browser=True, headless=True, max_pages_before_recycle=1
+        )
+    )
+    permit_restart = asyncio.Event()
+    await _drive_to_mid_recycle(manager, permit_restart)
+
+    try:
+        monkeypatch.setattr(crawler_pool, "MAX_BROWSER_INSTANCES", 1)
+        sig = "sig:old"
+        crawler_pool.COLD_POOL[sig] = _crawler_with_manager(manager)
+        crawler_pool.LAST_USED[sig] = _stale_last_used(600)
+
+        with pytest.raises(RuntimeError, match="at capacity"):
+            crawler_pool._make_browser_capacity()
+
+        assert sig in crawler_pool.COLD_POOL  # untouched, not orphaned
+    finally:
+        permit_restart.set()
+        await manager._recycle_task
