@@ -13,6 +13,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import httpx
 import pytest
@@ -26,7 +27,9 @@ if str(_DEPLOY_DOCKER) not in sys.path:
     sys.path.insert(0, str(_DEPLOY_DOCKER))
 
 from crawl4ai.docker_client import (  # noqa: E402
+    Crawl4aiClientError,
     Crawl4aiDockerClient,
+    ConnectionError,
     RequestError,
 )
 from crawl4ai.async_configs import CrawlerRunConfig  # noqa: E402
@@ -384,3 +387,221 @@ async def test_streaming_crawl_error_does_not_leave_body_unread(streaming_client
             pass
 
     assert long_detail in str(exc_info.value)
+
+
+# --- streaming crawl() transport-error contract ---
+# crawl() exposes two response modes. The non-streaming path's _request()
+# normalizes every httpx failure family: TimeoutException/RequestError ->
+# ConnectionError, HTTPStatusError -> RequestError. The streaming branch
+# previously only caught HTTPStatusError, so transport failures such as
+# httpx.ReadTimeout (mid-stream) and httpx.ConnectError (on entry) leaked to
+# the caller as raw httpx exceptions outside the client's own hierarchy.
+# These tests pin the streaming path to the same transport-error contract as
+# _request() (regression coverage for the leak introduced when commit
+# baee824 added the HTTPStatusError handler without its transport
+# counterparts). httpx.ASGITransport cannot synthesise transport-level
+# exceptions (it serves in-process responses), so these cases use
+# httpx.MockTransport, the natural way to raise ReadTimeout/ConnectError.
+# No docker server, browser, or Redis required.
+
+@pytest_asyncio.fixture
+async def mock_client():
+    """A client whose transport is swapped per-test with ``httpx.MockTransport``.
+
+    Unlike ``streaming_client``, ``_check_server`` is NOT bypassed: each
+    test's handler serves ``/health`` so the real prelude runs (mirroring
+    production, where the server is reachable when the stream opens and the
+    transport failure happens during/after stream entry). The default
+    ``_http_client`` from ``__init__`` is closed up front (it is never used)
+    and whatever client is installed at teardown is closed in the same event
+    loop, so no ``httpx.AsyncClient`` leaks regardless of which path the
+    test took.
+    """
+    c = Crawl4aiDockerClient(base_url="http://test", verbose=False)
+    await c._http_client.aclose()
+    try:
+        yield c
+    finally:
+        if c._http_client is not None and not c._http_client.is_closed:
+            await c._http_client.aclose()
+
+
+def _install_mock(client, handler):
+    client._http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def _health_ok(req):
+    return httpx.Response(200, content=b'{"status":"ok"}')
+
+
+def _ndjson_first_line():
+    return json.dumps(
+        {"url": "https://example.com", "html": "", "success": True}
+    ) + "\n"
+
+
+def test_httpx_exception_hierarchy_supports_fix_ordering():
+    """Pin the class-hierarchy facts the fix relies on.
+
+    The fix must catch ``httpx.TimeoutException`` before ``httpx.RequestError``
+    (TimeoutException is a subclass of RequestError, so the broader clause
+    would otherwise shadow it and lose the "timed out" message), and the
+    client's own ``RequestError``/``ConnectionError`` must remain outside
+    httpx's hierarchy so the new outer transport handlers do not re-catch the
+    ``RequestError`` re-raised by the inner ``HTTPStatusError`` handler. A
+    future httpx upgrade or refactor that violates these assumptions would
+    re-open the leak; this test makes that visible here.
+    """
+    assert issubclass(httpx.TimeoutException, httpx.RequestError)
+    assert issubclass(httpx.ReadTimeout, httpx.TimeoutException)
+    assert issubclass(httpx.ConnectTimeout, httpx.TimeoutException)
+    assert issubclass(httpx.ConnectError, httpx.RequestError)
+    assert not issubclass(RequestError, httpx.RequestError)
+    assert not issubclass(RequestError, httpx.HTTPStatusError)
+    assert not issubclass(ConnectionError, httpx.RequestError)
+    assert issubclass(ConnectionError, Crawl4aiClientError)
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_raises_connection_error_on_read_timeout(mock_client):
+    """A mid-stream read timeout is normalized to ``ConnectionError``.
+
+    This is the production-reachable case from the bug report: the stream
+    opens, one CrawlResult is delivered, then a read timeout while waiting for
+    the next line must surface as ``ConnectionError`` (as the non-streaming
+    ``_request()`` would), not leak as a raw ``httpx.ReadTimeout``. Asserting
+    that exactly one result was delivered proves the failure is genuinely
+    mid-stream, not on entry.
+    """
+    first_line = _ndjson_first_line()
+
+    async def body():
+        yield first_line.encode()
+        raise httpx.ReadTimeout("read timeout after first line")
+
+    def handler(req):
+        if "/health" in str(req.url):
+            return _health_ok(req)
+        return httpx.Response(
+            200, content=body(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    _install_mock(mock_client, handler)
+
+    delivered = []
+    with pytest.raises(ConnectionError) as exc_info:
+        gen = await mock_client.crawl(
+            ["https://example.com"], crawler_config=CrawlerRunConfig(stream=True)
+        )
+        async for result in gen:
+            delivered.append(result)
+
+    assert len(delivered) == 1
+    assert delivered[0].url == "https://example.com"
+    assert isinstance(exc_info.value, Crawl4aiClientError)
+    assert not isinstance(exc_info.value, httpx.HTTPStatusError)
+    assert "Request timed out" in str(exc_info.value)
+    assert "read timeout after first line" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_raises_connection_error_on_connect_error(mock_client):
+    """A connection failure on stream entry is normalized to ``ConnectionError``.
+
+    The handler serves ``/health`` (prelude passes) and raises
+    ``httpx.ConnectError`` for ``/crawl/stream``. The streaming branch must
+    surface this as ``ConnectionError`` with the "Failed to connect" message,
+    matching ``_request()``'s ``RequestError -> ConnectionError`` mapping.
+    """
+    def handler(req):
+        if "/health" in str(req.url):
+            return _health_ok(req)
+        raise httpx.ConnectError("connection refused")
+
+    _install_mock(mock_client, handler)
+
+    with pytest.raises(ConnectionError) as exc_info:
+        gen = await mock_client.crawl(
+            ["https://example.com"], crawler_config=CrawlerRunConfig(stream=True)
+        )
+        async for _ in gen:
+            pass
+
+    assert isinstance(exc_info.value, Crawl4aiClientError)
+    assert not isinstance(exc_info.value, httpx.HTTPStatusError)
+    assert "Failed to connect" in str(exc_info.value)
+    assert "connection refused" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_raises_connection_error_on_connect_timeout(mock_client):
+    """A connect timeout surfaces as ``ConnectionError`` with the timeout message.
+
+    ``httpx.ConnectTimeout`` is a ``TimeoutException`` (itself a subclass of
+    ``RequestError``), so the fix must catch the ``TimeoutException`` clause
+    first and produce the "Request timed out" message rather than the broader
+    "Failed to connect" message. This guards against reordering the two
+    ``except`` clauses.
+    """
+    def handler(req):
+        if "/health" in str(req.url):
+            return _health_ok(req)
+        raise httpx.ConnectTimeout("connect timeout")
+
+    _install_mock(mock_client, handler)
+
+    with pytest.raises(ConnectionError) as exc_info:
+        gen = await mock_client.crawl(
+            ["https://example.com"], crawler_config=CrawlerRunConfig(stream=True)
+        )
+        async for _ in gen:
+            pass
+
+    assert "Request timed out" in str(exc_info.value)
+    assert "connect timeout" in str(exc_info.value)
+    assert "Failed to connect" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_and_non_streaming_read_timeout_raise_same_exception_type(
+    mock_client,
+):
+    """Same transport failure, same exception type regardless of ``stream`` flag.
+
+    Pins the "no exception type drift" guarantee from the bug report: a
+    ``httpx.ReadTimeout`` that the non-streaming ``_request()`` surfaces as
+    ``ConnectionError("Request timed out: ...")`` must surface identically on
+    the streaming path, so the ``stream`` flag never changes the exception
+    family a caller has to handle.
+    """
+    def handler(req):
+        if "/health" in str(req.url):
+            return _health_ok(req)
+        raise httpx.ReadTimeout("simulated read timeout")
+
+    _install_mock(mock_client, handler)
+
+    streaming_exc: Optional[ConnectionError] = None
+    try:
+        gen = await mock_client.crawl(
+            ["https://example.com"], crawler_config=CrawlerRunConfig(stream=True)
+        )
+        async for _ in gen:
+            pass
+    except ConnectionError as e:
+        streaming_exc = e
+
+    request_exc: Optional[ConnectionError] = None
+    try:
+        await mock_client._request("POST", "/crawl", json={})
+    except ConnectionError as e:
+        request_exc = e
+
+    assert isinstance(streaming_exc, ConnectionError)
+    assert isinstance(request_exc, ConnectionError)
+    assert type(streaming_exc) is type(request_exc)
+    assert str(streaming_exc) == str(request_exc)
+    assert str(streaming_exc) == "Request timed out: simulated read timeout"
