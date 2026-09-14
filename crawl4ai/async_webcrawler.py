@@ -391,15 +391,17 @@ class AsyncWebCrawler:
                         if not await self.robots_parser.can_fetch(
                             url, self.browser_config.user_agent
                         ):
-                            return CrawlResult(
-                                url=url,
-                                html="",
-                                success=False,
-                                status_code=403,
-                                error_message="Access denied by robots.txt",
-                                response_headers={
-                                    "X-Robots-Status": "Blocked by robots.txt"
-                                },
+                            return CrawlResultContainer(
+                                CrawlResult(
+                                    url=url,
+                                    html="",
+                                    success=False,
+                                    status_code=403,
+                                    error_message="Access denied by robots.txt",
+                                    response_headers={
+                                        "X-Robots-Status": "Blocked by robots.txt"
+                                    },
+                                )
                             )
 
                     # --- Anti-bot retry setup ---
