@@ -1160,6 +1160,131 @@ def test_worker_heartbeats_during_a_long_crawl():
     assert redis.claims == [entry.stream_id]
 
 
+class FlakyHeartbeatRedis(FakeRedis):
+    """FakeRedis that injects failures into the heartbeat eval path.
+
+    ``fail_on_heartbeat_numbers`` raises ``error`` on those heartbeat calls so the
+    heartbeat loop's resilience can be exercised; ``lose_lease_on_heartbeat_number``
+    makes the fence check return 0 so ``CrawlJobQueue.heartbeat`` raises
+    ``CrawlJobLeaseLost`` (genuine lease takeover).
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_on_heartbeat_numbers=(),
+        error=ConnectionError,
+        lose_lease_on_heartbeat_number=None,
+    ):
+        super().__init__()
+        self._fail_on = set(fail_on_heartbeat_numbers)
+        self._error = error
+        self._lose_lease_on = lose_lease_on_heartbeat_number
+        self._heartbeat_count = 0
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        if "crawl4ai:heartbeat" in script:
+            self._heartbeat_count += 1
+            if self._heartbeat_count in self._fail_on:
+                raise self._error("heartbeat redis connection reset")
+            if self._lose_lease_on is not None and self._heartbeat_count == self._lose_lease_on:
+                return 0
+        return await super().eval(script, numkeys, *keys_and_args)
+
+
+@pytest.mark.parametrize("error", [ConnectionError, TimeoutError])
+def test_transient_heartbeat_error_does_not_abort_an_in_progress_crawl(error):
+    redis = FlakyHeartbeatRedis(fail_on_heartbeat_numbers={2}, error=error)
+    config = queue_config(
+        max_attempts=3, max_attempt_seconds=3600,
+        heartbeat_seconds=1, lease_seconds=120, read_block_ms=1,
+    )
+    queue, task_id = enqueue(redis, config)
+    entry = asyncio.run(queue.read_new("worker-a"))[0]
+
+    crawl_progress = []
+
+    async def long_running_crawl(_payload):
+        try:
+            await asyncio.sleep(3.5)
+        except asyncio.CancelledError:
+            crawl_progress.append("cancelled-lost-work")
+            raise
+        crawl_progress.append("completed")
+        return {"success": True, "results": [{"url": "https://example.com"}]}
+
+    worker = CrawlJobWorker(queue, config, "worker-a", crawl=long_running_crawl, webhook_service=NoopWebhook())
+    asyncio.run(worker.process(entry))
+
+    assert crawl_progress == ["completed"]
+    assert entry.stream_id not in redis.pending
+    assert redis.acks == [(queue.settings.stream, entry.stream_id)]
+    assert redis.hashes[queue.task_key(task_id)]["status"] == "completed"
+    # The failing heartbeat was reached, and a later heartbeat still renewed the
+    # lease: the heartbeat loop retried instead of aborting the crawl.
+    assert redis._heartbeat_count >= 3
+    assert len(redis.claims) >= 2
+
+
+def test_sustained_heartbeat_errors_keep_the_crawl_alive():
+    redis = FlakyHeartbeatRedis(fail_on_heartbeat_numbers={2, 3}, error=ConnectionError)
+    config = queue_config(
+        max_attempts=3, max_attempt_seconds=3600,
+        heartbeat_seconds=1, lease_seconds=120, read_block_ms=1,
+    )
+    queue, task_id = enqueue(redis, config)
+    entry = asyncio.run(queue.read_new("worker-a"))[0]
+
+    crawl_progress = []
+
+    async def long_running_crawl(_payload):
+        try:
+            await asyncio.sleep(3.5)
+        except asyncio.CancelledError:
+            crawl_progress.append("cancelled-lost-work")
+            raise
+        crawl_progress.append("completed")
+        return {"success": True, "results": [{"url": "https://example.com"}]}
+
+    worker = CrawlJobWorker(queue, config, "worker-a", crawl=long_running_crawl, webhook_service=NoopWebhook())
+    asyncio.run(worker.process(entry))
+
+    assert crawl_progress == ["completed"]
+    assert redis.acks == [(queue.settings.stream, entry.stream_id)]
+    assert redis.hashes[queue.task_key(task_id)]["status"] == "completed"
+    assert redis._heartbeat_count >= 3
+    assert len(redis.claims) == 1
+
+
+def test_genuine_lease_loss_during_heartbeat_still_cancels_the_crawl():
+    redis = FlakyHeartbeatRedis(lose_lease_on_heartbeat_number=2)
+    config = queue_config(
+        max_attempts=3, max_attempt_seconds=3600,
+        heartbeat_seconds=1, lease_seconds=120, read_block_ms=1,
+    )
+    queue, task_id = enqueue(redis, config)
+    entry = asyncio.run(queue.read_new("worker-a"))[0]
+
+    crawl_progress = []
+
+    async def long_running_crawl(_payload):
+        try:
+            await asyncio.sleep(3.5)
+        except asyncio.CancelledError:
+            crawl_progress.append("cancelled-lost-work")
+            raise
+        crawl_progress.append("completed")
+        return {"success": True, "results": [{"url": "https://example.com"}]}
+
+    worker = CrawlJobWorker(queue, config, "worker-a", crawl=long_running_crawl, webhook_service=NoopWebhook())
+    asyncio.run(worker.process(entry))
+
+    assert crawl_progress == ["cancelled-lost-work"]
+    assert entry.stream_id in redis.pending
+    assert redis.acks == []
+    assert redis.hashes[queue.task_key(task_id)]["status"] == "processing"
+
+
 def test_worker_releases_an_attempt_that_outlives_its_budget():
     """A hung crawl must not hold its consumer: the heartbeat would renew its lease forever."""
     redis = FakeRedis()

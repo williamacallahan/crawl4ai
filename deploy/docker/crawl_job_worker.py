@@ -247,7 +247,17 @@ class CrawlJobWorker:
     ) -> None:
         while True:
             await asyncio.sleep(self.queue.settings.heartbeat_seconds)
-            await self.queue.heartbeat(entry, payload, self.consumer, attempt)
+            try:
+                await self.queue.heartbeat(entry, payload, self.consumer, attempt)
+            except CrawlJobLeaseLost:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Heartbeat renewal failed for crawl job %s; will retry next tick",
+                    entry.task_id,
+                )
 
     async def _notify(
         self,
