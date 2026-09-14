@@ -301,7 +301,12 @@ class DefaultTableExtraction(TableExtractionStrategy):
                     pending[col] = (value, remaining - 1)
                 col += 1
 
-            for cell in row.xpath("./td"):
+            # When a <thead> is present, headers come from <thead>; any <th> in
+            # <tbody> is a row-header label and must occupy a grid column (HTML
+            # table model). With no <thead>, the first row may have been adopted
+            # as headers, so keep ./td only to avoid re-emitting it as data.
+            cell_selector = "./td|./th" if thead_rows else "./td"
+            for cell in row.xpath(cell_selector):
                 # Fill columns still occupied by an earlier rowspan before
                 # consuming this row's own cell.
                 while col in pending:
