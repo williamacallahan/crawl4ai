@@ -201,10 +201,18 @@ _XML_DATA_ROOT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Leading whitespace AND the Unicode byte-order mark (U+FEFF) to strip before
+# classification. ``str.strip()`` does NOT remove U+FEFF (``'\ufeff'.isspace()``
+# is ``False``), so a BOM-prefixed JSON/XML response served as text/html would
+# survive the strip and defeat every prefix/first-char check in this function.
+# The character class handles any interleaving of whitespace and the BOM
+# (e.g. ``'\ufeff\n<rss/>'`` or ``'\n\ufeff{"k":1}'``).
+_BOM_LSTRIP_RE = re.compile(r'^[\s\ufeff]+')
+
 
 def _looks_like_data(html: str) -> bool:
     """Check if content looks like a JSON/XML API response (not an HTML block page)."""
-    stripped = html.strip()
+    stripped = _BOM_LSTRIP_RE.sub('', html)
     if not stripped:
         return False
     # Raw JSON/XML (not wrapped in HTML)
