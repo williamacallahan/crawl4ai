@@ -256,6 +256,7 @@ class UndetectedAdapter(BrowserAdapter):
     
     def __init__(self):
         self._console_script_injected = {}
+        self._error_script_injected = {}
     
     async def evaluate(self, page: UndetectedPage, expression: str, arg: Any = None) -> Any:
         """Undetected browser evaluate with isolated context"""
@@ -315,7 +316,7 @@ class UndetectedAdapter(BrowserAdapter):
     
     async def setup_error_capture(self, page: UndetectedPage, captured_console: List[Dict]) -> Optional[Callable]:
         """Setup error capture using JavaScript injection for undetected browsers"""
-        if not self._console_script_injected.get(page, False):
+        if not self._error_script_injected.get(page, False):
             await page.add_init_script("""
                 // Capture errors
                 window.addEventListener('error', (event) => {
@@ -348,7 +349,7 @@ class UndetectedAdapter(BrowserAdapter):
                     }
                 });
             """)
-            self._console_script_injected[page] = True
+            self._error_script_injected[page] = True
         
         return None  # No handler function needed for undetected browser
     
