@@ -284,6 +284,90 @@ def test_stop_grace_covers_the_shipped_container_drain_budget(monkeypatch):
         rollout._policy(application())
 
 
+@pytest.mark.parametrize(
+    ("value", "seconds"),
+    [
+        # Pure-digit values str.isdigit() already accepted: no regression.
+        ("0", 0), ("00", 0), ("2", 2), ("30", 30), ("40", 40), ("600", 600),
+        ("007", 7),
+        # Leading '+' the container's sleep honors but isdigit rejected.
+        ("+2", 2), ("+0", 0),
+        # Fractional numbers the container's sleep honors but isdigit rejected.
+        ("1.5", 1), ("31.5", 31), (".5", 0), ("1.", 1), ("0.0", 0), ("10.0", 10),
+        # Suffixed values: the realistic operator raise, all rejected by isdigit.
+        ("30s", 30), ("2s", 2), ("1m", 60), ("2m", 120), ("1h", 3600), ("1d", 86400),
+        ("0m", 0), ("0s", 0), ("0d", 0),
+        # Fractional suffixed.
+        ("1.5m", 90), (".5m", 30), ("1.m", 60), ("1.0m", 60), ("2.5h", 9000),
+        ("1.5h", 5400), (".5s", 0),
+        # Leading '+' with a suffix.
+        ("+1m", 60), ("+1.5m", 90),
+    ],
+)
+def test_parse_sleep_seconds_accepts_the_sleep_intervals_the_container_honors(value, seconds):
+    # entrypoint.sh runs `sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"`, so the
+    # verifier must measure any single argument the container's sleep accepts;
+    # isdigit rejected every non-digit row below, masking it with the 2-literal.
+    assert rollout._parse_sleep_seconds(value) == seconds
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # Not a number.
+        "abc", "m", "s", "",
+        # Units the container's sleep rejects.
+        "1y", "1w", "1M", "1S", "1x",
+        # Multi-component single arguments (sleep wants separate args).
+        "1m30s", "1d2h", "1 m",
+        # Malformed decimals.
+        "1.5.5", "1.5.", "1..5", "1.5.5m", "+.", "+", "1_000",
+        # Negative: sleep treats as an option, and a negative drain is meaningless.
+        "-2", "-2s",
+        # Exotic forms strtod accepts but a drain delay must never be: a huge or
+        # infinite sleep would always SIGKILL the task, so reject loudly so the
+        # operator's typo can never slip past the gate unmeasured.
+        "inf", "nan", "1.5e2", "0x10",
+    ],
+)
+def test_parse_sleep_seconds_rejects_non_intervals_loudly(value):
+    with pytest.raises(ValueError, match="CRAWL4AI_DRAIN_DELAY_SECONDS"):
+        rollout._parse_sleep_seconds(value)
+
+
+@pytest.mark.parametrize("drain", [None, "", "   ", "2"])
+def test_drain_budget_ns_falls_back_only_when_the_delay_is_unset(drain):
+    # 360 (stopwaitsecs) + 2 (entrypoint literal) == 362s: an unset variable and
+    # a value the grace easily covers both keep the shipped default budget.
+    env = "IGNORE=me\n"
+    if drain is not None:
+        env += f"CRAWL4AI_DRAIN_DELAY_SECONDS={drain}"
+    assert rollout._drain_budget_ns(env) == 362_000_000_000
+
+
+@pytest.mark.parametrize(
+    "drain",
+    ["abc", "1m30s", "1d2h", "-2", "1.5.5", "1M", "1_000", "inf", "nan", "1.5e2"],
+)
+def test_drain_budget_ns_raises_loudly_when_a_set_delay_is_unparseable(drain):
+    # The original bug fell back to the entrypoint literal 2 whenever isdigit
+    # rejected a set value; a value that is set but unparseable must fail the
+    # deploy loudly instead of silently passing a gate on a budget it never
+    # measured.
+    with pytest.raises(ValueError, match="CRAWL4AI_DRAIN_DELAY_SECONDS"):
+        rollout._drain_budget_ns(f"CRAWL4AI_DRAIN_DELAY_SECONDS={drain}")
+
+
+@pytest.mark.parametrize(
+    "drain", ["1m", "30s", "31.5", "1.5m", "2m", "1h", "40", "600"]
+)
+def test_policy_blocks_a_rollout_whose_drain_delay_meets_or_exceeds_the_stop_grace(drain):
+    raised = application()
+    raised["env"] += f"\nCRAWL4AI_DRAIN_DELAY_SECONDS={drain}"
+    with pytest.raises(ValueError, match="drain budget"):
+        rollout._policy(raised)
+
+
 def test_policy_accepts_only_stock_docker_image_configuration():
     rollout._policy(application())
     for field, value in (

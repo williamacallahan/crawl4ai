@@ -429,6 +429,36 @@ def _eligible_nodes() -> frozenset[str]:
     return frozenset(ready)
 
 
+_SLEEP_UNITS = {"s": 1, "m": 60, "h": 3_600, "d": 86_400}
+# One GNU sleep interval as a single quoted argument: an optionally-signed,
+# optionally-fractional decimal number followed by an optional single
+# s/m/h/d suffix. ``re.fullmatch`` (not ``re.match``) keeps multi-component
+# values such as ``1m30s`` or ``1d2h`` from parsing as their first component.
+_SLEEP_INTERVAL = re.compile(r"([+]?(?:\d+(?:\.\d*)?|\.\d+))([smhd])?")
+
+
+def _parse_sleep_seconds(value: str) -> int:
+    """Parse one GNU sleep time interval to whole seconds.
+
+    entrypoint.sh runs ``sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"``, so the
+    deployed value reaches ``sleep`` as a single quoted argument. GNU sleep
+    accepts one (optionally fractional) number with an optional single
+    ``s``/``m``/``h``/``d`` suffix; anything else is rejected here so the deploy
+    fails loudly rather than silently falling back to the entrypoint literal.
+    Falling back when the operator has set a value would undermeasure the real
+    shutdown and let a rolling update SIGKILL a task mid-drain — the exact
+    data-loss class the STOP_GRACE_NS gate exists to prevent.
+    """
+    match = _SLEEP_INTERVAL.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "CRAWL4AI_DRAIN_DELAY_SECONDS must be a number bash sleep accepts"
+            f" (a number with an optional s/m/h/d suffix); got {value!r}"
+        )
+    seconds = float(match.group(1)) * _SLEEP_UNITS[match.group(2) or "s"]
+    return int(seconds)
+
+
 def _drain_budget_ns(environment: Any) -> int:
     """What PID 1 needs to shut down cleanly, read from the sources that own it.
 
@@ -438,7 +468,12 @@ def _drain_budget_ns(environment: Any) -> int:
 
     The delay is read from the deployed environment when it sets one: the
     literal in entrypoint.sh is only the fallback, and reading it alone would
-    miss a value raised in the Dokploy console.
+    miss a value raised in the Dokploy console. The deployed value is parsed
+    as the single GNU sleep interval the container's ``sleep`` honors — a
+    number with an optional ``s``/``m``/``h``/``d`` suffix, fractional or not —
+    so a value the container actually sleeps (``1m`` or ``31.5``) is what is
+    measured, and a value that is set but unparseable fails the deploy loudly
+    instead of being masked by the fallback literal.
     """
     here = Path(__file__).resolve().parent
     # The slowest program in the group bounds supervisord's own shutdown.
@@ -451,7 +486,10 @@ def _drain_budget_ns(environment: Any) -> int:
     if not stop_waits or not fallback:
         raise ValueError("container drain budget is no longer readable from its own sources")
     deployed = _environment_values(environment).get("CRAWL4AI_DRAIN_DELAY_SECONDS", "").strip()
-    drain = int(deployed) if deployed.isdigit() else int(fallback.group(1))
+    if deployed:
+        drain = _parse_sleep_seconds(deployed)
+    else:
+        drain = int(fallback.group(1))
     return (max(int(value) for value in stop_waits) + drain) * 1_000_000_000
 
 
