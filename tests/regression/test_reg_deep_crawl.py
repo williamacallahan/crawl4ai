@@ -522,6 +522,78 @@ def test_deep_crawl_deduplication():
     )
 
 
+def test_deep_crawl_query_order_dedup():
+    """Same query params in different order must collapse to one dedup key.
+
+    Regression for the prefetch-mode duplicate-fetch bug: BFS/DFS/BestFirst
+    strategies insert this function's output into their ``visited``/``_dfs_seen``
+    sets. If two orderings of the same params produce distinct keys, the crawler
+    fetches the same page twice. This mimics a ``visited`` set simulation directly
+    to lock the dedup behavior the strategies depend on.
+    """
+    base = "http://example.com/"
+    visited = set()
+
+    links = [
+        "/product?id=42&color=red",
+        "/product?color=red&id=42",
+        "/product?id=42&color=red",  # exact duplicate
+    ]
+    fetched = []
+    for href in links:
+        key = normalize_url_for_deep_crawl(href, base)
+        if key in visited:
+            continue
+        visited.add(key)
+        fetched.append(key)
+
+    assert len(fetched) == 1, (
+        f"Order-differing query params should dedup to a single fetch, "
+        f"got {len(fetched)}: {fetched}"
+    )
+    assert fetched[0] == "http://example.com/product?color=red&id=42", (
+        f"Unexpected normalized form: {fetched[0]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefetch_deep_crawl_query_order_dedup(local_server):
+    """End-to-end: prefetch + BFS must not double-fetch a target whose links
+    differ only in query-parameter order.
+
+    Regression for the prefetch-mode duplicate-fetch bug. The hub page exposes
+    three links to ``/target``: two with the same query params in different
+    orders plus an exact duplicate. With the sort fix in
+    ``normalize_url_for_deep_crawl`` the crawler must fetch ``/target`` exactly
+    once. Without the fix (params not sorted) the two orderings produce distinct
+    dedup keys and ``/target`` is fetched twice.
+    """
+    base = _to_ip_url(local_server)
+    hub_url = base + "/query-dedup/hub"
+    strategy = BFSDeepCrawlStrategy(max_depth=1, max_pages=10)
+    config = CrawlerRunConfig(
+        deep_crawl_strategy=strategy, prefetch=True, verbose=False
+    )
+
+    async with AsyncWebCrawler(
+        config=BrowserConfig(headless=True, verbose=False)
+    ) as crawler:
+        results = await crawler.arun(url=hub_url, config=config)
+        result_list = list(results)
+
+    target_results = [r for r in result_list if r.url.split("?")[0].endswith("/target")]
+    target_query_strings = sorted(r.url.split("?", 1)[1] for r in target_results)
+
+    assert len(target_results) == 1, (
+        f"Target should be fetched exactly once (deduped), but got "
+        f"{len(target_results)}: {target_query_strings}"
+    )
+    # The single fetch must carry the sorted query string.
+    assert target_query_strings[0] == "color=red&page=1", (
+        f"Target query should be sorted: {target_query_strings[0]}"
+    )
+
+
 def test_deep_crawl_efficient_normalization():
     """efficient_normalize_url_for_deep_crawl should produce consistent results."""
     base = "http://example.com/deep/hub"
