@@ -341,8 +341,5 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
             )
 
         for url, score in valid_links:
-            if score:
-                result.metadata = result.metadata or {}
-                result.metadata["score"] = score
             next_level.append((url, source_url))
             depths[url] = next_depth
