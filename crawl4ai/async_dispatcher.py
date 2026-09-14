@@ -38,29 +38,33 @@ class RateLimiter:
         self.max_retries = max_retries
         self.rate_limit_codes = rate_limit_codes or [429, 503]
         self.domains: Dict[str, DomainState] = {}
+        self._domain_locks: Dict[str, asyncio.Lock] = {}
 
     def get_domain(self, url: str) -> str:
         return urlparse(url).netloc
 
     async def wait_if_needed(self, url: str) -> None:
         domain = self.get_domain(url)
-        state = self.domains.get(domain)
+        state = self.domains.setdefault(domain, DomainState())
+        lock = self._domain_locks.setdefault(domain, asyncio.Lock())
 
-        if not state:
-            self.domains[domain] = DomainState()
-            state = self.domains[domain]
+        # Serialize same-domain callers so each one reserves its slot (advances
+        # ``last_request_time``) before the next caller can read the timestamp.
+        # Without this lock, N concurrent same-domain callers all observe the
+        # same stale ``last_request_time``, compute the same ``wait_time``, and
+        # wake together into a burst within a single ``current_delay`` window.
+        async with lock:
+            # Random delay within base range if no current delay
+            if state.current_delay == 0:
+                state.current_delay = random.uniform(*self.base_delay)
 
-        now = time.time()
-        if state.last_request_time:
-            wait_time = max(0, state.current_delay - (now - state.last_request_time))
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
+            now = time.time()
+            if state.last_request_time:
+                wait_time = max(0, state.current_delay - (now - state.last_request_time))
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
 
-        # Random delay within base range if no current delay
-        if state.current_delay == 0:
-            state.current_delay = random.uniform(*self.base_delay)
-
-        state.last_request_time = time.time()
+            state.last_request_time = time.time()
 
     def update_delay(self, url: str, status_code: int) -> bool:
         domain = self.get_domain(url)
