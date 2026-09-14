@@ -212,6 +212,50 @@ async def test_bfs_level_order(local_server):
             max_depth_seen = max(max_depth_seen, d)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+async def test_bfs_url_scorer_per_page_own_score(local_server, stream):
+    """BFS with url_scorer must attach each page's *own* score to its own
+    ``metadata["score"]`` -- never a child's score.
+
+    Regression for the per-page score metadata bug introduced in commit
+    c308a79: BFS never set the page's own score in its result-annotation loop,
+    and ``link_discovery`` wrote each child's score onto the parent's
+    ``metadata["score"]`` (last non-zero child won). The hub (/deep/hub, no
+    keyword match) used to surface a child's score; leaves had no key at all.
+    """
+    base = _to_ip_url(local_server)
+    hub_url = base + "/deep/hub"
+    scorer = KeywordRelevanceScorer(keywords=["sub1"])
+    strategy = BFSDeepCrawlStrategy(max_depth=1, max_pages=10, url_scorer=scorer)
+    config = CrawlerRunConfig(deep_crawl_strategy=strategy, stream=stream, verbose=False)
+
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        if stream:
+            results = []
+            async for r in await crawler.arun(url=hub_url, config=config):
+                results.append(r)
+        else:
+            results = list(await crawler.arun(url=hub_url, config=config))
+
+        assert len(results) >= 1, "Should return at least the hub page"
+        for r in results:
+            assert "score" in r.metadata, (
+                f"missing 'score' key on {r.url}: {r.metadata!r}"
+            )
+            assert r.metadata["score"] == scorer.score(r.url), (
+                f"{r.url} metadata['score']={r.metadata['score']!r} but own "
+                f"scorer.score={scorer.score(r.url)!r} (got a child's score?)"
+            )
+        # The hub has no 'sub1' in its URL path -> its own score must be 0.0,
+        # not /deep/sub1's score (which is > 0).
+        hub_result = results[0]
+        assert "/deep/hub" in hub_result.url
+        assert hub_result.metadata["score"] == 0.0, (
+            f"hub contaminated by a child score: got {hub_result.metadata['score']!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # DFS Deep Crawl
 # ---------------------------------------------------------------------------
@@ -301,6 +345,47 @@ async def test_dfs_max_pages_exact_boundary(local_server, stream):
         f"DFS {mode} max_pages=5: expected exactly 5, got {len(results)}. "
         f"URLs: {[r.url for r in results]}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+async def test_dfs_url_scorer_hub_not_contaminated(local_server, stream):
+    """DFS hub must carry its own score, not a child's.
+
+    Regression for the secondary parent-contamination defect shared with BFS:
+    DFS already set each page's own score, but its ``link_discovery`` overwrote
+    the parent's ``metadata["score"]`` with the last non-zero child's score.
+    With a scorer matching a child path, the hub's score is its own 0.0, not
+    the child's.
+    """
+    base = _to_ip_url(local_server)
+    hub_url = base + "/deep/hub"
+    scorer = KeywordRelevanceScorer(keywords=["sub1"])
+    strategy = DFSDeepCrawlStrategy(max_depth=1, max_pages=10, url_scorer=scorer)
+    config = CrawlerRunConfig(deep_crawl_strategy=strategy, stream=stream, verbose=False)
+
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        if stream:
+            results = []
+            async for r in await crawler.arun(url=hub_url, config=config):
+                results.append(r)
+        else:
+            results = list(await crawler.arun(url=hub_url, config=config))
+
+        assert len(results) >= 1
+        for r in results:
+            assert "score" in r.metadata, (
+                f"missing 'score' key on {r.url}: {r.metadata!r}"
+            )
+            assert r.metadata["score"] == scorer.score(r.url), (
+                f"{r.url} metadata['score']={r.metadata['score']!r} but own "
+                f"scorer.score={scorer.score(r.url)!r}"
+            )
+        hub_result = results[0]
+        assert "/deep/hub" in hub_result.url
+        assert hub_result.metadata["score"] == 0.0, (
+            f"DFS hub contaminated by a child score: got {hub_result.metadata['score']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

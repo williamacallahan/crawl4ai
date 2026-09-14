@@ -195,12 +195,10 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             valid_links = valid_links[:remaining_capacity]
             self.logger.info(f"Limiting to {remaining_capacity} URLs due to max_pages limit")
             
-        # Process the final selected links
-        for url, score in valid_links:
-            # attach the score to metadata if needed
-            if score:
-                result.metadata = result.metadata or {}
-                result.metadata["score"] = score
+        # Process the final selected links. Child scores are used only for
+        # filtering/sorting above; each page's own score is attached to its own
+        # CrawlResult in _arun_batch/_arun_stream, never onto the parent here.
+        for url, _score in valid_links:
             next_level.append((url, source_url))
             depths[url] = next_depth
 
@@ -261,6 +259,8 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 result.metadata["depth"] = depth
                 parent_url = next((parent for (u, parent) in current_level if u == url), None)
                 result.metadata["parent_url"] = parent_url
+                if self.url_scorer:
+                    result.metadata["score"] = self.url_scorer.score(url)
                 results.append(result)
 
                 # Only discover links from successful crawls
@@ -364,7 +364,9 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 result.metadata["depth"] = depth
                 parent_url = next((parent for (u, parent) in current_level if u == url), None)
                 result.metadata["parent_url"] = parent_url
-                
+                if self.url_scorer:
+                    result.metadata["score"] = self.url_scorer.score(url)
+
                 results_count += 1
                 # Only count successful crawls toward max_pages limit
                 if result.success:
