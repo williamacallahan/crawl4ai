@@ -618,33 +618,6 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 self._log("error", f"Error extracting metadata: {str(e)}", "SCRAPE")
                 meta = {}
 
-            content_element = None
-            if css_selector:
-                try:
-                    selected = body.cssselect(css_selector)
-                    if selected:
-                        content_element = lhtml.Element("div")
-                        content_element.extend(copy.deepcopy(selected))
-                    else:
-                        content_element = body
-                except Exception as e:
-                    self._log("error", f"Error with css_selector: {str(e)}", "SCRAPE")
-                    content_element = body
-
-            if target_elements:
-                try:
-                    source = content_element if content_element is not None else body
-                    for_content_targeted_element = []
-                    for target_element in target_elements:
-                        for_content_targeted_element.extend(source.cssselect(target_element))
-                    content_element = lhtml.Element("div")
-                    content_element.extend(copy.deepcopy(for_content_targeted_element))
-                except Exception as e:
-                    self._log("error", f"Error with target element detection: {str(e)}", "SCRAPE")
-                    return None
-            elif content_element is None:
-                content_element = body
-
             # Replace mermaid SVGs with text before they get stripped
             for svg in body.xpath('.//svg[starts-with(@id, "mermaid-")]'):
                 try:
@@ -797,9 +770,33 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 body, keep_data_attributes=kwargs.get("keep_data_attributes", False)
             )
 
+            content_element = body
+            if css_selector:
+                try:
+                    selected = body.cssselect(css_selector)
+                    if selected:
+                        content_element = lhtml.Element("div")
+                        content_element.extend(copy.deepcopy(selected))
+                    else:
+                        content_element = body
+                except Exception as e:
+                    self._log("error", f"Error with css_selector: {str(e)}", "SCRAPE")
+                    content_element = body
+
+            if target_elements:
+                try:
+                    source = content_element if content_element is not body else body
+                    for_content_targeted_element = []
+                    for target_element in target_elements:
+                        for_content_targeted_element.extend(source.cssselect(target_element))
+                    content_element = lhtml.Element("div")
+                    content_element.extend(copy.deepcopy(for_content_targeted_element))
+                except Exception as e:
+                    self._log("error", f"Error with target element detection: {str(e)}", "SCRAPE")
+                    return None
+
             # Generate output HTML
             cleaned_html = lhtml.tostring(
-                # body,   
                 content_element,
                 encoding="unicode",
                 pretty_print=True,
