@@ -739,13 +739,14 @@ class LLMExtractionStrategy(ExtractionStrategy):
                     elif isinstance(blocks, list):
                         # If it is a list then assign that to blocks
                         blocks = blocks
-                else: 
+                else:
                     # blocks = extract_xml_data(["blocks"], response.choices[0].message.content)["blocks"]
                     blocks = extract_xml_data(["blocks"], content)["blocks"]
                     blocks = json.loads(blocks)
 
                 for block in blocks:
-                    block["error"] = False
+                    if "error" not in block.get("tags", []):
+                        block["error"] = False
             except Exception:
                 raw_content = response.choices[0].message.content or ""
                 parsed, unparsed = split_and_parse_json_objects(raw_content)
@@ -944,7 +945,8 @@ class LLMExtractionStrategy(ExtractionStrategy):
                     blocks = json.loads(blocks)
 
                 for block in blocks:
-                    block["error"] = False
+                    if "error" not in block.get("tags", []):
+                        block["error"] = False
             except Exception:
                 raw_content = response.choices[0].message.content or ""
                 parsed, unparsed = split_and_parse_json_objects(raw_content)
