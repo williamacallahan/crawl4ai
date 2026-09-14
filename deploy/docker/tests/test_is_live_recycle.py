@@ -301,11 +301,11 @@ async def test_get_crawler_serves_recycling_permanent_without_force_replace(monk
     force_true = 0
     real_init = crawler_pool._init_permanent_locked
 
-    async def spy_init(cfg, *, force=False):
+    async def spy_init(cfg, *, force=False, target=None):
         nonlocal force_true
         if force:
             force_true += 1
-        return await real_init(cfg, force=force)
+        return await real_init(cfg, force=force, target=target)
 
     monkeypatch.setattr(crawler_pool, "_init_permanent_locked", spy_init)
 
@@ -354,11 +354,11 @@ async def test_blast_radius_zero_force_replaces_with_fix(monkeypatch):
     force_true = 0
     real_init = crawler_pool._init_permanent_locked
 
-    async def spy_init(cfg, *, force=False):
+    async def spy_init(cfg, *, force=False, target=None):
         nonlocal force_true
         if force:
             force_true += 1
-        return await real_init(cfg, force=force)
+        return await real_init(cfg, force=force, target=target)
 
     monkeypatch.setattr(crawler_pool, "_init_permanent_locked", spy_init)
 

@@ -362,7 +362,9 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     replace_permanent = True
                 elif not _is_live(PERMANENT):
                     logger.warning("Permanent browser is unavailable; replacing it")
-                    close_task = await _init_permanent_locked(cfg, force=True)
+                    close_task, _done = await _init_permanent_locked(
+                        cfg, force=True, target=PERMANENT
+                    )
                     replace_permanent = close_task is not None
                 else:
                     LAST_USED[sig] = time.time()
@@ -459,17 +461,55 @@ async def release_crawler(crawler: AsyncWebCrawler):
 
 
 async def _init_permanent_locked(
-    cfg: BrowserConfig, *, force: bool = False
-) -> Optional[asyncio.Task]:
+    cfg: BrowserConfig,
+    *,
+    force: bool = False,
+    target: Optional[AsyncWebCrawler] = None,
+) -> tuple[Optional[asyncio.Task], bool]:
+    """Bring up the permanent browser, or detach the current one for replacement.
+
+    Returns ``(close_task, done)`` where ``close_task`` is a background close to
+    await *outside* the pool lock (or ``None`` to stop looping), and ``done``
+    records whether *this call* owns the (re)placement:
+
+    * ``done=True``  - no work was needed (a live permanent is current), the
+      current permanent was detached and will be rebuilt on the next loop, or a
+      fresh permanent was created.
+    * ``done=False`` - a force restart was *superseded*: a concurrent non-force
+      caller already rebuilt ``PERMANENT`` into a crawler that is not the
+      ``target`` the restart captured. The fresh permanent - and any in-flight
+      crawl admitted on it - is left untouched; the original the restart meant
+      to retire is already gone.
+
+    ``target`` is the permanent instance a force restart intends to replace.
+    A force restart detaches *only* that instance, never a permanent a
+    concurrent request placed during the lock-free close wait - the race that
+    killed in-flight default-config crawls. ``None`` (the default) is treated as
+    "no identity constraint": non-force callers detach whatever is current
+    (they hold LOCK for the whole call so it cannot move under them).
+    """
     global PERMANENT, DEFAULT_CONFIG_SIG
+    # Non-force callers are idempotent: a live permanent already serves this config.
     if PERMANENT and not force and _is_live(PERMANENT):
-        return None
-    if PERMANENT:
-        return _close_in_background(_detach_permanent())
+        return None, True
+    # Detach the current permanent for a bounded background close. A force
+    # restart only detaches the instance it captured at the start (``target``);
+    # a permanent rebuilt by a concurrent non-force caller during the lock-free
+    # close wait is NOT ours to tear down.
+    if PERMANENT and (not force or PERMANENT is target):
+        return _close_in_background(_detach_permanent()), True
+    # Force restart only: a concurrent default-config request already rebuilt
+    # PERMANENT into a fresh crawler that is not our original target. The old
+    # permanent is gone (the restart's intent - retire it - is satisfied); leave
+    # the fresh one alone. ``PERMANENT is not None`` excludes the normal "we
+    # just finished closing the original, nothing rebuilt it" case, which must
+    # fall through to create the replacement.
+    if force and target is not None and PERMANENT is not None and PERMANENT is not target:
+        return None, False
 
     close_task = _make_browser_capacity()
     if close_task is not None:
-        return close_task
+        return close_task, True
 
     sig = _sig(cfg)
     logger.info("🔥 Creating permanent default browser")
@@ -479,16 +519,28 @@ async def _init_permanent_locked(
     DEFAULT_CONFIG_SIG = sig
     LAST_USED[sig] = time.time()
     USAGE_COUNT[sig] = 0
-    return None
+    return None, True
 
 
-async def init_permanent(cfg: BrowserConfig, *, force: bool = False) -> None:
-    """Initialize or atomically replace the permanent default browser."""
+async def init_permanent(cfg: BrowserConfig, *, force: bool = False) -> bool:
+    """Initialize or atomically replace the permanent default browser.
+
+    Returns ``True`` if this call performed the (re)placement, or ``False`` if a
+    force restart was *superseded* - a concurrent non-force request already
+    rebuilt the permanent into a fresh crawler that is not the one the restart
+    captured, so the restart leaves it (and any in-flight crawl on it) alone.
+    Non-force callers always return ``True``; the return value is ignored by
+    the admission path and the server lifespan, so widening it from ``None`` to
+    ``bool`` is backward-compatible.
+    """
+    original = PERMANENT
     while True:
         async with LOCK:
-            close_task = await _init_permanent_locked(cfg, force=force)
+            close_task, done = await _init_permanent_locked(
+                cfg, force=force, target=original
+            )
             if close_task is None:
-                return
+                return done
         await asyncio.shield(close_task)
 
 
