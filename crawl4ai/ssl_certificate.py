@@ -17,6 +17,14 @@ class SSLCertificate(dict):
     and provides methods for export and property access.
 
     Inherits from dict, so instances are directly JSON serializable.
+
+    Construction:
+        - ``from_url(url, timeout=10)``: fetch and parse the TLS certificate
+          presented by an HTTPS endpoint (returns ``None`` for non-HTTPS URLs).
+        - ``from_file(file_path)``: load and parse a certificate from a local
+          file containing PEM- or DER-encoded certificate data.
+        - ``from_binary(binary_data)``: parse a certificate from raw PEM or DER
+          bytes (e.g. captured from a socket or another source).
     """
 
     # Use __slots__ for potential memory optimization if desired, though less common when inheriting dict
@@ -148,6 +156,101 @@ class SSLCertificate(dict):
              return SSLCertificate(cert_info_raw)
         else:
              return None
+
+    @staticmethod
+    def from_binary(binary_data: bytes) -> Optional["SSLCertificate"]:
+        """
+        Create an SSLCertificate instance from raw certificate bytes.
+
+        Accepts either PEM (base64-encoded, ``-----BEGIN CERTIFICATE-----``)
+        or DER (binary ASN.1) input. The parsed certificate is normalized to
+        DER internally so that the ``raw_cert`` field and the ``to_der`` /
+        ``to_pem`` exports are always consistent regardless of the input
+        format.
+
+        Args:
+            binary_data (bytes): PEM- or DER-encoded certificate bytes.
+                ``bytearray`` and ``memoryview`` are also accepted (coerced
+                to ``bytes``) to support data captured directly from a socket.
+
+        Returns:
+            Optional["SSLCertificate"]: The parsed certificate, or ``None`` if
+            the bytes could not be parsed as either PEM or DER (a warning is
+            printed in that case, matching ``from_url``'s convention).
+        """
+        try:
+            # OpenSSL.crypto.load_certificate requires ``bytes``; accept the
+            # common bytes-like types a caller might have assembled from a
+            # socket capture (bytearray/memoryview) by coercing to bytes.
+            if isinstance(binary_data, (bytearray, memoryview)):
+                binary_data = bytes(binary_data)
+            x509 = None
+            # Try PEM first, then DER/ASN.1. Each format only parses its own
+            # encoding, so the order does not risk a false-positive match.
+            for ftype in (OpenSSL.crypto.FILETYPE_PEM, OpenSSL.crypto.FILETYPE_ASN1):
+                try:
+                    x509 = OpenSSL.crypto.load_certificate(ftype, binary_data)
+                    break
+                except OpenSSL.crypto.Error:
+                    continue
+            if x509 is None:
+                print("Error: Could not parse certificate data in PEM or DER format")
+                return None
+
+            # Normalize to DER so to_der/to_pem round-trip regardless of
+            # whether the caller supplied PEM or DER bytes. from_url stores
+            # base64(der) too (getpeercert(binary_form=True) returns DER), so
+            # this keeps the on-disk/raw-bytes path consistent with it.
+            der_bytes = OpenSSL.crypto.dump_certificate(
+                OpenSSL.crypto.FILETYPE_ASN1, x509
+            )
+
+            cert_info_raw = {
+                "subject": dict(x509.get_subject().get_components()),
+                "issuer": dict(x509.get_issuer().get_components()),
+                "version": x509.get_version(),
+                "serial_number": hex(x509.get_serial_number()),
+                "not_before": x509.get_notBefore(),
+                "not_after": x509.get_notAfter(),
+                "fingerprint": x509.digest("sha256").hex(),
+                "signature_algorithm": x509.get_signature_algorithm(),
+                "raw_cert": base64.b64encode(der_bytes),
+            }
+
+            extensions = []
+            for i in range(x509.get_extension_count()):
+                ext = x509.get_extension(i)
+                extensions.append({"name": ext.get_short_name(), "value": str(ext)})
+            cert_info_raw["extensions"] = extensions
+
+            return SSLCertificate(cert_info_raw)
+        except Exception as e:
+            print(f"Error processing certificate binary data: {e}")
+            return None
+
+    @staticmethod
+    def from_file(file_path: str) -> Optional["SSLCertificate"]:
+        """
+        Create an SSLCertificate instance from a local certificate file.
+
+        The file may contain either PEM- or DER-encoded certificate data;
+        parsing is delegated to :meth:`from_binary` after reading the file.
+
+        Args:
+            file_path (str): Path to a PEM (``.pem``) or DER (``.der``)
+                certificate file.
+
+        Returns:
+            Optional["SSLCertificate"]: The parsed certificate, or ``None`` if
+            the file could not be read or parsed (a warning is printed in
+            that case, matching ``from_url``'s convention).
+        """
+        try:
+            binary_data = Path(file_path).read_bytes()
+        except (OSError, IOError) as e:
+            print(f"Error reading certificate file {file_path}: {e}")
+            return None
+        return SSLCertificate.from_binary(binary_data)
 
 
     # --- Properties now access the dictionary items directly via self[] ---
