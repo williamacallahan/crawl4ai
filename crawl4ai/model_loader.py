@@ -15,7 +15,9 @@ def get_available_memory(device):
     if device.type == "cuda":
         return torch.cuda.get_device_properties(device).total_memory
     elif device.type == "mps":
-        return 48 * 1024**3  # Assuming 8GB for MPS, as a conservative estimate
+        import psutil
+
+        return psutil.virtual_memory().total
     else:
         return 0
 
