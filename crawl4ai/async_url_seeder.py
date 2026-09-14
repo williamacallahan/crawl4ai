@@ -1089,15 +1089,31 @@ class AsyncUrlSeeder:
                     await result_queue.put(None)
 
             tasks = [asyncio.create_task(process_subsitemap(sm)) for sm in sub_sitemaps]
-
-            while completed_count < total_sitemaps:
-                item = await result_queue.get()
-                if item is None:
-                    completed_count += 1
-                else:
-                    yield item
-
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                while completed_count < total_sitemaps:
+                    item = await result_queue.get()
+                    if item is None:
+                        completed_count += 1
+                    else:
+                        yield item
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                # Cancel and await every sub-sitemap task owned by this
+                # generator before returning control to the caller. When the
+                # generator is closed early (e.g. max_urls), GeneratorExit
+                # lands at ``yield item`` and the gather above is skipped; the
+                # task references would otherwise leak.
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                # Drain the queue so cancelled tasks' ``finally: put(None)``
+                # doesn't re-block on a still-full queue after CancelledError
+                # bypasses their ``except Exception``.
+                while not all(t.done() for t in tasks):
+                    while not result_queue.empty():
+                        result_queue.get_nowait()
+                    await asyncio.sleep(0)
+                await asyncio.gather(*tasks, return_exceptions=True)
         else:
             for u in regular_urls:
                 yield u
@@ -1262,16 +1278,33 @@ class AsyncUrlSeeder:
             tasks = [asyncio.create_task(process_subsitemap(sm))
                      for sm in sub_sitemaps]
 
-            # Yield results as they come in
-            while completed_count < total_sitemaps:
-                item = await result_queue.get()
-                if item is None:
-                    completed_count += 1
-                else:
-                    yield item
-
-            # Ensure all tasks are done
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                # Yield results as they come in
+                while completed_count < total_sitemaps:
+                    item = await result_queue.get()
+                    if item is None:
+                        completed_count += 1
+                    else:
+                        yield item
+                # Ensure all tasks are done
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                # Cancel and await every sub-sitemap task owned by this
+                # generator before returning control to the caller. When the
+                # generator is closed early (e.g. max_urls), GeneratorExit
+                # lands at ``yield item`` and the gather above is skipped; the
+                # task references would otherwise leak.
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                # Drain the queue so cancelled tasks' ``finally: put(None)``
+                # doesn't re-block on a still-full queue after CancelledError
+                # bypasses their ``except Exception``.
+                while not all(t.done() for t in tasks):
+                    while not result_queue.empty():
+                        result_queue.get_nowait()
+                    await asyncio.sleep(0)
+                await asyncio.gather(*tasks, return_exceptions=True)
         else:
             # Regular sitemap - yield URLs directly
             for u in regular_urls:
