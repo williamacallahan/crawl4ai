@@ -343,6 +343,22 @@ class AsyncWebCrawler:
                     if config.pdf and not pdf_data:
                         cached_result = None
 
+                    # Anti-bot cache healing: a cached blocked result carries
+                    # non-empty challenge HTML, so the read short-circuit
+                    # (``if not cached_result or not html``) below would serve
+                    # it forever.  Discard the poisoned row so the fresh-fetch
+                    # branch runs and, on a successful refetch, overwrites the
+                    # poison in the DB (the write gate only fires when
+                    # ``cached_result`` is falsy).  Scoped to ENABLED only:
+                    # READ_ONLY serves cached content verbatim by contract
+                    # (see test_cached_target_refusal_remains_failed).
+                    if (
+                        cached_result
+                        and not cached_result.success
+                        and cache_context.cache_mode == CacheMode.ENABLED
+                    ):
+                        cached_result = None
+
                     if cached_result is None:
                         extracted_content = None
 
@@ -704,8 +720,17 @@ class AsyncWebCrawler:
                             tag="COMPLETE",
                         )
 
-                    # Update cache if appropriate
-                    if cache_context.should_write() and not bool(cached_result):
+                    # Update cache if appropriate. Blocked/failed results
+                    # (success=False, e.g. anti-bot challenge pages with
+                    # non-empty HTML) are never persisted: doing so poisons
+                    # the cache because the read short-circuit treats a
+                    # cached row with non-empty HTML as a hit regardless of
+                    # its success flag.
+                    if (
+                        cache_context.should_write()
+                        and not bool(cached_result)
+                        and crawl_result.success
+                    ):
                         await async_db_manager.acache_url(crawl_result)
 
                     return CrawlResultContainer(crawl_result)
