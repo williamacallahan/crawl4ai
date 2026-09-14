@@ -1063,8 +1063,9 @@ class DomainMapper:
             if not normalized:
                 continue
 
-            # Strip trailing slash for dedup (keep in output)
-            key = normalized.rstrip("/").lower()
+            # Strip trailing slash for dedup (keep in output); preserve path/query
+            # case — normalize_url already lowercases the host (RFC 3986 §3.2.2).
+            key = normalized.rstrip("/")
 
             if key in seen:
                 # Merge source
