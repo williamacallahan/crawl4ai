@@ -76,7 +76,11 @@ def _make_http_proxy(
 
     async def proxy(**kwargs: Any) -> Any:
         # replace `/items/{id}` style params first
-        path = route.path
+        # Starlette keeps the typed-converter syntax verbatim in route.path
+        # (e.g. "/items/{item_id:int}") but exposes the bare "{name}" form in
+        # route.path_format, so substitution must use path_format or typed
+        # converters would never match.
+        path = route.path_format
         for k, v in list(kwargs.items()):
             placeholder = "{" + k + "}"
             if placeholder in path:
