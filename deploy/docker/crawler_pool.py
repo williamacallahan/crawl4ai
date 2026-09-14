@@ -560,7 +560,15 @@ async def retire_pool_crawlers(
             signatures = [
                 sig
                 for sig in pool
-                if sig_prefix is None or sig.startswith(sig_prefix)
+                if (sig_prefix is None or sig.startswith(sig_prefix))
+                # Dedicated hook crawlers live in COLD_POOL under
+                # "dedicated:<uuid>" signatures and are request-owned: only
+                # release_dedicated_crawler may tear them down. Admin pool
+                # retirement (kill_browser / restart_browser / force_cleanup)
+                # reaches this function via prefix or blanket match and would
+                # otherwise close an in-flight crawler mid-crawl, mirroring the
+                # active-request guard _janitor_pass already enforces.
+                and not sig.startswith("dedicated:")
             ]
             if sig_prefix is not None:
                 signatures = signatures[:1]
