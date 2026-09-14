@@ -556,7 +556,11 @@ class CrawlerMonitor:
                     self.urls_completed += 1
                 
                 # Track requeues
-                if old_status in [CrawlStatus.COMPLETED.name, CrawlStatus.FAILED.name] and not task_stats.get("counted_requeue", False):
+                if (
+                    old_status == CrawlStatus.IN_PROGRESS.name
+                    and status == CrawlStatus.QUEUED
+                    and not task_stats.get("counted_requeue", False)
+                ):
                     self.requeued_count += 1
                     task_stats["counted_requeue"] = True
             
