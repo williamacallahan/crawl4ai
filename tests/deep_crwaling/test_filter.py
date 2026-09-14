@@ -1,7 +1,7 @@
 # // File: tests/deep_crawling/test_filters.py
 import pytest
 from urllib.parse import urlparse
-from crawl4ai import ContentTypeFilter, URLPatternFilter, URLFilter
+from crawl4ai import ContentTypeFilter, DomainFilter, URLPatternFilter, URLFilter
 
 # Minimal URLFilter base class stub if not already importable directly for tests
 # In a real scenario, this would be imported from the library
@@ -104,4 +104,68 @@ class TestURLPatternFilter:
         # apply() is @lru_cache'd, so a fresh instance per case avoids stale
         # results across parametrized runs.
         f = URLPatternFilter(patterns=[pattern])
+        assert f.apply(url) is expected
+
+
+class TestDomainFilter:
+    # Regression guard for the port/userinfo/IPv6 stripping bug: a previous
+    # "fast" regex `://([^/]+)` returned the full authority (host:port and
+    # user:pass@host), which never matched configured allow/block entries.
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            # Ports must be stripped (the primary regression).
+            ("http://example.com:443/page", "example.com"),
+            ("http://example.com:8080/page", "example.com"),
+            ("https://guce.techcrunch.com:443/consent", "guce.techcrunch.com"),
+            ("http://127.0.0.1:443/secret", "127.0.0.1"),
+            # Userinfo must be stripped.
+            ("http://user:pass@example.com/page", "example.com"),
+            # IPv6 brackets and ports must be stripped.
+            ("http://[::1]:8000/page", "::1"),
+            ("http://[::1]/page", "::1"),
+            # Plain hosts unchanged; hostname is already lowercased.
+            ("http://example.com/page", "example.com"),
+            ("http://EXAMPLE.COM/page", "example.com"),
+            ("http://sub.example.com/page", "sub.example.com"),
+            # Non-URL / empty input must return "" rather than raising.
+            ("", ""),
+            ("not a url", ""),
+        ],
+    )
+    def test_extract_domain(self, url, expected):
+        assert DomainFilter._extract_domain(url) == expected
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            # Port-bearing blocked hrefs must be blocked (primary bypass bug).
+            ("http://evil.com:443/page", False),
+            ("http://evil.com:8080/page", False),
+            ("http://sub.evil.com:443/page", False),
+            ("http://127.0.0.1:443/secret", False),
+            # Port-bearing non-blocked hrefs still pass.
+            ("http://good.com:443/page", True),
+            ("http://good.com/page", True),
+        ],
+    )
+    def test_blocked_domains_with_port(self, url, expected):
+        f = DomainFilter(blocked_domains=["evil.com", "127.0.0.1"])
+        assert f.apply(url) is expected
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            # Port-bearing allowed hrefs must be allowed (over-block bug).
+            ("http://example.com:8080/page", True),
+            ("http://example.com:443/page", True),
+            ("http://sub.example.com:443/page", True),
+            # Port-bearing non-allowed hrefs are still rejected.
+            ("http://other.com:443/page", False),
+            ("http://other.com/page", False),
+        ],
+    )
+    def test_allowed_domains_with_port(self, url, expected):
+        f = DomainFilter(allowed_domains=["example.com"])
         assert f.apply(url) is expected
