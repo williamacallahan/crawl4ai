@@ -153,6 +153,11 @@ async def run_doctor():
             light_mode=True,
             viewport_width=1280,
             viewport_height=720,
+            extra_args=(
+                ["--no-sandbox"]
+                if hasattr(os, "geteuid") and os.geteuid() == 0
+                else []
+            ),
         )
 
         run_config = CrawlerRunConfig(
