@@ -8,7 +8,6 @@ from typing import Optional, List
 import json
 import asyncio
 
-# from contextlib import nullcontext, asynccontextmanager
 from contextlib import asynccontextmanager
 from .models import (
     CrawlResult,
@@ -110,8 +109,6 @@ class AsyncWebCrawler:
             result = await crawler.arun(url="https://example.com", config=crawler_config)
             print(result.markdown)
     """
-
-    _domain_last_hit = {}
 
     def __init__(
         self,
@@ -336,7 +333,6 @@ class AsyncWebCrawler:
                     # If screenshot is requested but its not in cache, then set cache_result to None
                     screenshot_data = cached_result.screenshot
                     pdf_data = cached_result.pdf
-                    # if config.screenshot and not screenshot or config.pdf and not pdf:
                     if config.screenshot and not screenshot_data:
                         cached_result = None
 
@@ -839,9 +835,6 @@ class AsyncWebCrawler:
             metadata = result.get("metadata", {})
         else:
             cleaned_html = sanitize_input_encode(result.cleaned_html)
-            # media = result.media.model_dump()
-            # tables = media.pop("tables", [])
-            # links = result.links.model_dump()
             media = result.media.model_dump() if hasattr(result.media, 'model_dump') else result.media
             tables = media.pop("tables", []) if isinstance(media, dict) else []
             links = result.links.model_dump() if hasattr(result.links, 'model_dump') else result.links
@@ -910,7 +903,6 @@ class AsyncWebCrawler:
                     markdown_generator.generate_markdown,
                     input_html=markdown_input_html,
                     base_url=base_url,
-                    # html2text_options=kwargs.get('html2text', {})
                 )
             )
         except BaseException:
@@ -945,11 +937,6 @@ class AsyncWebCrawler:
             timing=int((time.perf_counter() - t1) * 1000) / 1000,
             tag="SCRAPE"
         )
-        # self.logger.info(
-        #     message="{url:.50}... | Time: {timing}s",
-        #     tag="SCRAPE",
-        #     params={"url": _url, "timing": int((time.perf_counter() - t1) * 1000) / 1000},
-        # )
 
         ################################
         # Structured Content Extraction           #
@@ -987,7 +974,6 @@ class AsyncWebCrawler:
                 else config.chunking_strategy
             )
             sections = chunking.chunk(content)
-            # extracted_content = config.extraction_strategy.run(_url, sections)
 
             # Use async version if available for better parallelism
             if hasattr(config.extraction_strategy, 'arun'):
