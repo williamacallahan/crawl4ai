@@ -409,13 +409,6 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
         else:
             return await self._arun_batch(start_url, crawler, config)
 
-    async def shutdown(self) -> None:
-        """
-        Signal cancellation and clean up resources.
-        """
-        self._cancel_event.set()
-        self.stats.end_time = datetime.now()
-
     def export_state(self) -> Optional[Dict[str, Any]]:
         """
         Export current crawl state for external persistence.

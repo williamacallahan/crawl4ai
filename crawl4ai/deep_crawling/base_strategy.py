@@ -48,7 +48,6 @@ class DeepCrawlStrategy(ABC):
     
     Core functions:
       - arun: Main entry point that returns an async generator of CrawlResults.
-      - shutdown: Clean up resources.
       - can_process_url: Validate a URL and decide whether to process it.
       - _process_links: Extract and process links from a CrawlResult.
     """
@@ -106,13 +105,6 @@ class DeepCrawlStrategy(ABC):
 
     def __call__(self, start_url: str, crawler: AsyncWebCrawler, config: CrawlerRunConfig):
         return self.arun(start_url, crawler, config)
-
-    @abstractmethod
-    async def shutdown(self) -> None:
-        """
-        Clean up resources used by the deep crawl strategy.
-        """
-        pass
 
     @abstractmethod
     async def can_process_url(self, url: str, depth: int) -> bool:
