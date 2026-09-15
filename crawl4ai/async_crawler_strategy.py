@@ -161,9 +161,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         Close the browser and clean up resources.
         """
         await self.browser_manager.close()
-        # Explicitly reset the static Playwright instance (skip if using cached CDP)
-        if not self.browser_manager._using_cached_cdp:
-            BrowserManager._playwright_instance = None
 
     async def kill_session(self, session_id: str):
         """

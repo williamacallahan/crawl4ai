@@ -646,8 +646,6 @@ class BrowserManager:
         session_ttl (int): Session timeout in seconds
     """
 
-    _playwright_instance = None
-
     # Class-level tracking of pages in use, keyed by browser endpoint (CDP URL or instance id)
     # This ensures multiple BrowserManager instances connecting to the same browser
     # share the same page tracking, preventing race conditions.
@@ -668,15 +666,6 @@ class BrowserManager:
             cls._global_pages_lock = asyncio.Lock()
             cls._global_pages_lock_loop = loop
         return cls._global_pages_lock
-
-    @classmethod
-    async def get_playwright(cls, use_undetected: bool = False):
-        if use_undetected:
-            from patchright.async_api import async_playwright
-        else:
-            from playwright.async_api import async_playwright
-        cls._playwright_instance = await async_playwright().start()
-        return cls._playwright_instance    
 
     def __init__(self, browser_config: BrowserConfig, logger=None, use_undetected: bool = False):
         """
