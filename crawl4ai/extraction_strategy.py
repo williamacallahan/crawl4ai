@@ -250,19 +250,6 @@ class CosineStrategy(ExtractionStrategy):
 
         self.buffer_embeddings = np.array([])
 
-        # if model_name == "bert-base-uncased":
-        #     self.tokenizer, self.model = load_bert_base_uncased()
-        #     self.model.eval()  # Ensure the model is in evaluation mode
-        #     self.get_embedding_method = "batch"
-        # elif model_name == "BAAI/bge-small-en-v1.5":
-        #     self.tokenizer, self.model = load_bge_small_en_v1_5()
-        #     self.model.eval()  # Ensure the model is in evaluation mode
-        #     self.get_embedding_method = "batch"
-        # elif model_name == "sentence-transformers/all-MiniLM-L6-v2":
-        #     self.model = load_onnx_all_MiniLM_l6_v2()
-        #     self.tokenizer = self.model.tokenizer
-        #     self.get_embedding_method = "direct"
-
         if self.verbose:
             print(f"[LOG] Loading Multilabel Classifier for {self.device.type} device.")
 
@@ -380,18 +367,6 @@ class CosineStrategy(ExtractionStrategy):
                 all_embeddings.append(embeddings)
 
             self.buffer_embeddings = np.vstack(all_embeddings)
-        elif self.device.type == "cpu":
-            # self.buffer_embeddings = self.model(sentences)
-            if batch_size is None:
-                batch_size = self.default_batch_size
-
-            all_embeddings = []
-            for i in range(0, len(sentences), batch_size):
-                batch_sentences = sentences[i : i + batch_size]
-                embeddings = self.model(batch_sentences)
-                all_embeddings.append(embeddings)
-
-            self.buffer_embeddings = np.vstack(all_embeddings)
         return self.buffer_embeddings
 
     def hierarchical_clustering(self, sentences: List[str], embeddings=None):
@@ -497,22 +472,6 @@ class CosineStrategy(ExtractionStrategy):
 
             for cluster, label in zip(cluster_list, labels):
                 cluster["tags"] = label
-        # elif self.device.type == "cpu":
-        #     # Process the text with the loaded model
-        #     texts = [cluster['content'] for cluster in cluster_list]
-        #     # Batch process texts
-        #     docs = self.nlp.pipe(texts, disable=["tagger", "parser", "ner", "lemmatizer"])
-
-        #     for doc, cluster in zip(docs, cluster_list):
-        #         tok_k = self.top_k
-        #         top_categories = sorted(doc.cats.items(), key=lambda x: x[1], reverse=True)[:tok_k]
-        #         cluster['tags'] = [cat for cat, _ in top_categories]
-
-        # for cluster in  cluster_list:
-        #     doc = self.nlp(cluster['content'])
-        #     tok_k = self.top_k
-        #     top_categories = sorted(doc.cats.items(), key=lambda x: x[1], reverse=True)[:tok_k]
-        #     cluster['tags'] = [cat for cat, _ in top_categories]
 
         if self.verbose:
             print(f"[LOG] 🚀 Categorization done in {time.time() - t:.2f} seconds")
