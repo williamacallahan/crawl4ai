@@ -465,6 +465,15 @@ async def _init_permanent_locked(
     if PERMANENT and not force and _is_live(PERMANENT):
         return None
     if PERMANENT:
+        if force and _is_recycling(PERMANENT):
+            # The in-place recycle is already restarting the browser; mirroring
+            # d15fdd6/881307d, skip the detach so the 60s close cap cannot
+            # cancel the shielded start() and orphan the fresh driver +
+            # Chromium on this detached, _closing=True manager. The cycle in
+            # progress already satisfies the operator's restart intent, and
+            # _recycle_browser's finally clears _recycling within the bounded
+            # close/start caps so the next pass replaces normally.
+            return None
         return _close_in_background(_detach_permanent())
 
     close_task = _make_browser_capacity()
@@ -565,6 +574,14 @@ async def retire_pool_crawlers(
             if sig_prefix is not None:
                 signatures = signatures[:1]
             for sig in signatures:
+                if _is_recycling(pool[sig]):
+                    # Mirroring d15fdd6/881307d: detaching a mid-recycle entry
+                    # lets the 60s close cap cancel its shielded start() and
+                    # orphan the fresh driver + Chromium on a detached,
+                    # _closing=True manager. Skip it; the recycle clears within
+                    # the bounded close/start caps and the janitor's next pass
+                    # re-evaluates and evicts normally.
+                    continue
                 crawler = _detach_pool_crawler(pool, sig)
                 close_tasks.append(_close_in_background(crawler))
                 retired.append((sig, pool_type))
