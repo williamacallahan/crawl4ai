@@ -1124,6 +1124,243 @@ def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(monkeypatch, tmp_
         rollout.deploy()
 
 
+def _candidate_runtimes():
+    # On a no-op rerun the candidate already is the baseline, so one set of
+    # runtimes satisfies both the baseline proof and the candidate proof.
+    return {
+        f"task{index}": {
+            "container": f"container{index}",
+            "labels": rollout._labels(REVISION),
+            "image": CANDIDATE,
+            "addresses": {f"10.0.1.{index}"},
+        }
+        for index in range(1, 4)
+    }
+
+
+def _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, ready):
+    # Unlike the no-op rerun tests above, this wires the real _verify_tasks
+    # through deploy() so the lenient vs. strict converged branch is exercised
+    # end-to-end, not stubbed away.
+    candidate = CANDIDATE
+    state = application(image=candidate, revision=REVISION)
+    _deploy_env(monkeypatch)
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(
+        rollout, "_deployments", lambda *_args: [{"deploymentId": "old", "status": "done"}]
+    )
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(
+        rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
+    )
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: ready)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: instances for url in rollout.HEALTH_URLS},
+    )
+    _wire_verify_tasks(monkeypatch, rows, runtimes, revision=REVISION)
+
+    def request_json(url, *_args, ingress_container=None, **_kwargs):
+        # Per-task overlay probes carry the task's overlay IP; public probes
+        # fall through to candidate health (the baseline is the candidate here).
+        for runtime in runtimes.values():
+            if next(iter(runtime["addresses"])) in url:
+                return health(runtime["container"], revision=REVISION)
+        return health(revision=REVISION)
+
+    monkeypatch.setattr(rollout, "_request_json", request_json)
+
+
+def test_deploy_noop_rerun_proves_healed_colocation_in_place(monkeypatch, tmp_path, capsys):
+    # A healed-but-not-respread fleet doubles a replica onto a surviving node
+    # and strands a ghost on the down spare. The lenient baseline proof
+    # tolerates that; the strict converged proof rejects it as a placement
+    # fault. A no-op rerun performed no start-first placement, so its final
+    # proof must be lenient and re-prove the live SHA in place.
+    rows = [
+        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-5",
+         "DesiredState": "Running", "CurrentState": "Running 1m"},
+        {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-6",
+         "DesiredState": "Shutdown", "CurrentState": "Running 12 hours ago"},
+        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-5",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-9",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-9",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-18",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+    ]
+    runtimes = _candidate_runtimes()
+    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, ready)
+
+    rollout.deploy()
+
+    receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert receipt["deploymentId"] is None
+    assert receipt["image"] == CANDIDATE
+    assert receipt["revision"] == REVISION
+    # The lenient proof accepted the healed co-location: two replicas sit on
+    # haiku-5. A strict converged proof would have raised before reaching here.
+    assert receipt["nodes"] == ["haiku-5", "haiku-9"]
+
+
+def test_deploy_noop_rerun_proves_a_failed_predecessor_in_place(monkeypatch, tmp_path, capsys):
+    # A predecessor that crashed during an earlier drain leaves a
+    # DesiredState=shutdown / Status.State=failed task on a ready eligible
+    # node. The lenient baseline proof tolerates that "failed" exemption; the
+    # strict converged proof rejects it. A no-op rerun made no withdrawal of
+    # its own, so its final proof must stay lenient and re-prove in place.
+    rows = [
+        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-5",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "failed1", "Name": "crawl4ai.1", "Node": "haiku-9",
+         "DesiredState": "Shutdown", "CurrentState": "Failed 30m ago"},
+        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-9",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-5",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-18",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-9",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+    ]
+    runtimes = _candidate_runtimes()
+    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, ready)
+    monkeypatch.setattr(
+        rollout,
+        "_task_state",
+        lambda task: (
+            ("running", "running") if task.startswith("task")
+            else ("shutdown", "failed") if task.startswith("failed")
+            else ("shutdown", "shutdown")
+        ),
+    )
+
+    rollout.deploy()
+
+    receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert receipt["deploymentId"] is None
+    assert receipt["image"] == CANDIDATE
+    assert receipt["revision"] == REVISION
+    assert receipt["nodes"] == ["haiku-18", "haiku-5", "haiku-9"]
+
+
+def test_deploy_noop_rerun_passes_lenient_converged_to_the_candidate_proof(
+    monkeypatch, tmp_path
+):
+    # The no-op rerun owes no converged obligation, so every _verify_tasks call
+    # it makes (the baseline proof and both candidate proofs) must run lenient
+    # (converged=False). A regression that defaults the candidate proof back
+    # to converged=True surfaces here as a True recording.
+    calls = []
+
+    def spy(_app, image, _revision, _ready, converged=True):
+        calls.append((image, converged))
+        return {
+            "tasks": ["1", "2", "3"],
+            "nodes": sorted(rollout.ELIGIBLE_NODES),
+            "instances": ["a", "b", "c"],
+        }
+
+    candidate = CANDIDATE
+    state = application(image=candidate, revision=REVISION)
+    _deploy_env(monkeypatch)
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(
+        rollout, "_deployments", lambda *_args: [{"deploymentId": "old", "status": "done"}]
+    )
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(
+        rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
+    )
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(rollout, "_verify_tasks", spy)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: instances for url in rollout.HEALTH_URLS},
+    )
+    monkeypatch.setattr(rollout, "_request_json", lambda *_args: health(revision=REVISION))
+
+    rollout.deploy()
+
+    assert calls, "the no-op rerun must still take its candidate proof"
+    assert all(converged is False for _image, converged in calls), calls
+
+
+def test_deploy_real_rollout_passes_strict_converged_to_the_candidate_proof(
+    monkeypatch, tmp_path
+):
+    # A real start-first rollout performs the withdrawals the converged proof
+    # exists to check, so its candidate proof must stay strict
+    # (converged=True) while only the baseline proof stays lenient.
+    calls = []
+
+    def spy(_app, image, _revision, _ready, converged=True):
+        calls.append((image, converged))
+        return {
+            "tasks": ["1", "2", "3"],
+            "nodes": ["haiku-5", "haiku-6", "haiku-9"],
+            "instances": ["a", "b", "c"],
+        }
+
+    state = application()  # baseline running; candidate not yet deployed
+    _deploy_env(monkeypatch)
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
+    monkeypatch.setattr(
+        rollout, "_deployments", lambda *_args: [{"deploymentId": "old", "status": "done"}]
+    )
+
+    def post(url, _key, payload):
+        if url.endswith("application.update"):
+            state["dockerImage"] = payload["dockerImage"]
+            state["labelsSwarm"] = payload["labelsSwarm"]
+            state["placementSwarm"] = payload["placementSwarm"]
+
+    monkeypatch.setattr(rollout, "_post_json", post)
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(
+        rollout, "_service_spec",
+        lambda _name: service_spec(state["dockerImage"], state["labelsSwarm"]["otel.service.version"]),
+    )
+    monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(rollout, "_wait_deployment", lambda *_args: {"deploymentId": "new", "status": "done"})
+    monkeypatch.setattr(rollout, "_verify_tasks", spy)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: instances for url in rollout.HEALTH_URLS},
+    )
+    monkeypatch.setattr(
+        rollout, "_request_json",
+        lambda url, *_args: health(revision="baseline" if "baseline=" in url else REVISION),
+    )
+
+    rollout.deploy()
+
+    # The baseline proof (image == BASELINE) stays lenient; every candidate
+    # proof (image == CANDIDATE) the rollout takes for itself stays strict.
+    assert calls[0] == (BASELINE, False), calls
+    assert all(call == (CANDIDATE, True) for call in calls[1:]), calls
+
+
 @pytest.mark.parametrize("fail_on", [1, 2])
 def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
@@ -1326,6 +1563,105 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
         },
     )
     with pytest.raises(RuntimeError, match="task census changed before final evidence"):
+        rollout.evidence()
+
+
+def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, revision, baseline_revision):
+    # The leniency fix is in evidence() too: it derives converged from
+    # baselineRevision == revision (no-op rerun) vs != (real rollout). Wire the
+    # real _verify_tasks so the converged branch is exercised, not stubbed away.
+    candidate = CANDIDATE
+    path = tmp_path / "evidence.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps({"ok": True, "url": url, "revision": revision, "instance": "container1"})
+            for url in rollout.HEALTH_URLS
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(path))
+    monkeypatch.setenv("GITHUB_SHA", revision)
+    monkeypatch.setenv("DOKPLOY_URL", "https://dokploy")
+    monkeypatch.setenv("DOKPLOY_API_KEY", "key")
+    monkeypatch.setenv("APPLICATION_ID", "app")
+    rollout._task_proof_path().write_text(json.dumps({
+        "revision": revision,
+        "image": candidate,
+        "baselineRevision": baseline_revision,
+        "tasks": ["task1", "task2", "task3"],
+        "nodes": sorted(
+            {row["Node"] for row in rows if str(row.get("DesiredState", "")).lower() == "running"}
+        ),
+        "instances": ["container1", "container2", "container3"],
+        "publicInstances": {
+            url: ["container1", "container2", "container3"] for url in rollout.HEALTH_URLS
+        },
+    }))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application(candidate, revision))
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"}))
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, revision))
+    monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
+    monkeypatch.setattr(
+        rollout,
+        "_verify_public",
+        lambda _revision, instances: {url: sorted(instances) for url in rollout.HEALTH_URLS},
+    )
+    _wire_verify_tasks(monkeypatch, rows, runtimes, revision=revision)
+    return path
+
+
+def _healed_colocation_rows():
+    # Two replicas healed onto haiku-5; a ghost is stranded on the down spare
+    # haiku-6. Distinct placement fails here, so this state only passes a
+    # lenient (converged=False) proof.
+    return [
+        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-5",
+         "DesiredState": "Running", "CurrentState": "Running 1m"},
+        {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-6",
+         "DesiredState": "Shutdown", "CurrentState": "Running 12 hours ago"},
+        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-5",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-9",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-9",
+         "DesiredState": "Running", "CurrentState": "Running 1h"},
+        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-18",
+         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+    ]
+
+
+def test_evidence_noop_rerun_proves_healed_colocation_in_place(monkeypatch, tmp_path, capsys):
+    # evidence() re-proves a no-op rerun (baselineRevision == revision) leniently.
+    # On a healed-but-not-respread fleet it accepts the co-location that a real
+    # rollout's strict converged proof would reject, so the live SHA is re-proven
+    # in place without an out-of-band `docker service update --force`.
+    rows = _healed_colocation_rows()
+    runtimes = _candidate_runtimes()
+    _wire_real_verify_tasks_for_evidence(
+        monkeypatch, tmp_path, rows, runtimes, REVISION, REVISION
+    )
+
+    rollout.evidence()
+
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["publicFailures"] == 0
+    assert receipt["publicInstances"] == {
+        url: ["container1", "container2", "container3"] for url in rollout.HEALTH_URLS
+    }
+
+
+def test_evidence_real_rollout_stays_strict_on_healed_colocation(monkeypatch, tmp_path):
+    # When the proof file describes a real rollout (baselineRevision != revision),
+    # evidence() must keep the strict converged proof: a healed colocation the
+    # lenient branch would accept is still rejected, so a real rollout cannot
+    # hide behind the no-op's leniency after the fact.
+    rows = _healed_colocation_rows()
+    runtimes = _candidate_runtimes()
+    _wire_real_verify_tasks_for_evidence(
+        monkeypatch, tmp_path, rows, runtimes, REVISION, "baseline"
+    )
+
+    with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
         rollout.evidence()
 
 

@@ -1001,7 +1001,14 @@ def deploy() -> None:
     ready = _eligible_nodes()
     if len(ready) < REPLICAS:
         raise RuntimeError("not enough Ready eligible nodes to place every replica")
-    task_proof = _verify_tasks(app_name, candidate, revision, ready)
+    # The converged proof enforces distinct-node placement and clean
+    # "shutdown"/"complete" predecessors — obligations only a real start-first
+    # rollout incurs. A no-op rerun performed no such placement, started no
+    # replacement, and retired no predecessor, so like the lenient baseline
+    # proof above it re-proves the already-live SHA in place rather than
+    # bearing a converged obligation it cannot satisfy on a healed fleet.
+    converged = not already_deployed
+    task_proof = _verify_tasks(app_name, candidate, revision, ready, converged)
     verify_route(base, api_key, application_id, app_name)
     public_instances = _verify_public(revision, task_proof["instances"])
     post_public = _application(base, api_key, application_id)
@@ -1012,7 +1019,7 @@ def deploy() -> None:
         _service_spec(app_name), candidate, _labels(revision), placements=(PLACEMENT,)
     )
     verify_route(base, api_key, application_id, app_name)
-    if _verify_tasks(app_name, candidate, revision, ready) != task_proof:
+    if _verify_tasks(app_name, candidate, revision, ready, converged) != task_proof:
         raise RuntimeError("Crawl4AI task census changed during public proof")
     proof = {
         "revision": revision,
@@ -1116,11 +1123,16 @@ def evidence() -> None:
     recorded_task_proof = {
         key: task_proof.get(key) for key in ("tasks", "nodes", "instances")
     }
-    if _verify_tasks(app_name, image, revision, ready) != recorded_task_proof:
+    # The proof file's baselineRevision records whether this run was a no-op
+    # rerun (candidate already the baseline, so baselineRevision == revision)
+    # or a real start-first rollout (a different baseline). Only a real rollout
+    # owes the strict converged proof; a no-op re-proves the live SHA in place.
+    converged = baseline_revision != revision
+    if _verify_tasks(app_name, image, revision, ready, converged) != recorded_task_proof:
         raise RuntimeError("Crawl4AI task census changed before final evidence")
     current_public_instances = _verify_public(revision, sorted(expected))
     verify_route(base, api_key, application_id, app_name)
-    if _verify_tasks(app_name, image, revision, ready) != recorded_task_proof:
+    if _verify_tasks(app_name, image, revision, ready, converged) != recorded_task_proof:
         raise RuntimeError("Crawl4AI task census changed during final evidence")
     observed_urls = set()
     for row in rows:
