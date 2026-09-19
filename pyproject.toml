@@ -118,7 +118,7 @@ server = [
     "sse-starlette==2.2.1",
     "pydantic>=2.11",
     "rank-bm25==0.2.2",
-    "anyio==4.9.0",
+    "anyio==4.14.2",
     "pyjwt==2.10.1",
     "mcp>=1.18.0,<2",
     "websockets>=15.0.1",
