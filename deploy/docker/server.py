@@ -1017,11 +1017,6 @@ async def health():
         return JSONResponse(payload, status_code=503, headers=headers)
 
 
-@app.get(config["observability"]["prometheus"]["endpoint"])
-async def metrics():
-    return RedirectResponse(config["observability"]["prometheus"]["endpoint"])
-
-
 @app.post("/crawl")
 @limiter.limit(config["rate_limiting"]["default_limit"])
 @mcp_tool("crawl")
