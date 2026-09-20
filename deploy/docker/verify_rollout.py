@@ -751,7 +751,8 @@ def _verify_ingress_host() -> int:
 
 def _verify_tasks(
     app_name: str, image: str, revision: str,
-    eligibility: tuple[frozenset[str], frozenset[str]], converged: bool = True
+    eligibility: tuple[frozenset[str], frozenset[str]], converged: bool = True,
+    placement: dict[str, Any] = PLACEMENT,
 ) -> dict[str, Any]:
     eligible, ready = eligibility
     ingress_container = _verify_ingress_container()
@@ -768,10 +769,10 @@ def _verify_tasks(
     nodes = {row.get("Node") for row in current}
     if not nodes <= eligible:
         raise RuntimeError("Crawl4AI tasks are not on eligible nodes")
-    # Distinct placement is this deploy's converged obligation. The baseline is
-    # not held to it: a node death heals replicas onto the surviving nodes, and
-    # refusing to deploy from that state would leave co-location permanent.
-    if converged and len(nodes) != REPLICAS:
+    if not nodes <= ready:
+        raise RuntimeError("Crawl4AI tasks are not on Ready eligible nodes")
+    # MaxReplicas is a hard scheduler rule; hostname spread is only a preference.
+    if placement.get("MaxReplicas") == 1 and len(nodes) != REPLICAS:
         raise RuntimeError("Crawl4AI tasks are not on distinct eligible nodes")
     by_slot: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -938,16 +939,27 @@ def deploy() -> None:
     # predecessors the baseline may excuse.
     eligibility = _eligible_nodes()
     eligible, ready = eligibility
-    # Start-first needs a spare eligible node to preserve distinct placement.
-    # A no-op rerun starts no replacement and needs only steady capacity.
     already_deployed = _record_converged(application, candidate, revision, placement)
-    if not already_deployed and len(ready) <= REPLICAS:
+    if not already_deployed and len(ready) < REPLICAS:
+        raise RuntimeError(
+            f"not enough Ready eligible nodes to place every replica: {REPLICAS} replicas, "
+            f"{len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
+            f"not Ready: {', '.join(sorted(eligible - ready)) or 'none'}"
+        )
+    # Only a one-per-node cap makes a spare mandatory for start-first.
+    if (
+        not already_deployed
+        and placement.get("MaxReplicas") == 1
+        and len(ready) <= REPLICAS
+    ):
         raise RuntimeError(
             f"start-first needs a spare eligible node: {REPLICAS} replicas, "
             f"{len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
             f"not Ready: {', '.join(sorted(eligible - ready)) or 'none'}"
         )
-    _verify_tasks(app_name, baseline, baseline_revision, eligibility, False)
+    _verify_tasks(
+        app_name, baseline, baseline_revision, eligibility, False, placement
+    )
     for url in HEALTH_URLS:
         if not _exact_health(_request_json(f"{url}?baseline={uuid.uuid4()}"), baseline_revision):
             raise RuntimeError("public Crawl4AI baseline is not ready")
@@ -1022,14 +1034,12 @@ def deploy() -> None:
     _, ready = eligibility
     if len(ready) < REPLICAS:
         raise RuntimeError("not enough Ready eligible nodes to place every replica")
-    # The converged proof enforces distinct-node placement and clean
-    # "shutdown"/"complete" predecessors — obligations only a real start-first
-    # rollout incurs. A no-op rerun performed no such placement, started no
-    # replacement, and retired no predecessor, so like the lenient baseline
-    # proof above it re-proves the already-live SHA in place rather than
-    # bearing a converged obligation it cannot satisfy on a healed fleet.
+    # Real rollouts require clean predecessor withdrawals. A no-op rerun
+    # proves the live revision without attributing older withdrawals to this run.
     converged = not already_deployed
-    task_proof = _verify_tasks(app_name, candidate, revision, eligibility, converged)
+    task_proof = _verify_tasks(
+        app_name, candidate, revision, eligibility, converged, placement
+    )
     verify_route(base, api_key, application_id, app_name)
     public_instances = _verify_public(revision, task_proof["instances"])
     post_public = _application(base, api_key, application_id)
@@ -1040,7 +1050,9 @@ def deploy() -> None:
         _service_spec(app_name), candidate, _labels(revision), placements=(placement,)
     )
     verify_route(base, api_key, application_id, app_name)
-    if _verify_tasks(app_name, candidate, revision, eligibility, converged) != task_proof:
+    if _verify_tasks(
+        app_name, candidate, revision, eligibility, converged, placement
+    ) != task_proof:
         raise RuntimeError("Crawl4AI task census changed during public proof")
     proof = {
         "revision": revision,
@@ -1151,11 +1163,15 @@ def evidence() -> None:
     # or a real start-first rollout (a different baseline). Only a real rollout
     # owes the strict converged proof; a no-op re-proves the live SHA in place.
     converged = baseline_revision != revision
-    if _verify_tasks(app_name, image, revision, eligibility, converged) != recorded_task_proof:
+    if _verify_tasks(
+        app_name, image, revision, eligibility, converged, placement
+    ) != recorded_task_proof:
         raise RuntimeError("Crawl4AI task census changed before final evidence")
     current_public_instances = _verify_public(revision, sorted(expected))
     verify_route(base, api_key, application_id, app_name)
-    if _verify_tasks(app_name, image, revision, eligibility, converged) != recorded_task_proof:
+    if _verify_tasks(
+        app_name, image, revision, eligibility, converged, placement
+    ) != recorded_task_proof:
         raise RuntimeError("Crawl4AI task census changed during final evidence")
     observed_urls = set()
     for row in rows:

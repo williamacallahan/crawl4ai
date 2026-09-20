@@ -1350,7 +1350,7 @@ def test_deploy_noop_rerun_passes_lenient_converged_to_the_candidate_proof(
     # to converged=True surfaces here as a True recording.
     calls = []
 
-    def spy(_app, image, _revision, _ready, converged=True):
+    def spy(_app, image, _revision, _ready, converged=True, placement=rollout.PLACEMENT):
         calls.append((image, converged))
         return {
             "tasks": ["1", "2", "3"],
@@ -1397,7 +1397,7 @@ def test_deploy_real_rollout_passes_strict_converged_to_the_candidate_proof(
     # (converged=True) while only the baseline proof stays lenient.
     calls = []
 
-    def spy(_app, image, _revision, _ready, converged=True):
+    def spy(_app, image, _revision, _ready, converged=True, placement=rollout.PLACEMENT):
         calls.append((image, converged))
         return {
             "tasks": ["1", "2", "3"],
@@ -1661,7 +1661,7 @@ def test_evidence_rejects_changes_after_deploy(monkeypatch, tmp_path, drift):
         rollout.evidence()
 
 
-def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, revision, baseline_revision):
+def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, revision, baseline_revision, placement=rollout.PLACEMENT):
     # The leniency fix is in evidence() too: it derives converged from
     # baselineRevision == revision (no-op rerun) vs != (real rollout). Wire the
     # real _verify_tasks so the converged branch is exercised, not stubbed away.
@@ -1683,7 +1683,7 @@ def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, 
         "revision": revision,
         "image": candidate,
         "baselineRevision": baseline_revision,
-        "placement": copy.deepcopy(rollout.PLACEMENT),
+        "placement": copy.deepcopy(placement),
         "tasks": ["task1", "task2", "task3"],
         "nodes": sorted(
             {row["Node"] for row in rows if str(row.get("DesiredState", "")).lower() == "running"}
@@ -1693,9 +1693,9 @@ def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, 
             url: ["container1", "container2", "container3"] for url in rollout.HEALTH_URLS
         },
     }))
-    monkeypatch.setattr(rollout, "_application", lambda *_args: application(candidate, revision))
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application(candidate, revision, placement))
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})))
-    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, revision))
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, revision, placement))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
         rollout,
@@ -1707,9 +1707,8 @@ def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, 
 
 
 def _healed_colocation_rows():
-    # Two replicas healed onto haiku-5; a ghost is stranded on the down spare
-    # haiku-6. Distinct placement fails here, so this state only passes a
-    # lenient (converged=False) proof.
+    # Two replicas healed onto haiku-5; a ghost is stranded on haiku-6.
+    # Only the baseline proof can excuse that unconfirmed predecessor.
     return [
         {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-5",
          "DesiredState": "Running", "CurrentState": "Running 1m"},
@@ -1728,9 +1727,7 @@ def _healed_colocation_rows():
 
 def test_evidence_noop_rerun_proves_healed_colocation_in_place(monkeypatch, tmp_path, capsys):
     # evidence() re-proves a no-op rerun (baselineRevision == revision) leniently.
-    # On a healed-but-not-respread fleet it accepts the co-location that a real
-    # rollout's strict converged proof would reject, so the live SHA is re-proven
-    # in place without an out-of-band `docker service update --force`.
+    # An older ghost predecessor is not attributed to this no-op run.
     rows = _healed_colocation_rows()
     runtimes = _candidate_runtimes()
     _wire_real_verify_tasks_for_evidence(
@@ -1746,18 +1743,30 @@ def test_evidence_noop_rerun_proves_healed_colocation_in_place(monkeypatch, tmp_
     }
 
 
-def test_evidence_real_rollout_stays_strict_on_healed_colocation(monkeypatch, tmp_path):
-    # When the proof file describes a real rollout (baselineRevision != revision),
-    # evidence() must keep the strict converged proof: a healed colocation the
-    # lenient branch would accept is still rejected, so a real rollout cannot
-    # hide behind the no-op's leniency after the fact.
+def test_evidence_real_rollout_rejects_unconfirmed_predecessor(monkeypatch, tmp_path):
+    # Uncapped placement permits co-location, but a real rollout must still
+    # confirm predecessor shutdown before accepting its evidence.
     rows = _healed_colocation_rows()
     runtimes = _candidate_runtimes()
     _wire_real_verify_tasks_for_evidence(
         monkeypatch, tmp_path, rows, runtimes, REVISION, "baseline"
     )
 
-    with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
+    with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
+        rollout.evidence()
+
+
+@pytest.mark.parametrize("placement", rollout.PLACEMENTS)
+def test_final_evidence_uses_recorded_placement(monkeypatch, tmp_path, placement):
+    rows = _healed_colocation_rows()
+    rows[1].update(ID="old1", CurrentState="Shutdown 1m")
+    _wire_real_verify_tasks_for_evidence(
+        monkeypatch, tmp_path, rows, _candidate_runtimes(), REVISION, "baseline", placement
+    )
+    if placement.get("MaxReplicas") == 1:
+        with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
+            rollout.evidence()
+    else:
         rollout.evidence()
 
 
@@ -2138,7 +2147,8 @@ def test_baseline_tolerates_a_ghost_predecessor_on_a_down_node(monkeypatch):
         rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready))
 
 
-def test_baseline_tolerates_healed_colocation_but_converged_does_not(monkeypatch):
+@pytest.mark.parametrize("converged", [False, True])
+def test_capped_rollout_rejects_colocation(monkeypatch, converged):
     rows, runtimes = _healed_baseline_rows()
     for row in rows:
         if row["ID"] == "task1":
@@ -2148,7 +2158,10 @@ def test_baseline_tolerates_healed_colocation_but_converged_does_not(monkeypatch
     proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
     assert sorted(proof["nodes"]) == ["haiku-5", "haiku-9"]
     with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
-        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready))
+        rollout._verify_tasks(
+            "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), converged,
+            placement=rollout._CAPPED_PLACEMENT,
+        )
 
 
 def test_verify_tasks_does_not_retry_an_ingress_exec_failure(monkeypatch):
@@ -2193,46 +2206,56 @@ def _deploy_env(monkeypatch):
     monkeypatch.setattr(rollout, "_ensure_rollback_source", lambda _image: None)
 
 
-def test_deploy_requires_a_spare_node_for_start_first(monkeypatch):
+@pytest.mark.parametrize("placement", rollout.PLACEMENTS)
+@pytest.mark.parametrize("ready_count", [2, 3, 4])
+def test_deploy_capacity_follows_placement(monkeypatch, placement, ready_count):
     _deploy_env(monkeypatch)
-    monkeypatch.setattr(rollout, "_application", lambda *_args: application())
+    ready = frozenset(sorted(ELIGIBLE_NODES)[:ready_count])
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application(placement=placement))
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(placement=placement))
     monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
-
-    # Four ready of five labeled nodes leaves start-first its overlap slot:
-    # the gate passes and evaluation reaches the baseline task census.
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
     monkeypatch.setattr(
-        rollout,
-        "_eligible_nodes",
-        lambda: (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"})),
-    )
-    monkeypatch.setattr(
-        rollout,
-        "_verify_tasks",
+        rollout, "_verify_tasks",
         lambda *_args: (_ for _ in ()).throw(SystemExit("capacity gate passed")),
     )
-    with pytest.raises(SystemExit, match="capacity gate passed"):
-        rollout.deploy()
+    if ready_count < 3:
+        with pytest.raises(RuntimeError, match="not enough Ready eligible nodes"):
+            rollout.deploy()
+    elif ready_count == 3 and placement.get("MaxReplicas") == 1:
+        with pytest.raises(RuntimeError, match="start-first needs a spare eligible node"):
+            rollout.deploy()
+    else:
+        with pytest.raises(SystemExit, match="capacity gate passed"):
+            rollout.deploy()
 
-    # Exactly REPLICAS ready is the case that used to pass and then packed two
-    # tasks onto one node. Fail before the census, and name the absent nodes
-    # rather than the placement they caused.
-    monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: pytest.fail("census must not run"))
-    monkeypatch.setattr(
-        rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"}))
+
+@pytest.mark.parametrize("placement", [rollout.PLACEMENT, rollout._SPREAD_PLACEMENT])
+def test_uncapped_rollout_accepts_colocation_with_clean_withdrawals(monkeypatch, placement):
+    rows, runtimes = _healed_baseline_rows()
+    rows[0]["Node"] = "haiku-5"
+    rows[1].update(ID="old1", CurrentState="Shutdown 1m")
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    proof = rollout._verify_tasks(
+        "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES),
+        placement=placement,
     )
-    with pytest.raises(RuntimeError, match="start-first needs a spare eligible node") as excess:
-        rollout.deploy()
-    assert "3 replicas, 3 Ready" in str(excess.value)
-    assert "not Ready: haiku-6" in str(excess.value)
+    assert proof["nodes"] == ["haiku-5", "haiku-9"]
+    assert len(proof["instances"]) == 3
 
-    # Below REPLICAS fails the same way; the count is not a second gate.
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, frozenset({"haiku-9", "haiku-18"})))
-    with pytest.raises(RuntimeError, match="start-first needs a spare eligible node"):
-        rollout.deploy()
+
+@pytest.mark.parametrize("converged", [False, True])
+def test_verify_tasks_rejects_a_current_task_on_an_unavailable_node(monkeypatch, converged):
+    rows, runtimes = _healed_baseline_rows()
+    ready = frozenset(ELIGIBLE_NODES - {"haiku-18"})
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    with pytest.raises(RuntimeError, match="not on Ready eligible nodes"):
+        rollout._verify_tasks(
+            "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), converged,
+        )
 
 
 def test_deploy_treats_an_absent_update_status_as_terminal(monkeypatch):
