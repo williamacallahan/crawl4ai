@@ -6,6 +6,7 @@ from datetime import datetime
 from urllib.parse import unquote
 from rich.console import Console
 from rich.text import Text
+from rich.markup import escape
 from .utils import create_box_message
 
 
@@ -197,33 +198,20 @@ class AsyncLogger(AsyncLoggerBase):
         if level.value < self.log_level.value:
             return
 
-        # Escape literal "[" so Rich's markup parser does not consume
-        # bracketed text like "[zstd]" or "[Errno 2]" as style tags. Rich's
-        # escape syntax is "\[" (backslash), NOT "[[" doubling: "[[zstd]]"
-        # renders as "[]" (single-word tag stripped) or "[[Errno 2]]"
-        # (multi-word token doubled). Only "[" needs escaping: a "]" with no
-        # preceding unescaped "[" is already rendered literally by Rich, and
-        # escaping "]" would leave a stray backslash in the output.
-        parsed_message = message.replace("[", "\\[")
+        parsed_message = escape(message)
         if params:
             # FIXME: If there are formatting strings in floating point format, 
             # this may result in colors and boxes not being applied properly.
             # such as {value:.2f}, the value is 0.23333 format it to 0.23,
             # but we replace("0.23333", "[color]0.23333[/color]")
-            # Escape "[" in string param values so literal brackets in
-            # substituted text (e.g. exception strings like "httpx[zstd]")
-            # survive Rich's markup parser. Non-string values are left
-            # untouched so format specs like {timing:.2f} keep working.
+            # Preserve numeric values for format specs such as {timing:.2f}.
             escaped_params = {
-                k: (v.replace("[", "\\[") if isinstance(v, str) else v)
+                k: (escape(v) if isinstance(v, str) else v)
                 for k, v in params.items()
             }
             formatted_message = parsed_message.format(**escaped_params)
             for key, value in params.items():
-                # Re-derive the escaped string form of the value so the
-                # color/box substitution below can locate it inside
-                # formatted_message (which now contains the escaped value).
-                value_str = str(value).replace("[", "\\[")
+                value_str = escape(str(value))
                 # check is need apply color
                 if colors and key in colors:
                     color_str = f"[{colors[key]}]{value_str}[/{colors[key]}]"

@@ -366,3 +366,12 @@ class TestAsyncLoggerBracketEscaping:
         assert "httpx[zstd]" in captured.err
         assert "[Errno 2]" in captured.err
         assert "[/url]" in captured.err
+
+
+def test_raw_backslashes_and_tags_survive_template_and_colored_params():
+    text = r"C:\[file] and \[/url]"
+    console = _RecordingConsole()
+    logger = AsyncLogger(console=console)
+    logger.error(text)
+    logger.error("{detail}", params={"detail": text}, colors={"detail": LogColor.RED})
+    assert _render_markup(console.lines).count(text) == 2
