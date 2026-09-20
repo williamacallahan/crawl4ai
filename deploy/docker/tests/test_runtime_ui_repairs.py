@@ -551,7 +551,7 @@ def test_internal_mcp_auth_prefers_existing_static_operator_token(
 
 @pytest.mark.asyncio
 async def test_health_uses_effective_redis_client_when_lifespan_is_active(
-    server_module, monkeypatch
+    server_module, monkeypatch, caplog
 ):
     class ReadyRedis:
         async def ping(self):
@@ -561,25 +561,31 @@ async def test_health_uses_effective_redis_client_when_lifespan_is_active(
     monkeypatch.setenv("C4AI_GIT_SHA", "0123456789abcdef")
     monkeypatch.setenv("HOSTNAME", "crawl4ai.1.test")
     server_module.app.state.readiness_checks_active = True
+    probe_id = "01234567-89ab-4cde-8fab-0123456789ab"
+    caplog.set_level("INFO", logger=server_module.__name__)
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=server_module.app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/health")
+            response = await client.get("/health", headers={"X-Crawl4AI-Health-Probe": probe_id})
     finally:
         server_module.app.state.readiness_checks_active = False
     assert response.status_code == 200
     assert response.headers["connection"] == "close"
+    assert response.headers["x-crawl4ai-health-probe"] == probe_id
     payload = response.json()
     assert payload["components"]["redis"] == "ready"
     assert payload["revision"] == "0123456789abcdef"
     assert payload["instance"] == "crawl4ai.1.test"
+    assert f"health probe start probe_id={probe_id}" in caplog.text
+    assert f"health probe finish probe_id={probe_id}" in caplog.text
+    assert "outcome=ready" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_health_reports_unavailable_effective_redis_without_details(
-    server_module, monkeypatch
+    server_module, monkeypatch, caplog
 ):
     class UnavailableRedis:
         async def ping(self):
@@ -587,18 +593,86 @@ async def test_health_reports_unavailable_effective_redis_without_details(
 
     monkeypatch.setattr(server_module, "redis", UnavailableRedis())
     server_module.app.state.readiness_checks_active = True
+    probe_id = "01234567-89ab-4cde-8fab-0123456789ab"
+    caplog.set_level("INFO", logger=server_module.__name__)
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=server_module.app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/health")
+            response = await client.get("/health", headers={"X-Crawl4AI-Health-Probe": probe_id})
     finally:
         server_module.app.state.readiness_checks_active = False
     assert response.status_code == 503
     assert response.headers["connection"] == "close"
+    assert response.headers["x-crawl4ai-health-probe"] == probe_id
     assert response.json()["components"]["redis"] == "unavailable"
     assert "topology detail" not in response.text
+    assert f"health probe finish probe_id={probe_id}" in caplog.text
+    assert "outcome=redis_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_health_echoes_valid_probe_while_readiness_is_inactive(server_module, caplog):
+    probe_id = "01234567-89ab-4cde-8fab-0123456789ab"
+    server_module.app.state.readiness_checks_active = False
+    caplog.set_level("INFO", logger=server_module.__name__)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health", headers={"X-Crawl4AI-Health-Probe": probe_id})
+
+    assert response.status_code == 503
+    assert response.headers["x-crawl4ai-health-probe"] == probe_id
+    assert f"health probe finish probe_id={probe_id}" in caplog.text
+    assert "outcome=readiness_inactive" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_health_does_not_echo_an_unvalidated_probe(server_module, caplog):
+    server_module.app.state.readiness_checks_active = False
+    caplog.set_level("INFO", logger=server_module.__name__)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health", headers={"X-Crawl4AI-Health-Probe": "untrusted-value"})
+
+    assert response.status_code == 503
+    assert "x-crawl4ai-health-probe" not in response.headers
+    assert "untrusted-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_health_logs_probe_cancellation_without_responding(
+    server_module, monkeypatch, caplog
+):
+    from starlette.requests import Request
+
+    class CancelledRedis:
+        async def ping(self):
+            raise asyncio.CancelledError
+
+    probe_id = "01234567-89ab-4cde-8fab-0123456789ab"
+    monkeypatch.setattr(server_module, "redis", CancelledRedis())
+    server_module.app.state.readiness_checks_active = True
+    caplog.set_level("INFO", logger=server_module.__name__)
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/health",
+            "query_string": b"",
+            "headers": [(b"x-crawl4ai-health-probe", probe_id.encode())],
+        }
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await server_module.health(request)
+    finally:
+        server_module.app.state.readiness_checks_active = False
+
+    assert f"health probe finish probe_id={probe_id}" in caplog.text
+    assert "outcome=cancelled" in caplog.text
 
 
 def test_swarm_drain_keeps_established_vip_connections_ready():

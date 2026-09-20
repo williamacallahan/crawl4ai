@@ -153,7 +153,7 @@ class AsyncWebCrawler:
 
         # Thread safety setup
         self._lock = asyncio.Lock() if thread_safe else None
-        self._markdown_generation_sem = asyncio.Semaphore(1)
+        self._content_processing_sem = asyncio.Semaphore(1)
 
         # Initialize directories
         self.crawl4ai_folder = os.path.join(base_directory, ".crawl4ai")
@@ -770,6 +770,36 @@ class AsyncWebCrawler:
                     )
                 )
 
+    async def _run_content_processing(self, operation, *args, **kwargs):
+        # A cancelled request cannot stop a running thread. Keep this crawler's
+        # processing permit until the actual operation finishes.
+        await self._content_processing_sem.acquire()
+        cancelled_by_caller = False
+        try:
+            task = asyncio.create_task(operation(*args, **kwargs))
+        except BaseException:
+            self._content_processing_sem.release()
+            raise
+
+        def complete_processing(completed):
+            try:
+                error = None if completed.cancelled() else completed.exception()
+                if cancelled_by_caller and error is not None:
+                    self.logger.error(
+                        "Content processing failed after request cancellation: {error}",
+                        tag="ERROR",
+                        params={"error": str(error)},
+                    )
+            finally:
+                self._content_processing_sem.release()
+
+        task.add_done_callback(complete_processing)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled_by_caller = True
+            raise
+
     async def aprocess_html(
         self,
         url: str,
@@ -838,8 +868,9 @@ class AsyncWebCrawler:
             ################################
             # Scraping Strategy Execution  #
             ################################
-            result: ScrapingResult = scraping_strategy.scrap(
-                url, html, **params)
+            result: ScrapingResult = await self._run_content_processing(
+                scraping_strategy.ascrap, url, html, **params
+            )
 
             if result is None:
                 raise ValueError(
@@ -868,7 +899,10 @@ class AsyncWebCrawler:
             links = result.links.model_dump() if hasattr(result.links, 'model_dump') else result.links
             metadata = result.metadata
 
-        fit_html = preprocess_html_for_schema(html_content=html, text_threshold= 500, max_size= 300_000)
+        fit_html = await self._run_content_processing(
+            asyncio.to_thread, preprocess_html_for_schema,
+            html_content=html, text_threshold=500, max_size=300_000,
+        )
 
         ################################
         # Generate Markdown            #
@@ -923,40 +957,10 @@ class AsyncWebCrawler:
         if base_tag_match:
             base_url = base_tag_match.group(1)
 
-        await self._markdown_generation_sem.acquire()
-        cancelled_by_caller = False
-        try:
-            markdown_task = asyncio.create_task(
-                asyncio.to_thread(
-                    markdown_generator.generate_markdown,
-                    input_html=markdown_input_html,
-                    base_url=base_url,
-                )
-            )
-        except BaseException:
-            self._markdown_generation_sem.release()
-            raise
-
-        def complete_markdown(task: asyncio.Task) -> None:
-            try:
-                error = None if task.cancelled() else task.exception()
-                if cancelled_by_caller and error is not None:
-                    self.logger.error(
-                        "Markdown generation failed after request cancellation: {error}",
-                        tag="ERROR",
-                        params={"error": str(error)},
-                    )
-            finally:
-                self._markdown_generation_sem.release()
-
-        markdown_task.add_done_callback(complete_markdown)
-        try:
-            markdown_result: MarkdownGenerationResult = await asyncio.shield(
-                markdown_task
-            )
-        except asyncio.CancelledError:
-            cancelled_by_caller = True
-            raise
+        markdown_result: MarkdownGenerationResult = await self._run_content_processing(
+            asyncio.to_thread, markdown_generator.generate_markdown,
+            input_html=markdown_input_html, base_url=base_url,
+        )
 
         # Log processing completion — reflect actual content outcome
         self.logger.url_status(

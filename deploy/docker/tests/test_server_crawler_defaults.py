@@ -1,5 +1,6 @@
 import asyncio
 import time
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -512,6 +513,65 @@ def test_handle_llm_qa_returns_result_when_permit_release_fails(monkeypatch):
     api.aperform_completion_with_backoff.assert_awaited_once()
 
 
+@pytest.mark.parametrize("phase", ["scrape", "preprocess"])
+def test_html_processing_keeps_loop_responsive_and_holds_cancelled_permit(monkeypatch, phase):
+    import crawl4ai.async_webcrawler as crawler_module
+    from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        calls = []
+        strategy = LXMLWebScrapingStrategy()
+        owner, name = (
+            (strategy, "scrap") if phase == "scrape"
+            else (crawler_module, "preprocess_html_for_schema")
+        )
+        original = getattr(owner, name)
+
+        def controlled(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                loop.call_soon_threadsafe(started.set)
+                assert release.wait(2), "HTML processing blocked the event loop"
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, controlled)
+        crawler = object.__new__(AsyncWebCrawler)
+        crawler.logger = AsyncLogger(verbose=False)
+        crawler._content_processing_sem = asyncio.Semaphore(1)
+        config = CrawlerRunConfig(scraping_strategy=strategy)
+
+        def process():
+            return crawler.aprocess_html(
+                "https://example.com", "<html><body><h1>Example</h1></body></html>",
+                None, config, None, None, False,
+            )
+
+        task = asyncio.create_task(process())
+        replacement = None
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            replacement = asyncio.create_task(process())
+            await asyncio.sleep(0.05)
+            assert len(calls) == 1, "cancelled work released admission before finishing"
+        finally:
+            release.set()
+            if replacement is not None:
+                result = await replacement
+            else:
+                await asyncio.gather(task, return_exceptions=True)
+        assert result.success
+        assert "Example" in result.cleaned_html
+        assert len(calls) == 2
+
+    asyncio.run(exercise())
+
+
 def test_markdown_generation_does_not_block_the_event_loop():
     class SlowMarkdownGenerator(MarkdownGenerationStrategy):
         def generate_markdown(self, **_kwargs):
@@ -525,7 +585,7 @@ def test_markdown_generation_does_not_block_the_event_loop():
     async def exercise():
         crawler = object.__new__(AsyncWebCrawler)
         crawler.logger = AsyncLogger(verbose=False)
-        crawler._markdown_generation_sem = asyncio.Semaphore(1)
+        crawler._content_processing_sem = asyncio.Semaphore(1)
         config = CrawlerRunConfig(markdown_generator=SlowMarkdownGenerator())
         processing = asyncio.create_task(
             crawler.aprocess_html(
@@ -566,7 +626,7 @@ def test_markdown_deadline_keeps_admission_until_worker_completion():
     async def exercise():
         crawler = object.__new__(AsyncWebCrawler)
         crawler.logger = AsyncLogger(verbose=False)
-        crawler._markdown_generation_sem = asyncio.Semaphore(1)
+        crawler._content_processing_sem = asyncio.Semaphore(1)
         config = CrawlerRunConfig(markdown_generator=SlowMarkdownGenerator())
         processing = asyncio.create_task(
             crawler.aprocess_html(

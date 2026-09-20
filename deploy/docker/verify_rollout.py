@@ -142,12 +142,62 @@ class CurlError(RuntimeError):
         self.curl_exit = curl_exit
 
 
+_PROBE_TIMING_MARKER = "\n__crawl4ai_probe_timing__"
+_PROBE_TIMING_FIELDS = (
+    "response_code",
+    "dns_ms",
+    "connect_ms",
+    "tls_ms",
+    "start_transfer_ms",
+    "curl_total_ms",
+)
+
+
+def _record_probe_timing(probe: dict[str, Any], stdout: str) -> str:
+    """Strip curl timing output and retain only numeric phase measurements."""
+    probe.update(echoed_probe_id=None, correlation_verified=False)
+    body, marker, raw_timing = stdout.rpartition(_PROBE_TIMING_MARKER)
+    if not marker:
+        probe["timing_error"] = "curl timing output missing"
+        return stdout
+    values = raw_timing.strip().split("|", len(_PROBE_TIMING_FIELDS))
+    if len(values) != len(_PROBE_TIMING_FIELDS) + 1:
+        probe["timing_error"] = "curl timing output malformed"
+        return body
+    try:
+        probe.update(
+            zip(
+                _PROBE_TIMING_FIELDS,
+                (
+                    int(values[0]),
+                    *(round(float(value) * 1_000, 3) for value in values[1:-1]),
+                ),
+            )
+        )
+    except ValueError:
+        probe["timing_error"] = "curl timing output malformed"
+    if values[-1]:
+        try:
+            if len(values[-1]) != 36:
+                raise ValueError("invalid probe ID length")
+            probe["echoed_probe_id"] = str(uuid.UUID(values[-1]))
+        except ValueError:
+            probe["correlation_error"] = "invalid probe echo"
+        else:
+            if probe["echoed_probe_id"] != probe["probe_id"]:
+                probe["correlation_error"] = "probe echo mismatch"
+    # Older tasks do not echo the header during a mixed-version rollout.
+    probe["correlation_verified"] = probe["echoed_probe_id"] == probe["probe_id"]
+    return body
+
+
 def _request_json(
     url: str,
     api_key: str | None = None,
     *,
     network_namespace_pid: int | None = None,
     ingress_container: str | None = None,
+    probe: dict[str, Any] | None = None,
 ) -> Any:
     config = ""
     if ingress_container is not None:
@@ -180,6 +230,18 @@ def _request_json(
             "--connect-timeout", "5", "--max-time", "15",
             "--max-filesize", "65536", "--config", "-", url,
         ]
+        if probe is not None:
+            command.extend(
+                [
+                    "--header", f"X-Crawl4AI-Health-Probe: {probe['probe_id']}",
+                    "--write-out",
+                    (
+                        f"{_PROBE_TIMING_MARKER}%{{response_code}}|%{{time_namelookup}}|"
+                        "%{time_connect}|%{time_appconnect}|%{time_starttransfer}|"
+                        "%{time_total}|%header{x-crawl4ai-health-probe}"
+                    ),
+                ]
+            )
         if network_namespace_pid is not None:
             if (
                 isinstance(network_namespace_pid, bool)
@@ -199,6 +261,10 @@ def _request_json(
         capture_output=True,
         timeout=20,
     )
+    stdout = response.stdout
+    if probe is not None:
+        probe["curl_exit"] = response.returncode
+        stdout = _record_probe_timing(probe, stdout)
     if response.returncode:
         # Carry curl's own diagnosis: a bare "HTTP request failed" made the
         # 2026-08-31 single-sample monitor failure unattributable (connection
@@ -211,7 +277,7 @@ def _request_json(
         )
     if ingress_container is not None and len(response.stdout.encode()) > 65536:
         raise ValueError("ingress health response exceeds 65536 bytes")
-    return json.loads(response.stdout) if response.stdout else None
+    return json.loads(stdout) if stdout else None
 
 
 def _post_json(url: str, api_key: str, payload: dict[str, Any]) -> Any:
@@ -1084,23 +1150,49 @@ def monitor() -> None:
     with evidence.open("a") as output:
         while not stop.exists():
             for url in HEALTH_URLS:
+                probe_id = str(uuid.uuid4())
+                started_at = time.time()
+                started_monotonic = time.monotonic()
+                probe: dict[str, Any] = {"probe_id": probe_id}
                 try:
-                    health = _request_json(f"{url}?rollout={uuid.uuid4()}")
+                    health = _request_json(f"{url}?rollout={probe_id}", probe=probe)
+                    if (
+                        health.get("revision") == os.environ.get("GITHUB_SHA")
+                        and not probe.get("correlation_verified")
+                    ):
+                        probe.setdefault("correlation_error", "candidate probe echo missing")
                     sample = {
-                        "ok": _exact_health(health),
-                        "url": url,
-                        "timestamp": time.time(),
+                        "ok": (
+                            _exact_health(health)
+                            and not probe.get("correlation_error")
+                            and not probe.get("timing_error")
+                        ),
                         "revision": health.get("revision"),
                         "instance": health.get("instance"),
+                    }
+                except subprocess.TimeoutExpired:
+                    sample = {
+                        "ok": False,
+                        "error": "TimeoutExpired: curl wrapper exceeded 20 seconds",
+                        "curl_exit": None,
                     }
                 except Exception as error:
                     sample = {
                         "ok": False,
-                        "url": url,
-                        "timestamp": time.time(),
-                        "error": f"{type(error).__name__}: {error}"[:300],
+                        "error": (
+                            re.sub(r"https?://\S+", "<url>", f"CurlError: {error}")[:300]
+                            if isinstance(error, CurlError)
+                            else type(error).__name__
+                        ),
                         "curl_exit": getattr(error, "curl_exit", None),
                     }
+                sample.update({
+                    "url": url,
+                    "started_at": started_at,
+                    "timestamp": time.time(),
+                    "elapsed_ms": round((time.monotonic() - started_monotonic) * 1_000, 3),
+                    **probe,
+                })
                 failures += not sample["ok"]
                 output.write(json.dumps(sample, separators=(",", ":")) + "\n")
                 output.flush()

@@ -1779,7 +1779,7 @@ def test_monitor_arms_only_after_both_domains_are_ready(monkeypatch, tmp_path):
     monkeypatch.setenv("ROLLOUT_MONITOR_STOP_PATH", str(stop_path))
     calls = []
 
-    def ready(url, *_args):
+    def ready(url, *_args, **_kwargs):
         assert not armed_path.exists()
         calls.append(url)
         if len(calls) == len(rollout.HEALTH_URLS):
@@ -1806,6 +1806,89 @@ def test_request_json_failure_carries_curl_diagnosis(monkeypatch):
     assert error.value.curl_exit == 56
     assert "curl exit 56" in str(error.value)
     assert "Connection reset" in str(error.value)
+
+
+def test_request_json_records_probe_phase_timings(monkeypatch):
+    invocation = []
+    probe_id = "01234567-89ab-4cde-8fab-0123456789ab"
+
+    def run(command, **kwargs):
+        invocation.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(health("one"))
+            + f"{rollout._PROBE_TIMING_MARKER}200|0.001|0.002|0.003|0.004|0.005|{probe_id}",
+            "",
+        )
+
+    monkeypatch.setattr(rollout.subprocess, "run", run)
+    probe = {"probe_id": probe_id}
+
+    assert rollout._request_json(
+        "https://example.test/health?rollout=probe", probe=probe
+    ) == health("one")
+    assert "--write-out" in invocation[0][0]
+    assert probe == {
+        "probe_id": probe_id,
+        "echoed_probe_id": probe_id,
+        "correlation_verified": True,
+        "curl_exit": 0,
+        "response_code": 200,
+        "dns_ms": 1.0,
+        "connect_ms": 2.0,
+        "tls_ms": 3.0,
+        "start_transfer_ms": 4.0,
+        "curl_total_ms": 5.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("echo", "error"),
+    [("", None), ("11234567-89ab-4cde-8fab-0123456789ab", "probe echo mismatch"),
+     ("untrusted-header", "invalid probe echo"),
+     ("invalid|echo", "invalid probe echo")],
+)
+def test_probe_echo_distinguishes_legacy_tasks_from_bad_correlation(monkeypatch, echo, error):
+    probe_id = "01234567-89ab-4cde-8fab-0123456789ab"
+    monkeypatch.setattr(
+        rollout.subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0,
+            json.dumps(health()) + f"{rollout._PROBE_TIMING_MARKER}200|0|0|0|0|0|{echo}",
+            "",
+        ),
+    )
+    probe = {"probe_id": probe_id}
+    assert rollout._request_json("https://example.test/health", probe=probe) == health()
+    assert probe["correlation_verified"] is False
+    assert probe.get("correlation_error") == error
+    assert "untrusted-header" not in json.dumps(probe)
+
+
+@pytest.mark.parametrize("revision", ["baseline", REVISION])
+def test_monitor_requires_candidate_echo_but_accepts_legacy_tasks(monkeypatch, tmp_path, revision):
+    evidence_path = tmp_path / "evidence.jsonl"
+    stop_path = tmp_path / "stop"
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(evidence_path))
+    monkeypatch.setenv("ROLLOUT_MONITOR_ARMED_PATH", str(tmp_path / "armed"))
+    monkeypatch.setenv("ROLLOUT_MONITOR_STOP_PATH", str(stop_path))
+    monkeypatch.setenv("GITHUB_SHA", REVISION)
+
+    def legacy_response(*_args, probe, **_kwargs):
+        stop_path.touch()
+        probe["correlation_verified"] = False
+        return {**health(), "revision": revision}
+
+    monkeypatch.setattr(rollout, "_request_json", legacy_response)
+    monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+    if revision == REVISION:
+        with pytest.raises(RuntimeError, match="baseline is not ready"):
+            rollout.monitor()
+    else:
+        rollout.monitor()
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert all(row["ok"] == (revision != REVISION) for row in rows)
 
 
 def test_request_json_uses_namespace_argv_and_existing_bounds(monkeypatch):
@@ -1955,14 +2038,17 @@ def test_monitor_failure_sample_is_attributable(monkeypatch, tmp_path):
     monkeypatch.setenv("ROLLOUT_MONITOR_STOP_PATH", str(tmp_path / "stop"))
     calls = []
 
-    def probe(url, *_args):
+    def probe(url, *_args, **_kwargs):
         calls.append(url)
         if len(calls) <= len(rollout.HEALTH_URLS):
             if len(calls) == len(rollout.HEALTH_URLS):
                 pass  # first round healthy: arms the monitor
             return health()
         (tmp_path / "stop").touch()
-        raise rollout.CurlError("HTTP request failed: curl exit 56: reset", 56)
+        raise rollout.CurlError(
+            "HTTP request failed: curl exit 56: https://example.test/health?rollout=secret",
+            56,
+        )
 
     monkeypatch.setattr(rollout, "_request_json", probe)
     monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
@@ -1973,6 +2059,38 @@ def test_monitor_failure_sample_is_attributable(monkeypatch, tmp_path):
     assert failed
     assert failed[0]["curl_exit"] == 56
     assert failed[0]["error"].startswith("CurlError: HTTP request failed: curl exit 56")
+    assert "?rollout=" not in failed[0]["error"]
+    assert failed[0]["probe_id"]
+    assert failed[0]["started_at"] <= failed[0]["timestamp"]
+
+
+def test_monitor_timeout_sample_keeps_correlation_without_command_details(monkeypatch, tmp_path):
+    evidence_path = tmp_path / "evidence.jsonl"
+    stop_path = tmp_path / "stop"
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(evidence_path))
+    monkeypatch.setenv("ROLLOUT_MONITOR_ARMED_PATH", str(tmp_path / "armed"))
+    monkeypatch.setenv("ROLLOUT_MONITOR_STOP_PATH", str(stop_path))
+    calls = []
+
+    def probe(url, *_args, **_kwargs):
+        calls.append(url)
+        if len(calls) <= len(rollout.HEALTH_URLS):
+            return health()
+        stop_path.touch()
+        raise subprocess.TimeoutExpired(["curl", url], 20)
+
+    monkeypatch.setattr(rollout, "_request_json", probe)
+    monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError, match="recorded"):
+        rollout.monitor()
+
+    samples = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    failed = next(sample for sample in samples if not sample["ok"])
+    assert failed["curl_exit"] is None
+    assert failed["error"] == "TimeoutExpired: curl wrapper exceeded 20 seconds"
+    assert "?rollout=" not in failed["error"]
+    assert failed["probe_id"]
+    assert failed["elapsed_ms"] >= 0
 
 
 def _node_commands(nodes):

@@ -561,6 +561,20 @@ app.include_router(monitor_router)
 
 logger = logging.getLogger(__name__)
 
+_HEALTH_PROBE_HEADER = "X-Crawl4AI-Health-Probe"
+_HEALTH_PROBE_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _health_probe_id(request: Request) -> str | None:
+    """Accept only the canonical UUID emitted by the rollout monitor."""
+    value = request.headers.get(_HEALTH_PROBE_HEADER)
+    if not value or not _HEALTH_PROBE_ID.fullmatch(value):
+        return None
+    return str(uuid.UUID(value))
+
 
 # ── central exception handling (no internal detail leaks) ─────────────
 # 16 sites used to return raw str(e) to clients, leaking paths, dependency
@@ -978,29 +992,66 @@ async def get_hooks_info():
 
 
 @app.get(HEALTH_PATH)
-async def health():
+async def health(request: Request):
+    started_at = time.time()
+    probe_id = _health_probe_id(request)
+    started_monotonic = time.monotonic() if probe_id else None
+    revision = os.environ.get("C4AI_GIT_SHA", "")
+    instance = os.environ.get("HOSTNAME", "")
     headers = {"Connection": "close"}
+    if probe_id:
+        headers[_HEALTH_PROBE_HEADER] = probe_id
+        logger.info(
+            "health probe start probe_id=%s instance=%s revision=%s started_at=%.6f",
+            probe_id,
+            instance,
+            revision,
+            started_at,
+        )
     payload = {
         "status": "unhealthy",
-        "timestamp": time.time(),
+        "timestamp": started_at,
         "version": __version__,
-        "revision": os.environ.get("C4AI_GIT_SHA", ""),
-        "instance": os.environ.get("HOSTNAME", ""),
+        "revision": revision,
+        "instance": instance,
         "components": {"api": "unavailable"},
     }
-    if not getattr(app.state, "readiness_checks_active", False):
-        return JSONResponse(payload, status_code=503, headers=headers)
+    status_code = None
+    outcome = "cancelled"
     try:
+        if not getattr(app.state, "readiness_checks_active", False):
+            status_code = 503
+            outcome = "readiness_inactive"
+            return JSONResponse(payload, status_code=status_code, headers=headers)
         await asyncio.wait_for(redis.ping(), timeout=2.0)
         payload["status"] = "ok"
         payload["components"] = {"api": "ready", "redis": "ready"}
-        return JSONResponse(payload, headers=headers)
+        status_code = 200
+        outcome = "ready"
+        return JSONResponse(payload, status_code=status_code, headers=headers)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         # Log the failure class: a fast ConnectionError points at the overlay /
         # stale pooled connection, a TimeoutError at a stalled Redis.
         logger.warning("health: redis ping failed: %r", exc)
         payload["components"]["redis"] = "unavailable"
-        return JSONResponse(payload, status_code=503, headers=headers)
+        status_code = 503
+        outcome = "redis_unavailable"
+        return JSONResponse(payload, status_code=status_code, headers=headers)
+    finally:
+        if probe_id:
+            logger.log(
+                logging.WARNING if outcome == "cancelled" else logging.INFO,
+                "health probe finish probe_id=%s instance=%s revision=%s status=%s "
+                "outcome=%s elapsed_ms=%.3f",
+                probe_id,
+                instance,
+                revision,
+                status_code,
+                outcome,
+                (time.monotonic() - started_monotonic) * 1_000,
+            )
 
 
 @app.post("/crawl")
