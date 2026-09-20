@@ -103,6 +103,7 @@ class HTML2Text(html.parser.HTMLParser):
         self.outtextlist: List[str] = []
 
         self.quiet = 0
+        self.quiet_tags: List[str] = []
         self.p_p = 0  # number of newline character to print before next output
         self.outcount = 0
         self.start = True
@@ -145,9 +146,6 @@ class HTML2Text(html.parser.HTMLParser):
     def update_params(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
-
-    def feed(self, data: str) -> None:
-        super().feed(data)
 
     def handle(self, data: str) -> str:
         self.start = True
@@ -401,18 +399,17 @@ class HTML2Text(html.parser.HTMLParser):
 
         if tag in ["head", "style", "script"]:
             if start:
+                self.quiet_tags.append(tag)
                 self.quiet += 1
-            elif self.quiet > 0:
+            elif tag in self.quiet_tags:
+                self.quiet_tags.remove(tag)
                 self.quiet -= 1
+            self.style = self.quiet_tags.count("style")
 
-        if tag == "style":
-            if start:
-                self.style += 1
-            else:
-                self.style -= 1
-
-        if tag in ["body"]:
+        if tag == "body":
             self.quiet = 0  # sites like 9rules.com never close <head>
+            self.quiet_tags.clear()
+            self.style = 0
 
         if tag == "blockquote":
             if start:

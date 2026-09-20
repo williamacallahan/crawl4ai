@@ -325,3 +325,26 @@ def test_empty_input_still_works():
 
 def test_plain_text_no_tags_still_works():
     assert _convert("just plain text").strip() == "just plain text"
+
+
+@pytest.mark.parametrize("hidden", [
+    "<head>before</style>LEAK</head>",
+    "<head><style>p{color:red}</style></style>LEAK</head>",
+    "<head>before</script>LEAK</head>",
+])
+def test_mismatched_end_tags_do_not_end_head_suppression(hidden):
+    html = hidden + "<p>after</p>"
+    cli = subprocess.run(
+        [sys.executable, "-m", "crawl4ai.html2text", "-b", "0"],
+        input=html, text=True, capture_output=True, check=True, env=_CLI_ENV,
+    )
+    for result in (_convert(html), html2text(html), cli.stdout):
+        assert "LEAK" not in result
+        assert "before" not in result
+        assert "after" in result
+
+
+def test_body_resets_unclosed_head_suppression():
+    result = _convert("<head>hidden<body></head><p>visible</p></body>")
+    assert "hidden" not in result
+    assert "visible" in result
