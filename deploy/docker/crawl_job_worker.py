@@ -257,6 +257,7 @@ class CrawlJobWorker:
                 logger.warning(
                     "Heartbeat renewal failed for crawl job %s; will retry next tick",
                     entry.task_id,
+                    exc_info=True,
                 )
 
     async def _notify(

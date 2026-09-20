@@ -1193,7 +1193,7 @@ class FlakyHeartbeatRedis(FakeRedis):
 
 
 @pytest.mark.parametrize("error", [ConnectionError, TimeoutError])
-def test_transient_heartbeat_error_does_not_abort_an_in_progress_crawl(error):
+def test_transient_heartbeat_error_does_not_abort_an_in_progress_crawl(error, caplog):
     redis = FlakyHeartbeatRedis(fail_on_heartbeat_numbers={2}, error=error)
     config = queue_config(
         max_attempts=3, max_attempt_seconds=3600,
@@ -1224,6 +1224,12 @@ def test_transient_heartbeat_error_does_not_abort_an_in_progress_crawl(error):
     # lease: the heartbeat loop retried instead of aborting the crawl.
     assert redis._heartbeat_count >= 3
     assert len(redis.claims) >= 2
+    renewal_errors = [
+        record for record in caplog.records
+        if "Heartbeat renewal failed" in record.getMessage()
+    ]
+    assert len(renewal_errors) == 1
+    assert renewal_errors[0].exc_info[0] is error
 
 
 def test_sustained_heartbeat_errors_keep_the_crawl_alive():
