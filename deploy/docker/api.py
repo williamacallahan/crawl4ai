@@ -347,14 +347,19 @@ async def handle_llm_qa(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Crawl4AI LLM admission is unavailable",
             )
+        effective_temperature = (
+            temperature if temperature is not None else llm["temperature"]
+        )
+        qa_extra_args = dict(llm["extra_args"])
+        if effective_temperature is not None:
+            qa_extra_args["temperature"] = effective_temperature
         async with llm_permit(redis, config):
             response = await aperform_completion_with_backoff(
                 provider=llm["provider"],
                 prompt_with_variables=prompt,
                 api_token=llm["api_token"],
-                temperature=temperature or llm["temperature"],
                 base_url=llm["base_url"],
-                extra_args=llm["extra_args"],
+                extra_args=qa_extra_args,
                 base_delay=config["llm"].get("backoff_base_delay", 2),
                 max_attempts=config["llm"].get("backoff_max_attempts", 1),
                 exponential_factor=config["llm"].get("backoff_exponential_factor", 2)
@@ -429,11 +434,16 @@ async def process_llm_extraction(
             "num_retries": config["llm"].get("job_request_retries", 0),
             "max_tokens": config["llm"].get("job_max_output_tokens", 4096),
         }
+        effective_temperature = (
+            temperature if temperature is not None else _llm["temperature"]
+        )
+        if effective_temperature is not None:
+            job_extra_args["temperature"] = effective_temperature
         llm_strategy = LLMExtractionStrategy(
             llm_config=LLMConfig(
                 provider=_llm["provider"],
                 api_token=_llm["api_token"],
-                temperature=temperature or _llm["temperature"],
+                temperature=effective_temperature,
                 base_url=_llm["base_url"],
                 backoff_max_attempts=config["llm"].get("backoff_max_attempts", 1),
             ),
@@ -618,13 +628,19 @@ async def handle_markdown_request(
                 "{REQUEST}",
                 query or "Extract main content",
             )
+            effective_temperature = (
+                temperature if temperature is not None else llm["temperature"]
+            )
+            md_extra_args = dict(llm["extra_args"])
+            if effective_temperature is not None:
+                md_extra_args["temperature"] = effective_temperature
             async with llm_permit(redis, config):
                 response = await aperform_completion_with_backoff(
                     provider=llm["provider"],
                     prompt_with_variables=prompt,
                     api_token=llm["api_token"],
                     base_url=llm["base_url"],
-                    extra_args=llm["extra_args"],
+                    extra_args=md_extra_args,
                     max_attempts=1,
                 )
             markdown = extract_xml_data(
