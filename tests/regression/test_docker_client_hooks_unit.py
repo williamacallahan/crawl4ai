@@ -599,3 +599,187 @@ async def test_streaming_and_non_streaming_read_timeout_raise_same_exception_typ
     assert type(streaming_exc) is type(request_exc)
     assert str(streaming_exc) == str(request_exc)
     assert str(streaming_exc) == "Request timed out: simulated read timeout"
+
+
+# --- streaming crawl() interrupted-error-body contract ---
+# crawl()'s streaming branch reads the error body with ``await e.response.aread()``
+# inside the ``except httpx.HTTPStatusError`` handler to enrich the message.
+# If that read itself fails (connection drop, read timeout, protocol error
+# between the status line and the body), the resulting ``httpx.RequestError``
+# subclass must NOT escape to the outer transport handler added in commit
+# 782c7473 -- the server had already returned a non-2xx status, so the
+# correct classification is ``RequestError`` carrying that status code, not
+# ``ConnectionError``. These tests pin the streaming path to the same
+# ``RequestError`` classification as the non-streaming ``_request()`` does
+# for any server non-2xx, regardless of whether the error body could be
+# read. ``httpx.ASGITransport`` cannot synthesise transport-level exceptions
+# mid-body, so these cases use ``httpx.MockTransport`` (like the transport-
+# error tests above). No docker server, browser, or Redis required.
+
+
+def _error_body_raising(exc):
+    """An async generator that raises ``exc`` when the body is read.
+
+    The unreachable ``yield`` makes this an async generator so httpx treats
+    the response body as a streaming byte source; iterating it (which
+    ``aread()`` does) raises ``exc`` before any bytes are produced, mirroring
+    a connection drop / read timeout between the response status line and
+    the (small) error body.
+    """
+    async def body():
+        raise exc
+        yield b"{}"  # pragma: no cover - unreachable; makes body an async generator
+
+    return body()
+
+
+@pytest.mark.asyncio
+async def test_streaming_403_with_readerror_during_error_body_raises_request_error(
+    mock_client,
+):
+    """A 403 whose error body read raises ``httpx.ReadError`` is ``RequestError``.
+
+    This is the exact case from the bug report: the server returns 403 (status
+    code known), but the connection drops while reading the error body. Before
+    the fix the ``httpx.ReadError`` escaped the inner ``HTTPStatusError``
+    handler and was caught by the outer ``except httpx.RequestError``,
+    surfacing as ``ConnectionError("Failed to connect: ...")`` and losing the
+    403 status code. The fix must surface ``RequestError`` carrying the
+    status code, consistent with the non-streaming ``_request()`` path.
+    """
+    def handler(req):
+        if "/health" in str(req.url):
+            return _health_ok(req)
+        return httpx.Response(
+            403,
+            content=_error_body_raising(
+                httpx.ReadError("connection dropped during error body read")
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+    _install_mock(mock_client, handler)
+
+    with pytest.raises(RequestError) as exc_info:
+        gen = await mock_client.crawl(
+            ["https://example.com"], crawler_config=CrawlerRunConfig(stream=True)
+        )
+        async for _ in gen:
+            pass
+
+    assert not isinstance(exc_info.value, ConnectionError)
+    assert not isinstance(exc_info.value, httpx.RequestError)
+    assert not isinstance(exc_info.value, httpx.HTTPStatusError)
+    assert isinstance(exc_info.value, Crawl4aiClientError)
+    assert "Server error 403" in str(exc_info.value)
+    assert "Failed to connect" not in str(exc_info.value)
+    assert "Request timed out" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_403_with_readtimeout_during_error_body_raises_request_error(
+    mock_client,
+):
+    """A 403 whose error body read raises ``httpx.ReadTimeout`` is ``RequestError``.
+
+    ``httpx.ReadTimeout`` is both a ``TimeoutException`` and a ``RequestError``.
+    Without the fix, the outer ``except httpx.TimeoutException`` catches it
+    and surfaces ``ConnectionError("Request timed out: ...")``, losing the
+    403 status. The fix's inner ``except (httpx.RequestError, ...)`` must
+    catch the ``ReadTimeout`` locally (it is a ``RequestError``) before the
+    outer ``except httpx.TimeoutException`` can, preserving the status code
+    in a ``RequestError``.
+    """
+    def handler(req):
+        if "/health" in str(req.url):
+            return _health_ok(req)
+        return httpx.Response(
+            403,
+            content=_error_body_raising(
+                httpx.ReadTimeout("body read timed out")
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+    _install_mock(mock_client, handler)
+
+    with pytest.raises(RequestError) as exc_info:
+        gen = await mock_client.crawl(
+            ["https://example.com"], crawler_config=CrawlerRunConfig(stream=True)
+        )
+        async for _ in gen:
+            pass
+
+    assert not isinstance(exc_info.value, ConnectionError)
+    assert not isinstance(exc_info.value, httpx.RequestError)
+    assert "Server error 403" in str(exc_info.value)
+    # The outer TimeoutException handler must NOT have classified this.
+    assert "Request timed out" not in str(exc_info.value)
+    assert "Failed to connect" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_and_non_streaming_agree_on_request_error_for_non_2xx(
+    mock_client,
+):
+    """A server non-2xx yields ``RequestError`` on both paths, no exception drift.
+
+    Pins the "no exception type drift" guarantee from the bug report: the
+    ``stream`` flag must never change the exception family a caller has to
+    handle for a server non-2xx. The streaming path's error body read is
+    interrupted (``httpx.ReadError``); the non-streaming path's body is
+    complete (it buffers before ``raise_for_status()``). Both must surface
+    ``RequestError`` carrying the status code -- not ``ConnectionError``.
+    """
+    streaming_detail = "hooks are disabled"
+
+    def handler(req):
+        if "/health" in str(req.url):
+            return _health_ok(req)
+        if "/crawl/stream" in str(req.url):
+            # Streaming path: error body read is interrupted.
+            return httpx.Response(
+                403,
+                content=_error_body_raising(
+                    httpx.ReadError("connection dropped during error body read")
+                ),
+                headers={"content-type": "application/json"},
+            )
+        # Non-streaming path: complete JSON 403 body (buffered before
+        # raise_for_status(), so aread() is never invoked).
+        return httpx.Response(
+            403,
+            content=json.dumps({"detail": streaming_detail}).encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    _install_mock(mock_client, handler)
+
+    streaming_exc: Optional[RequestError] = None
+    try:
+        gen = await mock_client.crawl(
+            ["https://example.com"], crawler_config=CrawlerRunConfig(stream=True)
+        )
+        async for _ in gen:
+            pass
+    except RequestError as e:
+        streaming_exc = e
+
+    request_exc: Optional[RequestError] = None
+    try:
+        await mock_client._request("POST", "/crawl", json={})
+    except RequestError as e:
+        request_exc = e
+
+    assert isinstance(streaming_exc, RequestError)
+    assert isinstance(request_exc, RequestError)
+    assert not isinstance(streaming_exc, ConnectionError)
+    assert not isinstance(request_exc, ConnectionError)
+    assert type(streaming_exc) is type(request_exc)
+    # Both carry the 403 status code; the streaming message falls back to
+    # the HTTPStatusError text (body unreadable) while the non-streaming
+    # message carries the JSON detail, but the status code is preserved on
+    # both paths.
+    assert "Server error 403" in str(streaming_exc)
+    assert "Server error 403" in str(request_exc)
+    assert streaming_detail in str(request_exc)

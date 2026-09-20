@@ -269,8 +269,11 @@ class Crawl4aiDockerClient:
                         try:
                             response.raise_for_status()
                         except httpx.HTTPStatusError as e:
-                            await e.response.aread()
-                            error_msg = _http_error_detail(e.response, e)
+                            try:
+                                await e.response.aread()
+                                error_msg = _http_error_detail(e.response, e)
+                            except (httpx.RequestError, httpx.HTTPStatusError):
+                                error_msg = str(e)
                             raise RequestError(f"Server error {e.response.status_code}: {error_msg}")
                         async for line in response.aiter_lines():
                             if line.strip():
