@@ -8,6 +8,7 @@ import pytest
 from crawl4ai import BrowserConfig, CrawlerRunConfig
 from crawl4ai import browser_manager as browser_manager_module
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
+from crawl4ai.browser_adapter import UndetectedAdapter
 from crawl4ai.browser_manager import BrowserManager
 
 
@@ -932,3 +933,71 @@ async def test_failed_start_releases_cached_driver_without_stopping_other_users(
         assert not manager._using_cached_cdp
     finally:
         cache._cache.pop(endpoint, None)
+
+
+# ---------------------------------------------------------------------------
+# Regression for the shared-init-script-flag bug in UndetectedAdapter.
+#
+# `UndetectedAdapter.setup_console_capture` and `setup_error_capture` used a
+# single per-page flag (`self._console_script_injected`) to dedupe
+# `page.add_init_script(...)` injection. The production caller
+# (`AsyncPlaywrightCrawlerStrategy._crawl_web`) always invokes them paired,
+# console-first, so `setup_error_capture` saw the flag already set and skipped
+# injecting its `error`/`unhandledrejection` listeners. Result:
+# `window.__capturedErrors` stayed `[]` and uncaught exceptions / unhandled
+# promise rejections were silently dropped. Introduced in commit 5c33cbc.
+#
+# The fix: a second per-page flag (`_error_script_injected`) so each init
+# script is tracked independently.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingPage:
+    """Minimal page double recording `add_init_script` calls.
+
+    Mirrors the surface `UndetectedAdapter` touches: `add_init_script(script)`
+    for init-script injection. Hashable/usable as a dict key by identity (the
+    real Playwright/patchright `Page` is also keyed by identity in the adapter's
+    per-page flag dicts)."""
+
+    def __init__(self):
+        self.init_scripts = []
+
+    async def add_init_script(self, script):
+        self.init_scripts.append(script)
+
+
+@pytest.mark.asyncio
+async def test_undetected_adapter_injects_both_init_scripts_when_paired():
+    """Production call order is `setup_console_capture` then
+    `setup_error_capture` under the same `capture_console_messages` guard.
+    Both init scripts must be injected (one each), not just the console one.
+
+    Pre-fix: the shared `self._console_script_injected` flag was set by the
+    console call, so the error call short-circuited and injected zero error
+    listeners — only one init script was registered total.
+    """
+    adapter = UndetectedAdapter()
+    page = _RecordingPage()
+    captured_console = []
+
+    handle_console = await adapter.setup_console_capture(page, captured_console)
+    handle_error = await adapter.setup_error_capture(page, captured_console)
+
+    # Both setup methods return None (no Playwright event handler to track).
+    assert handle_console is None
+    assert handle_error is None
+    # Exactly two init scripts are injected — one per concern.
+    assert len(page.init_scripts) == 2
+
+    console_script = page.init_scripts[0]
+    error_script = page.init_scripts[1]
+    # The console script installs the console-method override and seeds
+    # `window.__capturedErrors = []`.
+    assert "console[method] = function" in console_script
+    assert "window.__capturedConsole" in console_script
+    assert "window.__capturedErrors = []" in console_script
+    # The error script registers the error/unhandledrejection listeners —
+    # this is the script that was silently skipped before the fix.
+    assert "addEventListener('error'" in error_script
+    assert "addEventListener('unhandledrejection'" in error_script
