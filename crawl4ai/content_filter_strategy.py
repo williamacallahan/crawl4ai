@@ -368,7 +368,6 @@ class BM25ContentFilter(RelevantContentFilter):
 
         if not query:
             return []
-            # return [self.clean_element(soup)]
 
         candidates = self.extract_text_chunks(body, min_word_threshold)
 
@@ -376,13 +375,6 @@ class BM25ContentFilter(RelevantContentFilter):
             return []
 
         # Tokenize corpus
-        # tokenized_corpus = [chunk.lower().split() for _, chunk, _, _ in candidates]
-        # tokenized_query = query.lower().split()
-
-        # tokenized_corpus = [[ps.stem(word) for word in chunk.lower().split()]
-        #                 for _, chunk, _, _ in candidates]
-        # tokenized_query = [ps.stem(word) for word in query.lower().split()]
-
         if self.use_stemming:
             tokenized_corpus = [
                 [self.stemmer.stemWord(word) for word in chunk.lower().split()]
@@ -396,10 +388,6 @@ class BM25ContentFilter(RelevantContentFilter):
                 chunk.lower().split() for _, chunk, _, _ in candidates
             ]
             tokenized_query = query.lower().split()
-
-        # tokenized_corpus = [[self.stemmer.stemWord(word) for word in tokenize_text(chunk.lower())]
-        #            for _, chunk, _, _ in candidates]
-        # tokenized_query = [self.stemmer.stemWord(word) for word in tokenize_text(query.lower())]
 
         # Clean from stop words and noise
         tokenized_corpus = [clean_tokens(tokens) for tokens in tokenized_corpus]
@@ -765,8 +753,6 @@ class LLMContentFilter(RelevantContentFilter):
         chunk_token_threshold: int = int(1e9),
         overlap_rate: float = OVERLAP_RATE,
         word_token_rate: float = WORD_TOKEN_RATE,
-        # char_token_rate: float = WORD_TOKEN_RATE * 5,
-        # chunk_mode: str = "char",
         verbose: bool = False,
         logger: Optional[AsyncLogger] = None,
         ignore_cache: bool = True,
@@ -786,9 +772,6 @@ class LLMContentFilter(RelevantContentFilter):
         self.chunk_token_threshold = chunk_token_threshold
         self.overlap_rate = overlap_rate
         self.word_token_rate = word_token_rate or WORD_TOKEN_RATE
-        # self.chunk_mode: str = chunk_mode
-        # self.char_token_rate = char_token_rate or word_token_rate / 5
-        # self.token_rate = word_token_rate if chunk_mode == "word" else self.char_token_rate
         self.token_rate = word_token_rate or WORD_TOKEN_RATE
         self.extra_args = extra_args or {}
         self.ignore_cache = ignore_cache
@@ -862,7 +845,6 @@ class LLMContentFilter(RelevantContentFilter):
         cache_key = self._get_cache_key(html, self.instruction or "")
         cache_file = cache_dir / f"{cache_key}.json"
 
-        # if ignore_cache == None:
         ignore_cache = self.ignore_cache
 
         if not ignore_cache and cache_file.exists():
