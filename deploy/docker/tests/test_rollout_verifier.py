@@ -15,9 +15,10 @@ import verify_rollout as rollout
 BASELINE = "registry.example/crawl4ai@sha256:baseline"
 CANDIDATE = "registry.example/crawl4ai@sha256:candidate"
 REVISION = "a" * 40
+ELIGIBLE_NODES = frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"})
 
 
-def application(image=BASELINE, revision="baseline"):
+def application(image=BASELINE, revision="baseline", placement=rollout.PLACEMENT):
     return {
         "applicationId": "app",
         "appName": "crawl4ai",
@@ -31,7 +32,7 @@ def application(image=BASELINE, revision="baseline"):
         ),
         "replicas": 3,
         "healthCheckSwarm": copy.deepcopy(rollout.HEALTHCHECK),
-        "placementSwarm": copy.deepcopy(rollout.PLACEMENT),
+        "placementSwarm": copy.deepcopy(placement),
         "endpointSpecSwarm": {"Mode": "vip", "Ports": []},
         "updateConfigSwarm": {
             "Parallelism": 1,
@@ -57,7 +58,7 @@ def application(image=BASELINE, revision="baseline"):
     }
 
 
-def service_spec(image=BASELINE, revision="baseline"):
+def service_spec(image=BASELINE, revision="baseline", placement=rollout.PLACEMENT):
     return {
         "TaskTemplate": {
             "ContainerSpec": {
@@ -71,7 +72,7 @@ def service_spec(image=BASELINE, revision="baseline"):
                 "Healthcheck": copy.deepcopy(rollout.HEALTHCHECK),
                 "StopGracePeriod": rollout.STOP_GRACE_NS,
             },
-            "Placement": copy.deepcopy(rollout.PLACEMENT),
+            "Placement": copy.deepcopy(placement),
             "Resources": copy.deepcopy(rollout.RESOURCES),
         },
         "Mode": {"Replicated": {"Replicas": 3}},
@@ -803,7 +804,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         )
 
     monkeypatch.setattr(rollout, "_request_json", direct_health)
-    proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, rollout.ELIGIBLE_NODES)
+    proof = rollout._verify_tasks("crawl4ai", CANDIDATE, REVISION, (ELIGIBLE_NODES, ELIGIBLE_NODES))
     assert proof["nodes"] == ["haiku-5", "haiku-6", "haiku-9"]
     assert len(proof["instances"]) == 3
     assert ingress_calls == [None]
@@ -840,7 +841,7 @@ def test_verify_tasks_rejects_vip_membership_drift(monkeypatch, drift):
             "crawl4ai",
             BASELINE,
             "baseline",
-            frozenset({"haiku-5", "haiku-9", "haiku-18"}),
+            (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})),
             False,
         )
 
@@ -862,7 +863,7 @@ def test_verify_tasks_rejects_record_label_drift_beside_control_plane_labels(
             "crawl4ai",
             BASELINE,
             "baseline",
-            frozenset({"haiku-5", "haiku-9", "haiku-18"}),
+            (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})),
             False,
         )
 
@@ -959,8 +960,9 @@ def test_public_proof_rejects_wrong_revision_or_unhealthy_response(monkeypatch, 
         rollout._verify_public(REVISION, ["one", "two", "three"])
 
 
-def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys):
-    state = application()
+@pytest.mark.parametrize("placement", rollout.PLACEMENTS)
+def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys, placement):
+    state = application(placement=placement)
     posts = []
     events = []
     deployments = [{"deploymentId": "old", "status": "done"}]
@@ -984,8 +986,8 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     )
     monkeypatch.setattr(rollout, "_post_json", post)
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
-    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(state["dockerImage"], state["labelsSwarm"]["otel.service.version"]))
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(state["dockerImage"], state["labelsSwarm"]["otel.service.version"], placement))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: events.append("verify_redis"))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
@@ -1020,13 +1022,14 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
         "application.deploy",
     ]
     assert "idempotencyKey" not in posts[1][1]
-    assert posts[0][1]["placementSwarm"] == rollout.PLACEMENT
+    assert posts[0][1]["placementSwarm"] == placement
     assert "expectedDockerImage" not in posts[0][1]
     proof = json.loads(rollout._task_proof_path().read_text())
     assert proof["instances"] == ["a", "b", "c"]
     assert set(proof["publicInstances"]) == set(rollout.HEALTH_URLS)
+    assert proof["placement"] == placement
 
-    state = application()
+    state = application(placement=placement)
     posts.clear()
     events.clear()
     deployments[:] = [{"deploymentId": "running", "status": "running"}]
@@ -1034,7 +1037,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
         rollout.deploy()
     assert not posts
 
-    state = application()
+    state = application(placement=placement)
     posts.clear()
     events.clear()
     deployments[:] = [{"deploymentId": "old", "status": "done"}]
@@ -1048,7 +1051,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys)
     with pytest.raises(RuntimeError, match="task census changed"):
         rollout.deploy()
 
-    state = application()
+    state = application(placement=placement)
     posts.clear()
     events.clear()
     monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: {})
@@ -1077,7 +1080,7 @@ def test_deploy_proves_an_already_deployed_candidate_without_resubmitting(
         rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
@@ -1121,7 +1124,7 @@ def test_deploy_proves_an_already_deployed_candidate_with_a_non_redis_spare_down
     # rerun path added in f43ef89, whose spare gate ran above the branch.
     candidate = "registry.example/crawl4ai@sha256:candidate"
     state = application(image=candidate, revision=REVISION)
-    ready = frozenset(rollout.ELIGIBLE_NODES - {down_node})
+    ready = frozenset(ELIGIBLE_NODES - {down_node})
     _deploy_env(monkeypatch)
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
     monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
@@ -1133,7 +1136,7 @@ def test_deploy_proves_an_already_deployed_candidate_with_a_non_redis_spare_down
         rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: ready)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
@@ -1184,7 +1187,7 @@ def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(monkeypatch, tmp_
         rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: ready)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
@@ -1239,7 +1242,7 @@ def _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtim
         rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: ready)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
@@ -1351,7 +1354,7 @@ def test_deploy_noop_rerun_passes_lenient_converged_to_the_candidate_proof(
         calls.append((image, converged))
         return {
             "tasks": ["1", "2", "3"],
-            "nodes": sorted(rollout.ELIGIBLE_NODES),
+            "nodes": sorted(ELIGIBLE_NODES),
             "instances": ["a", "b", "c"],
         }
 
@@ -1368,7 +1371,7 @@ def test_deploy_noop_rerun_passes_lenient_converged_to_the_candidate_proof(
         rollout, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
@@ -1418,7 +1421,7 @@ def test_deploy_real_rollout_passes_strict_converged_to_the_candidate_proof(
 
     monkeypatch.setattr(rollout, "_post_json", post)
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
     monkeypatch.setattr(
         rollout, "_service_spec",
         lambda _name: service_spec(state["dockerImage"], state["labelsSwarm"]["otel.service.version"]),
@@ -1459,7 +1462,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
     monkeypatch.setattr(rollout, "_deployments", lambda *_args: [])
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
     monkeypatch.setattr(rollout, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
     monkeypatch.setattr(rollout, "_ensure_rollback_source", lambda _image: None)
@@ -1488,7 +1491,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
 
 
 def _wire_final_evidence(monkeypatch, tasks):
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: rollout.ELIGIBLE_NODES)
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(CANDIDATE, REVISION))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
@@ -1514,6 +1517,7 @@ def test_evidence_requires_candidate_on_both_domains(monkeypatch, tmp_path, caps
         "revision": REVISION,
         "image": CANDIDATE,
         "baselineRevision": "baseline",
+        "placement": copy.deepcopy(rollout.PLACEMENT),
         "tasks": ["task1", "task2", "task3"],
         "nodes": ["haiku-5", "haiku-6", "haiku-9"],
         "instances": ["one", "two", "three"],
@@ -1580,6 +1584,7 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
         "revision": REVISION,
         "image": CANDIDATE,
         "baselineRevision": "baseline",
+        "placement": copy.deepcopy(rollout.PLACEMENT),
         "tasks": ["task1", "task2", "task3"],
         "nodes": ["haiku-5", "haiku-6", "haiku-9"],
         "instances": ["one", "two", "three"],
@@ -1608,7 +1613,8 @@ def test_evidence_rejects_public_instance_set_mismatch(monkeypatch, tmp_path, fa
         rollout.evidence()
 
 
-def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
+@pytest.mark.parametrize("drift", ["task", "placement"])
+def test_evidence_rejects_changes_after_deploy(monkeypatch, tmp_path, drift):
     path = tmp_path / "evidence.jsonl"
     path.write_text(
         "\n".join(
@@ -1628,6 +1634,7 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
         "revision": REVISION,
         "image": CANDIDATE,
         "baselineRevision": "baseline",
+        "placement": copy.deepcopy(rollout.PLACEMENT),
         "tasks": ["task1", "task2", "task3"],
         "nodes": ["haiku-5", "haiku-6", "haiku-9"],
         "instances": ["one", "two", "three"],
@@ -1636,7 +1643,10 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
         },
     }))
     monkeypatch.setattr(
-        rollout, "_application", lambda *_args: application(CANDIDATE, REVISION)
+        rollout, "_application", lambda *_args: application(
+            CANDIDATE, REVISION,
+            rollout._SPREAD_PLACEMENT if drift == "placement" else rollout.PLACEMENT,
+        )
     )
     _wire_final_evidence(
         monkeypatch,
@@ -1646,7 +1656,8 @@ def test_evidence_rejects_a_task_replaced_after_deploy(monkeypatch, tmp_path):
             "instances": ["one", "two", "four"],
         },
     )
-    with pytest.raises(RuntimeError, match="task census changed before final evidence"):
+    message = "candidate metadata changed" if drift == "placement" else "task census changed"
+    with pytest.raises(RuntimeError, match=message):
         rollout.evidence()
 
 
@@ -1672,6 +1683,7 @@ def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, 
         "revision": revision,
         "image": candidate,
         "baselineRevision": baseline_revision,
+        "placement": copy.deepcopy(rollout.PLACEMENT),
         "tasks": ["task1", "task2", "task3"],
         "nodes": sorted(
             {row["Node"] for row in rows if str(row.get("DesiredState", "")).lower() == "running"}
@@ -1682,7 +1694,7 @@ def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, 
         },
     }))
     monkeypatch.setattr(rollout, "_application", lambda *_args: application(candidate, revision))
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"}))
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(candidate, revision))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
@@ -1971,8 +1983,7 @@ def _node_commands(nodes):
 
 
 def test_eligible_nodes_excludes_a_down_member_without_failing(monkeypatch):
-    # A down node is a capacity event: it leaves the result, not raises. It keeps
-    # its label, so the inventory check still sees the full ELIGIBLE_NODES set.
+    # Down nodes retain membership but cannot supply rollout capacity.
     monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
         ("haiku-0", False, "ready", "active"),
         ("haiku-18", True, "down", "drain"),
@@ -1980,45 +1991,57 @@ def test_eligible_nodes_excludes_a_down_member_without_failing(monkeypatch):
         ("haiku-6", True, "ready", "active"),
         ("haiku-9", True, "ready", "active"),
     ]))
-    assert rollout._eligible_nodes() == frozenset(
-        {"haiku-5", "haiku-6", "haiku-9"}
+    assert rollout._eligible_nodes() == (
+        ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-6", "haiku-9"})
     )
 
 
-def test_eligible_nodes_flags_membership_drift_even_when_ready(monkeypatch):
+def test_eligible_nodes_tracks_live_label_membership(monkeypatch):
     monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
         ("haiku-4", True, "ready", "active"),
         ("haiku-5", True, "ready", "active"),
         ("haiku-9", True, "ready", "active"),
     ]))
-    with pytest.raises(RuntimeError, match="inventory drifted"):
-        rollout._eligible_nodes()
+    labeled = frozenset({"haiku-4", "haiku-5", "haiku-9"})
+    assert rollout._eligible_nodes() == (labeled, labeled)
 
 
-def test_policy_accepts_legacy_capped_placement_during_transition():
+
+def test_task_proof_rejects_a_node_without_the_live_eligibility_label(monkeypatch):
+    rows, runtimes = _healed_baseline_rows()
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    labeled = ELIGIBLE_NODES - {"haiku-18"}
+    with pytest.raises(RuntimeError, match="not on eligible nodes"):
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (labeled, labeled), False)
+
+
+def test_policy_accepts_capped_placement():
     app = application()
-    app["placementSwarm"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    app["placementSwarm"] = copy.deepcopy(rollout._CAPPED_PLACEMENT)
     rollout._policy(app)
 
 
-def test_policy_rejects_foreign_placement():
-    app = application()
-    app["placementSwarm"] = {"Constraints": [rollout.NODE_CONSTRAINT], "MaxReplicas": 2}
+@pytest.mark.parametrize("placement", [
+    {**rollout.PLACEMENT, "MaxReplicas": 2},
+    {"Constraints": ["node.role==manager"]},
+    {**rollout.PLACEMENT, "Preferences": [{"Spread": {"SpreadDescriptor": "node.role"}}]},
+])
+def test_policy_rejects_foreign_placement(placement):
+    app = application(placement=placement)
     with pytest.raises(ValueError, match="placement drifted"):
         rollout._policy(app)
 
 
-def test_running_spec_accepts_legacy_capped_placement():
+def test_running_spec_accepts_capped_placement():
     spec = service_spec()
-    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._CAPPED_PLACEMENT)
     rollout._running_spec(spec, BASELINE, rollout._labels("baseline"))
 
 
-def test_running_spec_strict_mode_rejects_legacy_placement():
-    # The post-deploy readback must prove the cap is actually gone from the
-    # rendered service — legacy tolerance is for the pre-write baseline only.
+def test_running_spec_requires_the_exact_record_placement():
+    # An accepted placement still must match the provider record.
     spec = service_spec()
-    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._CAPPED_PLACEMENT)
     with pytest.raises(ValueError, match="placement drifted"):
         rollout._running_spec(
             spec, BASELINE, rollout._labels("baseline"), placements=(rollout.PLACEMENT,)
@@ -2107,12 +2130,12 @@ def test_baseline_tolerates_a_ghost_predecessor_on_a_down_node(monkeypatch):
     rows, runtimes = _healed_baseline_rows()
     ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
     _wire_verify_tasks(monkeypatch, rows, runtimes)
-    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
     assert sorted(proof["nodes"]) == ["haiku-18", "haiku-5", "haiku-9"]
     # The same state must still fail a converged proof: the ghost's shutdown
     # was never confirmed, so this deploy's own withdrawals stay strict.
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
-        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready)
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready))
 
 
 def test_baseline_tolerates_healed_colocation_but_converged_does_not(monkeypatch):
@@ -2122,10 +2145,10 @@ def test_baseline_tolerates_healed_colocation_but_converged_does_not(monkeypatch
             row["Node"] = "haiku-5"  # healed replica doubled up
     ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
     _wire_verify_tasks(monkeypatch, rows, runtimes)
-    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
     assert sorted(proof["nodes"]) == ["haiku-5", "haiku-9"]
     with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
-        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready)
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready))
 
 
 def test_verify_tasks_does_not_retry_an_ingress_exec_failure(monkeypatch):
@@ -2148,7 +2171,7 @@ def test_verify_tasks_does_not_retry_an_ingress_exec_failure(monkeypatch):
             "crawl4ai",
             BASELINE,
             "baseline",
-            frozenset({"haiku-5", "haiku-9", "haiku-18"}),
+            (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})),
             False,
         )
 
@@ -2184,7 +2207,7 @@ def test_deploy_requires_a_spare_node_for_start_first(monkeypatch):
     monkeypatch.setattr(
         rollout,
         "_eligible_nodes",
-        lambda: frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"}),
+        lambda: (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"})),
     )
     monkeypatch.setattr(
         rollout,
@@ -2199,7 +2222,7 @@ def test_deploy_requires_a_spare_node_for_start_first(monkeypatch):
     # rather than the placement they caused.
     monkeypatch.setattr(rollout, "_verify_tasks", lambda *_args: pytest.fail("census must not run"))
     monkeypatch.setattr(
-        rollout, "_eligible_nodes", lambda: frozenset({"haiku-5", "haiku-9", "haiku-18"})
+        rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"}))
     )
     with pytest.raises(RuntimeError, match="start-first needs a spare eligible node") as excess:
         rollout.deploy()
@@ -2207,7 +2230,7 @@ def test_deploy_requires_a_spare_node_for_start_first(monkeypatch):
     assert "not Ready: haiku-6" in str(excess.value)
 
     # Below REPLICAS fails the same way; the count is not a second gate.
-    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: frozenset({"haiku-9", "haiku-18"}))
+    monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, frozenset({"haiku-9", "haiku-18"})))
     with pytest.raises(RuntimeError, match="start-first needs a spare eligible node"):
         rollout.deploy()
 
@@ -2237,7 +2260,7 @@ def test_deploy_rejects_a_reintroduced_cap_once_the_record_converged(monkeypatch
     # drift, not transition residue.
     _deploy_env(monkeypatch)
     spec = service_spec()
-    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._CAPPED_PLACEMENT)
     monkeypatch.setattr(rollout, "_application", lambda *_args: application())
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: spec)
@@ -2246,12 +2269,12 @@ def test_deploy_rejects_a_reintroduced_cap_once_the_record_converged(monkeypatch
         rollout.deploy()
 
 
-def test_deploy_tolerates_legacy_live_spec_only_while_record_is_legacy(monkeypatch):
+def test_deploy_accepts_capped_live_spec_when_record_matches(monkeypatch):
     _deploy_env(monkeypatch)
     state = application()
-    state["placementSwarm"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    state["placementSwarm"] = copy.deepcopy(rollout._CAPPED_PLACEMENT)
     spec = service_spec()
-    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._LEGACY_PLACEMENT)
+    spec["TaskTemplate"]["Placement"] = copy.deepcopy(rollout._CAPPED_PLACEMENT)
     monkeypatch.setattr(rollout, "_application", lambda *_args: copy.deepcopy(state))
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "completed")
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: spec)
@@ -2271,11 +2294,11 @@ def test_baseline_looks_past_a_rejection_on_an_eligible_node(monkeypatch):
                     "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"})
     ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
     _wire_verify_tasks(monkeypatch, rows, runtimes)
-    rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+    rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
 
     # The deploy's own census never looks past its own withdrawals.
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
-        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, True)
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), True)
 
 
 def test_baseline_accepts_a_slot_placed_only_by_scheduler_recovery(monkeypatch):
@@ -2286,11 +2309,11 @@ def test_baseline_accepts_a_slot_placed_only_by_scheduler_recovery(monkeypatch):
                "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"}
     ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
     _wire_verify_tasks(monkeypatch, rows, runtimes)
-    rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+    rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
 
     # The deploy's own census still demands the withdrawal it just performed.
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
-        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, True)
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), True)
 
 
 def test_baseline_keeps_unassigned_attempts_strict(monkeypatch):
@@ -2302,7 +2325,7 @@ def test_baseline_keeps_unassigned_attempts_strict(monkeypatch):
     ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
-        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", ready, False)
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
 OBSERVER_INCOMPLETE = observer.CoverageSnapshot(3, 2, 1)
 OBSERVER_COMPLETE = observer.CoverageSnapshot(3, 3, 3)
 OBSERVER_MISMATCH = observer.NetworkDbFdbComparison.DESTINATION_MISMATCH
@@ -2981,7 +3004,7 @@ def test_baseline_accepts_terminal_failed_predecessor_but_rollout_does_not(monke
         else ("shutdown", "failed") if task.startswith("ghost")
         else ("shutdown", "shutdown")
     ))
-    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", rollout.ELIGIBLE_NODES, False)
+    proof = rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES), False)
     assert len(proof["instances"]) == rollout.REPLICAS
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
-        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", rollout.ELIGIBLE_NODES)
+        rollout._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES))
