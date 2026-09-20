@@ -10,7 +10,7 @@ Tests are organized into:
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-from crawl4ai.antibot_detector import is_blocked
+from crawl4ai.antibot_detector import is_blocked, _looks_like_data
 
 PASS = 0
 FAIL = 0
@@ -532,6 +532,73 @@ check("403 namespaced RDF is not blocked (data exemption)",
     is_blocked(403, '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>'),
     False)
 
+
+# =========================================================================
+# BOM (U+FEFF) REGRESSIONS — BOM-prefixed JSON/XML data must stay exempted
+# =========================================================================
+# ``str.strip()`` does NOT remove U+FEFF (``'\ufeff'.isspace()`` is ``False``),
+# so a leading BOM survived the old ``stripped = html.strip()`` in
+# ``_looks_like_data``. Every prefix/first-char check then missed, valid
+# JSON/RSS was misclassified as non-data, and ``is_blocked`` flagged it via
+# the near-empty branch (short bodies) or the structural-integrity branch
+# (bodies in the ~100-byte..50-KB window). The BOM-free twin was always
+# exempted — see the differential cases below.
+_BOM = "\ufeff"
+
+# Short BOM data (exercises the near-empty data-exemption guard at the
+# 200 + near-empty path, which calls ``_looks_like_data``).
+check("200 BOM-prefixed JSON is not blocked (data exemption)",
+    is_blocked(200, _BOM + '{"items": [1, 2, 3]}'),
+    False)
+check("200 BOM-prefixed RSS (with xml decl) is not blocked (data exemption)",
+    is_blocked(200, _BOM + '<?xml version="1.0"?><rss version="2.0"><channel><item/></channel></rss>'),
+    False)
+check("200 BOM + leading whitespace RSS is not blocked (data exemption)",
+    is_blocked(200, _BOM + '\n<rss version="2.0"><channel/></rss>'),
+    False)
+check("200 whitespace + BOM JSON is not blocked (data exemption)",
+    is_blocked(200, '\n' + _BOM + '{"k": 1}'),
+    False)
+
+# ~7 KB BOM data (exercises the Tier 3 structural-integrity gate, which
+# calls ``_looks_like_data`` to exempt feeds — this is the user-visible
+# mechanism described in the report: BOM JSON/RSS served as text/html).
+_BOM_BIG_JSON = _BOM + '{"items":[' + ('{"id":1,"name":"item","category":"test","price":9.99},' * 130) + '{"id":131}]}'
+_BOM_BIG_RSS = _BOM + '<?xml version="1.0"?><rss version="2.0"><channel><title>F</title>' + ('<item><title>P</title><link>http://e/</link><description>desc</description></item>' * 90) + '</channel></rss>'
+assert len(_BOM_BIG_JSON) > 100 and len(_BOM_BIG_RSS) > 100
+check("~7KB BOM JSON (text/html path) is not blocked (structural gate exempted)",
+    is_blocked(200, _BOM_BIG_JSON),
+    False)
+check("~7.5KB BOM RSS (text/html path) is not blocked (structural gate exempted)",
+    is_blocked(200, _BOM_BIG_RSS),
+    False)
+# Differential: the byte-identical BOM-free twins must also pass (they
+# already did before the fix; this assertion pins that the fix did not
+# regress the no-BOM path).
+check("~7KB no-BOM JSON twin is not blocked",
+    is_blocked(200, _BOM_BIG_JSON[1:]),
+    False)
+check("~7.5KB no-BOM RSS twin is not blocked",
+    is_blocked(200, _BOM_BIG_RSS[1:]),
+    False)
+
+# 403/503 BOM data must also be exempted via the ``_looks_like_data`` guard.
+check("403 BOM JSON is not blocked (data exemption)",
+    is_blocked(403, _BOM + '{"error": "forbidden"}'),
+    False)
+check("503 BOM JSON big is not blocked (data exemption)",
+    is_blocked(503, _BOM_BIG_JSON),
+    False)
+
+# BOM-prefixed HTML must NOT be classified as data (it is still a normal
+# page) and must not be flagged as blocked. Body is > 100 chars to avoid
+# the near-empty check, which flags ALL sub-100-char pages (BOM or not).
+_BOM_HTML = _BOM + "<html><body>" + ("<p>content</p>" * 10) + "</body></html>"
+assert len(_BOM_HTML) >= 100, "body must exceed near-empty threshold"
+check("200 BOM-prefixed HTML is not data and is not blocked",
+    is_blocked(200, _BOM_HTML),
+    False)
+
 check("403 feedback-panel lookalike is blocked",
     is_blocked(403, '<feedback-panel>Temporarily unavailable</feedback-panel>'),
     True)
@@ -644,3 +711,38 @@ def test_legit_page_with_head_title_no_false_positive():
             + ('<p>More article content. </p>' * 50) + '</body></html>')
     assert _visible_text_len(html) > 50
     assert is_blocked(200, html) == (False, "")
+
+
+def test_bom_prefixed_data_is_not_blocked():
+    # str.strip() does not remove U+FEFF; without a fix _looks_like_data misses
+    # the BOM and is_blocked() flags valid JSON/RSS as a block page.
+    bom = "\ufeff"
+    cases = [
+        (bom + '{"items": [1, 2, 3]}', 200),
+        (bom + '<?xml version="1.0"?><rss version="2.0"><channel><item/></channel></rss>', 200),
+        (bom + '\n<rss version="2.0"><channel/></rss>', 200),
+        ('\n' + bom + '{"k": 1}', 200),
+    ]
+
+    for html, status in cases:
+        blocked, reason = is_blocked(status, html)
+        assert not blocked, f"unexpected block for BOM body: {reason!r}\n{html[:40]!r}"
+
+    # BOM-prefixed HTML must NOT be classified as data, and must not be flagged as blocked.
+    # Ensure body is > 100 chars to avoid the near-empty check.
+    bom_html = bom + "<html><body>" + ("<p>content</p>" * 10) + "</body></html>"
+    assert len(bom_html) >= 100
+    assert not is_blocked(200, bom_html)[0]
+
+
+def test_bom_does_not_reclassify_html_as_data():
+    # A BOM-prefixed <html> document must remain NOT classified as data — the
+    # fix strips the BOM for classification of data, not to turn HTML into data.
+    bom = "\ufeff"
+    bom_html = bom + "<html><body>" + ("<p>content</p>" * 10) + "</body></html>"
+    assert _looks_like_data(bom_html) is False
+    # And plain (no-BOM) classification is byte-identical to the old behaviour.
+    assert _looks_like_data(bom_html[1:]) is False
+    assert _looks_like_data(bom + '{"k":1}') is True
+    assert _looks_like_data(bom + '\n<rss version="2.0"><channel/></rss>') is True
+    assert _looks_like_data('\n' + bom + '{"k":1}') is True
