@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple, Any, Callable, Awaitable, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urldefrag
 
 from ..models import TraversalStats
 from .filters import FilterChain
@@ -167,9 +167,10 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             url = link.get("href")
             # Strip URL fragments to avoid duplicate crawling
             # base_url = url.split('#')[0] if url else url
-            base_url = normalize_url_for_deep_crawl(url, source_url)
-            if base_url in visited:
+            url_key = normalize_url_for_deep_crawl(url, source_url)
+            if not url_key or url_key in visited:
                 continue
+            base_url = urldefrag(urljoin(source_url, url.strip()))[0]
             if not await self.can_process_url(base_url, next_depth):
                 self.stats.urls_skipped += 1
                 continue
@@ -183,7 +184,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 self.stats.urls_skipped += 1
                 continue
 
-            visited.add(base_url)
+            visited.add(url_key)
             valid_links.append((base_url, score))
         
         # If we have more valid links than capacity, sort by score and take the top ones
@@ -217,7 +218,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
         # Conditional state initialization for resume support
         if self._resume_state:
-            visited = set(self._resume_state.get("visited", []))
+            visited = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("visited", [])}
             current_level = [
                 (item["url"], item["parent_url"])
                 for item in self._resume_state.get("pending", [])
@@ -246,7 +247,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
             next_level: List[Tuple[str, Optional[str]]] = []
             urls = [url for url, _ in current_level]
-            visited.update(urls)
+            visited.update(normalize_url_for_deep_crawl(u, u) for u in urls)
 
             # Clone the config to disable deep crawling recursion and enforce batch mode.
             batch_config = config.clone(deep_crawl_strategy=None, stream=False)
@@ -324,7 +325,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
         # Conditional state initialization for resume support
         if self._resume_state:
-            visited = set(self._resume_state.get("visited", []))
+            visited = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("visited", [])}
             current_level = [
                 (item["url"], item["parent_url"])
                 for item in self._resume_state.get("pending", [])
@@ -350,7 +351,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
             next_level: List[Tuple[str, Optional[str]]] = []
             urls = [url for url, _ in current_level]
-            visited.update(urls)
+            visited.update(normalize_url_for_deep_crawl(u, u) for u in urls)
 
             stream_config = config.clone(deep_crawl_strategy=None, stream=True)
             stream_gen = await crawler.arun_many(urls=urls, config=stream_config)
@@ -418,6 +419,11 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             }
             self._last_state = state
             await self._on_state_change(state)
+
+    async def shutdown(self) -> None:
+        """Signal cancellation and record the end of the crawl."""
+        self.cancel()
+        self.stats.end_time = datetime.now()
 
     def export_state(self) -> Optional[Dict[str, Any]]:
         """

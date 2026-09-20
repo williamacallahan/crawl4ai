@@ -107,6 +107,11 @@ class DeepCrawlStrategy(ABC):
         return self.arun(start_url, crawler, config)
 
     @abstractmethod
+    async def shutdown(self) -> None:
+        """Signal cancellation and record the end of the crawl."""
+        pass
+
+    @abstractmethod
     async def can_process_url(self, url: str, depth: int) -> bool:
         """
         Validate the URL format and apply custom filtering logic.

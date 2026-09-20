@@ -17,7 +17,7 @@ import httpx
 from socket import gaierror
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, Generator, Tuple, Iterable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urldefrag
 import requests
 from requests.exceptions import InvalidSchema
 import xxhash
@@ -2312,7 +2312,7 @@ def normalize_url(
 
 
 def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_scheme=None):
-    """Normalize URLs to ensure consistent format"""
+    """Build a crawl deduplication key; preserve the discovered URL for fetching."""
     from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 
     # Handle None or empty values
@@ -2360,11 +2360,7 @@ def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_
                 del params[param]
                 
         # Rebuild query string, sorted for consistency
-        if params:
-            sorted_params = sorted(params.items(), key=lambda kv: kv[0])
-            query = urlencode(sorted_params, doseq=True)
-        else:
-            query = ''
+        query = urlencode(sorted(params.items()), doseq=True)
     
     # Build normalized URL
     normalized = urlunparse((
@@ -2465,10 +2461,11 @@ def quick_extract_links(html: str, base_url: str) -> Dict[str, List[Dict[str, st
             continue
 
         # Normalize URL
-        normalized = normalize_url_for_deep_crawl(href, base_url)
-        if not normalized or normalized in seen:
+        url_key = normalize_url_for_deep_crawl(href, base_url)
+        if not url_key or url_key in seen:
             continue
-        seen.add(normalized)
+        seen.add(url_key)
+        normalized = urldefrag(urljoin(base_url, href))[0]
 
         # Extract text (truncated for memory efficiency)
         text = (a.text_content() or "").strip()[:200]

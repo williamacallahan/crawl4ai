@@ -1,5 +1,6 @@
 # dfs_deep_crawl_strategy.py
 import asyncio
+from urllib.parse import urljoin, urldefrag
 from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple
 
 from ..models import CrawlResult
@@ -23,7 +24,7 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
 
     def _reset_seen(self, start_url: str) -> None:
         """Start each crawl with a clean dedupe set seeded with the root URL."""
-        self._dfs_seen = {start_url}
+        self._dfs_seen = {normalize_url_for_deep_crawl(start_url, start_url)}
 
     async def _arun_batch(
         self,
@@ -44,14 +45,14 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
 
         # Conditional state initialization for resume support
         if self._resume_state:
-            visited = set(self._resume_state.get("visited", []))
+            visited = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("visited", [])}
             stack = [
                 (item["url"], item["parent_url"], item["depth"])
                 for item in self._resume_state.get("stack", [])
             ]
             depths = dict(self._resume_state.get("depths", {}))
             self._pages_crawled = self._resume_state.get("pages_crawled", 0)
-            self._dfs_seen = set(self._resume_state.get("dfs_seen", []))
+            self._dfs_seen = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("dfs_seen", [])}
             results: List[CrawlResult] = []
         else:
             # Original initialization
@@ -74,9 +75,10 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                 break
 
             url, parent, depth = stack.pop()
-            if url in visited or depth > self.max_depth:
+            url_key = normalize_url_for_deep_crawl(url, url)
+            if url_key in visited or depth > self.max_depth:
                 continue
-            visited.add(url)
+            visited.add(url_key)
 
             # Clone config to disable recursive deep crawling.
             batch_config = config.clone(deep_crawl_strategy=None, stream=False)
@@ -164,14 +166,14 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
 
         # Conditional state initialization for resume support
         if self._resume_state:
-            visited = set(self._resume_state.get("visited", []))
+            visited = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("visited", [])}
             stack = [
                 (item["url"], item["parent_url"], item["depth"])
                 for item in self._resume_state.get("stack", [])
             ]
             depths = dict(self._resume_state.get("depths", {}))
             self._pages_crawled = self._resume_state.get("pages_crawled", 0)
-            self._dfs_seen = set(self._resume_state.get("dfs_seen", []))
+            self._dfs_seen = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("dfs_seen", [])}
         else:
             # Original initialization
             visited: Set[str] = set()
@@ -191,9 +193,10 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                 break
 
             url, parent, depth = stack.pop()
-            if url in visited or depth > self.max_depth:
+            url_key = normalize_url_for_deep_crawl(url, url)
+            if url_key in visited or depth > self.max_depth:
                 continue
-            visited.add(url)
+            visited.add(url_key)
 
             stream_config = config.clone(deep_crawl_strategy=None, stream=True)
             stream_gen = await crawler.arun_many(urls=[url], config=stream_config)
@@ -313,9 +316,10 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
             if not raw_url:
                 continue
 
-            normalized_url = normalize_url_for_deep_crawl(raw_url, source_url)
-            if not normalized_url or normalized_url in seen:
+            url_key = normalize_url_for_deep_crawl(raw_url, source_url)
+            if not url_key or url_key in seen:
                 continue
+            normalized_url = urldefrag(urljoin(source_url, raw_url.strip()))[0]
 
             if not await self.can_process_url(normalized_url, next_depth):
                 self.stats.urls_skipped += 1
@@ -329,7 +333,7 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                 self.stats.urls_skipped += 1
                 continue
 
-            seen.add(normalized_url)
+            seen.add(url_key)
             valid_links.append((normalized_url, score))
 
         if len(valid_links) > remaining_capacity:

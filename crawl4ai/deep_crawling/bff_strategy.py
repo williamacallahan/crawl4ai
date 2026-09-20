@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple, Any, Callable, Awaitable, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urldefrag
 
 from ..models import TraversalStats
 from .filters import FilterChain
@@ -173,20 +173,21 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
             links += result.links.get("external", [])
 
         # If we have more links than remaining capacity, limit how many we'll process
-        valid_links = []
+        valid_links = {}
         for link in links:
             url = link.get("href")
-            base_url = normalize_url_for_deep_crawl(url, source_url)
-            if base_url in visited:
+            url_key = normalize_url_for_deep_crawl(url, source_url)
+            if not url_key or url_key in visited:
                 continue
+            base_url = urldefrag(urljoin(source_url, url.strip()))[0]
             if not await self.can_process_url(base_url, new_depth):
                 self.stats.urls_skipped += 1
                 continue
                 
-            valid_links.append(base_url)
+            valid_links.setdefault(url_key, base_url)
             
         # Record the new depths and add to next_links
-        for url in valid_links:
+        for url in valid_links.values():
             depths[url] = new_depth
             next_links.append((url, source_url))
 
@@ -209,7 +210,7 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
 
         # Conditional state initialization for resume support
         if self._resume_state:
-            visited = set(self._resume_state.get("visited", []))
+            visited = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("visited", [])}
             depths = dict(self._resume_state.get("depths", {}))
             self._pages_crawled = self._resume_state.get("pages_crawled", 0)
             # Restore queue from saved items
@@ -264,9 +265,10 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
                     except ValueError:
                         pass  # Item may have been removed already
                 score, depth, url, parent_url = item
-                if url in visited:
+                url_key = normalize_url_for_deep_crawl(url, url)
+                if url_key in visited:
                     continue
-                visited.add(url)
+                visited.add(url_key)
                 batch.append(item)
 
             if not batch:
@@ -408,6 +410,11 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
             return self._arun_stream(start_url, crawler, config)
         else:
             return await self._arun_batch(start_url, crawler, config)
+
+    async def shutdown(self) -> None:
+        """Signal cancellation and record the end of the crawl."""
+        self.cancel()
+        self.stats.end_time = datetime.now()
 
     def export_state(self) -> Optional[Dict[str, Any]]:
         """
