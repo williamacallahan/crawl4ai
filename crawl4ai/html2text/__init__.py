@@ -147,7 +147,6 @@ class HTML2Text(html.parser.HTMLParser):
             setattr(self, key, value)
 
     def feed(self, data: str) -> None:
-        data = data.replace("</' + 'script>", "</ignore>")
         super().feed(data)
 
     def handle(self, data: str) -> str:
@@ -403,7 +402,7 @@ class HTML2Text(html.parser.HTMLParser):
         if tag in ["head", "style", "script"]:
             if start:
                 self.quiet += 1
-            else:
+            elif self.quiet > 0:
                 self.quiet -= 1
 
         if tag == "style":
