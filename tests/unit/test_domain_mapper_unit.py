@@ -227,6 +227,58 @@ class TestNormalizationDedup:
         assert "sitemap" in sources
         assert "homepage" in sources
 
+    def test_path_case_distinct_urls_preserved(self):
+        """URLs differing only in path case must NOT be folded together."""
+        mapper = DomainMapper.__new__(DomainMapper)
+        results = [
+            {"url": "https://example.com/About", "host": "example.com", "source": "homepage", "status": "valid", "head_data": {}},
+            {"url": "https://example.com/about", "host": "example.com", "source": "sitemap", "status": "valid", "head_data": {}},
+        ]
+        deduped = mapper._normalize_and_dedup(results, "example.com")
+        assert len(deduped) == 2
+        urls = {r["url"] for r in deduped}
+        assert "https://example.com/About" in urls
+        assert "https://example.com/about" in urls
+
+    def test_path_case_distinct_urls_preserved_no_source_merge(self):
+        """Case-distinct paths must keep independent source attribution (not merge)."""
+        mapper = DomainMapper.__new__(DomainMapper)
+        results = [
+            {"url": "https://example.com/About", "host": "example.com", "source": "homepage", "status": "valid", "head_data": {}},
+            {"url": "https://example.com/about", "host": "example.com", "source": "sitemap", "status": "valid", "head_data": {}},
+        ]
+        deduped = mapper._normalize_and_dedup(results, "example.com")
+        by_url = {r["url"]: r["source"] for r in deduped}
+        assert by_url["https://example.com/About"] == "homepage"
+        assert by_url["https://example.com/about"] == "sitemap"
+
+    def test_query_case_distinct_urls_preserved(self):
+        """URLs differing only in query value case must NOT be folded together."""
+        mapper = DomainMapper.__new__(DomainMapper)
+        results = [
+            {"url": "https://example.com/page?cHash=AbCd", "host": "example.com", "source": "feed", "status": "valid", "head_data": {}},
+            {"url": "https://example.com/page?cHash=abcd", "host": "example.com", "source": "sitemap", "status": "valid", "head_data": {}},
+        ]
+        deduped = mapper._normalize_and_dedup(results, "example.com")
+        assert len(deduped) == 2
+        urls = {r["url"] for r in deduped}
+        assert any("cHash=AbCd" in u for u in urls)
+        assert any("cHash=abcd" in u for u in urls)
+
+    def test_host_case_dedup_still_works(self):
+        """Host case is still folded (normalize_url lowercases netloc)."""
+        mapper = DomainMapper.__new__(DomainMapper)
+        results = [
+            {"url": "https://Example.COM/about", "host": "example.com", "source": "sitemap", "status": "valid", "head_data": {}},
+            {"url": "https://example.com/about", "host": "example.com", "source": "homepage", "status": "valid", "head_data": {}},
+        ]
+        deduped = mapper._normalize_and_dedup(results, "example.com")
+        assert len(deduped) == 1
+        sources = set(deduped[0]["source"].split("+"))
+        assert "sitemap" in sources
+        assert "homepage" in sources
+        assert deduped[0]["url"] == "https://example.com/about"
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  Nonsense Filter
