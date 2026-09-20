@@ -231,10 +231,22 @@ async def restart_browser(req: KillBrowserRequest):
         if req.sig == "permanent" or (DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig)):
             from server import get_default_browser_config
 
-            await init_permanent(get_default_browser_config(), force=True)
+            replaced = await init_permanent(get_default_browser_config(), force=True)
 
-            logger.info("🔄 Restarted permanent browser")
-            return {"success": True, "restarted": "permanent"}
+            if replaced:
+                logger.info("🔄 Restarted permanent browser")
+                return {"success": True, "restarted": "permanent"}
+            # A concurrent default-config request already rebuilt the permanent
+            # the restart meant to retire. The old permanent is gone (the
+            # restart's intent is satisfied); the fresh permanent - and any
+            # in-flight crawl admitted on it - was left untouched. Tell the admin
+            # the restart was superseded instead of claiming success.
+            logger.info("🔄 Permanent browser restart superseded by a concurrent rebuild")
+            return {
+                "success": True,
+                "restarted": False,
+                "reason": "superseded by a concurrent rebuild",
+            }
 
         # Handle hot/cold browser restart
         retired = await retire_pool_crawlers(req.sig)
