@@ -76,7 +76,6 @@ class SSLCertificate(dict):
         scheme) would silently connect to port 443 and return a certificate that
         was never used for the actual request. Returns ``None`` for such URLs.
         """
-        cert_info_raw = None # Variable to hold the fetched dict
         try:
             parsed = urlparse(url)
             if parsed.scheme.lower() != "https":
@@ -108,32 +107,7 @@ class SSLCertificate(dict):
                          print(f"Warning: No certificate returned for {hostname}")
                          return None
 
-                    x509 = OpenSSL.crypto.load_certificate(
-                        OpenSSL.crypto.FILETYPE_ASN1, cert_binary
-                    )
-
-                    # Create the dictionary directly
-                    cert_info_raw = {
-                        "subject": dict(x509.get_subject().get_components()),
-                        "issuer": dict(x509.get_issuer().get_components()),
-                        "version": x509.get_version(),
-                        "serial_number": hex(x509.get_serial_number()),
-                        "not_before": x509.get_notBefore(), # Keep as bytes initially, _decode handles it
-                        "not_after": x509.get_notAfter(),   # Keep as bytes initially
-                        "fingerprint": x509.digest("sha256").hex(), # hex() is already string
-                        "signature_algorithm": x509.get_signature_algorithm(), # Keep as bytes
-                        "raw_cert": base64.b64encode(cert_binary), # Base64 is bytes, _decode handles it
-                    }
-
-                    # Add extensions
-                    extensions = []
-                    for i in range(x509.get_extension_count()):
-                        ext = x509.get_extension(i)
-                        # get_short_name() returns bytes, str(ext) handles value conversion
-                        extensions.append(
-                            {"name": ext.get_short_name(), "value": str(ext)}
-                        )
-                    cert_info_raw["extensions"] = extensions
+                    return SSLCertificate.from_binary(cert_binary)
 
         except ssl.SSLCertVerificationError as e:
              print(f"SSL Verification Error for {url}: {e}")
@@ -150,12 +124,6 @@ class SSLCertificate(dict):
             print(f"Error fetching/processing certificate for {url}: {e}")
             # Log the full error details if needed: logging.exception("Cert fetch error")
             return None
-
-        # If successful, create the SSLCertificate instance from the dictionary
-        if cert_info_raw:
-             return SSLCertificate(cert_info_raw)
-        else:
-             return None
 
     @staticmethod
     def from_binary(binary_data: bytes) -> Optional["SSLCertificate"]:
@@ -220,7 +188,12 @@ class SSLCertificate(dict):
             extensions = []
             for i in range(x509.get_extension_count()):
                 ext = x509.get_extension(i)
-                extensions.append({"name": ext.get_short_name(), "value": str(ext)})
+                try:
+                    value = str(ext)
+                except OpenSSL.crypto.Error:
+                    # OpenSSL cannot render unknown extension OIDs as text.
+                    value = ext.get_data().hex()
+                extensions.append({"name": ext.get_short_name(), "value": value})
             cert_info_raw["extensions"] = extensions
 
             return SSLCertificate(cert_info_raw)

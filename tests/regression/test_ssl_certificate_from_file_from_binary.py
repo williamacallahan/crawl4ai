@@ -13,7 +13,7 @@ one-call entry point on the class for loading a certificate from an on-disk
 ``.der``/``.pem`` file or from raw bytes captured from another source.
 
 The fix adds both methods to ``SSLCertificate``. These tests are fully
-offline: certificates are generated in-memory with ``OpenSSL.crypto``, so no
+offline: a public certificate is embedded, so no
 network or filesystem fixtures beyond a temporary directory are required.
 """
 
@@ -27,39 +27,44 @@ from crawl4ai.ssl_certificate import SSLCertificate
 
 
 # ---------------------------------------------------------------------------
-# Fixtures: in-memory self-signed certificate (no network/filesystem needed)
+# Fixtures: public certificate (no network or signing key needed)
 # ---------------------------------------------------------------------------
 
 
-def _make_x509():
-    """Build a real self-signed X.509 certificate with one extension.
-
-    The extension lets us assert the extensions loop in ``from_binary``
-    actually runs and populates the ``extensions`` field, rather than
-    silently always being an empty list.
-    """
-    key = openssl_crypto.PKey()
-    key.generate_key(openssl_crypto.TYPE_RSA, 2048)
-
-    cert = openssl_crypto.X509()
-    cert.set_serial_number(0x1234)
-    cert.get_subject().CN = "example.com"
-    cert.get_subject().O = "ExampleOrg"
-    cert.get_issuer().CN = "Test CA"
-    cert.get_issuer().O = "ExampleOrg"
-    cert.set_notBefore(b"20240101000000Z")
-    cert.set_notAfter(b"20250101000000Z")
-    cert.set_pubkey(key)
-    cert.add_extensions(
-        [openssl_crypto.X509Extension(b"subjectAltName", False, b"DNS:example.com")]
-    )
-    cert.sign(key, "sha256")
-    return cert
+# Public Entrust root from Mozilla's CA bundle; no private key is needed.
+PUBLIC_CERTIFICATE = b"""-----BEGIN CERTIFICATE-----
+MIIEkTCCA3mgAwIBAgIERWtQVDANBgkqhkiG9w0BAQUFADCBsDELMAkGA1UEBhMC
+VVMxFjAUBgNVBAoTDUVudHJ1c3QsIEluYy4xOTA3BgNVBAsTMHd3dy5lbnRydXN0
+Lm5ldC9DUFMgaXMgaW5jb3Jwb3JhdGVkIGJ5IHJlZmVyZW5jZTEfMB0GA1UECxMW
+KGMpIDIwMDYgRW50cnVzdCwgSW5jLjEtMCsGA1UEAxMkRW50cnVzdCBSb290IENl
+cnRpZmljYXRpb24gQXV0aG9yaXR5MB4XDTA2MTEyNzIwMjM0MloXDTI2MTEyNzIw
+NTM0MlowgbAxCzAJBgNVBAYTAlVTMRYwFAYDVQQKEw1FbnRydXN0LCBJbmMuMTkw
+NwYDVQQLEzB3d3cuZW50cnVzdC5uZXQvQ1BTIGlzIGluY29ycG9yYXRlZCBieSBy
+ZWZlcmVuY2UxHzAdBgNVBAsTFihjKSAyMDA2IEVudHJ1c3QsIEluYy4xLTArBgNV
+BAMTJEVudHJ1c3QgUm9vdCBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBALaVtkNC+sZtKm9I35RMOVcF7sN5EUFo
+Nu3s/poBj6E4KPz3EEZmLk0eGrEaTsbRwJWIsMn/MYszA9u3g3s+IIRe7bJWKKf4
+4LlAcTfFy0cOlypowCKVYhXbR9n10Cv/gkvJrT7eTNuQgFA/CYqEAOwwCj0Yzfv9
+KlmaI5UXLEWeH25DeW0MXJj+SKfFI0dcXv1u5x609mhF0YaDW6KKjbHjKYD+JXGI
+rb68j6xSlkuqUY3kEzEZ6E5Nn9uss2rVvDlUccp6en+Q3X0dgNmBu1kmwhH+5pPi
+94DkZfs0Nw4pgHBNrziGLp5/V6+eF67rHMsoIV+2HNjnogQi+dPa2MsCAwEAAaOB
+sDCBrTAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zArBgNVHRAEJDAi
+gA8yMDA2MTEyNzIwMjM0MlqBDzIwMjYxMTI3MjA1MzQyWjAfBgNVHSMEGDAWgBRo
+kORnpKZTgMeGZqTx90tD+4S9bTAdBgNVHQ4EFgQUaJDkZ6SmU4DHhmak8fdLQ/uE
+vW0wHQYJKoZIhvZ9B0EABBAwDhsIVjcuMTo0LjADAgSQMA0GCSqGSIb3DQEBBQUA
+A4IBAQCT1DCw1wMgKtD5Y+iRDAUgqV8ZyntyTtSx29CW+1RaGSwMCPeyvIWonX9t
+O1KzKtvn1ISMY/YPyyYBkVBs9F8U4pN0wBOeMDpQ47RgxRzwIkSNcUesyBrJ6Zua
+AGAT/3B+XxFNSRuzFVJ7yVTav52Vr2ua2J7p8eRDjeIRRDq/r72DQnNSi6q7pynP
+9WQcCk3RvKqsnyrQ/39/2n3qse0wJcGE2jTSW3iDVuycNsMm4hH2Z0kdkquM++v/
+eu6FSqdQgPCnXEqULl8FmTxSQeDNtGPPAUO6nIPcj2A781q0tHuu2guQOHXvgR1m
+0vdXcDazv/wor3ElhVsT/h5/WrQ8
+-----END CERTIFICATE-----
+"""
 
 
 @pytest.fixture(scope="module")
 def x509_cert():
-    return _make_x509()
+    return openssl_crypto.load_certificate(openssl_crypto.FILETYPE_PEM, PUBLIC_CERTIFICATE)
 
 
 @pytest.fixture(scope="module")
@@ -117,22 +122,24 @@ def test_from_binary_returns_certificate(x509_cert, format_name, request):
     assert isinstance(cert, SSLCertificate)
     # Inherits from dict and is directly JSON-serializable.
     assert isinstance(cert, dict)
-    assert cert.subject == {"CN": "example.com", "O": "ExampleOrg"}
-    assert cert.issuer == {"CN": "Test CA", "O": "ExampleOrg"}
-    assert cert.valid_from == "20240101000000Z"
-    assert cert.valid_until == "20250101000000Z"
+    assert cert.subject == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
+    assert cert.issuer == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
+    assert cert.valid_from == "20061127202342Z"
+    assert cert.valid_until == "20261127205342Z"
     assert cert.fingerprint == x509_cert.digest("sha256").hex()
-    assert cert["serial_number"] == hex(0x1234)
+    assert cert["serial_number"] == hex(1164660820)
 
 
 def test_from_binary_populates_extensions(der_bytes):
     """The extensions loop must run and populate the extensions list -- a
-    real cert with one SAN extension yields exactly one extension entry."""
+    public root yields its six extension entries."""
     cert = SSLCertificate.from_binary(der_bytes)
     assert isinstance(cert["extensions"], list)
-    assert len(cert["extensions"]) == 1
+    assert len(cert["extensions"]) == 6
     ext = cert["extensions"][0]
     assert "name" in ext and "value" in ext
+    unknown = next(ext for ext in cert["extensions"] if ext["name"] == "UNDEF")
+    assert bytes.fromhex(unknown["value"])
 
 
 def test_from_binary_normalizes_raw_cert_to_der(der_bytes, pem_bytes, x509_cert):
@@ -180,8 +187,8 @@ def test_from_file_returns_certificate(fmt, request):
     cert = SSLCertificate.from_file(file_path)
 
     assert isinstance(cert, SSLCertificate)
-    assert cert.subject == {"CN": "example.com", "O": "ExampleOrg"}
-    assert cert.issuer == {"CN": "Test CA", "O": "ExampleOrg"}
+    assert cert.subject == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
+    assert cert.issuer == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
 
 
 def test_from_file_returns_none_for_missing_file(capsys):

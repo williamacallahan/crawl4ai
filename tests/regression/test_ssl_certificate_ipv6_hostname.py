@@ -97,6 +97,9 @@ def test_from_url_returns_certificate_for_ipv6_literal_on_success():
             with patch(
                 "crawl4ai.ssl_certificate.OpenSSL.crypto.load_certificate",
                 return_value=fake_x509,
+            ), patch(
+                "crawl4ai.ssl_certificate.OpenSSL.crypto.dump_certificate",
+                return_value=fake_cert_binary,
             ):
                 result = SSLCertificate.from_url("https://[2001:db8::1]/", timeout=1)
 
