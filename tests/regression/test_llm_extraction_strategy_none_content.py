@@ -10,8 +10,8 @@ to ``False``, so downstream consumers that key off ``block["error"]`` (notably
 ``deploy/docker/api.py``'s ``LlmExtractionRejected`` filter) could not see the
 no-content failure.
 
-The fix skips the clobber for strategy-sentinel error blocks (those carrying
-``"tags": ["error"]``), preserving the happy-path normalization for user data.
+The fix normalizes only parsed provider content, preserving the locally
+constructed no-content sentinel regardless of user-data tags.
 These tests pin that contract for both the sync and async paths and guard
 against the ``setdefault`` alternative, which would misclassify user-data
 blocks whose schema legitimately contains ``"error": true`` as data.
@@ -77,7 +77,7 @@ def test_extract_none_content_preserves_error_flag():
     assert len(blocks) == 1
     assert blocks[0]["error"] is True, (
         "BUG: error flag was clobbered to False; the normalization loop "
-        "must skip strategy-sentinel blocks (tags=['error'])."
+        "must preserve the locally constructed no-content sentinel."
     )
     assert "LLM returned no content" in blocks[0]["content"]
     assert "finish_reason: content_filter" in blocks[0]["content"]
@@ -106,7 +106,7 @@ def test_extract_user_data_error_field_is_clobbered_to_false():
     """A user-data block whose schema legitimately contains ``"error": true``
     as DATA must be clobbered to ``error=False``.
 
-    This pins the chosen ``tags``-based fix against the ``setdefault``
+    This pins success normalization against the ``setdefault``
     alternative described in the bug report: ``setdefault`` would preserve the
     user's ``error: true`` data field, and ``deploy/docker/api.py``'s
     ``extraction_errors`` filter (``block.get("error")``) would then
@@ -189,3 +189,18 @@ def test_mixed_no_content_and_data_blocks_keep_per_block_error_flag():
     errors = _api_extraction_errors(merged)
     assert len(errors) == 1
     assert "content_filter" in errors[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tags", [["error"], None, ["ordinary"]])
+async def test_successful_schema_tags_do_not_become_strategy_errors(tags):
+    record = {"tags": tags, "error": True, "status": 503}
+    response = _make_response(json.dumps([record]), finish_reason="stop")
+    strategy = _strategy(force_json_response=True)
+    with patch(SYNC_PATCH_TARGET, return_value=response):
+        sync_blocks = strategy.extract("https://example.com", 0, "content")
+    with patch(ASYNC_PATCH_TARGET, return_value=response):
+        async_blocks = await strategy.aextract("https://example.com", 0, "content")
+    expected = [{**record, "error": False}]
+    assert sync_blocks == expected
+    assert async_blocks == expected

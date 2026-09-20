@@ -744,8 +744,8 @@ class LLMExtractionStrategy(ExtractionStrategy):
                     blocks = extract_xml_data(["blocks"], content)["blocks"]
                     blocks = json.loads(blocks)
 
-                for block in blocks:
-                    if "error" not in block.get("tags", []):
+                if content:
+                    for block in blocks:
                         block["error"] = False
             except Exception:
                 raw_content = response.choices[0].message.content or ""
@@ -944,8 +944,8 @@ class LLMExtractionStrategy(ExtractionStrategy):
                     blocks = extract_xml_data(["blocks"], content)["blocks"]
                     blocks = json.loads(blocks)
 
-                for block in blocks:
-                    if "error" not in block.get("tags", []):
+                if content:
+                    for block in blocks:
                         block["error"] = False
             except Exception:
                 raw_content = response.choices[0].message.content or ""
