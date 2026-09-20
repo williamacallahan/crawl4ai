@@ -269,6 +269,77 @@ class TestNormalizeUrlForDeepCrawl:
         assert "Ref_Src" not in result
         assert "data=1" in result
 
+    def test_query_sorting(self):
+        """Query parameters should be sorted alphabetically.
+
+        Mirrors ``TestNormalizeUrl.test_query_sorting``. The line comment in
+        ``normalize_url_for_deep_crawl`` says the rebuilt query string is
+        "sorted for consistency" -- this enforces that contract so the deep-crawl
+        dedup key is order-independent (regression for the prefetch-mode
+        duplicate-fetch bug).
+        """
+        result = normalize_url_for_deep_crawl("/page?z=1&a=2&m=3", "http://x.com")
+        idx_a = result.index("a=2")
+        idx_m = result.index("m=3")
+        idx_z = result.index("z=1")
+        assert idx_a < idx_m < idx_z, (
+            f"Query params should be sorted alphabetically: {result}"
+        )
+
+    def test_query_param_order_dedup(self):
+        """URLs differing only in query-param order must normalize equally.
+
+        This is the core of the prefetch-mode duplicate-fetch bug: the deep-crawl
+        ``visited`` set uses this function's output as its dedup key, so two
+        orderings of the same params must collapse to one key.
+        """
+        base = "http://x.com"
+        a = normalize_url_for_deep_crawl("/p?z=1&a=2", base)
+        b = normalize_url_for_deep_crawl("/p?a=2&z=1", base)
+        assert a == b, (
+            f"Different query-param order should normalize to the same URL: "
+            f"{a} vs {b}"
+        )
+
+    def test_query_param_order_dedup_with_tracking(self):
+        """Order-independence must hold after tracking params are stripped.
+
+        Tracking-param removal plus sorting must still collapse two orderings
+        that differ in both tracking and non-tracking param positions.
+        """
+        base = "http://x.com"
+        a = normalize_url_for_deep_crawl(
+            "/p?utm_source=g&keep=yes&z=1&a=2", base
+        )
+        b = normalize_url_for_deep_crawl(
+            "/p?a=2&z=1&utm_source=g&keep=yes", base
+        )
+        assert a == b, f"{a} vs {b}"
+        assert "utm_source" not in a
+        assert "keep=yes" in a
+
+    def test_multi_value_query_key_sorted(self):
+        """Repeated query keys (parse_qs doseq) must be sorted by key position.
+
+        ``parse_qs`` aggregates repeated keys into a list; ``urlencode(doseq=True)``
+        re-expands them. Sorting happens at the key level, not within a key's
+        value list, which preserves value order for that key.
+        """
+        result = normalize_url_for_deep_crawl("/p?z=2&a=1&z=1&a=2", "http://x.com")
+        idx_a = result.index("a=1")
+        idx_z = result.index("z=2")
+        assert idx_a < idx_z, f"Keys should be sorted: {result}"
+        assert "a=1" in result and "a=2" in result
+        assert "z=2" in result and "z=1" in result
+
+    def test_all_tracking_stripped_yields_sortable_remainder(self):
+        """When only tracking params remain, query is dropped (no spurious '&=')."""
+        result = normalize_url_for_deep_crawl(
+            "/page?utm_source=g&utm_medium=cpc", "http://x.com"
+        )
+        assert "?" not in result, f"Empty query should be dropped: {result}"
+        assert result == "http://x.com/page"
+
     def test_hostname_lowercased(self):
         """Hostname should be lowercased."""
         result = normalize_url_for_deep_crawl("/page", "http://EXAMPLE.COM")

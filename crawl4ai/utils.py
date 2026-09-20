@@ -2360,7 +2360,11 @@ def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_
                 del params[param]
                 
         # Rebuild query string, sorted for consistency
-        query = urlencode(params, doseq=True) if params else ''
+        if params:
+            sorted_params = sorted(params.items(), key=lambda kv: kv[0])
+            query = urlencode(sorted_params, doseq=True)
+        else:
+            query = ''
     
     # Build normalized URL
     normalized = urlunparse((

@@ -445,6 +445,25 @@ DEEP_LEAF_TEMPLATE = """\
 </body>
 </html>"""
 
+# Hub page whose links point to the same target path with query parameters in
+# different orders. Used to verify prefetch + deep-crawl dedup: both links must
+# collapse to a single dedup key (and a single fetch) once
+# normalize_url_for_deep_crawl sorts query params.
+QUERY_DEDUP_HUB_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><title>Query Dedup Hub</title></head>
+<body>
+    <h1>Query-Order Dedup Hub</h1>
+    <p>Three links to the same target; two differ only in query-param order.</p>
+    <nav>
+        <a href="/target?page=1&color=red">Target A</a>
+        <a href="/target?color=red&page=1">Target B (reordered)</a>
+        <a href="/target?page=1&color=red">Target A (exact dup)</a>
+    </nav>
+</body>
+</html>"""
+
 IFRAME_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -538,6 +557,21 @@ async def _deep_leaf_handler(request):
     html = DEEP_LEAF_TEMPLATE.format(title=title)
     return await _serve_html(html)
 
+
+async def _query_dedup_hub_handler(request):
+    return await _serve_html(QUERY_DEDUP_HUB_HTML)
+
+
+async def _query_dedup_target_handler(request):
+    # Echo the received query string so tests can detect duplicate fetches.
+    qs = request.query_string
+    return await _serve_html(
+        f"<html><head><title>Target</title></head>"
+        f"<body><h1>Target Page</h1>"
+        f"<p>Received query: {qs}</p>"
+        f"</body></html>"
+    )
+
 async def _catch_all_handler(request):
     """Serve a simple page for any unmatched path (useful for link targets)."""
     path = request.path
@@ -579,6 +613,9 @@ def _create_app():
     app.router.add_get("/deep/hub", _deep_hub_handler)
     app.router.add_get("/deep/{sub_id}", _deep_sub_handler)
     app.router.add_get("/deep/{sub_id}/{leaf_id}", _deep_leaf_handler)
+    # Specific routes for query-order dedup e2e test (must precede catch-all).
+    app.router.add_get("/query-dedup/hub", _query_dedup_hub_handler)
+    app.router.add_get("/target", _query_dedup_target_handler)
     # Catch-all for auto-generated pages (internal link targets, etc.)
     app.router.add_get("/{path:.*}", _catch_all_handler)
     return app
