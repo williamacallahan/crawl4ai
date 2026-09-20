@@ -166,6 +166,7 @@ jobs:
               uv venv --system-site-packages /tmp/browser-test-env
               uv export --locked --only-group test --no-hashes > /tmp/browser-test-requirements.txt
               uv pip install --python /tmp/browser-test-env/bin/python -r /tmp/browser-test-requirements.txt
+              # Keep directory groups contiguous so pytest retains fixture scope.
               /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m "browser and not network" \
                 deploy/docker/tests/test_real_browser_recycle_window.py \
                 deploy/docker/tests/test_real_admin_recycle_eviction.py \
@@ -175,9 +176,9 @@ jobs:
                 tests/regression/test_robots_blocked_return_type.py \
                 tests/regression/test_c4a_wait_text_injection.py \
                 tests/regression/test_c4a_wait_text_integration.py \
-                tests/test_issue_2161_overlay_html_body.py \
                 tests/regression/test_reg_browser.py \
-                tests/regression/test_reg_deep_crawl.py
+                tests/regression/test_reg_deep_crawl.py \
+                tests/test_issue_2161_overlay_html_body.py
             '
           # Docker owns layer-transfer retries; surface its terminal failure.
           docker push "${IMAGE}:${GIT_SHA}-${ARCH}"
