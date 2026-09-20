@@ -1325,31 +1325,34 @@ class AdaptiveCrawler:
                     break
                 
                 # Crawl selected links
-                new_results = await self._crawl_batch(to_crawl, query)
+                crawled_pairs = await self._crawl_batch(to_crawl, query)
                 
-                if new_results:
+                if crawled_pairs:
                     # Update knowledge base
+                    new_results = [result for _, result in crawled_pairs]
                     self.state.knowledge_base.extend(new_results)
                     
-                    # Update crawled URLs and pending links
-                    for result, (link, _) in zip(new_results, to_crawl):
-                        if result:
-                            self.state.crawled_urls.add(link.href)
-                            # Extract links from result - handle both dict and Links object formats
-                            if hasattr(result, 'links') and result.links:
-                                new_links = []
-                                if isinstance(result.links, dict):
-                                    # Extract internal and external links from dict
-                                    internal_links = [Link(**link_data) for link_data in result.links.get('internal', [])]
-                                    new_links = internal_links
-                                else:
-                                    # Handle Links object
-                                    new_links = result.links.internal
-                                
-                                # Add new links to pending
-                                for new_link in new_links:
-                                    if new_link.href not in self.state.crawled_urls:
-                                        self.state.pending_links.append(new_link)
+                    # Update crawled URLs and pending links. Each pair's link
+                    # is the originating link (1:1 with its result), so we mark
+                    # exactly the successfully crawled URLs and never a failed
+                    # URL shifted in by a length-mismatched zip.
+                    for link, result in crawled_pairs:
+                        self.state.crawled_urls.add(link.href)
+                        # Extract links from result - handle both dict and Links object formats
+                        if hasattr(result, 'links') and result.links:
+                            new_links = []
+                            if isinstance(result.links, dict):
+                                # Extract internal and external links from dict
+                                internal_links = [Link(**link_data) for link_data in result.links.get('internal', [])]
+                                new_links = internal_links
+                            else:
+                                # Handle Links object
+                                new_links = result.links.internal
+                            
+                            # Add new links to pending
+                            for new_link in new_links:
+                                if new_link.href not in self.state.crawled_urls:
+                                    self.state.pending_links.append(new_link)
                     
                     # Update state with new results
                     await self.strategy.update_state(self.state, new_results)
@@ -1416,28 +1419,39 @@ class AdaptiveCrawler:
             print(f"Error crawling {url}: {e}")
             return None
     
-    async def _crawl_batch(self, links_with_scores: List[Tuple[Link, float]], query: str) -> List[CrawlResult]:
-        """Crawl multiple URLs in parallel"""
-        tasks = []
-        for link, score in links_with_scores:
-            task = self._crawl_with_preview(link.href, query)
-            tasks.append(task)
+    async def _crawl_batch(self, links_with_scores: List[Tuple[Link, float]], query: str) -> List[Tuple[Link, CrawlResult]]:
+        """Crawl multiple URLs in parallel.
         
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        Returns a list of ``(link, result)`` pairs, one per *successfully*
+        crawled URL. Each pair's ``link`` is the originating link, preserving
+        the 1:1 correspondence with ``result`` regardless of batch failures.
         
-        # Filter out exceptions and failed crawls
-        valid_results = []
-        for result in results:
-            if isinstance(result, CrawlResult):
-                # Only include successful crawls
-                if hasattr(result, 'success') and result.success:
-                    valid_results.append(result)
-                else:
-                    print(f"Skipping failed crawl: {result.url if hasattr(result, 'url') else 'unknown'}")
-            elif isinstance(result, Exception):
+        Failed crawls (exceptions, ``None`` returns, or ``success=False``
+        results) are skipped, but the pairing is performed against the
+        in-order raw ``asyncio.gather`` results (which preserve input order)
+        rather than a filtered subsequence. This guarantees a failed crawl
+        can never be misattributed to a different link's href.
+        """
+        tasks = [self._crawl_with_preview(link.href, query) for link, _ in links_with_scores]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Pair each raw result back to its originating link. asyncio.gather
+        # with return_exceptions=True preserves input order, so raw_results[i]
+        # corresponds to links_with_scores[i]. Filtering in-place keeps the
+        # link/result alignment intact even when some crawls fail, so a
+        # shorter result list can never be zipped against the full link list.
+        valid_pairs: List[Tuple[Link, CrawlResult]] = []
+        for (link, _), result in zip(links_with_scores, raw_results):
+            if isinstance(result, Exception):
                 print(f"Error in batch crawl: {result}")
-        
-        return valid_results
+                continue
+            if isinstance(result, CrawlResult) and getattr(result, 'success', False):
+                valid_pairs.append((link, result))
+            elif isinstance(result, CrawlResult):
+                print(f"Skipping failed crawl: {result.url if hasattr(result, 'url') else 'unknown'}")
+            # result is None when _crawl_with_preview swallowed an exception;
+            # nothing to record in that case -- the link stays re-eligible.
+        return valid_pairs
     
     # Status properties
     @property
