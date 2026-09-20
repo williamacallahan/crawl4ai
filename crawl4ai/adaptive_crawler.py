@@ -529,18 +529,7 @@ class StatisticalStrategy(CrawlStrategy):
             except AttributeError:
                 print(f"Warning: CrawlResult {result.url} has no markdown content")
                 content = ""
-            # content = ""
-            # if hasattr(result, 'extracted_content') and result.extracted_content:
-            #     content = result.extracted_content
-            # elif hasattr(result, 'markdown') and result.markdown:
-            #     content = result.markdown.raw_markdown
-            # elif hasattr(result, 'cleaned_html') and result.cleaned_html:
-            #     content = result.cleaned_html
-            # elif hasattr(result, 'html') and result.html:
-            #     # Use raw HTML as last resort
-            #     content = result.html
-                
-                
+
             terms = self._tokenize(content.lower())
             
             # Update term frequencies
@@ -1053,11 +1042,7 @@ class EmbeddingStrategy(CrawlStrategy):
         # Find minimum distance for each validation query (vectorized)
         min_distances = np.min(distance_matrix, axis=1)
         scores = 1.0 - min_distances  # Convert distances to scores (0-1 range)
-        
-        # Compute scores using same exponential as training
-        # k_exp = self.config.embedding_k_exp if hasattr(self, 'config') else 1.0
-        # scores = np.exp(-k_exp * min_distances)
-        
+
         validation_confidence = np.mean(scores)
         state.metrics['validation_confidence'] = validation_confidence
         
@@ -1101,9 +1086,7 @@ class EmbeddingStrategy(CrawlStrategy):
             
             # Only stop if validation is reasonable
             validation_min = self.config.embedding_validation_min_score if hasattr(self, 'config') else 0.4
-            # k_exp = self.config.embedding_k_exp if hasattr(self, 'config') else 1.0
-            # validation_min = np.exp(-k_exp * validation_min)
-                    
+
             if val_score > validation_min:
                 state.metrics['stopped_reason'] = 'converged_validated'
                 self._validation_passed = True
