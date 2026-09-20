@@ -340,9 +340,6 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
                 f"Limiting to {remaining_capacity} URLs due to max_pages limit"
             )
 
-        for url, score in valid_links:
-            if score:
-                result.metadata = result.metadata or {}
-                result.metadata["score"] = score
+        for url, _score in valid_links:
             next_level.append((url, source_url))
             depths[url] = next_depth
