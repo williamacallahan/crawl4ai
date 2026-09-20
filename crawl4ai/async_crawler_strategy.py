@@ -109,6 +109,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         """
         # Initialize browser config, either from provided object or kwargs
         self.browser_config = browser_config or BrowserConfig.from_kwargs(kwargs)
+        self.user_agent = self.browser_config.user_agent
         # Initialize with default logger if none provided to prevent NoneType errors
         self.logger = logger if logger is not None else AsyncLogger(verbose=False)
         
@@ -446,11 +447,12 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         session_id = kwargs.get("session_id") or str(uuid.uuid4())
 
         user_agent = kwargs.get("user_agent", self.user_agent)
+        forwarded = {k: v for k, v in kwargs.items() if k not in ("session_id", "user_agent")}
         # Use browser_manager to get a fresh page & context assigned to this session_id
         page, context = await self.browser_manager.get_page(CrawlerRunConfig(
             session_id=session_id,
             user_agent=user_agent,
-            **kwargs,
+            **forwarded,
         ))
         return session_id
 
