@@ -355,7 +355,7 @@ class AsyncWebCrawler:
                     ):
                         cached_result = None
 
-                    if cached_result is None:
+                    if cached_result is None or not html:
                         extracted_content = None
 
                     self.logger.url_status(
