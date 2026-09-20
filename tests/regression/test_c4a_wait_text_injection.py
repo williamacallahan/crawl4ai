@@ -146,6 +146,7 @@ def browser_page():
             browser.close()
 
 
+@pytest.mark.browser
 class TestWaitTextSecurity:
     """The core security and hang regressions, verified in a real browser."""
 

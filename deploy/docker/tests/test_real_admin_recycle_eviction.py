@@ -158,11 +158,11 @@ async def test_real_recycle_admin_force_restart_skips_mid_recycle_no_orphan():
         assert recycle_observed, "never observed the real mid-recycle window"
 
         # The guard under test: admin force-restart of a mid-recycle PERMANENT
-        # must skip the detach and return None (the fix).
+        # must skip the detach without scheduling a close.
         assert crawler_pool._is_recycling(crawler) is True
-        close_task = await crawler_pool._init_permanent_locked(
+        close_task, _done = await crawler_pool._init_permanent_locked(
             BrowserConfig(headless=True, extra_args=["--no-sandbox"]),
-            force=True,
+            force=True, target=crawler,
         )
         assert close_task is None, "guard did not skip mid-recycle PERMANENT"
         assert crawler_pool.PERMANENT is crawler, "PERMANENT was detached despite the guard"
@@ -375,7 +375,7 @@ async def test_real_managed_browser_recycle_admin_force_restart_no_orphan():
 
         # The guard under test: skip the detach on a mid-recycle managed PERMANENT.
         assert crawler_pool._is_recycling(crawler) is True
-        close_task = await crawler_pool._init_permanent_locked(config, force=True)
+        close_task, _done = await crawler_pool._init_permanent_locked(config, force=True, target=crawler)
         assert close_task is None, "guard did not skip mid-recycle managed PERMANENT"
         assert crawler_pool.PERMANENT is crawler
         assert manager._closing is False

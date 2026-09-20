@@ -152,17 +152,26 @@ class TestPruningContentFilter:
         assert "long high-quality paragraph" in combined_content
         assert "short comment" not in combined_content
 
-    def test_threshold_types(self, basic_html):
-        """Test fixed vs dynamic thresholds"""
-        fixed_filter = PruningContentFilter(threshold_type="fixed", threshold=0.48)
-        dynamic_filter = PruningContentFilter(threshold_type="dynamic", threshold=0.45)
+    def test_dynamic_threshold_preserves_short_paragraph(self):
+        """Dynamic mode relaxes the cutoff for prose tags and text density."""
+        html = """<body><article>
+            <p>Substantive article prose with enough detail to remain useful
+            under a strict cutoff in either pruning mode.</p>
+            <p><span>Brief summary.</span></p>
+            <div class="sidebar"><a href="/share">Share</a></div>
+        </article></body>"""
+        fixed = " ".join(PruningContentFilter(
+            threshold_type="fixed", threshold=0.9
+        ).filter_content(html))
+        dynamic = " ".join(PruningContentFilter(
+            threshold_type="dynamic", threshold=0.9
+        ).filter_content(html))
 
-        fixed_contents = fixed_filter.filter_content(basic_html)
-        dynamic_contents = dynamic_filter.filter_content(basic_html)
-
-        assert len(fixed_contents) != len(
-            dynamic_contents
-        ), "Fixed and dynamic thresholds should yield different results"
+        assert "Brief summary." not in fixed
+        assert "Brief summary." in dynamic
+        for content in (fixed, dynamic):
+            assert "Substantive article prose" in content
+            assert "Share" not in content
 
     def test_link_density_impact(self, link_heavy_html):
         """Test handling of link-heavy content"""

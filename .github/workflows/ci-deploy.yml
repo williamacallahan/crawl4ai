@@ -42,7 +42,7 @@ jobs:
           version: "0.9.18"
 
       - name: Build test env
-        run: uv sync --locked --no-dev --group server --group test
+        run: uv sync --locked --no-dev --group server --group test --extra pdf
 
       - name: Unit gate
         run: |
@@ -67,6 +67,19 @@ jobs:
             tests/unit/test_domain_mapper_concurrency.py \
             tests/proxy/test_antibot_detector.py \
             tests/test_pruning_per_call_min_word_threshold.py \
+            tests/async/test_content_filter_prune.py \
+            tests/deep_crawling/test_bfs_score_metadata_repro.py \
+            tests/deep_crawling/test_dfs_metadata_score.py \
+            tests/unit/test_domain_mapper_unit.py \
+            tests/unit/test_pdf_download_limits.py \
+            tests/unit/test_pdf_html_escaping.py \
+            tests/test_config_defaults.py \
+            tests/test_body_visibility_warning.py \
+            tests/test_placeholder_html_antibot.py \
+            tests/test_pdf_process_batch_concurrency.py \
+            tests/test_issue_1833_selector_sanitization.py \
+            tests/test_issue_2127_docker_pdf.py \
+            tests/test_docker_pdf_crawler_pairing.py \
             --ignore=deploy/docker/tests/test_1_basic.py \
             --ignore=deploy/docker/tests/test_2_memory.py \
             --ignore=deploy/docker/tests/test_3_pool.py \
@@ -153,10 +166,18 @@ jobs:
               uv venv --system-site-packages /tmp/browser-test-env
               uv export --locked --only-group test --no-hashes > /tmp/browser-test-requirements.txt
               uv pip install --python /tmp/browser-test-env/bin/python -r /tmp/browser-test-requirements.txt
-              /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m browser \
+              /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m "browser and not network" \
                 deploy/docker/tests/test_real_browser_recycle_window.py \
+                deploy/docker/tests/test_real_admin_recycle_eviction.py \
                 tests/regression/test_adjust_viewport_screenshot_formula.py \
-                tests/regression/test_e2e_stale_extraction_fallthrough.py
+                tests/regression/test_e2e_stale_extraction_fallthrough.py \
+                tests/regression/test_create_session_user_agent.py \
+                tests/regression/test_robots_blocked_return_type.py \
+                tests/regression/test_c4a_wait_text_injection.py \
+                tests/regression/test_c4a_wait_text_integration.py \
+                tests/test_issue_2161_overlay_html_body.py \
+                tests/regression/test_reg_browser.py \
+                tests/regression/test_reg_deep_crawl.py
             '
           # Docker owns layer-transfer retries; surface its terminal failure.
           docker push "${IMAGE}:${GIT_SHA}-${ARCH}"

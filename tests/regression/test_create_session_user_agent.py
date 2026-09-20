@@ -42,10 +42,11 @@ def test_user_agent_seeded_in_init():
         del strategy
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_create_session_on_cold_strategy_returns_uuid():
     """``create_session`` on a never-warmed strategy must return a valid UUID, not raise."""
-    strategy = AsyncPlaywrightCrawlerStrategy(browser_config=BrowserConfig(headless=True, verbose=False))
+    strategy = AsyncPlaywrightCrawlerStrategy(browser_config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"]))
     try:
         session_id = await strategy.create_session()
     finally:
@@ -55,10 +56,11 @@ async def test_create_session_on_cold_strategy_returns_uuid():
     assert str(parsed) == session_id
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_create_session_with_explicit_user_agent_kwarg_no_crash():
     """An explicit user_agent kwarg must not trigger AttributeError or duplicate-kwarg TypeError."""
-    strategy = AsyncPlaywrightCrawlerStrategy(browser_config=BrowserConfig(headless=True, verbose=False))
+    strategy = AsyncPlaywrightCrawlerStrategy(browser_config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"]))
     try:
         session_id = await strategy.create_session(user_agent="MyUA/1.0")
     finally:
@@ -67,10 +69,11 @@ async def test_create_session_with_explicit_user_agent_kwarg_no_crash():
     uuid.UUID(session_id)
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_create_session_honors_explicit_session_id_kwarg():
     """An explicit session_id kwarg must be returned as-is so callers can pin a session."""
-    strategy = AsyncPlaywrightCrawlerStrategy(browser_config=BrowserConfig(headless=True, verbose=False))
+    strategy = AsyncPlaywrightCrawlerStrategy(browser_config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"]))
     try:
         session_id = await strategy.create_session(session_id="my-pinned-session")
     finally:
@@ -78,10 +81,11 @@ async def test_create_session_honors_explicit_session_id_kwarg():
     assert session_id == "my-pinned-session"
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_create_session_reusable_by_subsequent_crawl(local_server):
     """A session_id from create_session must be reusable with CrawlerRunConfig(session_id=...)."""
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         session_id = await crawler.crawler_strategy.create_session()
         assert isinstance(session_id, str)
         uuid.UUID(session_id)

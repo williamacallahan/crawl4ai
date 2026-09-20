@@ -9,7 +9,9 @@ WordPress themes such as Qode/Bridge put classes like
 
 import pytest
 
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+pytestmark = pytest.mark.browser
 
 
 QODE_BODY_HTML = """\
@@ -49,7 +51,7 @@ FIXED_BODY_HTML = """\
 @pytest.mark.asyncio
 async def test_overlay_removal_keeps_body_with_popup_in_class():
     """#2161: Body/html with a class substring 'popup' must remain after overlay removal."""
-    async with AsyncWebCrawler() as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(
             f"raw:{QODE_BODY_HTML}",
             config=CrawlerRunConfig(remove_overlay_elements=True, verbose=False),
@@ -68,7 +70,7 @@ async def test_overlay_removal_keeps_body_with_popup_in_class():
 @pytest.mark.asyncio
 async def test_overlay_removal_keeps_position_fixed_body():
     """#2161: A scroll-locked (position:fixed) body must not be treated as an overlay."""
-    async with AsyncWebCrawler() as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(
             f"raw:{FIXED_BODY_HTML}",
             config=CrawlerRunConfig(remove_overlay_elements=True, verbose=False),

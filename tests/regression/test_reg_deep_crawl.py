@@ -212,6 +212,7 @@ async def test_bfs_level_order(local_server):
             max_depth_seen = max(max_depth_seen, d)
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
 async def test_bfs_url_scorer_per_page_own_score(local_server, stream):
@@ -230,7 +231,7 @@ async def test_bfs_url_scorer_per_page_own_score(local_server, stream):
     strategy = BFSDeepCrawlStrategy(max_depth=1, max_pages=10, url_scorer=scorer)
     config = CrawlerRunConfig(deep_crawl_strategy=strategy, stream=stream, verbose=False)
 
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         if stream:
             results = []
             async for r in await crawler.arun(url=hub_url, config=config):
@@ -347,6 +348,7 @@ async def test_dfs_max_pages_exact_boundary(local_server, stream):
     )
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
 async def test_dfs_url_scorer_hub_not_contaminated(local_server, stream):
@@ -364,7 +366,7 @@ async def test_dfs_url_scorer_hub_not_contaminated(local_server, stream):
     strategy = DFSDeepCrawlStrategy(max_depth=1, max_pages=10, url_scorer=scorer)
     config = CrawlerRunConfig(deep_crawl_strategy=strategy, stream=stream, verbose=False)
 
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         if stream:
             results = []
             async for r in await crawler.arun(url=hub_url, config=config):
@@ -641,6 +643,7 @@ def test_deep_crawl_query_order_dedup():
     )
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_prefetch_deep_crawl_query_order_dedup(local_server):
     """End-to-end: prefetch + BFS must not double-fetch a target whose links
@@ -661,7 +664,7 @@ async def test_prefetch_deep_crawl_query_order_dedup(local_server):
     )
 
     async with AsyncWebCrawler(
-        config=BrowserConfig(headless=True, verbose=False)
+        config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])
     ) as crawler:
         results = await crawler.arun(url=hub_url, config=config)
         result_list = list(results)
@@ -673,9 +676,9 @@ async def test_prefetch_deep_crawl_query_order_dedup(local_server):
         f"Target should be fetched exactly once (deduped), but got "
         f"{len(target_results)}: {target_query_strings}"
     )
-    # The single fetch must carry the sorted query string.
-    assert target_query_strings[0] == "color=red&page=1", (
-        f"Target query should be sorted: {target_query_strings[0]}"
+    # Keep the first discovered request's query order; only the dedup key is sorted.
+    assert target_query_strings[0] == "page=1&color=red", (
+        f"Target query order changed: {target_query_strings[0]}"
     )
 
 

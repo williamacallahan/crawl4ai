@@ -49,7 +49,7 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           uv lock --check
-          uv sync --locked --no-dev --group server --group test
+          uv sync --locked --no-dev --group server --group test --extra pdf
 
       - name: Run security suite
         run: |
@@ -74,7 +74,7 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           uv lock --check
-          uv sync --locked --no-dev --group server --group test
+          uv sync --locked --no-dev --group server --group test --extra pdf
 
       - name: Default-posture gate
         run: |

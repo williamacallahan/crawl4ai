@@ -25,6 +25,8 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from crawl4ai.cache_context import CacheMode
 from crawl4ai.models import CrawlResult, CrawlResultContainer
 
+pytestmark = pytest.mark.browser
+
 
 # Running as root in CI requires --no-sandbox; harmless elsewhere.
 _BROWSER_CONFIG = BrowserConfig(

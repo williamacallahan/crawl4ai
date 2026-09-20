@@ -18,6 +18,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.browser
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 
@@ -28,7 +30,7 @@ async def test_c4a_script_wait_text_resolves_during_crawl(local_server):
     from crawl4ai import AsyncWebCrawler
 
     config = CrawlerRunConfig(c4a_script='WAIT "Welcome" 3')
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(local_server + "/", config=config)
         assert result.success, f"Crawl failed: {result.error_message}"
         assert "Welcome to the Crawl4AI Test Site" in result.markdown
@@ -48,7 +50,7 @@ async def test_c4a_script_wait_text_with_dollar_curly_does_not_hang(local_server
     from crawl4ai import AsyncWebCrawler
 
     config = CrawlerRunConfig(c4a_script='WAIT "${never_defined_var}" 1')
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         try:
             result = await asyncio.wait_for(
                 crawler.arun(local_server + "/", config=config),

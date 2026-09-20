@@ -38,6 +38,7 @@ async def test_browser_lifecycle(local_server):
         await crawler.close()
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_failed_browser_launch_leaves_no_driver(monkeypatch):
     """Issue #2155: a browser-launch failure inside __aenter__ must roll back
@@ -81,6 +82,7 @@ async def test_failed_browser_launch_leaves_no_driver(monkeypatch):
     assert leaked == [], f"leaked Playwright driver process(es): {leaked}"
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_failed_cached_cdp_connect_leaves_no_driver():
     """Issue #2155: a failed connect inside _CDPConnectionCache.acquire() must
@@ -371,6 +373,7 @@ async def test_remove_overlay_elements(local_server):
         assert len(result.html) > 0, "HTML should still be present after overlay removal"
 
 
+@pytest.mark.browser
 @pytest.mark.asyncio
 @pytest.mark.network
 async def test_overlay_removal_on_csp_sandbox_page():
@@ -382,7 +385,7 @@ async def test_overlay_removal_on_csp_sandbox_page():
     config = CrawlerRunConfig(
         remove_overlay_elements=True, remove_consent_popups=True, verbose=False
     )
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         start = time.perf_counter()
         result = await crawler.arun(url=url, config=config)
         elapsed = time.perf_counter() - start
