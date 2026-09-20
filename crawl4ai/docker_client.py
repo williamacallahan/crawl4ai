@@ -1,4 +1,5 @@
 from typing import List, Optional, Union, AsyncGenerator, Dict, Any
+from base64 import b64decode
 import httpx
 import json
 import warnings
@@ -35,6 +36,24 @@ def _http_error_detail(response: httpx.Response, error: httpx.HTTPStatusError) -
     except ValueError:
         return fallback
     return payload.get("detail", fallback) if isinstance(payload, dict) else fallback
+
+
+def _decode_pdf(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``result`` with a base64-encoded ``pdf`` field decoded to bytes.
+
+    The Docker server base64-encodes ``CrawlResult.pdf`` bytes into a JSON
+    string for transport (``deploy/docker/api.py`` on both ``/crawl`` and
+    ``/crawl/stream``); this undoes that transform before ``CrawlResult``
+    reconstruction so the ``pdf: Optional[bytes]`` field receives raw PDF bytes
+    rather than the base64 text pydantic v2 would silently UTF-8-coerce to
+    ``bytes`` (yielding e.g. ``b'JVBE...'`` instead of ``b'%PDF...'``). Only a
+    ``str`` value is decoded — ``None`` (no PDF) and any other type pass
+    through unchanged, matching the server's ``pdf``-only ``b64encode``.
+    """
+    pdf = result.get("pdf")
+    if isinstance(pdf, str):
+        return {**result, "pdf": b64decode(pdf)}
+    return result
 
 
 class Crawl4aiDockerClient:
@@ -264,7 +283,7 @@ class Crawl4aiDockerClient:
                                 if result.get("status") == "completed":
                                     continue
                                 else:
-                                    yield CrawlResult(**result)
+                                    yield CrawlResult(**_decode_pdf(result))
                 except httpx.TimeoutException as e:
                     raise ConnectionError(f"Request timed out: {str(e)}")
                 except httpx.RequestError as e:
@@ -276,7 +295,7 @@ class Crawl4aiDockerClient:
         if not result_data.get("success", False):
             raise RequestError(f"Crawl failed: {result_data.get('msg', 'Unknown error')}")
 
-        results = [CrawlResult(**r) for r in result_data.get("results", [])]
+        results = [CrawlResult(**_decode_pdf(r)) for r in result_data.get("results", [])]
         self.logger.success(f"Crawl completed with {len(results)} results", tag="CRAWL")
         return results[0] if len(results) == 1 else results
 
