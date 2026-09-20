@@ -384,6 +384,38 @@ class TestCacheMode:
         assert ctx.is_cacheable is True
         assert ctx.is_local_file is True
 
+    def test_file_url_never_read_from_cache(self):
+        """file:// URLs must never be read from cache, regardless of mode.
+
+        Regression guard for the bug where ``should_read()`` was gated on
+        ``is_cacheable`` (True for ``file://``) instead of ``is_web_url``.
+        Under ENABLED/READ_ONLY that served a stale cached snapshot of a
+        local file forever, even after the on-disk file changed, because
+        ``CacheValidator`` cannot freshness-validate ``file://`` URLs
+        (httpx only speaks http(s), so validation errors fall back to the
+        stale entry). Legacy behavior gated cache reads on ``is_web_url``,
+        making ``file://`` effectively write-only — this test pins that.
+        """
+        url = "file:///tmp/test.html"
+        for mode in CacheMode:
+            ctx = CacheContext(url, mode)
+            assert ctx.should_read() is False, (
+                f"file:// must not read from cache under {mode.name}; "
+                "no freshness validation exists for the file:// scheme"
+            )
+
+    def test_file_url_can_still_write_to_cache(self):
+        """file:// URLs remain writeable so snapshots may be stored.
+
+        ``should_write()`` is intentionally left gated on ``is_cacheable``
+        (not ``is_web_url``): writing a snapshot is harmless and matches
+        legacy behavior. Only the read side is restricted.
+        """
+        ctx = CacheContext("file:///tmp/test.html", CacheMode.ENABLED)
+        assert ctx.should_write() is True
+        ctx = CacheContext("file:///tmp/test.html", CacheMode.WRITE_ONLY)
+        assert ctx.should_write() is True
+
     def test_always_bypass_overrides_everything(self):
         """always_bypass=True should force read=False, write=False."""
         ctx = CacheContext("http://example.com", CacheMode.ENABLED, always_bypass=True)

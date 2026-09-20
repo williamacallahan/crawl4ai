@@ -61,13 +61,19 @@ class CacheContext:
         Determines if cache should be read based on context.
 
         How it works:
-        1. If always_bypass is True or is_cacheable is False, return False.
+        1. If always_bypass is True or is_web_url is False, return False.
         2. If cache_mode is ENABLED or READ_ONLY, return True.
+
+        Reads are restricted to web (HTTP/HTTPS) URLs because only those can
+        be freshness-validated later (CacheValidator speaks httpx/http only).
+        Local files change on disk and have no ETag/Last-Modified, so serving
+        a cached copy would silently return stale content. Local files remain
+        writable (see should_write) so snapshots may still be stored.
 
         Returns:
             bool: True if cache should be read, False otherwise.
         """
-        if self.always_bypass or not self.is_cacheable:
+        if self.always_bypass or not self.is_web_url:
             return False
         return self.cache_mode in [CacheMode.ENABLED, CacheMode.READ_ONLY]
 
