@@ -898,3 +898,37 @@ def test_get_page_third_branch_survives_concurrent_reuse_across_event_loops():
     asyncio.run(run_two_concurrent_get_page_calls())  # loop 1: bind lock
     assert BrowserManager._global_pages_lock is not None
     asyncio.run(run_two_concurrent_get_page_calls())  # loop 2: must not crash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("references", [1, 2])
+async def test_failed_start_releases_cached_driver_without_stopping_other_users(references):
+    cache = browser_manager_module._CDPConnectionCache
+    endpoint = "http://cached-start-failure.invalid:9222"
+    driver = MagicMock(stop=AsyncMock())
+    browser = MagicMock(close=AsyncMock())
+    cache._cache[endpoint] = (driver, browser, references)
+    manager = _manager(BrowserConfig(cdp_url=endpoint, cache_cdp_connection=True))
+    manager._using_cached_cdp = True
+    manager.playwright = driver
+    manager.browser = browser
+    manager._start_impl = AsyncMock(side_effect=RuntimeError("startup failed"))
+    manager.close = AsyncMock(side_effect=RuntimeError("session cleanup failed"))
+
+    try:
+        with pytest.raises(RuntimeError, match="startup failed"):
+            await manager.start()
+
+        if references == 2:
+            assert cache._cache[endpoint] == (driver, browser, 1)
+            driver.stop.assert_not_awaited()
+            browser.close.assert_not_awaited()
+        else:
+            assert endpoint not in cache._cache
+            driver.stop.assert_awaited_once()
+            browser.close.assert_awaited_once()
+        assert manager.playwright is None
+        assert manager.browser is None
+        assert not manager._using_cached_cdp
+    finally:
+        cache._cache.pop(endpoint, None)

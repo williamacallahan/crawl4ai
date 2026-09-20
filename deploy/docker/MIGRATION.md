@@ -26,6 +26,9 @@ Provide the existing operator-managed credential through
 lifecycle remains owned by the operator and secret manager; this migration
 makes no credential-lifecycle changes.
 
+With `docker compose`, supply the existing token through the host environment
+or the configured secret mount before starting the service.
+
 - With a token set, you may expose the server (put a TLS-terminating reverse
   proxy in front) and must send `Authorization: Bearer <token>` on every
   request except `GET /health`.
@@ -59,6 +62,10 @@ safe maximums.
 
 ### Hooks: declarative actions instead of code
 
+Hooks are now **disabled by default** — enable them with
+`CRAWL4AI_HOOKS_ENABLED=true` in the container environment, or any request
+containing `hooks` returns HTTP 403.
+
 `hooks.code` (Python strings) is replaced by a fixed set of declarative actions:
 
 ```jsonc
@@ -76,6 +83,13 @@ Available actions: `block_resources`, `add_cookies`, `set_headers`,
 `scroll_to_bottom`, `wait_for_timeout`. Call `GET /hooks/info` for the parameter
 schemas. Arbitrary hook code is available in a self-hosted in-process build.
 
+> ⚠️ **Legacy `hooks.code` requests fail silently.** With hooks enabled, a
+> request in the old format returns HTTP 200 with
+> `"hooks": {"status": "success", "attached": []}` — the inline code is
+> dropped without error. If `attached` is empty, your hooks did not run.
+> (With hooks disabled, the same request returns the generic 403, whose
+> "enable hooks" hint will not make code hooks work either.)
+
 ### Screenshot / PDF: artifact id instead of `output_path`
 
 `output_path` is removed. The server stores the result and returns an id + URL:
@@ -87,6 +101,10 @@ schemas. Arbitrary hook code is available in a self-hosted in-process build.
 
 Fetch the file with `GET /artifacts/{artifact_id}` (authenticated). Artifacts
 have a TTL and a storage quota.
+
+> ⚠️ A request that still includes `output_path` is **silently ignored** — it
+> returns `success: true` with an artifact id, but no file is written to the
+> requested path. Update your code to fetch from `/artifacts/{artifact_id}`.
 
 ### LLM endpoints: provider by name
 

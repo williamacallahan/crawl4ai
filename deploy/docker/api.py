@@ -255,6 +255,15 @@ def _project_crawl_result(result, result_fields):
         return result
     return {field: result[field] for field in result_fields if field in result}
 
+
+def _raise_for_crawl_failure(result):
+    if not result.success:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=public_error_detail(result.error_message),
+        )
+
+
 # --- Helper to get memory ---
 def _get_memory_mb():
     try:
@@ -317,13 +326,7 @@ async def handle_llm_qa(
             url=url,
             config=crawler_config,
         )
-        if not result.success:
-            # Upstream fetch failed: report the reason as a gateway error, not
-            # a genericized internal 500.
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=public_error_detail(result.error_message)
-            )
+        _raise_for_crawl_failure(result)
         content = result.markdown.fit_markdown or result.markdown.raw_markdown
 
         # Create prompt and get LLM response
@@ -358,10 +361,10 @@ async def handle_llm_qa(
             )
 
         return response.choices[0].message.content
-    except LLMProviderNotAllowed as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
+    except LLMProviderNotAllowed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"QA processing error: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -605,13 +608,7 @@ async def handle_markdown_request(
             config=crawler_config,
         )
 
-        if not result.success:
-            # Upstream fetch failed: report the reason as a gateway error, not
-            # a genericized internal 500.
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=public_error_detail(result.error_message)
-            )
+        _raise_for_crawl_failure(result)
 
         if filter_type == FilterType.LLM:
             prompt = PROMPT_FILTER_CONTENT.replace(

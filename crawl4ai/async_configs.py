@@ -219,6 +219,20 @@ UNTRUSTED_FORBIDDEN_FIELDS = {
         "cache_validation_timeout", "check_robots_txt", "link_preview_config",
         "method", "capture_network_requests", "capture_console_messages",
     },
+
+}
+
+# Field names that must NEVER be set from an untrusted body on ANY allowed
+# type, checked regardless of per-type allowlist. This is the fail-closed
+# backstop for filesystem and code fields on every allowed strategy.
+# Presence => 400 (loud), matching js_code/extra_args behavior.
+UNTRUSTED_GLOBAL_FORBIDDEN_FIELDS = {
+    # filesystem write / read sinks
+    "image_save_dir", "save_images_locally", "downloads_path", "user_data_dir",
+    "output_path", "save_path", "file_path", "local_path", "storage_state",
+    # code / command execution
+    "js_code", "js_code_before_wait", "c4a_script", "init_scripts",
+    "code", "command", "hook", "hooks",
 }
 
 # Scalar knobs an untrusted body MAY set, per class. A field not listed here is
@@ -247,6 +261,7 @@ UNTRUSTED_FIELD_ALLOWLIST = {
         "no_cache_write",
         # timing / waiting
         "wait_until", "page_timeout", "wait_for", "wait_for_timeout",
+        "body_visibility_timeout",
         "wait_for_images", "delay_before_return_html", "mean_delay", "max_range",
         # scrolling / rendering
         "ignore_body_visibility", "scan_full_page", "scroll_delay",
@@ -317,7 +332,7 @@ def _filter_untrusted_fields(type_name: str, params: dict) -> dict:
         )
     out = {}
     for key, value in params.items():
-        if key in forbidden:
+        if key in UNTRUSTED_GLOBAL_FORBIDDEN_FIELDS or key in forbidden:
             raise UntrustedConfigError(
                 f"field '{key}' is not permitted on {type_name} from an untrusted request"
             )
@@ -462,7 +477,7 @@ def _clamp_untrusted(type_name: str, params: dict) -> dict:
                     url_matcher,
                     maximum_length=_MAX_SELECTOR_LENGTH,
                 )
-        for field in ("page_timeout", "wait_for_timeout"):
+        for field in ("page_timeout", "wait_for_timeout", "body_visibility_timeout"):
             if field in params and params[field] is not None:
                 params[field] = _bounded_number(
                     type_name, field, params[field], minimum=0,
@@ -1771,6 +1786,8 @@ class CrawlerRunConfig():
                         Default: False.
         ignore_body_visibility (bool): If True, ignore whether the body is visible before proceeding.
                                        Default: True.
+        body_visibility_timeout (int): Maximum time in ms to wait for the body to become visible.
+                                       Default: 30000.
         scan_full_page (bool): If True, scroll through the entire page to load all content.
                                Default: False.
         scroll_delay (float): Delay in seconds between scroll steps if scan_full_page is True.
@@ -1948,6 +1965,7 @@ class CrawlerRunConfig():
         c4a_script: Union[str, List[str]] = None,
         js_only: bool = False,
         ignore_body_visibility: bool = True,
+        body_visibility_timeout: int = 30000,
         scan_full_page: bool = False,
         scroll_delay: float = 0.2,
         max_scroll_steps: Optional[int] = None,
@@ -2078,6 +2096,13 @@ class CrawlerRunConfig():
         self.c4a_script = c4a_script
         self.js_only = js_only
         self.ignore_body_visibility = ignore_body_visibility
+        if (
+            not isinstance(body_visibility_timeout, (int, float))
+            or isinstance(body_visibility_timeout, bool)
+            or body_visibility_timeout <= 0
+        ):
+            raise ValueError("body_visibility_timeout must be a positive number")
+        self.body_visibility_timeout = body_visibility_timeout
         self.scan_full_page = scan_full_page
         self.scroll_delay = scroll_delay
         self.max_scroll_steps = max_scroll_steps
@@ -2445,6 +2470,7 @@ class CrawlerRunConfig():
             "js_code_before_wait": self.js_code_before_wait,
             "js_only": self.js_only,
             "ignore_body_visibility": self.ignore_body_visibility,
+            "body_visibility_timeout": self.body_visibility_timeout,
             "scan_full_page": self.scan_full_page,
             "scroll_delay": self.scroll_delay,
             "max_scroll_steps": self.max_scroll_steps,

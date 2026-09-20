@@ -1,12 +1,9 @@
 """Regression coverage for the Docker client hooks payload contract.
 
-The Docker server's ``HookConfig`` schema (since 0.9.0) accepts only a
-declarative ``hooks`` list; the legacy ``code``/``timeout`` fields were
-removed (replaced by fixed actions to prevent RCE) - see
-``deploy/docker/MIGRATION.md``. These tests pin the client/server hook
-contract so a future server schema change (or a client regression to the
-legacy shape) is caught here instead of causing hooks to be silently
-ignored again. No browser, network, or Redis required.
+The client sends declarative ``hooks`` only. The server captures legacy
+``code`` solely to warn that it was ignored; the global ``timeout`` field
+remains removed. These tests keep the client's executable hook payload
+aligned with the server schema. No browser, network, or Redis required.
 """
 
 import asyncio
@@ -55,11 +52,8 @@ def _spec(action="block_resources", **params):
 
 
 # --- server contract pin (would have caught this bug when the server changed) ---
-def test_server_hook_config_accepts_only_the_declarative_hooks_field():
-    # If the server re-adds ``code``/``timeout`` or renames ``hooks``, the client
-    # payload format must be revisited. Mirrors the server-side contract test
-    # in deploy/docker/tests/test_crawl_hook_lifecycle.py.
-    assert set(HookConfig.model_json_schema()["properties"]) == {"hooks"}
+def test_server_hook_config_has_declarative_hooks_and_inert_code():
+    assert set(HookConfig.model_json_schema()["properties"]) == {"hooks", "code"}
 
 
 # --- _build_hooks_payload: declarative input ---

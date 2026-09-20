@@ -772,7 +772,7 @@
                         method: 'GET',
                         headers: { 'Accept': 'application/json' }
                     });
-                    responseData = await response.json();
+                    responseData = await response.json().catch(() => ({}));
                     const time = Math.round(performance.now() - startTime);
                     if (!response.ok) {
                         throw new Error(apiErrorMessage(responseData));
@@ -818,7 +818,7 @@
                         body: JSON.stringify(payload)
                     });
 
-                    responseData = await response.json();
+                    responseData = await response.json().catch(() => ({}));
                     const time = Math.round(performance.now() - startTime);
 
                     if (!response.ok) {

@@ -313,3 +313,6 @@ out/
 
 # entrypoint.sh is a required deployment artifact (Dockerfile COPYs it)
 !deploy/docker/entrypoint.sh
+
+# Local task worktrees
+.worktrees/

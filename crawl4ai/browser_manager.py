@@ -590,7 +590,15 @@ class _CDPConnectionCache:
             else:
                 from playwright.async_api import async_playwright
             pw = await async_playwright().start()
-            browser = await pw.chromium.connect_over_cdp(cdp_url)
+            try:
+                browser = await pw.chromium.connect_over_cdp(cdp_url)
+            except BaseException:
+                # Stop the driver we just started so a failed connect doesn't leak it
+                try:
+                    await pw.stop()
+                except BaseException:
+                    pass
+                raise
             cls._cache[cdp_url] = (pw, browser, 1)
             return pw, browser
 
@@ -789,6 +797,33 @@ class BrowserManager:
 
         Note: This method should be called in a separate task to avoid blocking the main event loop.
         """
+        try:
+            await self._start_impl()
+        except BaseException:
+            # Roll back partial startup (e.g. Playwright driver) since a failed __aenter__ never triggers __aexit__
+            try:
+                await self.close()
+            except BaseException:
+                pass
+            if self._using_cached_cdp:
+                # close() may fail before releasing our shared-cache reference.
+                try:
+                    await _CDPConnectionCache.release(self.config.cdp_url)
+                except BaseException:
+                    pass
+                self._using_cached_cdp = False
+                self.playwright = None
+            elif self.playwright is not None:
+                # A failed external-CDP startup still owns its local driver.
+                try:
+                    await self.playwright.stop()
+                except BaseException:
+                    pass
+                self.playwright = None
+            self.browser = None
+            raise
+
+    async def _start_impl(self):
         if self.playwright is not None:
             await self.close()
 

@@ -185,7 +185,7 @@ def run(coro):
 
 
 def test_declarative_hook_contract_has_no_inert_global_timeout(server_module):
-    assert set(HookConfig.model_json_schema()["properties"]) == {"hooks"}
+    assert set(HookConfig.model_json_schema()["properties"]) == {"hooks", "code"}
     assert HookConfig.model_validate({"timeout": 30}).hooks == []
     response = run(server_module.get_hooks_info())
     info = json.loads(response.body)

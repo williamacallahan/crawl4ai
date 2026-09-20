@@ -472,7 +472,7 @@ class AsyncWebCrawler:
                                     pdf_data = async_response.pdf_data
                                     js_execution_result = async_response.js_execution_result
 
-                                    if _is_raw_url:
+                                    if _is_raw_url or async_response.placeholder_html:
                                         _blocked = False
                                         _block_reason = ""
                                     else:
@@ -644,7 +644,8 @@ class AsyncWebCrawler:
                         # empty by design, and is_blocked() would misread "0 bytes
                         # html" as a block.
                         _has_download = bool(getattr(crawl_result, "downloaded_files", None))
-                        if not _fallback_succeeded and not _is_raw_url and not _has_download:
+                        _placeholder = bool(getattr(async_response, "placeholder_html", False))
+                        if not _fallback_succeeded and not _is_raw_url and not _has_download and not _placeholder:
                             _target_outcome = _blocked
                             if _blocked:
                                 crawl_result.success = False
