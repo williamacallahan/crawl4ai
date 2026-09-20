@@ -3,11 +3,8 @@
 Regression test for the PDF-image arbitrary-write via untrusted config body
 (reported by sec-reex).
 
-Root cause: PDFContentScrapingStrategy is an UNTRUSTED_ALLOWED_TYPE but had no
-field allowlist, so _filter_untrusted_fields fell open and kept its
-filesystem-write knobs (image_save_dir / save_images_locally). A request body
-the API loads as UNTRUSTED could then steer the PDF image writer to an
-attacker-chosen directory.
+The public API rejects the PDF scraping constructor, including filesystem
+write options. Trusted SDK callers retain PDF image extraction.
 
 These tests hit the real deserialization path (from_serializable_dict /
 CrawlerRunConfig.load with provenance=UNTRUSTED), not a copy.
@@ -57,12 +54,10 @@ class TestPdfImageWriteGate(unittest.TestCase):
         with self.assertRaises(UntrustedConfigError):
             CrawlerRunConfig.load(body, provenance=Provenance.UNTRUSTED)
 
-    def test_untrusted_extract_images_still_allowed(self):
-        """Negative control: extract_images returns bytes base64-inline, no disk
-        write, so it must NOT be blocked (feature preserved over the API)."""
+    def test_untrusted_inline_image_extraction_is_rejected(self):
         body = _pdf_strategy({"extract_images": True})
-        obj = from_serializable_dict(body, provenance=Provenance.UNTRUSTED)
-        self.assertEqual(type(obj).__name__, "PDFContentScrapingStrategy")
+        with self.assertRaises(UntrustedConfigError):
+            from_serializable_dict(body, provenance=Provenance.UNTRUSTED)
 
     def test_trusted_path_unchanged(self):
         """No regression: the in-process SDK (TRUSTED) may still set image_save_dir."""

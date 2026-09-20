@@ -16,20 +16,11 @@ DEFAULT_MAX_REDIRECTS = 5
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
-# Destination-policy hooks, injected by whoever embeds the library.
-#
-# The library deliberately has no egress policy of its own: as a plain library
-# the caller already chooses the URL, so there is nothing to defend against.
-# It matters when the URL comes from an untrusted API client, which is the
-# Docker server's situation -- deploy/docker/server.py installs the egress
-# broker here at boot so the PDF path enforces the same non-global-IP policy
-# the browser path already gets via enforce_egress().
-#
-# _url_validator runs on every hop (initial URL and each redirect Location).
-# _peer_ip_validator runs on the IP actually connected to; without it a name
-# that passed validation could still resolve to an internal address on the
-# second lookup requests performs (DNS rebinding).
-# Both must raise to block; returning anything is treated as "allowed".
+# Optional destination-policy hooks for SDK embedders. The Docker API rejects
+# this strategy in untrusted configuration and does not install these hooks.
+# URL checks run before each request; peer checks run after connection and
+# cannot prevent the initial request from reaching a rebound destination.
+# Validators must raise to block; their return values are ignored.
 _url_validator = None
 _peer_ip_validator = None
 
@@ -112,9 +103,7 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
                  logger: AsyncLogger = None,
                  url_validator=None):
         self.logger = logger
-        # Per-instance validator, set by deploy/docker/api.py on the strategy it
-        # builds for a request. It runs in addition to the module-level policy
-        # installed at server boot, not instead of it.
+        # An embedder's per-instance check supplements the module-level hook.
         self.url_validator = url_validator
         self.max_pdf_bytes = max_pdf_bytes
         self.max_pdf_pages = max_pdf_pages
@@ -186,9 +175,7 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
             # Cleanup temp file if downloaded
             if url.startswith(("http://", "https://")):
                 try:
-                    Path(pdf_path).unlink(missing_ok=True)
-                    if pdf_path in self._temp_files:
-                        self._temp_files.remove(pdf_path)
+                    self._discard_temp_file(pdf_path)
                 except Exception as e:
                     if self.logger:
                         self.logger.warning(f"Failed to cleanup temp file {pdf_path}: {e}")

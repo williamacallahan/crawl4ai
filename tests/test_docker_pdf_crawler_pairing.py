@@ -1,11 +1,4 @@
-"""Tests for the Docker API's PDF crawler pairing.
-
-When a client requests PDFContentScrapingStrategy, the crawl handlers must
-pair it with PDFCrawlerStrategy (which downloads the PDF itself) instead of a
-pooled Playwright crawler — headless Chromium cannot render PDFs inline, so
-browser navigation fails with "Page.goto: Download is starting" before the
-scraping strategy ever runs.
-"""
+"""Docker PDF strategies remain rejected; SDK PDF redirects remain supported."""
 
 import importlib
 from pathlib import Path
@@ -13,18 +6,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from crawl4ai.processors.pdf import PDFContentScrapingStrategy, PDFCrawlerStrategy
+from crawl4ai.processors.pdf import PDFContentScrapingStrategy
+from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parent.parent
-
-CONFIG = {
-    "crawler": {
-        "memory_threshold_percent": 90,
-        "rate_limiter": {"enabled": False, "base_delay": [0.1, 0.3]},
-        "base_config": {},
-    }
-}
-
 
 def _crawler_config_payload(with_pdf_strategy):
     params = {"cache_mode": "bypass"}
@@ -49,64 +34,52 @@ def pool_mock(api, monkeypatch):
     governor = importlib.import_module("governor")
 
     pooled = MagicMock()
-    pooled.arun = AsyncMock(return_value=[])
-    pooled.arun_many = AsyncMock(return_value=[])  # per-URL config list path
+    pooled.arun = AsyncMock(return_value=[{"success": True, "url": "https://example.com/"}])
+    pooled.arun_many = AsyncMock(return_value=[])
+    pooled._docker_admission_released = False
+    pooled._docker_request_owned = False
     pooled.active_requests = 1  # release_crawler decrements this int
     mock = AsyncMock(return_value=pooled)
     monkeypatch.setattr(crawler_pool, "get_crawler", mock)
-    monkeypatch.setattr(api, "_normalize_and_validate_seeds", lambda urls: urls)
+    monkeypatch.setattr(api, "_normalize_and_validate_seeds", AsyncMock(side_effect=lambda urls: urls))
+    monkeypatch.setattr(api, "_track_request_start", AsyncMock(return_value="pdf-strategy"))
+    monkeypatch.setattr(api, "_close_aborted_request", AsyncMock())
+    monkeypatch.setattr(crawler_pool, "release_crawler", AsyncMock())
     monkeypatch.setattr(egress_broker, "enforce_egress", lambda _: None)
     monkeypatch.setattr(governor, "clamp_deep_crawl", lambda _: None)
     return mock
 
 
+@pytest.fixture
+def config(api):
+    return importlib.import_module("utils").load_config()
+
+
 @pytest.mark.asyncio
-async def test_pdf_scraping_strategy_gets_pdf_crawler(api, pool_mock, monkeypatch):
-    used = {}
-    real_crawler_cls = api.AsyncWebCrawler
+async def test_pdf_scraping_strategy_rejected_before_admission(api, pool_mock, config):
+    with pytest.raises(HTTPException) as rejected:
+        await api.handle_crawl_request(
+            urls=["https://example.com/document.pdf"],
+            browser_config={},
+            crawler_config=_crawler_config_payload(with_pdf_strategy=True),
+            config=config,
+        )
 
-    def spy_crawler(*args, **kwargs):
-        crawler = real_crawler_cls(*args, **kwargs)
-        used["crawler"] = crawler
-        used["crawler_strategy"] = crawler.crawler_strategy
-        crawler.arun = AsyncMock(return_value=[])
-        crawler.close = AsyncMock(wraps=crawler.close)
-        return crawler
-
-    monkeypatch.setattr(api, "AsyncWebCrawler", spy_crawler)
-
-    response = await api.handle_crawl_request(
-        urls=["https://example.com/document.pdf"],
-        browser_config={"type": "BrowserConfig", "params": {}},
-        crawler_config=_crawler_config_payload(with_pdf_strategy=True),
-        config=CONFIG,
-    )
-
-    assert response["success"] is True
-    assert isinstance(used["crawler_strategy"], PDFCrawlerStrategy)
+    assert rejected.value.status_code == 400
+    assert "PDFContentScrapingStrategy" in rejected.value.detail
     pool_mock.assert_not_awaited()
-    # The dedicated PDF crawler is not pooled, so the handler must close it.
-    used["crawler"].close.assert_awaited_once()
-    # SSRF protection: the handler must wire the server's URL validator into
-    # the scraping strategy so every download/redirect hop is vetted.
-    effective_config = used["crawler"].arun.await_args.kwargs["config"]
-    assert effective_config.scraping_strategy.url_validator is api.validate_url_destination
 
 
 @pytest.mark.asyncio
-async def test_pdf_strategy_with_hooks_rejected(api, pool_mock):
-    from fastapi import HTTPException
-
-    # A VALID hook action: without the guard this reaches set_hook and blows up
-    # with AttributeError (PDFCrawlerStrategy has no set_hook) -> 500. An invalid
-    # action would 400 via HookValidationError even without the guard, proving nothing.
+async def test_pdf_strategy_with_hooks_rejected(api, pool_mock, config):
+    # Valid hooks must not provide a second route to an untrusted PDF strategy.
     hooks = {"hooks": [{"action": "block_resources", "params": {"resource_types": ["image"]}}]}
     with pytest.raises(HTTPException) as exc_info:
         await api.handle_crawl_request(
             urls=["https://example.com/document.pdf"],
             browser_config={"type": "BrowserConfig", "params": {}},
             crawler_config=_crawler_config_payload(with_pdf_strategy=True),
-            config=CONFIG,
+            config=config,
             hooks_config=hooks,
         )
 
@@ -116,12 +89,12 @@ async def test_pdf_strategy_with_hooks_rejected(api, pool_mock):
 
 
 @pytest.mark.asyncio
-async def test_default_strategy_still_uses_pool(api, pool_mock):
+async def test_default_strategy_still_uses_pool(api, pool_mock, config):
     response = await api.handle_crawl_request(
         urls=["https://example.com/"],
         browser_config={"type": "BrowserConfig", "params": {}},
         crawler_config=_crawler_config_payload(with_pdf_strategy=False),
-        config=CONFIG,
+        config=config,
     )
 
     assert response["success"] is True
@@ -129,37 +102,23 @@ async def test_default_strategy_still_uses_pool(api, pool_mock):
 
 
 @pytest.mark.asyncio
-async def test_per_url_pdf_strategy_gets_validator(api, pool_mock):
-    """SSRF: a PDF strategy sent per-URL via crawler_configs must be vetted too.
-
-    crawler_configs is a public per-URL field on /crawl, and the handler builds
-    that config list on a separate branch from the top-level config. Wiring
-    url_validator only on the top-level branch leaves the per-URL one doing an
-    unvalidated download of whatever the request names.
-    """
+async def test_per_url_pdf_strategy_rejected_before_execution(api, pool_mock, config):
     pdf_config = _crawler_config_payload(with_pdf_strategy=True)
     plain_config = _crawler_config_payload(with_pdf_strategy=False)
 
-    response = await api.handle_crawl_request(
-        # The config list branch only engages with more than one URL.
-        urls=["https://example.com/document.pdf", "https://example.com/page.html"],
-        browser_config={"type": "BrowserConfig", "params": {}},
-        crawler_config=plain_config,  # top-level is clean; the PDF rides per-URL
-        crawler_configs=[pdf_config, plain_config],
-        config=CONFIG,
-    )
+    with pytest.raises(HTTPException) as rejected:
+        await api.handle_crawl_request(
+            urls=["https://example.com/document.pdf", "https://example.com/page.html"],
+            browser_config={},
+            crawler_config=plain_config,
+            crawler_configs=[pdf_config, plain_config],
+            config=config,
+        )
 
-    assert response["success"] is True
-    configs = pool_mock.return_value.arun_many.await_args.kwargs["config"]
-    pdf_strategies = [
-        cfg.scraping_strategy for cfg in configs
-        if isinstance(cfg.scraping_strategy, PDFContentScrapingStrategy)
-    ]
-    # Guard the guard: if deserialization ever drops the strategy, the loop
-    # below would pass vacuously and the test would protect nothing.
-    assert len(pdf_strategies) == 1
-    for strategy in pdf_strategies:
-        assert strategy.url_validator is api.validate_url_destination
+    assert rejected.value.status_code == 400
+    assert "PDFContentScrapingStrategy" in rejected.value.detail
+    pool_mock.return_value.arun.assert_not_awaited()
+    pool_mock.return_value.arun_many.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

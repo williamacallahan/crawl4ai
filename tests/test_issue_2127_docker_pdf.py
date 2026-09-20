@@ -2,27 +2,23 @@ import importlib
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 import pytest
-from packaging.requirements import InvalidRequirement, Requirement
+from packaging.requirements import Requirement
 
 from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_default_docker_dependencies_include_pypdf():
-    lines = (ROOT / "deploy" / "docker" / "requirements.txt").read_text().splitlines()
-    names = set()
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith(("#", "-")):
-            continue
-        try:
-            names.add(Requirement(line).name)
-        except InvalidRequirement:
-            continue
-
-    assert "pypdf" in names
+def test_sdk_pdf_extra_includes_pypdf():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    requirements = project["optional-dependencies"]["pdf"]
+    assert "pypdf" in {Requirement(requirement).name for requirement in requirements}
 
 
 @pytest.mark.asyncio
