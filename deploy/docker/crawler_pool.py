@@ -492,6 +492,8 @@ async def _init_permanent_locked(
     # Non-force callers are idempotent: a live permanent already serves this config.
     if PERMANENT and not force and _is_live(PERMANENT):
         return None, True
+    if PERMANENT and force and _is_recycling(PERMANENT):
+        return None, True
     # Detach the current permanent for a bounded background close. A force
     # restart only detaches the instance it captured at the start (``target``);
     # a permanent rebuilt by a concurrent non-force caller during the lock-free
@@ -504,7 +506,7 @@ async def _init_permanent_locked(
     # the fresh one alone. ``PERMANENT is not None`` excludes the normal "we
     # just finished closing the original, nothing rebuilt it" case, which must
     # fall through to create the replacement.
-    if force and target is not None and PERMANENT is not None and PERMANENT is not target:
+    if force and PERMANENT is not None and PERMANENT is not target:
         return None, False
 
     close_task = _make_browser_capacity()
@@ -625,6 +627,14 @@ async def retire_pool_crawlers(
             if sig_prefix is not None:
                 signatures = signatures[:1]
             for sig in signatures:
+                if _is_recycling(pool[sig]):
+                    # Mirroring d15fdd6/881307d: detaching a mid-recycle entry
+                    # lets the 60s close cap cancel its shielded start() and
+                    # orphan the fresh driver + Chromium on a detached,
+                    # _closing=True manager. Skip it; the recycle clears within
+                    # the bounded close/start caps and the janitor's next pass
+                    # re-evaluates and evicts normally.
+                    continue
                 crawler = _detach_pool_crawler(pool, sig)
                 close_tasks.append(_close_in_background(crawler))
                 retired.append((sig, pool_type))
