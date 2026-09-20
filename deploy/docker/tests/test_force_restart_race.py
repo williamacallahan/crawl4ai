@@ -243,17 +243,48 @@ async def test_slow_launch_under_lock_still_preserves_fresh_permanent(monkeypatc
     await crawler_pool.close_all()
 
 
+@pytest.mark.asyncio
+async def test_force_restart_preserves_initialization_already_in_progress(monkeypatch):
+    created = []
+    launch_started = asyncio.Event()
+    allow_launch = asyncio.Event()
+
+    def factory(**_kwargs):
+        crawler = _SlowLaunchCrawler()
+        crawler._launch_started = launch_started
+        crawler._launch_gate = allow_launch
+        created.append(crawler)
+        return crawler
+
+    _configure_pool(monkeypatch, factory)
+    config = BrowserConfig()
+    initializing = asyncio.create_task(crawler_pool.init_permanent(config))
+    await asyncio.wait_for(launch_started.wait(), timeout=2)
+    restarting = asyncio.create_task(crawler_pool.init_permanent(config, force=True))
+    await asyncio.sleep(0)  # Capture the absent original, then wait on the pool lock.
+    allow_launch.set()
+
+    assert await asyncio.wait_for(initializing, timeout=2) is True
+    assert await asyncio.wait_for(restarting, timeout=2) is False
+    assert len(created) == 1
+    assert crawler_pool.PERMANENT is created[0]
+    assert created[0].closed is False
+    await crawler_pool.close_all()
+
+
 # ───────────────────── _init_permanent_locked contract ──────────────
 
 
 @pytest.mark.asyncio
-async def test_init_permanent_locked_force_leaves_a_concurrent_rebuild_alone(monkeypatch):
+@pytest.mark.parametrize("recycling", [False, True])
+async def test_init_permanent_locked_force_leaves_a_concurrent_rebuild_alone(monkeypatch, recycling):
     """The fix: a force restart whose original target was already replaced by a
     concurrent rebuild returns ``(None, False)`` and does not detach the fresh
     permanent."""
     _configure_pool(monkeypatch, lambda **_kw: _PoolCrawler())
     stale = _PoolCrawler(connected=True)
     fresh = _PoolCrawler(connected=True)
+    fresh.crawler_strategy.browser_manager._recycling = recycling
     crawler_pool.PERMANENT = fresh  # a concurrent caller already rebuilt it
     crawler_pool.DEFAULT_CONFIG_SIG = "sig"
 

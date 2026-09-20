@@ -484,31 +484,20 @@ async def _init_permanent_locked(
     ``target`` is the permanent instance a force restart intends to replace.
     A force restart detaches *only* that instance, never a permanent a
     concurrent request placed during the lock-free close wait - the race that
-    killed in-flight default-config crawls. ``None`` (the default) is treated as
-    "no identity constraint": non-force callers detach whatever is current
-    (they hold LOCK for the whole call so it cannot move under them).
+    killed in-flight default-config crawls. A ``None`` target means no permanent
+    existed at capture time; a subsequently created permanent is also protected.
+    Non-force callers ignore the target.
     """
     global PERMANENT, DEFAULT_CONFIG_SIG
     # Non-force callers are idempotent: a live permanent already serves this config.
     if PERMANENT and not force and _is_live(PERMANENT):
         return None, True
-    if PERMANENT and force and _is_recycling(PERMANENT):
-        return None, True
-    # Detach the current permanent for a bounded background close. A force
-    # restart only detaches the instance it captured at the start (``target``);
-    # a permanent rebuilt by a concurrent non-force caller during the lock-free
-    # close wait is NOT ours to tear down.
-    if PERMANENT and (not force or PERMANENT is target):
-        return _close_in_background(_detach_permanent()), True
-    # Force restart only: a concurrent default-config request already rebuilt
-    # PERMANENT into a fresh crawler that is not our original target. The old
-    # permanent is gone (the restart's intent - retire it - is satisfied); leave
-    # the fresh one alone. ``PERMANENT is not None`` excludes the normal "we
-    # just finished closing the original, nothing rebuilt it" case, which must
-    # fall through to create the replacement.
     if force and PERMANENT is not None and PERMANENT is not target:
         return None, False
-
+    if PERMANENT and force and _is_recycling(PERMANENT):
+        return None, True
+    if PERMANENT:
+        return _close_in_background(_detach_permanent()), True
     close_task = _make_browser_capacity()
     if close_task is not None:
         return close_task, True

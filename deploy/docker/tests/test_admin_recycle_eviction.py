@@ -335,8 +335,8 @@ async def test_init_permanent_force_skips_recycling_permanent():
         assert manager._recycling is True
         assert crawler_pool._is_recycling(crawler) is True
 
-        close_task = await crawler_pool._init_permanent_locked(
-            BrowserConfig(headless=True), force=True
+        close_task, _done = await crawler_pool._init_permanent_locked(
+            BrowserConfig(headless=True), force=True, target=crawler
         )
 
         # The guard skips the detach: no background close, PERMANENT retained.
@@ -403,8 +403,8 @@ async def test_init_permanent_force_still_detaches_non_recycling_permanent():
     try:
         assert crawler_pool._is_recycling(crawler) is False
 
-        close_task = await crawler_pool._init_permanent_locked(
-            BrowserConfig(headless=True), force=True
+        close_task, _done = await crawler_pool._init_permanent_locked(
+            BrowserConfig(headless=True), force=True, target=crawler
         )
 
         assert isinstance(close_task, asyncio.Task)
@@ -420,7 +420,7 @@ async def test_init_permanent_force_still_detaches_non_recycling_permanent():
 @pytest.mark.asyncio
 async def test_init_permanent_no_force_live_recycling_permanent_returns_none():
     """No regression on the non-force path: ``_is_live`` already returns True
-    for a recycling manager, so ``force=False`` returns None without the new
+    for a recycling manager, so ``force=False`` returns no close task without the new
     guard firing. Confirms the new guard is scoped to ``force=True``.
     """
     manager = _manager(_recycle_config())
@@ -432,7 +432,7 @@ async def test_init_permanent_no_force_live_recycling_permanent_returns_none():
     crawler_pool.DEFAULT_CONFIG_SIG = "permdefault"
 
     try:
-        close_task = await crawler_pool._init_permanent_locked(
+        close_task, _done = await crawler_pool._init_permanent_locked(
             BrowserConfig(headless=True), force=False
         )
 
@@ -460,8 +460,8 @@ async def test_init_permanent_force_recycling_permanent_stays_closeable_no_orpha
 
     recycle_done = False
     try:
-        close_task = await crawler_pool._init_permanent_locked(
-            BrowserConfig(headless=True), force=True
+        close_task, _done = await crawler_pool._init_permanent_locked(
+            BrowserConfig(headless=True), force=True, target=crawler
         )
         assert close_task is None  # guard skipped the detach
 
