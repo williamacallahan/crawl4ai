@@ -1,16 +1,14 @@
 import time
 import threading
 import psutil
-from datetime import datetime, timedelta
-from typing import Dict, Optional, List
-import threading
+from datetime import timedelta
+from typing import Dict, Optional
 from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.live import Live
-from rich import box
 from ..models import CrawlStatus
 
 class TerminalUI:
@@ -60,7 +58,6 @@ class TerminalUI:
     def _ui_loop(self):
         """Main UI rendering loop."""
         import os
-        import sys
 
         if os.name == 'nt':
             self._ui_loop_windows()
@@ -758,13 +755,3 @@ class CrawlerMonitor:
             return f"{hours}:{minutes:02}:{seconds:02}"
         else:
             return f"{minutes}:{seconds:02}"
-    
-    def _calculate_estimated_completion(self) -> str:
-        """
-        Calculate estimated completion time based on current progress.
-        
-        Returns:
-            Formatted time string
-        """
-        summary = self.get_summary()
-        return summary.get("estimated_completion_time", "N/A")
