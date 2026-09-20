@@ -53,7 +53,7 @@ if cert:
 ```
 
 ### 2.2 **`from_file(file_path)`**
-Load from a file containing certificate data in ASN.1 or DER. Rarely needed unless you have local cert files:
+Load from a local file containing PEM- or DER-encoded certificate data. Rarely needed unless you have local cert files:
 
 ```python
 cert = SSLCertificate.from_file("/path/to/cert.der")
@@ -117,10 +117,6 @@ cert.to_pem("/path/to/cert.pem")     # saved to file
 der_bytes = cert.to_der()
 cert.to_der("certificate.der")
 ```
-
-### 4.4 (Optional) **`export_as_text()`**
-- If you see a method like `export_as_text()`, it typically returns an OpenSSL-style textual representation.  
-- Not always needed, but can help for debugging or manual inspection.
 
 ---
 
