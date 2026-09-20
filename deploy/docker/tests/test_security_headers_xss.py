@@ -231,6 +231,25 @@ class TestWebhookHeaderSanitization:
 
 
 class TestCRLFSafeLogging:
+    def test_configured_level_applies_after_logging_has_started(self, monkeypatch):
+        import io
+        import logging
+        from utils import setup_logging
+
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        root = logging.getLogger()
+        previous_level = root.level
+        monkeypatch.setattr(root, "handlers", [handler])
+        try:
+            root.setLevel(logging.WARNING)
+            setup_logging({"logging": {"level": "INFO", "format": "%(message)s"}})
+            logging.getLogger("server").info("health probe start\r\nprobe_id=example")
+            assert root.handlers == [handler]
+            assert output.getvalue() == "health probe startprobe_id=example\n"
+        finally:
+            root.setLevel(previous_level)
+
     def test_crlf_stripped_from_log_message(self):
         import logging
         from utils import CRLFSafeFilter

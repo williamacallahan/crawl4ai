@@ -201,6 +201,8 @@ def setup_logging(config: Dict) -> None:
         level=config["logging"]["level"],
         format=config["logging"]["format"]
     )
+    # Configuration loading may have already installed the default WARNING handler.
+    logging.getLogger().setLevel(config["logging"]["level"])
     crlf = CRLFSafeFilter()
     for handler in logging.getLogger().handlers:
         handler.addFilter(crlf)
