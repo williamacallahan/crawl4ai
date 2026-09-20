@@ -170,7 +170,23 @@ class CrawlResult(BaseModel):
         Setter for the markdown property.
         """
         self._markdown = value
-    
+
+    def get_markdown_generation_result(self) -> Optional["MarkdownGenerationResult"]:
+        """
+        Return the underlying MarkdownGenerationResult without the
+        StringCompatibleMarkdown wrapper.
+
+        The ``markdown`` property always returns a StringCompatibleMarkdown
+        wrapper whose string value is only ``raw_markdown``. Callers that need
+        to serialize the *full* object — e.g. cache writes in
+        ``AsyncDatabaseManager.acache_url``, which must persist
+        ``markdown_with_citations`` / ``references_markdown`` / ``fit_markdown``
+        / ``fit_html`` and not just ``raw_markdown`` — should use this accessor
+        instead of reaching into the ``_markdown`` ``PrivateAttr`` directly.
+        Returns ``None`` when markdown was never set.
+        """
+        return self._markdown
+
     @property
     def markdown_v2(self):
         """

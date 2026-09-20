@@ -6,7 +6,8 @@ import asyncio
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
 import json
-from .models import CrawlResult, MarkdownGenerationResult, StringCompatibleMarkdown
+from .models import CrawlResult, MarkdownGenerationResult
+from pydantic import ValidationError
 import aiofiles
 from .async_logger import AsyncLogger
 
@@ -332,13 +333,17 @@ class AsyncDatabaseManager:
                     else:
                         row_dict[field] = ""
 
-                # Parse JSON fields
+                # Parse JSON fields. Markdown is reconstructed separately by
+                # _parse_cached_markdown: its stored form is a MarkdownGenerationResult
+                # JSON, but legacy/lossy entries may store plain-text raw_markdown
+                # (possibly JSON-parseable), which must not be confused with a
+                # serialized MarkdownGenerationResult nor allowed to land as a bare
+                # scalar/list in CrawlResult._markdown.
                 json_fields = [
                     "media",
                     "links",
                     "metadata",
                     "response_headers",
-                    "markdown",
                 ]
                 for field in json_fields:
                     try:
@@ -346,21 +351,9 @@ class AsyncDatabaseManager:
                             json.loads(row_dict[field]) if row_dict[field] else {}
                         )
                     except json.JSONDecodeError:
-                        # Very UGLY, never mention it to me please
-                        if field == "markdown" and isinstance(row_dict[field], str):
-                            row_dict[field] = MarkdownGenerationResult(
-                                raw_markdown=row_dict[field] or "",
-                                markdown_with_citations="",
-                                references_markdown="",
-                                fit_markdown="",
-                                fit_html="",
-                            )
-                        else:
-                            row_dict[field] = {}
+                        row_dict[field] = {}
 
-                if isinstance(row_dict["markdown"], Dict):
-                    if row_dict["markdown"].get("raw_markdown"):
-                        row_dict["markdown"] = row_dict["markdown"]["raw_markdown"]
+                row_dict["markdown"] = self._parse_cached_markdown(row_dict["markdown"])
 
                 # Parse downloaded_files
                 try:
@@ -388,6 +381,50 @@ class AsyncDatabaseManager:
                 params={"error": str(e)},
             )
             return None
+
+    def _parse_cached_markdown(self, stored: str) -> MarkdownGenerationResult:
+        """
+        Reconstruct a MarkdownGenerationResult from markdown content read back
+        from cache.
+
+        New entries store the full MarkdownGenerationResult JSON produced by
+        ``acache_url`` (all enriched sub-fields preserved). Legacy/lossy entries
+        may store only the raw_markdown string. This method never lets a bare
+        scalar land in ``CrawlResult._markdown`` (which would make the
+        ``markdown`` property raise ``AttributeError``) and never silently turns
+        a valid cached entry into a cache miss:
+
+        - not valid JSON, or empty -> preserve the original string as raw_markdown;
+        - parses to a dict -> reconstruct ``MarkdownGenerationResult(**dict)``;
+          if the dict is not a valid model (e.g. a legacy lossy entry whose
+          raw_markdown happened to be a JSON object missing required fields),
+          preserve the original string as raw_markdown instead of raising;
+        - parses to a str/int/float/list/bool/None (the page's raw_markdown
+          happened to be JSON-parseable) -> preserve the original string as
+          raw_markdown.
+        """
+        def _from_raw(value: str) -> MarkdownGenerationResult:
+            return MarkdownGenerationResult(
+                raw_markdown=value or "",
+                markdown_with_citations="",
+                references_markdown="",
+            )
+
+        if not stored:
+            return _from_raw("")
+
+        try:
+            parsed = json.loads(stored)
+        except json.JSONDecodeError:
+            return _from_raw(stored)
+
+        if isinstance(parsed, dict):
+            try:
+                return MarkdownGenerationResult(**parsed)
+            except (ValidationError, ValueError, TypeError):
+                return _from_raw(stored)
+
+        return _from_raw(stored)
 
     async def aget_cache_metadata(self, url: str) -> Optional[Dict]:
         """
@@ -487,34 +524,46 @@ class AsyncDatabaseManager:
         }
 
         try:
-            if isinstance(result.markdown, StringCompatibleMarkdown):
-                content_map["markdown"] = (
-                    result.markdown,
-                    "markdown",
-                )
-            elif isinstance(result.markdown, MarkdownGenerationResult):
-                content_map["markdown"] = (
-                    result.markdown.model_dump_json(),
-                    "markdown",
-                )
-            elif isinstance(result.markdown, str):
-                markdown_result = MarkdownGenerationResult(raw_markdown=result.markdown)
-                content_map["markdown"] = (
-                    markdown_result.model_dump_json(),
-                    "markdown",
-                )
+            # The `markdown` property always returns a StringCompatibleMarkdown
+            # wrapper whose string value is only raw_markdown, so branching on
+            # isinstance(result.markdown, ...) would discard the enriched
+            # sub-fields (markdown_with_citations, references_markdown,
+            # fit_markdown, fit_html). Read the underlying MarkdownGenerationResult
+            # via the model accessor and serialize the full object instead.
+            md_obj = result.get_markdown_generation_result()
+            if isinstance(md_obj, MarkdownGenerationResult):
+                markdown_payload = md_obj.model_dump_json()
+            elif isinstance(md_obj, str):
+                # Defensive: a bare string was stored in _markdown (e.g. an old
+                # CrawlResult built with markdown="<str>"). Wrap it without going
+                # through the `markdown` property, which would raise on the bare
+                # string.
+                markdown_payload = MarkdownGenerationResult(
+                    raw_markdown=md_obj,
+                    markdown_with_citations="",
+                    references_markdown="",
+                ).model_dump_json()
             else:
-                content_map["markdown"] = (
-                    MarkdownGenerationResult().model_dump_json(),
-                    "markdown",
-                )
+                # markdown is None (or any unexpected type): persist an empty
+                # MarkdownGenerationResult. Pass the required fields explicitly
+                # because MarkdownGenerationResult() raises ValidationError.
+                markdown_payload = MarkdownGenerationResult(
+                    raw_markdown="",
+                    markdown_with_citations="",
+                    references_markdown="",
+                ).model_dump_json()
+            content_map["markdown"] = (markdown_payload, "markdown")
         except Exception as e:
             self.logger.warning(
                 message=f"Error processing markdown content: {str(e)}", tag="WARNING"
             )
-            # Fallback to empty markdown result
+            # Fallback to an empty markdown result (required fields explicit).
             content_map["markdown"] = (
-                MarkdownGenerationResult().model_dump_json(),
+                MarkdownGenerationResult(
+                    raw_markdown="",
+                    markdown_with_citations="",
+                    references_markdown="",
+                ).model_dump_json(),
                 "markdown",
             )
 
