@@ -1,12 +1,8 @@
 """Regression tests for the `cleaned_html` sanitization contract under
 ``css_selector`` / ``target_elements``.
 
-Guards against re-introducing the defect where
-``LXMLWebScrapingStrategy._scrap`` built ``content_element`` via
-``copy.deepcopy`` *before* the script/style/empty-element/attribute cleaning
-steps (which run on ``body``), then serialized the stale, un-cleaned
-``content_element`` into ``cleaned_html``. With the fix, ``content_element``
-is constructed from the already-cleaned ``body``.
+Selected content must be scoped using its original attributes, then have
+scripts, styles, empty nodes and unwanted attributes removed.
 """
 
 import pytest
@@ -87,9 +83,7 @@ def test_selector_paths_preserve_content_restriction(scraper):
 
 
 def test_keep_data_attributes_honored_under_selector(scraper):
-    """remove_unwanted_attributes_fast runs on body before the selector
-    extraction, so keep_data_attributes=True must still preserve data-*
-    attributes in the selector-path output (and on* handlers stay stripped)."""
+    """Data retention applies to selected output; event handlers stay stripped."""
     res = scraper._scrap(
         "https://example.com",
         SAMPLE_HTML,
@@ -101,3 +95,40 @@ def test_keep_data_attributes_honored_under_selector(scraper):
     assert "<script" not in ch
     assert "<style" not in ch
     assert "onclick" not in ch
+
+
+@pytest.mark.parametrize("selector", ['[data-region="article"]', '[role="main"]'])
+@pytest.mark.parametrize("mode", ["css", "targets", "combined"])
+def test_attribute_selectors_scope_cleaned_output(scraper, selector, mode):
+    html = """<body><aside><a href="/outside">Outside prose</a></aside>
+      <article data-region="article" role="main" onclick="bad()">
+        <p>Selected article text</p><script>bad()</script></article></body>"""
+    options = {"css_selector": selector} if mode == "css" else {"target_elements": [selector]}
+    if mode == "combined":
+        options["css_selector"] = "body"
+    result = scraper._scrap("https://example.com", html, **options)
+    cleaned = result["cleaned_html"]
+    assert "Selected article text" in cleaned
+    assert "Outside prose" not in cleaned
+    assert "data-region" not in cleaned
+    assert "role=" not in cleaned
+    assert "onclick" not in cleaned
+    assert "<script" not in cleaned
+    assert result["links"]["internal"][0]["href"] == "https://example.com/outside"
+
+
+@pytest.mark.parametrize("options", [
+    {"css_selector": "strong[data-region]"},
+    {"target_elements": ["strong[data-region]"]},
+])
+def test_only_text_runs_after_selector_matching(scraper, options):
+    html = """<body><p>Outside prose</p><strong data-region="article">
+      Selected <em>nested text</em></strong></body>"""
+    result = scraper._scrap("https://example.com", html, only_text=True, **options)
+    cleaned = result["cleaned_html"]
+    assert "Selected" in cleaned
+    assert "nested text" in cleaned
+    assert "Outside prose" not in cleaned
+    assert "<strong" not in cleaned
+    assert "<em" not in cleaned
+    assert "data-region" not in cleaned

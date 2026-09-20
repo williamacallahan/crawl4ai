@@ -746,30 +746,6 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                     extracted_tables = table_extraction.extract_tables(body, **kwargs)
                     media["tables"].extend(extracted_tables)
 
-            # Handle only_text option
-            if kwargs.get("only_text", False):
-                for tag in ONLY_TEXT_ELIGIBLE_TAGS:
-                    for element in body.xpath(f".//{tag}"):
-                        if element.text:
-                            new_text = lhtml.Element("span")
-                            new_text.text = element.text_content()
-                            if element.getparent() is not None:
-                                element.getparent().replace(element, new_text)
-
-            # Clean base64 images
-            for img in body.xpath(".//img[@src]"):
-                src = img.get("src", "")
-                if self.BASE64_PATTERN.match(src):
-                    img.set("src", self.BASE64_PATTERN.sub("", src))
-
-            # Remove empty elements
-            self.remove_empty_elements_fast(body, 1)
-
-            # Remove unneeded attributes
-            self.remove_unwanted_attributes_fast(
-                body, keep_data_attributes=kwargs.get("keep_data_attributes", False)
-            )
-
             content_element = body
             if css_selector:
                 try:
@@ -785,7 +761,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
 
             if target_elements:
                 try:
-                    source = content_element if content_element is not body else body
+                    source = content_element
                     for_content_targeted_element = []
                     for target_element in target_elements:
                         for_content_targeted_element.extend(source.cssselect(target_element))
@@ -794,6 +770,30 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 except Exception as e:
                     self._log("error", f"Error with target element detection: {str(e)}", "SCRAPE")
                     return None
+
+            # Handle only_text option
+            if kwargs.get("only_text", False):
+                for tag in ONLY_TEXT_ELIGIBLE_TAGS:
+                    for element in content_element.xpath(f".//{tag}"):
+                        if element.text:
+                            new_text = lhtml.Element("span")
+                            new_text.text = element.text_content()
+                            if element.getparent() is not None:
+                                element.getparent().replace(element, new_text)
+
+            # Clean base64 images
+            for img in content_element.xpath(".//img[@src]"):
+                src = img.get("src", "")
+                if self.BASE64_PATTERN.match(src):
+                    img.set("src", self.BASE64_PATTERN.sub("", src))
+
+            # Remove empty elements
+            self.remove_empty_elements_fast(content_element, 1)
+
+            # Remove unneeded attributes
+            self.remove_unwanted_attributes_fast(
+                content_element, keep_data_attributes=kwargs.get("keep_data_attributes", False)
+            )
 
             # Generate output HTML
             cleaned_html = lhtml.tostring(
