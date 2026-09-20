@@ -215,16 +215,6 @@ class CrawlResult(BaseModel):
             "The 'fit_markdown' attribute is deprecated and has been removed. "
             "Please use 'markdown.fit_markdown' instead."
         )
-    
-    @property
-    def fit_html(self):
-        """
-        Deprecated property that raises an AttributeError when accessed.
-        """
-        raise AttributeError(
-            "The 'fit_html' attribute is deprecated and has been removed. "
-            "Please use 'markdown.fit_html' instead."
-        )
 
     def model_dump(self, *args, **kwargs):
         """
@@ -242,14 +232,6 @@ class CrawlResult(BaseModel):
         requirements change, this is where you would update the logic.
         """
         result = super().model_dump(*args, **kwargs)
-        
-        # Remove any property descriptors that might have been included
-        # These deprecated properties should not be in the serialized output
-        for key in ['fit_html', 'fit_markdown', 'markdown_v2']:
-            if key in result and isinstance(result[key], property):
-                # del result[key]
-                # Nasrin: I decided to convert it to string instead of removing it.
-                result[key] = str(result[key])
         
         # Add the markdown field properly
         if self._markdown is not None:
