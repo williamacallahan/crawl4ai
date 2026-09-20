@@ -706,6 +706,12 @@ class BrowserManager:
         self.playwright = None
         self._using_cached_cdp = False
         self._launched_persistent = False  # True when using launch_persistent_context
+        # True when self.default_context was created by this manager via
+        # create_browser_context() (rather than reused from connect_over_cdp's
+        # contexts[0]). Such contexts must be explicitly closed in close() --
+        # connect_over_cdp's default context cannot be closed, and cached CDP
+        # connections share a browser whose contexts would leak otherwise.
+        self._default_context_owned = False
 
         # Session management
         self.sessions = {}
@@ -940,6 +946,7 @@ class BrowserManager:
                 # When connecting to a pre-created context, it should be in contexts
                 if contexts:
                     self.default_context = contexts[0]
+                    self._default_context_owned = False
                     if self.logger:
                         self.logger.debug(
                             f"Found {len(contexts)} existing context(s), using first one",
@@ -951,6 +958,7 @@ class BrowserManager:
                     contexts = self.browser.contexts
                     if contexts:
                         self.default_context = contexts[0]
+                        self._default_context_owned = False
                     else:
                         # Still no contexts - this shouldn't happen with pre-created context
                         if self.logger:
@@ -959,10 +967,22 @@ class BrowserManager:
                                 tag="BROWSER"
                             )
                         self.default_context = await self.create_browser_context()
+                        self._default_context_owned = True
             elif contexts:
-                self.default_context = contexts[0]
+                if self.config.proxy_config:
+                    # Chromium's default context (contexts[0]) is launched with
+                    # only --proxy-server=<server> (no credentials). Playwright
+                    # cannot retrofit proxy credentials onto an already-created
+                    # context, so create a new context carrying the full
+                    # proxy_config (server + username + password) instead.
+                    self.default_context = await self.create_browser_context()
+                    self._default_context_owned = True
+                else:
+                    self.default_context = contexts[0]
+                    self._default_context_owned = False
             else:
                 self.default_context = await self.create_browser_context()
+                self._default_context_owned = True
             await self.setup_context(self.default_context)
         else:
             browser_args = self._build_browser_args()
@@ -976,6 +996,7 @@ class BrowserManager:
                 self.browser = await self.playwright.chromium.launch(**browser_args)
 
             self.default_context = self.browser
+            self._default_context_owned = False
 
         # Set the browser endpoint key for global page tracking
         self._browser_endpoint_key = self._compute_browser_endpoint_key()
@@ -1345,7 +1366,22 @@ class BrowserManager:
             "width": self.config.viewport_width,
             "height": self.config.viewport_height,
         }
-        proxy_settings = {"server": self.config.proxy} if self.config.proxy else None
+        # Proxy credentials for managed/CDP contexts. BrowserConfig.__init__
+        # nullifies self.config.proxy whenever a proxy is configured, so the old
+        # `{"server": self.config.proxy}` branch was dead code and dropped the
+        # credentials carried on self.config.proxy_config. Build full
+        # ProxySettings (server + username + password) here instead.
+        # crawlerRunConfig.proxy_config (per-crawl override) is applied below.
+        from playwright.async_api import ProxySettings
+
+        if self.config.proxy_config:
+            proxy_settings = ProxySettings(
+                server=self.config.proxy_config.server,
+                username=self.config.proxy_config.username,
+                password=self.config.proxy_config.password,
+            )
+        else:
+            proxy_settings = None
 
         # CSS extensions (blocked separately via avoid_css flag)
         css_extensions = ["css", "less", "scss", "sass"]
@@ -1403,9 +1439,8 @@ class BrowserManager:
         }
         
         if crawlerRunConfig:
-            # Check if there is value for crawlerRunConfig.proxy_config set add that to context
+            # Per-crawl proxy_config overrides the browser-level BrowserConfig.proxy_config.
             if crawlerRunConfig.proxy_config:
-                from playwright.async_api import ProxySettings
                 proxy_settings = ProxySettings(
                     server=crawlerRunConfig.proxy_config.server,
                     username=crawlerRunConfig.proxy_config.username,
@@ -1884,6 +1919,7 @@ class BrowserManager:
             self.browser = None
             self.managed_browser = None
             self.default_context = None
+            self._default_context_owned = False
             # Dropped even when stop() hung: start() calls close() whenever
             # playwright is still set, and that close awaits this very recycle
             # task - the restart would deadlock against itself.
@@ -2209,11 +2245,14 @@ class BrowserManager:
             if self._using_cached_cdp:
                 await self._close_sessions()
                 await self._close_contexts()
+                if self._default_context_owned and self.default_context is not None:
+                    await self._close_context_quietly(self.default_context)
                 await _CDPConnectionCache.release(self.config.cdp_url)
                 self.browser = None
                 self.playwright = None
                 self._using_cached_cdp = False
                 self.default_context = None
+                self._default_context_owned = False
                 return
 
             if self.config.cdp_url:
@@ -2222,6 +2261,8 @@ class BrowserManager:
                 if self.config.cdp_cleanup_on_close:
                     await self._close_sessions()
                     await self._close_contexts()
+                    if self._default_context_owned and self.default_context is not None:
+                        await self._close_context_quietly(self.default_context)
                     if self.browser:
                         await self._close_browser_quietly(self.browser)
                     if self.config.cdp_close_delay > 0:
@@ -2229,6 +2270,7 @@ class BrowserManager:
                     await self._stop_playwright()
                     self.browser = None
                     self.default_context = None
+                    self._default_context_owned = False
                 return
 
             if self._launched_persistent:
@@ -2238,6 +2280,7 @@ class BrowserManager:
                     await self._close_context_quietly(self.default_context)
                 await self._stop_playwright()
                 self.default_context = None
+                self._default_context_owned = False
                 self._launched_persistent = False
                 return
 
@@ -2247,6 +2290,9 @@ class BrowserManager:
             await self._close_sessions()
             await self._close_contexts()
 
+            if self._default_context_owned and self.default_context is not None:
+                await self._close_context_quietly(self.default_context)
+
             if self.browser:
                 # Quietly: a concurrent close can already have torn down the
                 # connection, and raising here would skip managed_browser
@@ -2255,6 +2301,7 @@ class BrowserManager:
                 await self._close_browser_quietly(self.browser)
             self.browser = None
             self.default_context = None
+            self._default_context_owned = False
 
             if self.managed_browser:
                 await asyncio.sleep(0.5)
