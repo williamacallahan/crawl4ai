@@ -256,8 +256,20 @@ def _project_crawl_result(result, result_fields):
     return {field: result[field] for field in result_fields if field in result}
 
 
-def _raise_for_crawl_failure(result):
+class CorrelatedCrawlFailure(HTTPException):
+    """A redacted failed result that retains its private error-record id."""
+
+    def __init__(self, detail: str, correlation_id: Optional[str]):
+        super().__init__(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
+        self.correlation_id = correlation_id
+
+
+def _raise_for_crawl_failure(result, *, correlate_error: bool = False):
     if not result.success:
+        if correlate_error:
+            raw_error = result.error_message
+            detail = public_crawl_error(raw_error)
+            raise CorrelatedCrawlFailure(detail, detail.correlation_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=public_error_detail(result.error_message),
@@ -618,7 +630,7 @@ async def handle_markdown_request(
             config=crawler_config,
         )
 
-        _raise_for_crawl_failure(result)
+        _raise_for_crawl_failure(result, correlate_error=True)
 
         if filter_type == FilterType.LLM:
             prompt = PROMPT_FILTER_CONTENT.replace(

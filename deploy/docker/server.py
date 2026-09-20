@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from api import (
+    CorrelatedCrawlFailure,
     _raise_for_crawl_failure,
     handle_crawl_request,
     handle_llm_qa,
@@ -38,7 +39,7 @@ from auth import (
 )
 from auth_gate import AuthGateMiddleware
 from crawler_pool import close_all, get_crawler, janitor, release_crawler
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import (
@@ -566,6 +567,12 @@ _HEALTH_PROBE_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
+_CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
+_CLIENT_REQUEST_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 def _health_probe_id(request: Request) -> str | None:
@@ -574,6 +581,47 @@ def _health_probe_id(request: Request) -> str | None:
     if not value or not _HEALTH_PROBE_ID.fullmatch(value):
         return None
     return str(uuid.UUID(value))
+
+
+def _markdown_correlation(request: Request) -> tuple[str | None, str | None]:
+    """Retain only bounded correlation values that are safe to emit."""
+    traceparent = _TRACEPARENT.fullmatch(request.headers.get("traceparent", ""))
+    trace_id = None
+    if (
+        traceparent
+        and traceparent.group(1) != "0" * 32
+        and traceparent.group(2) != "0" * 16
+    ):
+        trace_id = traceparent.group(1)
+    client_request_id = request.headers.get(_CLIENT_REQUEST_ID_HEADER)
+    if client_request_id and _CLIENT_REQUEST_ID.fullmatch(client_request_id):
+        client_request_id = str(uuid.UUID(client_request_id))
+    else:
+        client_request_id = None
+    return trace_id, client_request_id
+
+
+def _log_markdown_terminal(
+    started_monotonic: float,
+    status_code: int,
+    outcome: str,
+    trace_id: str | None,
+    client_request_id: str | None,
+    correlation_id: str | None = None,
+) -> None:
+    fields = [
+        "event=md_terminal",
+        f"status={status_code}",
+        f"outcome={outcome}",
+        f"duration_ms={(time.monotonic() - started_monotonic) * 1_000:.3f}",
+    ]
+    if trace_id:
+        fields.append(f"trace_id={trace_id}")
+    if client_request_id:
+        fields.append(f"client_request_id={client_request_id}")
+    if correlation_id:
+        fields.append(f"correlation_id={correlation_id}")
+    logger.info(" ".join(fields))
 
 
 # ── central exception handling (no internal detail leaks) ─────────────
@@ -672,18 +720,41 @@ async def get_markdown(
             400, "Invalid URL format. Must start with http://, https://, or for raw HTML (raw:, raw://)")
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
-    markdown = await handle_markdown_request(
-        redis, body.url, body.f, body.q, body.c, config, body.provider,
-        body.temperature
+    trace_id, client_request_id = _markdown_correlation(request)
+    started_monotonic = time.monotonic()
+    try:
+        markdown = await handle_markdown_request(
+            redis, body.url, body.f, body.q, body.c, config, body.provider,
+            body.temperature
+        )
+    except CorrelatedCrawlFailure as error:
+        _log_markdown_terminal(
+            started_monotonic,
+            status.HTTP_502_BAD_GATEWAY,
+            "crawl_failure",
+            trace_id,
+            client_request_id,
+            error.correlation_id,
+        )
+        raise
+    response = JSONResponse(
+        {
+            "url": body.url,
+            "filter": body.f,
+            "query": body.q,
+            "cache": body.c,
+            "markdown": markdown,
+            "success": True,
+        }
     )
-    return JSONResponse({
-        "url": body.url,
-        "filter": body.f,
-        "query": body.q,
-        "cache": body.c,
-        "markdown": markdown,
-        "success": True
-    })
+    _log_markdown_terminal(
+        started_monotonic,
+        status.HTTP_200_OK,
+        "success",
+        trace_id,
+        client_request_id,
+    )
+    return response
 
 
 @app.post("/html")

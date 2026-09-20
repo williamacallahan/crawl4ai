@@ -244,7 +244,18 @@ def public_error_detail(error_message: Optional[str]) -> str:
     return message[:500]
 
 
-def correlated_error(public: str, detail: object, context: str = "crawl failure") -> str:
+class CorrelatedError(str):
+    """Client-safe detail paired with its private log correlation id."""
+
+    def __new__(cls, detail: str, correlation_id: Optional[str] = None):
+        value = super().__new__(cls, detail)
+        value.correlation_id = correlation_id
+        return value
+
+
+def correlated_error(
+    public: str, detail: object, context: str = "crawl failure"
+) -> CorrelatedError:
     """Stamp a client-safe message with the correlation id its full text is logged under.
 
     Nothing is discarded: the caller gets a message that cannot leak internals
@@ -259,10 +270,12 @@ def correlated_error(public: str, detail: object, context: str = "crawl failure"
         str(detail)[:2000],
         exc_info=detail if isinstance(detail, BaseException) else False,
     )
-    return f"{public} (correlation_id={cid})"
+    return CorrelatedError(f"{public} (correlation_id={cid})", cid)
 
 
-def public_crawl_error(raw: Optional[str], url: Optional[str] = None) -> str:
+def public_crawl_error(
+    raw: Optional[str], url: Optional[str] = None
+) -> CorrelatedError:
     """Client-safe form of a failed result's error_message.
 
     Every crawl surface serializes CrawlResult verbatim, so this runs at each
@@ -273,7 +286,7 @@ def public_crawl_error(raw: Optional[str], url: Optional[str] = None) -> str:
     message = (raw or "").strip()
     public = public_error_detail(raw)
     if not message or public == message[:500]:
-        return public
+        return CorrelatedError(public)
     return correlated_error(public, raw, f"crawl failure url={url or 'unknown'}")
 
 
