@@ -1,12 +1,27 @@
-"""Regression tests: CrawlerRunConfig.to_dict() must serialize virtual_scroll_config
-and force_viewport_screenshot so that clone() preserves them.
+"""Regression tests: CrawlerRunConfig.to_dict() must serialize every __init__
+parameter so that clone() (which rebuilds solely from to_dict() keys via
+from_kwargs) preserves it instead of silently resetting it to its default.
 
 Background: ``CrawlerRunConfig.clone()`` is built on ``to_dict()`` -> ``from_kwargs()``.
 ``dump()``/``load()`` uses the introspection-based ``to_serializable_dict()`` which
-already preserves these fields. The manual ``to_dict()`` previously omitted them,
-so ``clone()`` silently dropped allowlisted configuration (e.g. deep-crawled pages
-stopped using virtual scrolling).
+already preserves every field. The manual ``to_dict()`` historically omitted
+several fields (virtual_scroll_config, force_viewport_screenshot, base_url,
+check_cache_freshness, cache_validation_timeout, c4a_script, fallback_fetch_function),
+so ``clone()`` silently dropped them — e.g. deep-crawled pages stopped using
+virtual scrolling and Smart Cache freshness validation was disabled for every
+deep-crawl sub-batch.
+
+Included guards:
+* Per-field round-trip tests for the previously-omitted allowlisted fields
+  (virtual_scroll_config, force_viewport_screenshot).
+* A whole-class signature-coverage guard (every ``__init__`` param must appear in
+  ``to_dict()``) so any future ``__init__`` parameter that is forgotten in
+  ``to_dict()`` fails loudly instead of silently resetting on ``clone()``.
+* The pre-existing allowlist guard (TestSecurityAllowlistConsistency) for the
+  untrusted network-request path, which is independent of ``to_dict()`` output.
 """
+
+import inspect
 
 import pytest
 
@@ -111,4 +126,35 @@ class TestSecurityAllowlistConsistency:
         missing_allowlisted = sorted(f for f in allowlist if f not in d)
         assert missing_allowlisted == [], (
             f"Allowlisted fields missing from to_dict(): {missing_allowlisted}"
+        )
+
+
+class TestTrustedCloneRoundTripCoverage:
+    """Every __init__ parameter must be emitted by to_dict().
+
+    ``clone()`` rebuilds a config solely from the keys ``to_dict()`` returns
+    (via ``from_kwargs``, which only forwards keys that are present, leaving
+    every absent key at its ``__init__`` default). Therefore any ``__init__``
+    parameter omitted by ``to_dict()`` is silently reset to its default on
+    every clone — including the per-batch clones performed by every deep-crawl
+    strategy (``config.clone(deep_crawl_strategy=None, stream=...)``).
+
+    This is the trusted/SDK clone-round-trip guard and is intentionally
+    orthogonal to ``TestSecurityAllowlistConsistency`` (which guards the
+    untrusted network path keyed off ``UNTRUSTED_FIELD_ALLOWLIST``). The
+    untrusted path uses ``from_serializable_dict(..., provenance=UNTRUSTED)``
+    -> ``_filter_untrusted_fields`` and never reads ``to_dict()`` output, so
+    requiring full signature coverage here does not weaken the untrusted
+    gate.
+    """
+
+    def test_every_init_param_is_in_to_dict(self):
+        init_params = set(
+            inspect.signature(CrawlerRunConfig.__init__).parameters
+        ) - {"self"}
+        to_dict_keys = set(CrawlerRunConfig().to_dict())
+        missing = sorted(init_params - to_dict_keys)
+        assert missing == [], (
+            "CrawlerRunConfig.__init__ parameters missing from to_dict() are "
+            f"silently reset to defaults by clone(): {missing}"
         )

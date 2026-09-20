@@ -2457,6 +2457,8 @@ class CrawlerRunConfig():
             "no_cache_read": self.no_cache_read,
             "no_cache_write": self.no_cache_write,
             "shared_data": self.shared_data,
+            "check_cache_freshness": self.check_cache_freshness,
+            "cache_validation_timeout": self.cache_validation_timeout,
             "wait_until": self.wait_until,
             "page_timeout": self.page_timeout,
             "wait_for": self.wait_for,
@@ -2468,6 +2470,7 @@ class CrawlerRunConfig():
             "semaphore_count": self.semaphore_count,
             "js_code": self.js_code,
             "js_code_before_wait": self.js_code_before_wait,
+            "c4a_script": self.c4a_script,
             "js_only": self.js_only,
             "ignore_body_visibility": self.ignore_body_visibility,
             "body_visibility_timeout": self.body_visibility_timeout,
@@ -2517,10 +2520,12 @@ class CrawlerRunConfig():
             "link_preview_config": self.link_preview_config.to_dict() if self.link_preview_config else None,
             "virtual_scroll_config": self.virtual_scroll_config.to_dict() if self.virtual_scroll_config else None,
             "url": self.url,
+            "base_url": self.base_url,
             "url_matcher": self.url_matcher,
             "match_mode": self.match_mode,
             "experimental": self.experimental,
             "max_retries": self.max_retries,
+            "fallback_fetch_function": self.fallback_fetch_function,
         }
 
     def clone(self, **kwargs):
