@@ -25,7 +25,7 @@ self-redirect cannot be reintroduced:
   * State B — `enabled: false`: the configured endpoint is unregistered
         (404), not a self-redirect.
   * State C — `enabled: true`, `endpoint != "/metrics"`: the configured
-        endpoint does not self-redirect.
+        endpoint serves Prometheus exposition text without redirecting.
 
 The unauthenticated-401 posture of `/metrics` is already pinned by
 `test_security_default_posture.py`, so these tests cover the authenticated
@@ -147,12 +147,8 @@ def test_configured_endpoint_does_not_self_redirect_when_disabled(monkeypatch):
 # ─────────────── State C: enabled, non-default configured endpoint ───────────
 
 
-def test_configured_endpoint_does_not_self_redirect_with_non_default_path(monkeypatch):
-    """When the operator configures `endpoint != "/metrics"` and Prometheus is
-    enabled, the configured path must not self-redirect. Before the fix it had
-    only the buggy `metrics()` route and emitted a self-referential 307, while
-    the Instrumentator silently served `/metrics` (its own hardcoded default —
-    a separate, out-of-scope concern)."""
+def test_configured_endpoint_serves_metrics_with_non_default_path(monkeypatch):
+    """The configured path serves metrics instead of redirecting or returning 404."""
     from utils import load_config as _orig_load_config
 
     cfg = _orig_load_config()
@@ -164,12 +160,8 @@ def test_configured_endpoint_does_not_self_redirect_with_non_default_path(monkey
     tok = create_access_token({"sub": "ops@metrics.example"})
 
     r = client.get("/custom-metrics", headers=_bearer(tok), follow_redirects=False)
-    assert r.status_code != 307, (
-        f"GET /custom-metrics returned 307 to {r.headers.get('location')!r} — "
-        "the self-referential redirect loop is present at the configured endpoint."
-    )
-    assert "location" not in r.headers, (
-        f"GET /custom-metrics returned status {r.status_code} with a redirect "
-        f"to {r.headers.get('location')!r}; the configured metrics endpoint "
-        "must not redirect."
-    )
+    assert r.status_code == 200
+    assert "location" not in r.headers
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "# HELP" in r.text or "# TYPE" in r.text
+    assert client.get("/metrics", headers=_bearer(tok)).status_code == 404

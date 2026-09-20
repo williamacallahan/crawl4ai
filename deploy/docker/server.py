@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from api import (
+    _raise_for_crawl_failure,
     handle_crawl_request,
     handle_llm_qa,
     handle_markdown_request,
@@ -77,7 +78,6 @@ from starlette.exceptions import HTTPException as _StarletteHTTPException
 from utils import (
     get_browser_extra_args,
     load_config,
-    public_error_detail,
     public_crawl_error,
     setup_logging,
     validate_url_destination,
@@ -399,7 +399,9 @@ def _setup_security(app_: FastAPI):
 _setup_security(app)
 
 if config["observability"]["prometheus"]["enabled"]:
-    Instrumentator().instrument(app).expose(app)
+    Instrumentator().instrument(app).expose(
+        app, endpoint=config["observability"]["prometheus"]["endpoint"]
+    )
 
 token_dep = get_token_dependency(config)
 
@@ -688,11 +690,7 @@ async def generate_html(
     try:
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
-        if not results[0].success:
-            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
-            # timeout): a gateway failure with its reason, not an internal 500
-            # whose detail the central handler must genericize away.
-            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
+        _raise_for_crawl_failure(results[0])
 
         raw_html = results[0].html
         from crawl4ai.utils import preprocess_html_for_schema
@@ -789,11 +787,7 @@ async def generate_screenshot(
         )
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
-        if not results[0].success:
-            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
-            # timeout): a gateway failure with its reason, not an internal 500
-            # whose detail the central handler must genericize away.
-            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
+        _raise_for_crawl_failure(results[0])
         screenshot_data = results[0].screenshot
         art = await asyncio.to_thread(
             _store_artifact,
@@ -835,11 +829,7 @@ async def generate_pdf(
         cfg = server_crawler_config(config, pdf=True)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
-        if not results[0].success:
-            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
-            # timeout): a gateway failure with its reason, not an internal 500
-            # whose detail the central handler must genericize away.
-            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
+        _raise_for_crawl_failure(results[0])
         pdf_data = results[0].pdf
         art = await asyncio.to_thread(_store_artifact, "pdf", pdf_data)
         response = {"success": True, "pdf": base64.b64encode(pdf_data).decode(), **art}
@@ -920,11 +910,7 @@ async def execute_js(
         cfg = server_crawler_config(config, js_code=body.scripts)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
-        if not results[0].success:
-            # Upstream fetch failed (anti-bot block, navigation refusal, DNS,
-            # timeout): a gateway failure with its reason, not an internal 500
-            # whose detail the central handler must genericize away.
-            raise HTTPException(502, detail=public_error_detail(results[0].error_message))
+        _raise_for_crawl_failure(results[0])
         data = results[0].model_dump()
         if data.get("error_message"):
             data["error_message"] = public_crawl_error(data["error_message"], data.get("url"))

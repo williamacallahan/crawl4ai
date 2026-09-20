@@ -22,7 +22,6 @@ Run:
 """
 
 import asyncio
-import inspect
 import json
 
 import httpx
@@ -208,12 +207,3 @@ def test_call_paramless_post_tool_still_works(monkeypatch):
     result = asyncio.run(_call_tool(server, "crawl", {}))
     payload = _decode_text_content(result.content[0].text)
     assert payload == {"ok": True}
-
-
-def test_fix_uses_path_format():
-    """Source-level guard: ``_make_http_proxy`` must read ``route.path_format``,
-    not ``route.path``. Catches an accidental revert of the one-line fix."""
-    src = inspect.getsource(mcp_bridge._make_http_proxy)
-    assert "route.path_format" in src
-    # The buggy form must not remain as the substitution source.
-    assert "path = route.path\n" not in src

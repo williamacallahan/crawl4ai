@@ -6,16 +6,24 @@ from fastapi import HTTPException
 from api import _raise_for_crawl_failure
 
 
-def test_crawl_failure_is_reported_as_bad_gateway():
-    result = SimpleNamespace(success=False, error_message="Blocked by anti-bot protection: challenge")
+@pytest.mark.parametrize("error_message,expected_detail", [
+    ("Blocked by anti-bot protection: challenge", "Blocked by anti-bot protection: challenge"),
+    ("Permission denied: /app/private/cache.db", "Crawl failed"),
+])
+def test_crawl_failure_is_reported_as_sanitized_bad_gateway(error_message, expected_detail):
+    result = SimpleNamespace(success=False, error_message=error_message)
 
     with pytest.raises(HTTPException) as raised:
         _raise_for_crawl_failure(result)
 
     assert raised.value.status_code == 502
-    assert raised.value.detail == result.error_message
+    assert raised.value.detail == expected_detail
 
 
+@pytest.mark.parametrize("error_message,expected_detail", [
+    ("Blocked by anti-bot protection: challenge", "Blocked by anti-bot protection: challenge"),
+    ("Permission denied: /app/private/cache.db", "Crawl failed"),
+])
 @pytest.mark.parametrize(
     ("method", "path", "payload"),
     [
@@ -24,9 +32,8 @@ def test_crawl_failure_is_reported_as_bad_gateway():
     ],
 )
 def test_single_url_crawl_failure_reaches_client(
-    stock_client, server_module, monkeypatch, method, path, payload
+    stock_client, server_module, monkeypatch, method, path, payload, error_message, expected_detail
 ):
-    error_message = "Blocked by anti-bot protection: challenge"
     failed_result = SimpleNamespace(success=False, error_message=error_message)
 
     class FailedCrawler:
@@ -55,4 +62,4 @@ def test_single_url_crawl_failure_reaches_client(
     )
 
     assert response.status_code == 502
-    assert response.json() == {"detail": error_message}
+    assert response.json() == {"detail": expected_detail}
