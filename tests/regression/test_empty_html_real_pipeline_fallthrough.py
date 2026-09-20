@@ -29,7 +29,6 @@ Run:
 import os
 import uuid
 
-import aiosqlite
 import pytest
 
 from crawl4ai.async_configs import CrawlerRunConfig
@@ -119,28 +118,6 @@ class _ResponseStrategy:
         pass
 
 
-_FULL_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS crawled_data (
-    url TEXT PRIMARY KEY,
-    html TEXT,
-    cleaned_html TEXT,
-    markdown TEXT,
-    extracted_content TEXT,
-    success BOOLEAN,
-    media TEXT DEFAULT "{}",
-    links TEXT DEFAULT "{}",
-    metadata TEXT DEFAULT "{}",
-    screenshot TEXT DEFAULT "",
-    response_headers TEXT DEFAULT "{}",
-    downloaded_files TEXT DEFAULT "{}",
-    etag TEXT DEFAULT "",
-    last_modified TEXT DEFAULT "",
-    head_fingerprint TEXT DEFAULT "",
-    cached_at REAL DEFAULT 0
-)
-"""
-
-
 async def _isolate_db(monkeypatch, tmp_path):
     """Redirect the ``async_db_manager`` singleton to an isolated temp SQLite DB
     with the full ``crawled_data`` schema, and skip the singleton's auto-init
@@ -159,9 +136,8 @@ async def _isolate_db(monkeypatch, tmp_path):
     monkeypatch.setattr(async_db_manager, "_initialized", True)
     monkeypatch.setattr(async_db_manager, "connection_pool", {})
 
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(_FULL_SCHEMA_SQL)
-        await db.commit()
+    await async_db_manager.ainit_db()
+    await async_db_manager.update_db_schema()
 
     return downloads_dir
 

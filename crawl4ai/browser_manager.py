@@ -1355,19 +1355,17 @@ class BrowserManager:
             "width": self.config.viewport_width,
             "height": self.config.viewport_height,
         }
-        # Proxy credentials for managed/CDP contexts. BrowserConfig.__init__
-        # nullifies self.config.proxy whenever a proxy is configured, so the old
-        # `{"server": self.config.proxy}` branch was dead code and dropped the
-        # credentials carried on self.config.proxy_config. Build full
-        # ProxySettings (server + username + password) here instead.
-        # crawlerRunConfig.proxy_config (per-crawl override) is applied below.
         from playwright.async_api import ProxySettings
 
-        if self.config.proxy_config:
+        # Per-crawl proxy settings take precedence over browser configuration.
+        proxy_config = (
+            crawlerRunConfig.proxy_config if crawlerRunConfig else None
+        ) or self.config.proxy_config
+        if proxy_config:
             proxy_settings = ProxySettings(
-                server=self.config.proxy_config.server,
-                username=self.config.proxy_config.username,
-                password=self.config.proxy_config.password,
+                server=proxy_config.server,
+                username=proxy_config.username,
+                password=proxy_config.password,
             )
         else:
             proxy_settings = None
@@ -1427,16 +1425,6 @@ class BrowserManager:
             "java_script_enabled": self.config.java_script_enabled,
         }
         
-        if crawlerRunConfig:
-            # Per-crawl proxy_config overrides the browser-level BrowserConfig.proxy_config.
-            if crawlerRunConfig.proxy_config:
-                proxy_settings = ProxySettings(
-                    server=crawlerRunConfig.proxy_config.server,
-                    username=crawlerRunConfig.proxy_config.username,
-                    password=crawlerRunConfig.proxy_config.password,
-                )
-                context_settings["proxy"] = proxy_settings
-
         if self.config.text_mode:
             text_mode_settings = {
                 "has_touch": False,
