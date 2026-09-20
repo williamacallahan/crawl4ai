@@ -408,12 +408,12 @@ class Compiler:
                     }});
                 """).strip()
             if kind == "text":
-                txt = arg.replace('`', '\\`')
+                txt = arg.replace("\\", "\\\\").replace("'", "\\'")
                 return textwrap.dedent(f"""
                     await new Promise((res,rej)=>{{
                       const max={timeout*1000},t0=performance.now();
                       const id=setInterval(()=>{{
-                        if(document.body.innerText.includes(`{txt}`)){{clearInterval(id);res();}}
+                        if(document.body.innerText.includes('{txt}')){{clearInterval(id);res();}}
                         else if(performance.now()-t0>max){{clearInterval(id);rej('WAIT text timeout');}}
                       }},100);
                     }});
