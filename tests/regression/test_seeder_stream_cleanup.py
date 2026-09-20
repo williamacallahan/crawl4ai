@@ -14,35 +14,21 @@ result_queue.put(...)`` and resist a single ``Task.cancel()``: the first
 the still-full queue. ``asyncio.run`` shutdown (``_cancel_all_tasks`` issues a
 single cancel then gathers) then hangs.
 
-The fix wraps the yield loop in ``try/finally`` that cancels the tasks and drains
-the queue so the cancelled tasks' blocking ``finally: put(None)`` can complete.
+The fix cancels and awaits owned tasks on close. Producers send completion
+sentinels only after normal completion or caught errors, never after cancellation.
 These tests pin that behaviour for both ``_iter_sitemap_content`` and the
 recursive ``_iter_sitemap``, mirroring the existing
 ``test_memory_adaptive_stream_closure_cleans_up_tasks`` for the dispatcher.
 """
 
 import asyncio
-import gc
 import sys
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
-# Stub rank_bm25 before importing the seeder to avoid optional dependency issues
-# in CI (mirrors tests/unit/test_sitemap_namespace_parsing.py).
-class _FakeBM25:
-    def __init__(self, corpus):
-        self._scores = [1.0] * len(corpus)
-
-    def get_scores(self, tokens):
-        return self._scores
-
-
-sys.modules.setdefault("rank_bm25", SimpleNamespace(BM25Okapi=_FakeBM25))
 
 from crawl4ai.async_url_seeder import AsyncUrlSeeder
 from crawl4ai.async_configs import SeedingConfig
@@ -183,7 +169,7 @@ def _capture_sub_tasks(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_iter_sitemap_content_cancels_subtasks_on_early_close(tmp_path, monkeypatch):
-    n_subs, urls_per_sub = 50, 2000  # queue fills (min(50000, 50*1000)=50000)
+    n_subs, urls_per_sub = 2, 1010  # Exceeds the 2,000-entry queue after five reads.
     seeder, sitemap_url, index = _make_fixture(
         "https://example.com", n_subs, urls_per_sub, tmp_path)
     captured = _capture_sub_tasks(monkeypatch)
@@ -274,7 +260,7 @@ async def test_iter_sitemap_content_completes_under_backpressure(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_iter_sitemap_recursive_cancels_subtasks_on_early_close(tmp_path, monkeypatch):
-    n_subs, urls_per_sub = 50, 2000
+    n_subs, urls_per_sub = 2, 1010  # Exceeds the 2,000-entry queue after five reads.
     seeder, sitemap_url, _index = _make_fixture(
         "https://example.com", n_subs, urls_per_sub, tmp_path)
     captured = _capture_sub_tasks(monkeypatch)
@@ -327,10 +313,15 @@ async def test_iter_sitemap_recursive_completes_normally(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_urls_with_max_urls_leaves_no_orphan_tasks(tmp_path):
-    n_subs, urls_per_sub = 100, 2000
+@pytest.mark.parametrize("nested", [False, True])
+async def test_urls_with_max_urls_leaves_no_orphan_tasks(tmp_path, nested):
+    n_subs, urls_per_sub = 2, 1010  # Exceeds the 2,000-entry queue after five reads.
     seeder, sitemap_url, _index = _make_fixture(
         "https://example.com", n_subs, urls_per_sub, tmp_path)
+    if nested:
+        nested_url = "https://example.com/nested.xml"
+        seeder.client._urlsets[nested_url] = seeder.client._index
+        seeder.client._index = _index_xml([nested_url])
     config = SeedingConfig(
         source="sitemap", max_urls=5, concurrency=2, hits_per_sec=None, force=True,
     )
@@ -338,12 +329,6 @@ async def test_urls_with_max_urls_leaves_no_orphan_tasks(tmp_path):
     try:
         results = await seeder.urls("https://example.com", config)
         assert len(results) == 5
-
-        # The producer ``break`` does not synchronously aclose the sitemap
-        # generator; CPython defers the async-gen finalizer. Force it to run so
-        # the generator's try/finally (the fix) cancels + drains the fan-out tasks.
-        gc.collect()
-        await asyncio.sleep(0.3)
 
         assert not _sub_tasks(), "process_subsitemap tasks leaked after urls() returned"
     finally:
@@ -378,10 +363,7 @@ async def _e2e_main(domain, sitemap_url, index_xml, urlsets, tmp_path):
     )
     results = await seeder.urls(domain, config)
     assert len(results) == 5
-    gc.collect()
-    await asyncio.sleep(0.3)
-    # Return WITHOUT cancelling orphans — rely on the generator's try/finally
-    # (post-fix) to reclaim them so asyncio.run shutdown does not hang.
+    assert not _sub_tasks(), "urls() returned before sitemap workers stopped"
 
 
 def test_urls_does_not_hang_on_run_shutdown(tmp_path):
@@ -394,7 +376,7 @@ def test_urls_does_not_hang_on_run_shutdown(tmp_path):
     fails the test instead of hanging the suite.
     """
     domain = "https://example.com"
-    n_subs, urls_per_sub = 100, 2000
+    n_subs, urls_per_sub = 2, 1010  # Exceeds the 2,000-entry queue after five reads.
     sub_urls = [f"{domain}/sm{i}.xml" for i in range(n_subs)]
     index = _index_xml(sub_urls)
     urlsets = {
