@@ -4,7 +4,6 @@ import httpx
 import json
 import warnings
 from urllib.parse import urljoin
-import asyncio
 
 from .async_configs import BrowserConfig, CrawlerRunConfig
 from .models import CrawlResult
@@ -314,16 +313,3 @@ class Crawl4aiDockerClient:
 
     async def __aexit__(self, exc_type: Optional[type], exc_val: Optional[Exception], exc_tb: Optional[Any]) -> None:
         await self.close()
-
-
-# Example usage
-async def main():
-    async with Crawl4aiDockerClient(verbose=True) as client:
-        await client.authenticate("user@example.com")
-        result = await client.crawl(["https://example.com"])
-        print(result)
-        schema = await client.get_schema()
-        print(schema)
-
-if __name__ == "__main__":
-    asyncio.run(main())
