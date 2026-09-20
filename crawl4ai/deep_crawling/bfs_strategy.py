@@ -419,13 +419,6 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             self._last_state = state
             await self._on_state_change(state)
 
-    async def shutdown(self) -> None:
-        """
-        Clean up resources and signal cancellation of the crawl.
-        """
-        self._cancel_event.set()
-        self.stats.end_time = datetime.now()
-
     def export_state(self) -> Optional[Dict[str, Any]]:
         """
         Export current crawl state for external persistence.
