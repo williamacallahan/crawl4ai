@@ -22,6 +22,7 @@ _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 AsyncLogger = _mod.AsyncLogger
 AsyncFileLogger = _mod.AsyncFileLogger
 LogLevel = _mod.LogLevel
+LogColor = _mod.LogColor
 
 
 class _RecordingConsole:
@@ -204,3 +205,164 @@ class TestMCPScenario:
         )
         # All log output should be on stderr
         assert "Crawling started" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Helpers for bracket-escaping tests
+# ---------------------------------------------------------------------------
+
+
+def _render_markup(lines):
+    """Render Rich markup strings through a no-color Console and return the
+    concatenated plain-text output. The default AsyncLogger Console applies
+    markup parsing, so tests covering literal bracket preservation must
+    round-trip through Rich rather than inspect the raw markup string
+    (which contains ``\\[`` escapes)."""
+    buf = io.StringIO()
+    console = Console(file=buf, no_color=True, highlight=False, width=200)
+    for line in lines:
+        console.print(line)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Tests for Rich bracket escaping (issue: literal "[word]" tokens must survive)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncLoggerBracketEscaping:
+    """Literal bracket tokens like ``[zstd]`` or ``[Errno 2]`` in the message
+    template or in param values must render unchanged. Rich parses ``[word]``
+    as a markup/style tag, so the logger must escape literal ``[`` as ``\\[``
+    (Rich's escape syntax) — NOT as ``[[`` doubling, which strips single-word
+    tokens (``[zstd]`` -> ``[]``) and doubles multi-word tokens (``[Errno 2]``
+    -> ``[[Errno 2]]``)."""
+
+    def test_template_message_single_word_bracket_preserved(self):
+        """A template message (no params) with a single-word bracket token
+        must not have the inner word stripped by Rich."""
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+        logger.error("install httpx[zstd] to enable decoding", tag="FETCH")
+        rendered = _render_markup(console.lines)
+        assert "httpx[zstd]" in rendered, (
+            "Single-word bracket token [zstd] was stripped; rendered: "
+            f"{rendered!r}"
+        )
+        assert "httpx[]" not in rendered, "Bracket word was lost"
+
+    def test_template_message_multi_word_bracket_not_doubled(self):
+        """A multi-word bracket token on the no-params path must not have its
+        brackets doubled (the old ``[[Errno 2]]`` mangling)."""
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+        logger.error("[Errno 2] No such file or directory", tag="FETCH")
+        rendered = _render_markup(console.lines)
+        assert "[Errno 2]" in rendered, (
+            f"Multi-word bracket token missing; rendered: {rendered!r}"
+        )
+        assert "[[Errno 2]]" not in rendered, (
+            "Brackets were doubled by broken [[/]] escaping; rendered: "
+            f"{rendered!r}"
+        )
+
+    def test_error_status_preserves_bracket_in_error_param(self):
+        """``error_status`` passes the raw error text as a param with no
+        colors/boxes; bracket tokens in that string must survive."""
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+        logger.error_status(
+            "https://example.com/p",
+            "Make sure to install httpx using `pip install httpx[zstd]`.",
+            tag="FETCH",
+        )
+        rendered = _render_markup(console.lines)
+        assert "httpx[zstd]" in rendered, (
+            "Bracket token in error param was stripped; rendered: "
+            f"{rendered!r}"
+        )
+
+    def test_error_param_closing_tag_does_not_raise(self):
+        """A raw closing Rich tag ``[/url]`` in an error string must render
+        literally rather than raise ``MarkupError`` (unbalanced tag)."""
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+        logger.error_status(
+            "https://example.com/p",
+            "Config error: missing [/url] endpoint",
+            tag="FETCH",
+        )
+        rendered = _render_markup(console.lines)
+        assert "[/url]" in rendered, (
+            f"Closing tag [/url] not preserved; rendered: {rendered!r}"
+        )
+
+    def test_string_param_with_bracket_preserved(self):
+        """A string param value containing a bracket token must survive the
+        ``.format(**params)`` substitution into the template."""
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+        logger.error(
+            "importing {module}",
+            params={"module": "httpx[zstd]"},
+            tag="FETCH",
+        )
+        rendered = _render_markup(console.lines)
+        assert "httpx[zstd]" in rendered, (
+            "Bracket token in string param was stripped; rendered: "
+            f"{rendered!r}"
+        )
+
+    def test_url_status_timing_format_spec_still_works(self):
+        """Non-string params (floats) must remain unescaped so format specs
+        like ``{timing:.2f}`` keep working."""
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+        logger.url_status("https://example.com/p", True, 1.23333, tag="FETCH")
+        rendered = _render_markup(console.lines)
+        assert "1.23s" in rendered, (
+            f"Float format spec {timing:.2f} broken; rendered: {rendered!r}"
+        )
+
+    def test_colored_string_param_with_bracket_preserved(self):
+        """When a string param is both colored AND contains brackets, both
+        the color markup and the literal brackets must render correctly."""
+        console = _RecordingConsole()
+        logger = AsyncLogger(console=console)
+        logger.info(
+            "module is {name}",
+            params={"name": "httpx[zstd]"},
+            colors={"name": LogColor.CYAN},
+        )
+        rendered = _render_markup(console.lines)
+        assert "httpx[zstd]" in rendered, (
+            "Colored bracket param lost its bracket; rendered: "
+            f"{rendered!r}"
+        )
+
+    def test_file_log_preserves_bracket_in_error_param(self, tmp_path):
+        """The file-logging path (Text.from_markup -> plain) must preserve
+        bracket tokens from error_status's raw error param."""
+        log_file = tmp_path / "brackets.log"
+        logger = AsyncLogger(log_file=str(log_file), verbose=False)
+        logger.error_status(
+            "https://example.com/p",
+            "install httpx[zstd] to enable decoding",
+            tag="FETCH",
+        )
+        content = log_file.read_text(encoding="utf-8")
+        assert "httpx[zstd]" in content, (
+            "Bracket token lost in file output; content: "
+            f"{content!r}"
+        )
+        assert "httpx[]" not in content
+
+    def test_verbose_console_path_does_not_crash_on_brackets(self, capsys):
+        """The verbose console-print path (default stderr Console) must not
+        raise when the message contains literal bracket tokens."""
+        logger = AsyncLogger(verbose=True)
+        logger.error("install httpx[zstd] then [Errno 2] and [/url]", tag="FETCH")
+        captured = capsys.readouterr()
+        assert "httpx[zstd]" in captured.err
+        assert "[Errno 2]" in captured.err
+        assert "[/url]" in captured.err
