@@ -637,11 +637,7 @@ class PruningContentFilter(RelevantContentFilter):
 
         text_len = len(node.get_text(strip=True))
         tag_len = len(node.encode_contents().decode("utf-8"))
-        link_text_len = sum(
-            len(s.strip())
-            for s in (a.string for a in node.find_all("a", recursive=False))
-            if s
-        )
+        link_text_len = sum(len(a.get_text(strip=True)) for a in node.find_all("a"))
 
         metrics = {
             "node": node,
