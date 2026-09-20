@@ -563,8 +563,6 @@ class DomainMapper:
     async def _validate_hosts(self, hosts: Set[str], config: "DomainMapperConfig") -> Set[str]:
         """Validate hosts are reachable via HTTP."""
         validated: Set[str] = set()
-        # Track redirects so we can map canonical hosts
-        self._host_redirects: Dict[str, str] = {}
         # Track which scheme successfully reached each host so subsequent
         # scanning methods use the same scheme (handles HTTP-only hosts).
         self._host_schemes: Dict[str, str] = {}
@@ -573,16 +571,9 @@ class DomainMapper:
             for scheme in ("https", "http"):
                 url = f"{scheme}://{host}/"
                 try:
-                    resp = await self.client.head(
+                    await self.client.head(
                         url, timeout=config.http_timeout, follow_redirects=False
                     )
-                    # Record redirect target for dedup
-                    if resp.status_code in (301, 302, 303, 307, 308):
-                        loc = resp.headers.get("location", "")
-                        if loc:
-                            target_host = urlparse(urljoin(url, loc)).netloc.lower().split(":")[0]
-                            if target_host != host:
-                                self._host_redirects[host] = target_host
                     self._host_schemes[host] = scheme
                     return host
                 except Exception:

@@ -128,7 +128,6 @@ class TestValidateHostsRecordsScheme:
 
         assert "old.example" in hosts
         assert mapper._host_schemes["old.example"] == "https"
-        assert mapper._host_redirects["old.example"] == "canonical.example"
 
 
 # ════════════════════════════════════════════════════════════════════════
