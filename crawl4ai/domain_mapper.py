@@ -44,7 +44,6 @@ from .async_logger import AsyncLoggerBase, AsyncLogger
 from .async_url_seeder import AsyncUrlSeeder, _parse_head
 from .utils import (
     normalize_url,
-    is_external_url,
     quick_extract_links,
 )
 
@@ -992,10 +991,38 @@ class DomainMapper:
     async def _scan_homepage(
         self, host: str, base_domain: str, config: "DomainMapperConfig"
     ) -> List[str]:
-        """Extract internal links from a host's homepage."""
+        """Extract internal links from a host's homepage.
+
+        ``_scan_host`` stamps every returned URL with ``host=<scanned host>`` and
+        the per-host scan architecture (Phase 1 → Phase 2 → Phase 3) treats each
+        host's result set as that host's own URLs. ``quick_extract_links``'s
+        ``"internal"`` bucket is eTLD+1-internal by design (so it includes
+        sibling subdomains and the parent domain), and the ``<link>`` block used
+        ``is_external_url(…, base_domain)`` which is likewise eTLD+1-scoped. Both
+        therefore let cross-host URLs leak into a per-host result set, which
+        ``_scan_host`` then misattributes to the scanned host. Filter both
+        blocks to the exact host being scanned (mirroring the ``url_host ==
+        host`` check the Wayback branch already applies), keeping the
+        ``quick_extract_links`` eTLD+1 contract unchanged.
+        """
         urls: List[str] = []
         scheme = getattr(self, "_host_schemes", {}).get(host, "https")
         base_url = f"{scheme}://{host}/"
+
+        # Normalize the scanned host the same way ``is_external_url`` normalizes
+        # a URL's netloc (lowercase, strip port, strip leading ``www.``) so the
+        # exact-host predicate below agrees with the rest of the codebase on
+        # canonical ``www.``-aliasing.
+        host_norm = host.lower().split(":")[0].replace("www.", "")
+
+        def _on_host(u: str) -> bool:
+            try:
+                return (
+                    urlparse(u).netloc.lower().split(":")[0].replace("www.", "")
+                    == host_norm
+                )
+            except Exception:
+                return False
 
         try:
             resp = await self.client.get(
@@ -1006,14 +1033,17 @@ class DomainMapper:
 
             html = resp.text
 
-            # Extract <a href> links
+            # Extract <a href> links — quick_extract_links returns eTLD+1-internal
+            # links; narrow to the exact host being scanned.
             links = quick_extract_links(html, str(resp.url))
             for link in links.get("internal", []):
                 href = link.get("href", "")
-                if href:
+                if href and _on_host(href):
                     urls.append(href)
 
-            # Also mine <link> tags from <head>
+            # Also mine <link> tags from <head> — replace the previous
+            # ``is_external_url(full_url, base_domain)`` (eTLD+1-scoped) check
+            # with the exact-host predicate for the same reason.
             head_data = _parse_head(html)
             for rel, entries in head_data.get("link", {}).items():
                 if rel in ("alternate", "preload", "prefetch", "next", "prev"):
@@ -1021,7 +1051,7 @@ class DomainMapper:
                         href = entry.get("href", "")
                         if href:
                             full_url = urljoin(str(resp.url), href)
-                            if not is_external_url(full_url, base_domain):
+                            if _on_host(full_url):
                                 urls.append(full_url)
 
             self._log("info", "Homepage {host}: {count} internal links",
