@@ -6,8 +6,8 @@ from utils import FilterType
 
 class CrawlRequest(BaseModel):
     urls: list[str] = Field(min_length=1, max_length=100)
-    browser_config: dict | None = Field(default_factory=dict)
-    crawler_config: dict | None = Field(default_factory=dict)
+    browser_config: dict = Field(default_factory=dict)
+    crawler_config: dict = Field(default_factory=dict)
     crawler_configs: list[dict] | None = Field(
         default=None,
         description=(
