@@ -333,7 +333,18 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                     error_message = f"Rate limit retry count exceeded for domain {urlparse(url).netloc}"
                     if self.monitor:
                         self.monitor.update_task(task_id, status=CrawlStatus.FAILED)
-                        
+                    return CrawlerTaskResult(
+                        task_id=task_id,
+                        url=url,
+                        result=result,
+                        memory_usage=memory_usage,
+                        peak_memory=peak_memory,
+                        start_time=start_time,
+                        end_time=time.time(),
+                        error_message=error_message,
+                        retry_count=retry_count,
+                    )
+
             # Update status based on result
             if not result.success:
                 error_message = result.error_message
