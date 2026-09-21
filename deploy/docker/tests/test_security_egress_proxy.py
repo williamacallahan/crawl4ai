@@ -245,6 +245,95 @@ class TestUpstreamChaining:
         assert b"keep-alive" not in sent
         assert b"rebind.evil" not in sent  # the smuggled request never got upstream
 
+    async def test_no_proxy_ip_port_form_dials_direct_not_through_upstream(self, monkeypatch):
+        """End-to-end regression for be18eb4: an ``IP:port`` NO_PROXY entry must
+        cause the proxy to dial the pinned IP directly and not chain a CONNECT
+        through the corporate upstream (the bug silently routed the request
+        through the corporate proxy)."""
+        up, up_port = await _fake_upstream()  # stand-in for the pinned IP
+        corp_seen = []
+
+        async def corp_handle(reader, writer):
+            corp_seen.append(await reader.readline())
+            writer.close()
+
+        corp = await asyncio.start_server(corp_handle, "127.0.0.1", 0)
+        corp_port = corp.sockets[0].getsockname()[1]
+        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{corp_port}")
+        monkeypatch.setenv("NO_PROXY", f"127.0.0.1:{up_port}")  # IP:port form
+
+        def fake_pin(url):
+            return PinnedTarget("https", "good.example", up_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        dialed = {}
+        real_open = asyncio.open_connection
+
+        async def spy_open(host, port, *a, **k):
+            dialed["host"], dialed["port"] = host, port
+            return await real_open(host, port, *a, **k)
+        monkeypatch.setattr(egress_proxy.asyncio, "open_connection", spy_open)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await real_open(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT good.example:{up_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            status = await asyncio.wait_for(r.readline(), timeout=5)
+            assert b"200" in status
+            await r.readline()  # blank line after the 200
+            w.write(b"hello")
+            await w.drain()
+            body = await asyncio.wait_for(r.read(100), timeout=5)
+            assert b"UPSTREAM-OK" in body
+            w.close()
+        finally:
+            await proxy.stop()
+            up.close()
+            corp.close()
+        # Direct dial target was the pinned IP at the request port, NOT the
+        # corporate proxy port.
+        assert dialed["host"] == "127.0.0.1"
+        assert dialed["port"] == up_port
+        # Corporate proxy received zero CONNECT requests.
+        assert corp_seen == []
+
+    async def test_no_proxy_ip_port_mismatch_chains_through_upstream(self, monkeypatch):
+        """The port scope on ``IP:port`` is honored end-to-end: a port mismatch
+        must fall back to chaining through the corporate proxy (i.e. the bug
+        fix must NOT over-broaden to ignore the port)."""
+        up, up_port = await _fake_upstream()
+        seen = []
+        corp, corp_port = await _fake_corporate_proxy(seen)
+        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{corp_port}")
+        monkeypatch.setenv("NO_PROXY", f"127.0.0.1:1")  # port != up_port
+
+        def fake_pin(url):
+            return PinnedTarget("https", "good.example", up_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT good.example:{up_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            status = await asyncio.wait_for(r.readline(), timeout=5)
+            assert b"200" in status
+            await r.readline()
+            w.write(b"hello")
+            await w.drain()
+            body = await asyncio.wait_for(r.read(100), timeout=5)
+            assert body == b"TUNNEL-OK"
+            w.close()
+        finally:
+            await proxy.stop()
+            up.close()
+            corp.close()
+        # The corporate proxy DID receive a CONNECT to the pinned IP.
+        assert seen == [f"CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\n".encode()]
+
 
 def test_upstream_proxy_env_parsing(monkeypatch):
     assert egress_proxy.upstream_proxy() is None
@@ -285,6 +374,76 @@ def test_upstream_proxy_env_parsing(monkeypatch):
     assert egress_proxy._use_upstream(pin) is None
     monkeypatch.setenv("NO_PROXY", "site.corp.example:443")  # host:port form
     assert egress_proxy._use_upstream(pin) is None
+
+
+def test_no_proxy_ip_port_forms_bypass_with_port_scoping(monkeypatch):
+    """Regression for be18eb4: IP/CIDR/[IPv6] NO_PROXY entries with a trailing
+    ``:port`` were silently ignored because the port-stripping logic that the
+    same commit added was wired only into the hostname-suffix branch, not the
+    IP/CIDR branch directly above it. ``IP:port`` / ``CIDR:port`` /
+    ``[IPv6]:port`` entries must bypass the upstream proxy (and must honor the
+    port scope, like ``host:port`` already did).
+    """
+    monkeypatch.setenv("HTTP_PROXY", "http://192.168.180.254:56560")
+    proxy = ("192.168.180.254", 56560, None)
+    pin4 = PinnedTarget("https", "site.corp.example", 443, "203.0.113.7")
+    pin6 = PinnedTarget("https", "site.corp.example", 443, "2606:4700::1")
+    pin6_loop = PinnedTarget("https", "localhost", 443, "::1")
+    pin4_other = PinnedTarget("https", "site.example", 443, "198.51.100.5")
+
+    def expect(entry, pin, want_bypass):
+        monkeypatch.setenv("NO_PROXY", entry)
+        got = egress_proxy._use_upstream(pin)
+        return (got is None) == want_bypass, got
+
+    # Bugs being fixed: port-scoped IP/CIDR/[IPv6] now bypass.
+    ok, got = expect("203.0.113.7:443", pin4, True)
+    assert ok, f"203.0.113.7:443 expected bypass, got {got}"
+    ok, got = expect("203.0.113.0/24:443", pin4, True)
+    assert ok, f"203.0.113.0/24:443 expected bypass, got {got}"
+    ok, got = expect("[2606:4700::1]:443", pin6, True)
+    assert ok, f"[2606:4700::1]:443 expected bypass, got {got}"
+    ok, got = expect("[2606:4700::/32]:443", pin6, True)
+    assert ok, f"[2606:4700::/32]:443 expected bypass, got {got}"
+
+    # Port scope is honored: mismatched port does NOT bypass (uses upstream).
+    ok, got = expect("203.0.113.7:444", pin4, False)
+    assert ok, f"203.0.113.7:444 expected upstream, got {got}"
+    ok, got = expect("203.0.113.0/24:444", pin4, False)
+    assert ok, f"203.0.113.0/24:444 expected upstream, got {got}"
+    ok, got = expect("[2606:4700::1]:444", pin6, False)
+    assert ok, f"[2606:4700::1]:444 expected upstream, got {got}"
+    ok, got = expect("[2606:4700::/32]:444", pin6, False)
+    assert ok, f"[2606:4700::/32]:444 expected upstream, got {got}"
+
+    # Controls preserved: bare IP / CIDR / IPv6 still bypass all ports.
+    assert expect("203.0.113.7", pin4, True)[0]
+    assert expect("203.0.113.0/24", pin4, True)[0]
+    assert expect("2606:4700::1", pin6, True)[0]
+    assert expect("2606:4700::/32", pin6, True)[0]
+    assert expect("::1", pin6_loop, True)[0]
+
+    # Bare IPv6 is not split on a trailing group as a faux port (be18eb4 would
+    # have regressed this if ``rpartition(':')`` had been moved above the IP
+    # branch naively).
+    assert expect("2606:4700::1", pin6, True)[0]
+
+    # IDNA-style / suffix and host:port still behave (existing behavior).
+    assert expect(".corp.example", pin4, True)[0]
+    assert expect("site.corp.example:443", pin4, True)[0]
+    assert expect("site.corp.example:444", pin4, False)[0]
+
+    # Bare-bracket IPv6 without :port remains a no-match (existing behavior).
+    assert expect("[2606:4700::1]", pin6, False)[0]
+
+    # A bare-IP / CIDR entry that parses but does NOT contain the pin IP must
+    # NOT fall through to a hostname-suffix match (preserves the original
+    # try/continue semantics of the IP branch).
+    assert expect("10.0.0.0/8", pin4_other, False)[0]
+    assert expect("1.2.3.4", pin4_other, False)[0]
+
+    # Wildcard still bypasses everything.
+    assert expect("*", pin4, True)[0]
 
 
 class TestEnforceEgressWiring:
