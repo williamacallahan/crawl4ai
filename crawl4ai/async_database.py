@@ -62,20 +62,42 @@ class AsyncDatabaseManager:
                     if not result:
                         raise Exception("crawled_data table was not created")
 
-            # If version changed or fresh install, run updates
+            # Idempotent schema updates: only ADD columns that are missing, never
+            # mutate data. Safe to re-run on every version bump. The version
+            # file is updated afterwards so a routine upgrade (which flips
+            # needs_update True) runs schema updates once per release.
             if needs_update:
                 self.logger.info("New version detected, running updates", tag="INIT")
                 await self.update_db_schema()
+                self.version_manager.update_version()
+                self.logger.success(
+                    "Version update completed successfully", tag="COMPLETE"
+                )
+
+            # The blob->hash content migration is a ONE-TIME, DESTRUCTIVE data
+            # transformation. It is gated on a dedicated marker (independent of
+            # the package version) so a routine `pip install --upgrade` does
+            # NOT re-fire it and re-hash already-hashed rows -- that corruption
+            # was the f9fe6f8 bug: every release bumped __version__, made
+            # `needs_update` True and re-ran the non-idempotent migration,
+            # replacing cached html/markdown with the previous hash string.
+            # `migrate_database` is now idempotent too, so a re-run after a
+            # mid-migration crash (marker not yet written) stays safe. The live
+            # `self.db_path` is passed explicitly so custom-base users
+            # (CRAWL4_AI_BASE_DIRECTORY set) migrate their actual DB rather
+            # than the hardcoded Path.home() default.
+            if self.version_manager.needs_migration():
+                self.logger.info("Running one-time content migration", tag="INIT")
                 from .migrations import (
                     run_migration,
                 )  # Import here to avoid circular imports
 
-                await run_migration()
-                self.version_manager.update_version()  # Update stored version after successful migration
+                await run_migration(self.db_path)
+                self.version_manager.mark_migrated()
                 self.logger.success(
-                    "Version update completed successfully", tag="COMPLETE"
+                    "Content migration completed successfully", tag="COMPLETE"
                 )
-            else:
+            elif not needs_update:
                 self.logger.success(
                     "Database initialization completed successfully", tag="COMPLETE"
                 )

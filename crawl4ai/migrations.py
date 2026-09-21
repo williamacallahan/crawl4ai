@@ -43,9 +43,39 @@ class DatabaseMigration:
         return content_hash
         # return hashlib.sha256(content.encode()).hexdigest()
 
+    def _is_content_hash(self, content: str, content_type: str) -> bool:
+        """Return True if ``content`` is already a stored content-hash pointer.
+
+        After the blob->hash migration has run on a row, the DB column holds an
+        xxh64 hex string (16 chars) naming an existing file under
+        ``content_paths[content_type]``. Re-running the migration must detect
+        this and leave the pointer intact, otherwise it re-hashes the hash
+        string, updates the column to the new (hash-of-hash) pointer and
+        orphans the original content file on disk. Implementation of the
+        recommended fix: "skip rows whose column value already names an
+        existing ``*_content/<hash>`` file".
+        """
+        if not content or len(content) != 16:
+            return False
+        # xxh64 hexdigest is 16 hex chars; reject non-hex strings of that
+        # length so a 16-char raw blob that happens to exist as a file name
+        # under a different content dir is not misclassified.
+        try:
+            int(content, 16)
+        except (TypeError, ValueError):
+            return False
+        return os.path.exists(os.path.join(self.content_paths[content_type], content))
+
     async def _store_content(self, content: str, content_type: str) -> str:
         if not content:
             return ""
+
+        # Idempotency guard: if the column already holds a content-hash
+        # pointer (the migration has already run on this row), keep it as-is
+        # instead of re-hashing the hash string. This makes ``migrate_database``
+        # safe to re-run after a partial failure or a stale marker.
+        if self._is_content_hash(content, content_type):
+            return content
 
         content_hash = self._generate_content_hash(content)
         file_path = os.path.join(self.content_paths[content_type], content_hash)
@@ -160,12 +190,46 @@ async def backup_database(db_path: str) -> str:
 
 
 async def run_migration(db_path: Optional[str] = None):
-    """Run database migration"""
+    """Run the one-time blob->hash database migration.
+
+    The migration is idempotent: rows whose content columns already hold a
+    content-hash pointer (naming an existing ``*_content/<hash>`` file) are
+    skipped by ``DatabaseMigration._store_content``, so a re-run after a
+    partial failure or a stale marker does not re-hash already-migrated
+    content.
+    """
     if db_path is None:
         db_path = os.path.join(Path.home(), ".crawl4ai", "crawl4ai.db")
 
     if not os.path.exists(db_path):
         logger.info("No existing database found. Skipping migration.", tag="INIT")
+        return
+
+    # Nothing to migrate on a fresh/empty DB; skip the backup so a first
+    # launch (which now passes the live ``db_path`` and therefore always finds
+    # the just-created empty DB) does not leave a spurious empty ``.backup_*``
+    # file behind. Also short-circuits foreign/legacy DBs without the table.
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='crawled_data'"
+            ) as cursor:
+                if not await cursor.fetchone():
+                    logger.info(
+                        "No crawled_data table. Skipping migration.", tag="INIT"
+                    )
+                    return
+            async with db.execute("SELECT COUNT(*) FROM crawled_data") as cursor:
+                (row_count,) = await cursor.fetchone()
+    except Exception as e:
+        logger.error(
+            message="Migration pre-check failed: {error}",
+            tag="ERROR",
+            params={"error": str(e)},
+        )
+        raise
+    if row_count == 0:
+        logger.info("No rows to migrate. Skipping migration.", tag="INIT")
         return
 
     # Create backup first

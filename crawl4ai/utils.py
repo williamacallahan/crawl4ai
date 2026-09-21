@@ -222,9 +222,18 @@ def merge_chunks(
 
 
 class VersionManager:
+    # Dedicated marker for the one-time blob->hash content migration.
+    # This is intentionally separate from `version.txt`: the package version
+    # flips on every release (`needs_update` -> True), but the blob->hash
+    # migration is a destructive, one-time data transformation that must
+    # NOT re-fire on a routine `pip install --upgrade` (it re-hashes
+    # already-hashed rows, replacing cached content with the hash string).
+    MIGRATION_MARKER_FILENAME = "migration_blob_to_hash_complete"
+
     def __init__(self):
         self.home_dir = Path(os.getenv("CRAWL4_AI_BASE_DIRECTORY", Path.home())) / ".crawl4ai"
         self.version_file = self.home_dir / "version.txt"
+        self.migration_marker = self.home_dir / self.MIGRATION_MARKER_FILENAME
 
     def get_installed_version(self):
         """Get the version recorded in home directory"""
@@ -244,6 +253,24 @@ class VersionManager:
         installed = self.get_installed_version()
         current = version.parse(__version__.__version__)
         return installed is None or installed < current
+
+    def needs_migration(self):
+        """Check if the one-time blob->hash content migration needs to run.
+
+        Independent of the package version: the blob->hash migration is a
+        one-time, destructive data transformation. Re-running it re-hashes
+        rows whose columns already hold a content-hash pointer, replacing
+        the cached content with the hash string. It must therefore be gated
+        on a dedicated marker, not on `needs_update` (which is True on every
+        release). Also True when `version.txt` is missing/corrupted and the
+        marker has not yet been written (first run, or a stale install).
+        """
+        return not self.migration_marker.exists()
+
+    def mark_migrated(self):
+        """Mark the one-time blob->hash migration as complete."""
+        self.home_dir.mkdir(parents=True, exist_ok=True)
+        self.migration_marker.write_text("done")
 
 
 class RobotsParser:
