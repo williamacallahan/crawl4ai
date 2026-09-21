@@ -21,6 +21,8 @@ no real network/HTTPS connection is ever opened.
 
 from unittest.mock import MagicMock, patch
 
+import hashlib
+
 import pytest
 
 from crawl4ai.ssl_certificate import SSLCertificate
@@ -81,7 +83,13 @@ def test_from_url_returns_certificate_for_ipv6_literal_on_success():
     fake_x509.get_serial_number.return_value = 1
     fake_x509.get_notBefore.return_value = b"20240101000000Z"
     fake_x509.get_notAfter.return_value = b"20240101000000Z"
-    fake_x509.digest.return_value.hex.return_value = "deadbeef"
+    # The fixed ``from_binary`` computes the fingerprint as
+    # ``hashlib.sha256(der_bytes).hexdigest()`` of the (mocked)
+    # ``dump_certificate`` output, so the expected value is the SHA-256 of
+    # ``fake_cert_binary``. The old ``fake_x509.digest.return_value.hex
+    # .return_value = "deadbeef"`` stub was tautological with the buggy
+    # ``x509.digest("sha256").hex()`` transform and is removed because
+    # ``from_binary`` no longer calls ``x509.digest``.
     fake_x509.get_signature_algorithm.return_value = b"sha256"
     fake_x509.get_extension_count.return_value = 0
 
@@ -111,7 +119,9 @@ def test_from_url_returns_certificate_for_ipv6_literal_on_success():
     assert isinstance(result, SSLCertificate)
     assert result.subject == {"CN": "host"}
     assert result.issuer == {"CN": "issuer"}
-    assert result.fingerprint == "deadbeef"
+    # The fingerprint must be the SHA-256 of the mocked DER bytes
+    # (``dump_certificate`` is patched to return ``fake_cert_binary``).
+    assert result.fingerprint == hashlib.sha256(fake_cert_binary).hexdigest()
 
 
 def test_scoped_ipv6_keeps_interface_out_of_tls_identity():

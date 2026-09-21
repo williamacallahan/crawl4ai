@@ -4,6 +4,7 @@ import ssl
 import socket
 import base64
 import json
+import hashlib
 from typing import Dict, Any, Optional
 from urllib.parse import unquote, urlparse
 import OpenSSL.crypto
@@ -180,7 +181,7 @@ class SSLCertificate(dict):
                 "serial_number": hex(x509.get_serial_number()),
                 "not_before": x509.get_notBefore(),
                 "not_after": x509.get_notAfter(),
-                "fingerprint": x509.digest("sha256").hex(),
+                "fingerprint": hashlib.sha256(der_bytes).hexdigest(),
                 "signature_algorithm": x509.get_signature_algorithm(),
                 "raw_cert": base64.b64encode(der_bytes),
             }
