@@ -255,15 +255,67 @@ class DefaultTableExtraction(TableExtractionStrategy):
         summary = table.get("summary", "").strip()
         table_depth = len(table.xpath("ancestor::table")) + 1
         
-        # Extract headers with colspan handling
+        # Extract headers. When a <thead> is present, resolve ALL of its <tr>
+        # rows through the same colspan/rowspan grid expansion used for the
+        # body (the WHATWG "forming a table" algorithm), then take the leaf
+        # (deepest resolved) row as ``headers``. Reading only the first <thead>
+        # row drops rows 2..N of a multi-row <thead> entirely — they contribute
+        # neither to headers nor to rows — silently losing hierarchical column
+        # headers (hierarchical headers, pivot tables, financial filings) and
+        # surfacing duplicate/degenerate labels from the top row only.
         headers = []
         thead_rows = table.xpath("./thead/tr")
         if thead_rows:
-            header_cells = thead_rows[0].xpath("./th")
-            for cell in header_cells:
-                text = self._cell_text(cell, table_depth)
-                colspan = self._cell_span(cell, "colspan")
-                headers.extend([text] * colspan)
+            pending = {}  # col_index -> (value, rows_remaining)
+            current_group = None
+            header_row_data = []
+            for row in thead_rows:
+                row_group = row.getparent()
+                if row_group is not current_group:
+                    pending.clear()
+                    current_group = row_group
+                col = 0
+                row_data = []
+
+                def append_pending():
+                    nonlocal col
+                    value, remaining = pending[col]
+                    row_data.append(value)
+                    if remaining == 1:
+                        pending.pop(col)
+                    else:
+                        pending[col] = (value, remaining - 1)
+                    col += 1
+
+                for cell in row.xpath("./th"):
+                    while col in pending:
+                        append_pending()
+                    text = self._cell_text(cell, table_depth)
+                    colspan = self._cell_span(cell, "colspan")
+                    rowspan = self._cell_span(cell, "rowspan")
+                    if rowspan == 0:
+                        rowspan = len(row.xpath("following-sibling::tr")) + 1
+                    for _ in range(colspan):
+                        row_data.append(text)
+                        if rowspan > 1:
+                            pending[col] = (text, rowspan - 1)
+                        col += 1
+                # Fill trailing columns still occupied by an earlier rowspan
+                # (a blank continuation row consumes its pending spans). This
+                # mirrors the body row loop and keeps the leaf row a complete
+                # snapshot of the resolved header grid.
+                last_pending_col = max(
+                    (index for index in pending if index >= col), default=-1
+                )
+                while col <= last_pending_col:
+                    if col in pending:
+                        append_pending()
+                    else:
+                        row_data.append("")
+                        col += 1
+                if row_data:
+                    header_row_data = row_data
+            headers = list(header_row_data)
         else:
             # Only adopt the first row as headers when it is all <th>; a row
             # mixing <th> (row label) with <td> data must stay data, otherwise
