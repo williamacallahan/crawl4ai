@@ -375,3 +375,212 @@ def test_raw_backslashes_and_tags_survive_template_and_colored_params():
     logger.error(text)
     logger.error("{detail}", params={"detail": text}, colors={"detail": LogColor.RED})
     assert _render_markup(console.lines).count(text) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests for multi-line file-output normalization
+# (issue: file sink must preserve one-timestamp-per-record invariant when
+# the message template, a param value, or box art contains embedded newlines)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncLoggerFileNewlineNormalization:
+    """The file sink must emit exactly one timestamped physical line per
+    ``_log`` call. Multi-line content (template, param values, or box art)
+    used to fragment a single record across N physical lines with the
+    timestamp scoping only L1, breaking "one record per line" readers."""
+
+    def test_multiline_template_emits_single_timestamped_line(self, tmp_path):
+        """A template containing embedded ``\\n`` must produce exactly one
+        physical line in the file, prefixed by a single timestamp."""
+        log_file = tmp_path / "multiline.log"
+        logger = AsyncLogger(log_file=str(log_file), verbose=False)
+        logger.error(
+            "Database initialization failed:\n{error}\n\nContext:\n{context}\n\nTraceback:\n{traceback}",
+            tag="ERROR",
+            force_verbose=True,
+            params={
+                "error": "no such table: crawled_data",
+                "context": "  conn = await aiosqlite.connect(self.db_path)\n  await conn.execute('PRAGMA journal_mode = WAL')",
+                "traceback": (
+                    "Traceback (most recent call last):\n"
+                    '  File "async_database.py", line 134, in get_connection\n'
+                    "    conn = await aiosqlite.connect(self.db_path)\n"
+                    "sqlite3.OperationalError: no such table: crawled_data"
+                ),
+            },
+        )
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        # One log call -> exactly one physical line.
+        assert len(lines) == 1, (
+            f"Expected 1 physical line for 1 multi-line log call, got "
+            f"{len(lines)}: {lines!r}"
+        )
+        # That single line must carry the timestamp prefix.
+        assert lines[0].startswith("[20"), f"Missing timestamp prefix: {lines[0]!r}"
+        # Every section of the original message must remain readable on the line.
+        for fragment in (
+            "Database initialization failed:",
+            "no such table: crawled_data",
+            "Context:",
+            "conn = await aiosqlite.connect",
+            "Traceback (most recent call last):",
+            "sqlite3.OperationalError: no such table: crawled_data",
+        ):
+            assert fragment in lines[0], (
+                f"Fragment {fragment!r} lost from flattened record: {lines[0]!r}"
+            )
+        # A visible continuation marker must indicate where newlines were.
+        assert "⏎" in lines[0], (
+            f"Continuation marker missing from flattened record: {lines[0]!r}"
+        )
+
+    def test_one_log_call_produces_one_physical_line(self, tmp_path):
+        """N log calls must produce exactly N physical lines, regardless of
+        how many ``\\n`` characters each call's message contains."""
+        log_file = tmp_path / "counts.log"
+        logger = AsyncLogger(log_file=str(log_file), verbose=False)
+        messages = [
+            "single line",
+            "two\nlines",
+            "three\nline\nmessage",
+            "trailing newline\n",
+            "leading newline\nmid",
+            "\n\n\nblank lines only\n\n\n",
+        ]
+        for msg in messages:
+            logger.error(msg, tag="TEST")
+
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == len(messages), (
+            f"Expected {len(messages)} physical lines (one per call), got "
+            f"{len(lines)}: {lines!r}"
+        )
+        # Every physical line must carry a timestamp prefix (no orphan
+        # continuation lines).
+        assert all(line.startswith("[20") for line in lines), (
+            f"Found an un-timestamped continuation line: {lines!r}"
+        )
+
+    def test_single_line_messages_are_unaffected(self, tmp_path):
+        """Messages without ``\\n`` must round-trip unchanged (regression
+        guard for the normalization path)."""
+        log_file = tmp_path / "single.log"
+        logger = AsyncLogger(log_file=str(log_file), verbose=False)
+        logger.info("plain message", tag="TEST")
+        logger.error("another plain message", tag="TEST")
+
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        assert "plain message" in lines[0]
+        assert "another plain message" in lines[1]
+        # Single-line messages must NOT receive a continuation marker.
+        assert "⏎" not in lines[0], (
+            f"Continuation marker injected into single-line message: {lines[0]!r}"
+        )
+        assert "⏎" not in lines[1], (
+            f"Continuation marker injected into single-line message: {lines[1]!r}"
+        )
+
+    def test_boxes_variant_emits_single_timestamped_line(self, tmp_path):
+        """The ``boxes=[...]`` path goes through ``create_box_message`` which
+        returns ``\\n{box}\\n`` — this secondary trigger must also collapse
+        to one timestamped physical line."""
+        log_file = tmp_path / "boxes.log"
+        logger = AsyncLogger(log_file=str(log_file), verbose=False)
+        logger.error(
+            "{error}",
+            tag="ERROR",
+            params={"error": "Connection refused"},
+            boxes=["error"],
+        )
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1, (
+            f"boxes=['error'] must yield one physical line, got {len(lines)}: "
+            f"{lines!r}"
+        )
+        assert lines[0].startswith("[20"), f"Missing timestamp prefix: {lines[0]!r}"
+        assert "Connection refused" in lines[0], (
+            f"Box payload lost from flattened record: {lines[0]!r}"
+        )
+        # The continuation marker should appear because the box injects \n.
+        assert "⏎" in lines[0]
+
+    def test_carriage_returns_are_also_normalized(self, tmp_path):
+        """``\\r\\n`` and lone ``\\r`` (Windows / legacy) must collapse the
+        same way lone ``\\n`` does, so file output stays one-record-per-line
+        regardless of newline convention."""
+        log_file = tmp_path / "crlf.log"
+        logger = AsyncLogger(log_file=str(log_file), verbose=False)
+        logger.error("line1\r\nline2\rline3\nline4", tag="TEST")
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1, (
+            f"CRLF/CR must flatten to one line, got {len(lines)}: {lines!r}"
+        )
+        for frag in ("line1", "line2", "line3", "line4"):
+            assert frag in lines[0], f"Fragment {frag!r} lost: {lines[0]!r}"
+
+    def test_blank_line_collapsing_preserves_nonblank_content(self, tmp_path):
+        """A message that is only blank lines must not produce an orphan
+        empty line in the file (which would be an un-timestamped record)."""
+        log_file = tmp_path / "blanks.log"
+        logger = AsyncLogger(log_file=str(log_file), verbose=False)
+        logger.error("\n\n\n", tag="TEST")
+        logger.error("real\n\n\nmessage", tag="TEST")
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2, (
+            f"Expected 2 physical lines, got {len(lines)}: {lines!r}"
+        )
+        # The all-blank call must still carry a timestamp (empty payload ok).
+        assert lines[0].startswith("[20"), f"Missing timestamp on L1: {lines[0]!r}"
+        # The mixed call must retain the real content.
+        assert "real" in lines[1] and "message" in lines[1], (
+            f"Real content lost from mixed call: {lines[1]!r}"
+        )
+        # An empty-output call should not inject a continuation marker.
+        assert "⏎" not in lines[0], (
+            f"Continuation marker on empty record: {lines[0]!r}"
+        )
+
+
+class TestAsyncFileLoggerNewlineNormalization:
+    """The file-only ``AsyncFileLogger`` shares the one-timestamp-per-line
+    format and must preserve the same invariant when callers pass multi-line
+    messages directly."""
+
+    def test_multiline_message_emits_single_timestamped_line(self, tmp_path):
+        log_file = tmp_path / "filelogger.log"
+        logger = AsyncFileLogger(str(log_file))
+        logger.error("line1\nline2\nline3", tag="CUSTOM")
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1, (
+            f"Expected 1 physical line, got {len(lines)}: {lines!r}"
+        )
+        assert lines[0].startswith("[20"), f"Missing timestamp: {lines[0]!r}"
+        assert "[ERROR]" in lines[0] and "[CUSTOM]" in lines[0]
+        for frag in ("line1", "line2", "line3"):
+            assert frag in lines[0], f"Fragment {frag!r} lost: {lines[0]!r}"
+        assert "⏎" in lines[0]
+
+    def test_single_line_messages_are_unaffected(self, tmp_path):
+        log_file = tmp_path / "filelogger_single.log"
+        logger = AsyncFileLogger(str(log_file))
+        logger.info("plain", tag="T")
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert "plain" in lines[0]
+        assert "⏎" not in lines[0], (
+            f"Continuation marker on single-line message: {lines[0]!r}"
+        )
+
+    def test_multiple_calls_produce_equal_line_count(self, tmp_path):
+        log_file = tmp_path / "filelogger_multi.log"
+        logger = AsyncFileLogger(str(log_file))
+        msgs = ["a", "b\nc", "d\ne\nf"]
+        for m in msgs:
+            logger.warning(m, tag="W")
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == len(msgs), (
+            f"Expected {len(msgs)} lines, got {len(lines)}: {lines!r}"
+        )
+        assert all(l.startswith("[20") and "[WARNING]" in l for l in lines)
