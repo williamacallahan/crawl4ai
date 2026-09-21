@@ -317,10 +317,6 @@ async def handle_llm_qa(
         if not url.startswith(('http://', 'https://')) and not url.startswith(("raw:", "raw://")):
             url = 'https://' + url
         await asyncio.to_thread(validate_url_destination, url)
-        # Extract base URL by finding last '?q=' occurrence
-        last_q_index = url.rfind('?q=')
-        if last_q_index != -1:
-            url = url[:last_q_index]
 
         # Get markdown content (use default config)
         from utils import load_config
