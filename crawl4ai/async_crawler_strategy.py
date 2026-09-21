@@ -726,13 +726,29 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 ssl_cert = SSLCertificate.from_url(url)
 
             # Set up download handling
+            # Use a named handler with a stable identity so the `finally:`
+            # block can remove it via `page.remove_listener`. A fresh anonymous
+            # lambda each crawl would accumulate on a reused page (session_id /
+            # managed / persistent browser) because pyee stores handlers keyed
+            # by identity and never dedupes new closures. Track spawned tasks
+            # so any download still in flight at crawl boundary can be
+            # cancelled / awaited before the next crawl resets
+            # `self._downloaded_files`.
+            handle_download = None
+            _inflight_downloads: set = set()
             if self.browser_config.accept_downloads:
-                page.on(
-                    "download",
-                    lambda download: asyncio.create_task(
-                        self._handle_download(download)
-                    ),
-                )
+                async def _on_download(download):
+                    try:
+                        await self._handle_download(download)
+                    finally:
+                        _inflight_downloads.discard(asyncio.current_task())
+
+                def handle_download(download):
+                    task = asyncio.create_task(_on_download(download))
+                    _inflight_downloads.add(task)
+                    task.add_done_callback(_inflight_downloads.discard)
+
+                page.on("download", handle_download)
 
             # Handle page navigation and content loading
             if not config.js_only:
@@ -1244,6 +1260,19 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             page, handle_console, handle_error
                         )
                         captured_console.extend(final_messages or [])
+                    # Remove the download listener registered in the try: block
+                    # above and cancel any download still in flight. Without
+                    # this, the handler (a fresh closure per crawl) would
+                    # accumulate on a reused page, firing N times on the Nth
+                    # crawl and leaking closures for the lifetime of the page.
+                    if self.browser_config.accept_downloads and handle_download is not None:
+                        page.remove_listener("download", handle_download)
+                        for task in list(_inflight_downloads):
+                            task.cancel()
+                        if _inflight_downloads:
+                            await asyncio.gather(
+                                *_inflight_downloads, return_exceptions=True
+                            )
                 except asyncio.CancelledError:
                     cleanup_cancelled = True
                 except Exception:
