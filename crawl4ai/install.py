@@ -13,8 +13,8 @@ def setup_home_directory():
     """Set up the .crawl4ai folder structure in the user's home directory."""
     base_dir = os.getenv("CRAWL4_AI_BASE_DIRECTORY")
     crawl4ai_folder = Path(base_dir) if base_dir else Path.home()
-    crawl4ai_config = crawl4ai_folder / "global.yml"
     crawl4ai_folder = crawl4ai_folder / ".crawl4ai"
+    crawl4ai_config = crawl4ai_folder / "global.yml"
     cache_folder = crawl4ai_folder / "cache"
     content_folders = [
         "html_content",
