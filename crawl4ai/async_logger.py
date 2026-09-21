@@ -164,10 +164,20 @@ class AsyncLogger(AsyncLoggerBase):
         return shortened.ljust(length)  # Also pad shortened text to consistent length
 
     def _write_to_file(self, message: str):
-        """Write a message to the log file if configured."""
+        """Write a message to the log file if configured.
+
+        Embedded newlines in ``message`` (template, params, or box art) are
+        flattened to a single physical line so the file preserves the
+        one-record-per-line, one-timestamp-per-record invariant implied by the
+        ``[{timestamp}] {plain_text}\\n`` format string. A visible ``⏎``
+        continuation marker is inserted where a newline used to be, so the
+        original line breaks remain discoverable when grepping the log.
+        """
         if self.log_file:
             text = Text.from_markup(message)
-            plain_text = text.plain
+            plain_text = " ⏎ ".join(
+                line for line in text.plain.splitlines() if line.strip()
+            ).strip()
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(f"[{timestamp}] {plain_text}\n")
@@ -329,10 +339,21 @@ class AsyncFileLogger(AsyncLoggerBase):
         os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
 
     def _write_to_file(self, level: str, message: str, tag: str):
-        """Write a message to the log file."""
+        """Write a message to the log file.
+
+        Embedded newlines in ``message`` are flattened to a single physical
+        line so the file preserves the one-record-per-line, one-timestamp-
+        per-record invariant implied by the ``[{timestamp}] [{level}] [{tag}]
+        {message}\\n`` format string. A visible ``⏎`` continuation marker is
+        inserted where a newline used to be, so the original line breaks
+        remain discoverable when grepping the log.
+        """
+        plain_message = " ⏎ ".join(
+            line for line in message.splitlines() if line.strip()
+        ).strip()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [{level}] [{tag}] {message}\n")
+            f.write(f"[{timestamp}] [{level}] [{tag}] {plain_message}\n")
 
     def debug(self, message: str, tag: str = "DEBUG", **kwargs):
         """Log a debug message to file."""
