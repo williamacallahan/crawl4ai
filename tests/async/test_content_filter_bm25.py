@@ -153,18 +153,83 @@ class TestBM25ContentFilter:
         "unwanted_tag", ["script", "style", "nav", "footer", "header"]
     )
     def test_excluded_tags(self, unwanted_tag):
-        """Test that specific tags are properly excluded"""
-        html = f"""
-        <html><body>
-            <{unwanted_tag}>Should not appear</{unwanted_tag}>
-            <p>Should appear</p>
-        </body></html>
+        """Test that specific tags are properly excluded from the BM25 output.
+
+        Bug-history note: this test used to pass *vacuously*. Its HTML had no
+        ``<title>`` / ``<h1>`` / ``<meta>`` / long paragraph, so
+        ``extract_page_query`` returned ``""`` and ``filter_content`` short
+        -circuited at ``if not query: return []`` before any scoring ever
+        happened, so excluded-tag text was never compared against the
+        threshold.
+
+        The strengthened version guarantees a non-empty query (title) plus a
+        varied filler corpus (positive BM25 IDF) and a lenient threshold so
+        the BM25 path actually runs and any scoring-eligible chunk that
+        survives is selected. The leak text is intentionally chosen to
+        OVERLAP the query ("Python Tutorial ...") so the excluded-tag block
+        would have scored above the threshold and leaked verbatim (nav /
+        footer / header) or as an empty-string block (style) had it not been
+        removed before chunk extraction.
         """
-        filter = BM25ContentFilter()
+        leak_text = "Python Tutorial Boilerplate Should Not Appear In Output"
+        html = (
+            "<html><head><title>Python Tutorial</title></head><body>"
+            f"<{unwanted_tag}>{leak_text}</{unwanted_tag}>"
+            "<article><h1>Python Tutorial</h1>"
+            "<p>The Python tutorial walks beginners through syntax, data "
+            "structures, functions, modules, classes, and standard library "
+            "features with examples for newcomers to the language.</p>"
+            "</article>"
+            # Filler paragraphs so BM25 IDF stays positive across the corpus.
+            "<p>JavaScript powers interactive websites and modern browsers.</p>"
+            "<p>Rust provides memory safety through its ownership model.</p>"
+            "<p>Go was designed at Google for scalable network services.</p>"
+            "<p>TypeScript adds static type checking to JavaScript programs.</p>"
+            "<p>Java is dominant in enterprise and Android development.</p>"
+            "</body></html>"
+        )
+        filter = BM25ContentFilter(user_query="Python Tutorial", bm25_threshold=0.01)
         contents = filter.filter_content(html)
 
+        # Non-vacuity: the BM25 path ran and returned content (the article
+        # paragraph must be in the output, proving scoring actually executed).
+        assert contents, "Expected at least one content block"
+        assert any(
+            "walks beginners through syntax" in c for c in contents
+        ), "Article paragraph should be retained as content"
+
         combined_content = " ".join(contents).lower()
-        assert "should not appear" not in combined_content
+        assert "python tutorial boilerplate should not appear in output" not in combined_content, (
+            f"Excluded tag <{unwanted_tag}> text leaked into output"
+        )
+        # clean_element strips aside/style/form/iframe/noscript wrappers, so
+        # pre-fix those chunks were returned as empty-string padding; the fix
+        # removes excluded tags before scoring, so no empty blocks remain.
+        assert all(c.strip() for c in contents), (
+            f"Empty block returned for <{unwanted_tag}> (clean_element stripped "
+            "a wrapper that was wrongly scored as a candidate)"
+        )
+        filter = BM25ContentFilter(user_query="Python Tutorial", bm25_threshold=0.01)
+        contents = filter.filter_content(html)
+
+        # Non-vacuity: the BM25 path ran and returned content (the article
+        # paragraph must be in the output, proving scoring actually executed).
+        assert contents, "Expected at least one content block"
+        assert any(
+            "walks beginners through syntax" in c for c in contents
+        ), "Article paragraph should be retained as content"
+
+        combined_content = " ".join(contents).lower()
+        assert "should not appear in filtered output text" not in combined_content, (
+            f"Excluded tag <{unwanted_tag}> text leaked into output"
+        )
+        # clean_element strips aside/style/form/iframe/noscript wrappers, so
+        # pre-fix those chunks were returned as empty-string padding; the fix
+        # removes excluded tags before scoring, so no empty blocks remain.
+        assert all(c.strip() for c in contents), (
+            f"Empty block returned for <{unwanted_tag}> (clean_element stripped "
+            "a wrapper that was wrongly scored as a candidate)"
+        )
 
     def test_performance(self, basic_html):
         """Test performance with timer"""

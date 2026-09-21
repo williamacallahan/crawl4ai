@@ -227,6 +227,22 @@ class RelevantContentFilter(ABC):
         )
         return bool(self.negative_patterns.search(class_id))
 
+    def _remove_comments(self, soup):
+        """Removes HTML comments from the soup tree."""
+        for element in soup(string=lambda string: isinstance(string, Comment)):
+            element.extract()
+
+    def _remove_unwanted_tags(self, soup):
+        """Decomposes every tag listed in ``self.excluded_tags`` from the soup
+        tree (e.g. ``nav``, ``footer``, ``header``, ``aside``, ``script`` ...).
+
+        Shared by every concrete ``RelevantContentFilter`` so that boilerplate
+        sections are stripped before any scoring / chunk extraction runs.
+        """
+        for tag in self.excluded_tags:
+            for element in soup.find_all(tag):
+                element.decompose()
+
     def clean_element(self, tag: Tag) -> str:
         """Common method for cleaning HTML elements with minimal overhead"""
         if not tag or not isinstance(tag, Tag):
@@ -362,6 +378,13 @@ class BM25ContentFilter(RelevantContentFilter):
         if not soup.body:
             # Wrap in body tag if missing
             soup = BeautifulSoup(f"<body>{html}</body>", "lxml")
+
+        # Remove comments and unwanted tags before extraction so that
+        # nav/footer/header/aside/... boilerplate is never scored as content.
+        # Mirrors PruningContentFilter.filter_content.
+        self._remove_comments(soup)
+        self._remove_unwanted_tags(soup)
+
         body = soup.find("body")
 
         query = self.extract_page_query(soup, body)
@@ -574,17 +597,6 @@ class PruningContentFilter(RelevantContentFilter):
                 content_blocks.append(str(element))
 
         return content_blocks
-
-    def _remove_comments(self, soup):
-        """Removes HTML comments"""
-        for element in soup(string=lambda string: isinstance(string, Comment)):
-            element.extract()
-
-    def _remove_unwanted_tags(self, soup):
-        """Removes unwanted tags"""
-        for tag in self.excluded_tags:
-            for element in soup.find_all(tag):
-                element.decompose()
 
     def _is_preserved(self, node):
         """Check if a node matches the preserve whitelist."""
