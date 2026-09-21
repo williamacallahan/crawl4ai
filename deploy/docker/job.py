@@ -122,6 +122,7 @@ async def llm_job_status(
         _redis, task_id, base_url=str(request.base_url),
         collection="llm/job",
         requester=_owner_of(_td), is_admin=_is_admin(_td),
+        config=_config,
     )
 
 
@@ -170,4 +171,5 @@ async def crawl_job_status(
         _redis, task_id, base_url=str(request.base_url),
         collection="crawl/job",
         requester=_owner_of(_td), is_admin=_is_admin(_td),
+        config=_config,
     )

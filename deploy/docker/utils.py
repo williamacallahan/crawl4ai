@@ -297,7 +297,17 @@ def datetime_handler(obj: any) -> Optional[str]:
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 def should_cleanup_task(created_at: str, ttl_seconds: int = 3600) -> bool:
-    """Check if task should be cleaned up based on creation time."""
+    """Check if task should be cleaned up based on creation time.
+
+    A ``ttl_seconds`` of 0 (or any negative value) disables cleanup, mirroring
+    the "0 == disabled" sentinel documented for ``redis.task_ttl_seconds`` and
+    honored by :func:`hset_with_ttl` on the producer side. This keeps the
+    consumer-side lazy delete-after-read gate consistent with the producer-side
+    Redis key TTL contract: an operator who sets ``task_ttl_seconds: 0`` to
+    disable automatic expiry gets no delete-after-read either.
+    """
+    if ttl_seconds <= 0:
+        return False
     created = datetime.fromisoformat(created_at)
     return (datetime.now() - created).total_seconds() > ttl_seconds
 

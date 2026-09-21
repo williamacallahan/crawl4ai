@@ -710,6 +710,7 @@ async def handle_llm_request(
                 redis, input_path, base_url,
                 collection="llm/job",
                 requester=requester, is_admin=is_admin,
+                config=config,
             )
 
         if not query:
@@ -754,12 +755,23 @@ async def handle_task_status(
     keep: bool = False,
     requester: Optional[str] = None,
     is_admin: bool = False,
+    config: Optional[dict] = None,
 ) -> JSONResponse:
     """Handle task status check requests.
 
     Enforces ownership: a task records the `owner` (principal sub) that created
     it; a different requester gets 404 (not 403, so task existence is not
     revealed). Admin-scope principals may read any task.
+
+    The lazy delete-after-read gate (for COMPLETED/FAILED tasks when ``keep`` is
+    false) honors the operator's ``redis.task_ttl_seconds`` via
+    :func:`get_redis_task_ttl`, mirroring the producer-side TTL set by
+    :func:`hset_with_ttl`. This keeps the consumer and producer on the same
+    retention contract: a configured TTL of N seconds retains the task for N
+    seconds on both the write and read sides, and a TTL of 0 disables automatic
+    deletion on both sides. ``config`` defaults to ``None`` so the historical
+    effective TTL of 3600s (via :func:`get_redis_task_ttl`'s own default) is
+    preserved for callers that do not forward the app config.
     """
     task = await redis.hgetall(f"task:{task_id}")
     if not task:
@@ -781,7 +793,8 @@ async def handle_task_status(
     response = create_task_response(task, task_id, base_url, collection)
 
     if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
-        if not keep and should_cleanup_task(task["created_at"]):
+        ttl_seconds = get_redis_task_ttl(config or {})
+        if not keep and should_cleanup_task(task["created_at"], ttl_seconds=ttl_seconds):
             await redis.delete(f"task:{task_id}")
 
     return JSONResponse(response)
