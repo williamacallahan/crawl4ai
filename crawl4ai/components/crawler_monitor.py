@@ -154,7 +154,7 @@ class TerminalUI:
             memory_icon = "🔴"
         
         # Get current memory usage
-        current_memory = psutil.Process().memory_info().rss / (1024 * 1024)  # MB
+        current_memory = psutil.Process().memory_info().rss
         memory_percent = (current_memory / psutil.virtual_memory().total) * 100
         
         # Format runtime
@@ -572,7 +572,10 @@ class CrawlerMonitor:
                 task_stats["memory_usage"] = memory_usage
                 
                 # Update peak memory if necessary
-                current_percent = (memory_usage / psutil.virtual_memory().total) * 100
+                memory_usage_bytes = memory_usage * 1024 * 1024
+                current_percent = (
+                    memory_usage_bytes / psutil.virtual_memory().total
+                ) * 100
                 if current_percent > self.peak_memory_percent:
                     self.peak_memory_percent = current_percent
                     self.peak_memory_time = time.time()
