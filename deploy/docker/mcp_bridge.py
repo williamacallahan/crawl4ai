@@ -20,7 +20,7 @@ from mcp.server.lowlevel.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
 from mcp.shared.message import SessionMessage
-from pydantic import AnyUrl, BaseModel
+from pydantic import AnyUrl, BaseModel, create_model
 from starlette.routing import Mount, Route
 
 
@@ -120,7 +120,7 @@ def attach_mcp(
     mcp = Server(server_name)
 
     # tools: Dict[str, Callable] = {}
-    tools: dict[str, tuple[Callable[..., Awaitable[Any]], Callable[..., Any]]] = {}
+    tools: dict[str, tuple[Callable[..., Awaitable[Any]], Callable[..., Any], Route]] = {}
     resources: dict[str, tuple[str, Callable[..., Any]]] = {}
     templates: dict[str, tuple[Route, Callable[..., Any]]] = {}
 
@@ -146,7 +146,7 @@ def attach_mcp(
                 timeout=timeout,
                 auth_headers_provider=auth_headers_provider,
             )
-            tools[key] = (proxy, fn)
+            tools[key] = (proxy, fn, route)
             continue
         if kind == "resource":
             resources[_mcp_uri(route.path)] = (key, fn)
@@ -154,35 +154,64 @@ def attach_mcp(
             templates[key] = (route, fn)
 
     # helpers for JSON‑Schema
-    def _schema(model: type[BaseModel] | None) -> dict[str, Any]:
-        return {"type": "object"} if model is None else model.model_json_schema()
+    def _route_schema(route: Route) -> dict[str, Any]:
+        """Build the MCP ``inputSchema`` for a FastAPI route from its parsed
+        ``dependant``.
 
-    def _body_model(fn: Callable) -> type[BaseModel] | None:
-        for p in inspect.signature(fn).parameters.values():
-            a = p.annotation
-            if inspect.isclass(a) and issubclass(a, BaseModel):
-                return a
-        return None
+        Body case: a route whose body is a pydantic ``BaseModel`` advertises
+        that model's JSON schema verbatim (preserving ``$defs``/``$ref``s,
+        ``additionalProperties``, ``title``), matching the behaviour the POST
+        tools already rely on.
+
+        No-body case: synthesize a flat ``{"type":"object","properties":{...},
+        "required":[...]}`` from the route's ``Query(...)``/``Path(...)``
+        params. FastAPI's ``Query``/``Path`` field infos are pydantic
+        ``FieldInfo`` subclasses, so ``pydantic.create_model`` carries through
+        each param's type, default, description, and constraints
+        (``pattern``, ``ge``, ``le``, ...) — the schema is produced by
+        pydantic itself, not re-implemented here, so it stays correct as the
+        constraint vocabulary evolves. Request/``Depends`` parameters live
+        outside ``query_params``/``path_params`` and are excluded, as are
+        header/cookie params (the loopback proxy only forwards query/path
+        args, so advertising those would be misleading).
+        """
+        dependant = getattr(route, "dependant", None)
+        if dependant is not None and dependant.body_params:
+            model = dependant.body_params[0].field_info.annotation
+            if isinstance(model, type) and issubclass(model, BaseModel):
+                return model.model_json_schema()
+        fields: dict[str, Any] = {}
+        if dependant is not None:
+            for p in [*dependant.query_params, *dependant.path_params]:
+                fi = p.field_info
+                annotation = fi.annotation
+                if annotation is inspect.Parameter.empty:
+                    annotation = str
+                fields[p.name] = (annotation, fi)
+        if not fields:
+            return {"type": "object"}
+        schema = create_model("Input", **fields).model_json_schema()
+        schema.pop("title", None)  # drop the synthesized model name
+        return schema
 
     # MCP handlers
     @mcp.list_tools()
     async def _list_tools() -> list[t.Tool]:
         out = []
-        for k, (proxy, orig_fn) in tools.items():
+        for k, (proxy, orig_fn, route) in tools.items():
             desc   = getattr(orig_fn, "__mcp_description__", None) or inspect.getdoc(orig_fn) or ""
-            schema = getattr(orig_fn, "__mcp_schema__", None) or _schema(_body_model(orig_fn))
+            schema = getattr(orig_fn, "__mcp_schema__", None) or _route_schema(route)
             out.append(
                 t.Tool(name=k, description=desc, inputSchema=schema)
             )
         return out
-             
 
     @mcp.call_tool()
     async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[t.TextContent]:
         if name not in tools:
             raise HTTPException(404, "tool not found")
         
-        proxy, _ = tools[name]
+        proxy, _, _ = tools[name]
         try:
             res = await proxy(**(arguments or {}))
         except HTTPException as exc:
