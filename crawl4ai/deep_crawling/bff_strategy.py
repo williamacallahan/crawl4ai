@@ -253,8 +253,8 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
                 break
                 
             batch: List[Tuple[float, int, str, Optional[str]]] = []
-            # Retrieve up to BATCH_SIZE items from the priority queue.
-            for _ in range(BATCH_SIZE):
+            # Retrieve up to batch_size items from the priority queue.
+            for _ in range(batch_size):
                 if queue.empty():
                     break
                 item = await queue.get()

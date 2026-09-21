@@ -1264,3 +1264,221 @@ class TestMaxPagesBoundaryStreamClose:
         # At the max_pages boundary, link discovery is intentionally cut off;
         # no new child is added after the budget is exhausted.
         assert future_urls == []
+
+
+class TestBestFirstMaxPagesOverFetch:
+    """BestFirst must not fetch more URLs than max_pages allows per batch, and
+    URLs beyond the budget must remain resumable (not silently dropped).
+
+    Regression for the over-fetch bug introduced in commit 7b9aabc: the
+    dequeue loop used ``range(BATCH_SIZE)`` instead of ``range(batch_size)``,
+    so when ``max_pages - pages_crawled < BATCH_SIZE`` and the queue still
+    held ``>= BATCH_SIZE`` items, the loop pulled up to BATCH_SIZE URLs from
+    the queue, marked all of them visited, and handed all of them to
+    ``crawler.arun_many(...)``. The inner-loop boundary break then yielded
+    only ``remaining`` and silently discarded the surplus results. With
+    ``on_state_change`` set the surplus URLs landed in ``visited`` but were
+    absent from the saved queue, making them permanently missing on resume.
+
+    The fix caps the dequeue loop at ``batch_size`` so exactly ``max_pages``
+    URLs are fetched and the un-crawled frontier stays resumable. The
+    existing ``TestMaxPagesBoundaryYielded`` test uses ``max_pages=11``, a
+    quiescent value where ``remaining == BATCH_SIZE`` at every batch, so it
+    never exercised this code path; the parametrization below deliberately
+    covers the non-quiescent boundary batches.
+    """
+
+    _WIDE_TREE = {
+        "https://a.example.com": [f"https://a.example.com/child{i}" for i in range(20)],
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_pages", [3, 11, 20])
+    @pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+    async def test_no_overfetch_at_max_pages_boundary(self, max_pages, stream):
+        """Fetched URL count must equal max_pages, not min(BATCH_SIZE, ...).
+
+        The bug pulled a full BATCH_SIZE on the boundary batch even when only
+        ``remaining < BATCH_SIZE`` pages were still allowed, then silently
+        discarded the surplus results. ``max_pages=3`` is below BATCH_SIZE so
+        the whole batch is over-sized; ``max_pages=20`` ends on a non-quiescent
+        boundary (``remaining == 1`` at the last batch); ``max_pages=11`` is
+        the quiescent sentinel where ``remaining == BATCH_SIZE`` at every
+        batch, so it must keep passing.
+        """
+        config = _stream_config()
+        fetches: List[str] = []
+        strategy = BestFirstCrawlingStrategy(max_depth=10, max_pages=max_pages)
+        crawler = _make_tree_crawler(self._WIDE_TREE, fetches)
+
+        results: List[str] = []
+        if stream:
+            async for r in strategy._arun_stream(
+                "https://a.example.com", crawler, config
+            ):
+                results.append(r.url)
+        else:
+            res = await strategy._arun_batch("https://a.example.com", crawler, config)
+            results = [r.url for r in res]
+
+        assert len(fetches) == max_pages, (
+            f"max_pages={max_pages} stream={stream}: over-fetched "
+            f"{len(fetches)} URLs (expected exactly {max_pages}): {fetches}"
+        )
+        assert len(results) == max_pages, (
+            f"max_pages={max_pages} stream={stream}: yielded {len(results)}, "
+            f"expected exactly {max_pages}: {results}"
+        )
+        assert strategy._pages_crawled == max_pages, (
+            f"max_pages={max_pages} stream={stream}: pages_crawled="
+            f"{strategy._pages_crawled}, expected {max_pages}"
+        )
+        # Every fetched URL must be yielded (no silent drops inside the
+        # oversized batch). Before the fix the surplus results were fetched
+        # by arun_many and then dropped by the boundary break.
+        assert set(fetches) == set(results), (
+            f"max_pages={max_pages} stream={stream}: fetched but not yielded: "
+            f"{set(fetches) - set(results)}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "strategy_class",
+        [BFSDeepCrawlStrategy, BestFirstCrawlingStrategy],
+        ids=["bfs", "best_first"],
+    )
+    @pytest.mark.parametrize("max_pages", [3, 11])
+    async def test_fetch_count_parity_with_bfs(self, strategy_class, max_pages):
+        """BestFirst must cap fetches at max_pages exactly like BFS does.
+
+        BFS already trims ``valid_links[:remaining_capacity]`` in
+        ``link_discovery`` to avoid over-fetch; BestFirst achieves the same
+        cap via the ``batch_size`` dequeue limit. Both must fetch exactly
+        ``max_pages`` URLs against the same wide tree.
+        """
+        config = _stream_config()
+        fetches: List[str] = []
+        strategy = strategy_class(max_depth=10, max_pages=max_pages)
+        crawler = _make_tree_crawler(self._WIDE_TREE, fetches)
+        await strategy._arun_batch("https://a.example.com", crawler, config)
+
+        assert len(fetches) == max_pages, (
+            f"{strategy_class.__name__} max_pages={max_pages}: fetched "
+            f"{len(fetches)} URLs, expected exactly {max_pages}: {fetches}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True], ids=["batch", "stream"])
+    async def test_uncrawled_urls_remain_resumable(self, stream):
+        """Un-crawled URLs must NOT be in visited and MUST remain in the
+        queue, so a resume with a larger budget can re-discover them — no
+        permanent data loss across resume.
+
+        Tree: root -> [child0..child4]; ``max_pages=3`` so 3 of the 5
+        children are beyond the budget. Before the fix the boundary batch
+        dequeued all 6 URLs (root + 5 children) because the loop ran
+        ``range(BATCH_SIZE)`` and the queue held fewer than BATCH_SIZE items,
+        marking all 6 visited and fetching all 6 via arun_many; only 3 were
+        yielded and the 3 surplus URLs were dropped from the checkpoint
+        queue, making them permanently missing on resume. The fix only
+        dequeues ``remaining`` URLs (root + 2 children), leaving child2/3/4
+        in the queue and out of ``visited``, so resuming with a larger
+        budget crawls them.
+        """
+        tree = {
+            "https://a.example.com": [
+                f"https://a.example.com/child{i}" for i in range(5)
+            ],
+        }
+        for i in range(5):
+            tree[f"https://a.example.com/child{i}"] = []
+
+        captured: List[Dict[str, Any]] = []
+
+        async def capture(state):
+            captured.append(state)
+
+        config = _stream_config()
+        all_children = {f"https://a.example.com/child{i}" for i in range(5)}
+
+        # Phase 1: crawl with a tight budget that leaves URLs un-crawled.
+        phase1_fetches: List[str] = []
+        strategy1 = BestFirstCrawlingStrategy(
+            max_depth=10, max_pages=3, on_state_change=capture
+        )
+        crawler1 = _make_tree_crawler(tree, phase1_fetches)
+        phase1_results: List[str] = []
+        if stream:
+            async for r in strategy1._arun_stream(
+                "https://a.example.com", crawler1, config
+            ):
+                phase1_results.append(r.url)
+        else:
+            res = await strategy1._arun_batch("https://a.example.com", crawler1, config)
+            phase1_results = [r.url for r in res]
+
+        # No over-fetch in phase 1: only max_pages URLs were fetched.
+        assert len(phase1_fetches) == 3, (
+            f"Phase-1 over-fetched {len(phase1_fetches)} URLs, expected 3: "
+            f"{phase1_fetches}"
+        )
+        assert len(phase1_results) == 3
+        assert strategy1._pages_crawled == 3
+
+        last = captured[-1]
+        un_crawled = all_children - set(phase1_results)
+        assert un_crawled == {
+            "https://a.example.com/child2",
+            "https://a.example.com/child3",
+            "https://a.example.com/child4",
+        }, f"setup: un-crawled URLs = {sorted(un_crawled)}"
+
+        # Un-crawled URLs must NOT be marked visited (resume-blocking).
+        # Before the fix the over-fetched URLs were marked visited at
+        # dequeue time and never re-discoverable.
+        assert set(last["visited"]).isdisjoint(un_crawled), (
+            f"Un-crawled URLs must NOT be in visited (resume-blocking): "
+            f"visited={sorted(last['visited'])}, un_crawled={sorted(un_crawled)}"
+        )
+        # Un-crawled URLs MUST remain in the queue snapshot for resume.
+        last_queue = {item["url"] for item in last["queue_items"]}
+        assert un_crawled.issubset(last_queue), (
+            f"Un-crawled URLs must remain in the queue for resume: "
+            f"queue={sorted(last_queue)}, missing={sorted(un_crawled - last_queue)}"
+        )
+
+        # Phase 2: resume with a LARGER budget so the frontier drains. The
+        # previously-skipped URLs must be re-discoverable (no permanent
+        # data loss).
+        phase2_fetches: List[str] = []
+        strategy2 = BestFirstCrawlingStrategy(
+            max_depth=10, max_pages=10, resume_state=last
+        )
+        crawler2 = _make_tree_crawler(tree, phase2_fetches)
+        phase2_results: List[str] = []
+        if stream:
+            async for r in strategy2._arun_stream(
+                "https://a.example.com", crawler2, config
+            ):
+                phase2_results.append(r.url)
+        else:
+            res = await strategy2._arun_batch("https://a.example.com", crawler2, config)
+            phase2_results = [r.url for r in res]
+
+        combined = set(phase1_results) | set(phase2_results)
+        assert all_children.issubset(combined), (
+            f"Resume failed to re-discover un-crawled URLs (permanent data "
+            f"loss): combined={sorted(combined)}, "
+            f"missing={sorted(all_children - combined)}"
+        )
+        # Phase 2 must re-fetch exactly the previously un-crawled URLs (no
+        # over-fetch on resume either, and no duplicate of phase 1).
+        assert set(phase2_fetches) == un_crawled, (
+            f"Phase 2 should re-fetch only the un-crawled frontier: "
+            f"phase2_fetches={sorted(phase2_fetches)}, "
+            f"expected={sorted(un_crawled)}"
+        )
+        assert set(phase1_fetches).isdisjoint(set(phase2_fetches)), (
+            f"Resume re-fetched a phase-1 URL (duplicate): "
+            f"phase1={sorted(phase1_fetches)} phase2={sorted(phase2_fetches)}"
+        )
