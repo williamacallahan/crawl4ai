@@ -579,8 +579,10 @@ class Compiler:
                         for (let _i = 0; _i < _count; _i++) {{
                           {repeat_js}
                         }}
-                      }} else if (_count) {{
-                        {repeat_js}
+                      }} else {{
+                        while ({count_expr}) {{
+                          {repeat_js}
+                        }}
                       }}
                     }})();
                 """).strip()
