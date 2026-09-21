@@ -496,6 +496,7 @@ async def clone_runtime_state(
     dst: BrowserContext,
     crawlerRunConfig: CrawlerRunConfig | None = None,
     browserConfig: BrowserConfig | None = None,
+    page=None,
 ) -> None:
     """
     Bring everything that *can* be changed at runtime from `src` → `dst`.
@@ -503,6 +504,15 @@ async def clone_runtime_state(
     1. Cookies
     2. localStorage (and sessionStorage, same API)
     3. Extra headers, permissions, geolocation if supplied in configs
+
+    When ``dst`` is a context shared across concurrent crawls (the managed/CDP
+    ``default_context``), the caller MUST pass the page it created for *this*
+    crawl via ``page=``. Selecting a destination page from ``dst.pages`` here
+    would race with other crawls appending their own pages to the same shared
+    context and could navigate another crawl's in-flight page to the storage
+    origin. The ``page`` parameter keeps the clone pinned to the caller's page
+    and is only used for the localStorage injection path; the cookie copy is
+    context-wide and unaffected.
     """
 
     # ── 1. cookies ────────────────────────────────────────────────────────────
@@ -511,6 +521,9 @@ async def clone_runtime_state(
         await dst.add_cookies(cookies)
 
     # ── 2. localStorage / sessionStorage ──────────────────────────────────────
+    # ``page`` is rebound per-origin below only when the caller did not supply
+    # one, so each crawl's clone drives exactly its own page on the shared
+    # context rather than whichever page happens to be ``dst.pages[0]``.
     state = await src.storage_state()
     for origin in state.get("origins", []):
         url = origin["origin"]
@@ -518,7 +531,8 @@ async def clone_runtime_state(
         if not kvs:
             continue
 
-        page = dst.pages[0] if dst.pages else await dst.new_page()
+        if page is None:
+            page = dst.pages[0] if dst.pages else await dst.new_page()
         await page.goto(url, wait_until="domcontentloaded")
         for item in kvs:
             await page.evaluate(
@@ -2019,6 +2033,7 @@ class BrowserManager:
                         context,
                         crawlerRunConfig,
                         self.config,
+                        page=page,
                     )
                 finally:
                     if tmp_context is not None:
