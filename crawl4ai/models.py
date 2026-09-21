@@ -1,4 +1,4 @@
-from pydantic import BaseModel, HttpUrl, PrivateAttr, Field, ConfigDict, BeforeValidator
+from pydantic import BaseModel, HttpUrl, PrivateAttr, Field, ConfigDict, BeforeValidator, model_serializer
 from typing import Annotated
 from typing import List, Dict, Optional, Callable, Awaitable, Union, Any
 from typing import AsyncGenerator
@@ -216,26 +216,35 @@ class CrawlResult(BaseModel):
             "Please use 'markdown.fit_markdown' instead."
         )
 
-    def model_dump(self, *args, **kwargs):
+    @model_serializer(mode="wrap")
+    def _serialize_markdown(self, handler, info):
         """
-        Override model_dump to include the _markdown private attribute in serialization.
-        
-        This override is necessary because:
-        1. PrivateAttr fields are excluded from serialization by default
-        2. We need to maintain backward compatibility by including the 'markdown' field
-           in the serialized output
-        3. We're transitioning from 'markdown_v2' to enhancing 'markdown' to hold
-           the same type of data
-        
-        Future developers: This method ensures that the markdown content is properly
-        serialized despite being stored in a private attribute. If the serialization
-        requirements change, this is where you would update the logic.
+        Inject the ``_markdown`` private attribute into the serialized output as
+        the ``markdown`` key, inside the core schema so it applies consistently
+        to both ``model_dump()`` and ``model_dump_json()`` (Pydantic v2's
+        ``model_dump_json()`` dispatches via the core-schema serializer and does
+        NOT call ``model_dump()``, so a Python-level ``model_dump`` override is
+        invisible to JSON serialization).
+
+        This replaces the previous ``model_dump`` override, which operated
+        outside the core schema with no access to the serializer's
+        ``include``/``exclude``/``mode`` context — so ``model_dump(exclude=...)``
+        ignored the caller's ``exclude`` for the injected ``markdown`` key, and
+        ``model_dump_json()`` dropped ``markdown`` entirely.
+
+        Future developers: When the ``_markdown``/property shim is retired and
+        ``markdown`` becomes a standard field, this whole method can be removed;
+        pydantic will then serialize ``markdown`` through the normal field path
+        for both surfaces.
         """
-        result = super().model_dump(*args, **kwargs)
-        
-        # Add the markdown field properly
+        result = handler(self)
         if self._markdown is not None:
-            result["markdown"] = self._markdown.model_dump() 
+            excluded = bool(info.exclude) and "markdown" in info.exclude
+            included = info.include is None or "markdown" in info.include
+            if included and not excluded:
+                result["markdown"] = self._markdown.model_dump(
+                    mode="json" if info.mode_is_json() else "python"
+                )
         return result
 
 class StringCompatibleMarkdown(str):
