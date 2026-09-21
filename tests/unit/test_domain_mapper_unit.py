@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlparse
 from crawl4ai.domain_mapper import (
     DomainMapper,
     Soft404Fingerprint,
@@ -456,3 +457,299 @@ class TestHomepageLinkExtraction:
         # Should include link tags
         assert any("/es/" in u for u in urls)
         assert any("/features" in u for u in urls)
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Homepage exact-host attribution
+#
+#  ``_scan_host`` stamps ``host=<scanned host>`` onto every URL returned by
+#  ``_scan_homepage`` and reports the result set as that host's own URLs.
+#  ``quick_extract_links``'s ``"internal"`` bucket is eTLD+1-internal by
+#  design and the pre-fix ``<link>`` block called ``is_external_url(…,
+#  base_domain)`` (also eTLD+1-scoped); both therefore let cross-host URLs
+#  leak into a per-host result set, which ``_scan_host`` then misattributed.
+#  These tests pin the exact-host filter added to ``_scan_homepage``: only
+#  URLs on the scanned host (after the codebase's canonical ``www.``-strip
+#  normalization) may be returned.
+# ════════════════════════════════════════════════════════════════════════
+
+
+def _homepage_mapper(html: str, url: str = "https://app.example.com/"):
+    mapper = DomainMapper.__new__(DomainMapper)
+    mapper.logger = None
+    mapper.client = AsyncMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = html
+    resp.url = url
+    mapper.client.get = AsyncMock(return_value=resp)
+    return mapper
+
+
+class TestHomepageExactHostFilter:
+
+    @pytest.mark.asyncio
+    async def test_anchor_links_to_parent_domain_are_dropped(self):
+        """<a href> links to the parent domain (eTLD+1 sibling) must NOT
+        appear in a subdomain's homepage results — pre-fix they did."""
+        html = (
+            '<html><head><title>App</title></head><body>'
+            '<a href="https://example.com/secret-page">Secret</a>'
+            '<a href="https://api.example.com/v1">API sibling</a>'
+            '<a href="/local">Local</a>'
+            '</body></html>'
+        )
+        mapper = _homepage_mapper(html)
+        from crawl4ai.async_configs import DomainMapperConfig
+        urls = await mapper._scan_homepage(
+            "app.example.com", "example.com", DomainMapperConfig()
+        )
+        hosts = {urlparse(u).netloc.lower() for u in urls}
+        assert "app.example.com" in hosts            # same-host link survives
+        assert "example.com" not in hosts            # parent-domain link dropped
+        assert "api.example.com" not in hosts         # sibling-subdomain link dropped
+        assert "https://example.com/secret-page" not in urls
+        assert "https://api.example.com/v1" not in urls
+
+    @pytest.mark.asyncio
+    async def test_link_tag_to_parent_domain_is_dropped(self):
+        """The <link rel=…> block must apply the same exact-host filter as
+        the <a href> block — pre-fix it called ``is_external_url(…,
+        base_domain)`` (eTLD+1-scoped) and admitted cross-host URLs. Covers
+        both parent-domain and sibling-subdomain ``<link>`` targets."""
+        html = (
+            '<html><head><title>App</title></head>'
+            '<link rel="next" href="https://example.com/next-page">'
+            '<link rel="preload" href="https://api.example.com/assets">'
+            '<link rel="alternate" hreflang="x" href="/alt">'
+            '</head><body></body></html>'
+        )
+        mapper = _homepage_mapper(html)
+        from crawl4ai.async_configs import DomainMapperConfig
+        urls = await mapper._scan_homepage(
+            "app.example.com", "example.com", DomainMapperConfig()
+        )
+        hosts = {urlparse(u).netloc.lower() for u in urls}
+        assert "app.example.com" in hosts            # same-host <link> survives
+        assert "example.com" not in hosts            # cross-host <link> dropped
+        assert "api.example.com" not in hosts        # sibling-subdomain <link> dropped
+        assert "https://example.com/next-page" not in urls
+        assert "https://api.example.com/assets" not in urls
+
+    @pytest.mark.asyncio
+    async def test_www_alias_of_scanned_host_is_admitted_in_both_directions(self):
+        """The codebase's canonical ``www.``-strip normalization (mirroring
+        ``is_external_url``) must treat ``www.<host>`` and ``<host>`` as the
+        same host: scanning ``example.com`` should admit
+        ``https://www.example.com/page`` and vice-versa."""
+        from crawl4ai.async_configs import DomainMapperConfig
+
+        # example.com homepage links to https://www.example.com/page
+        html = (
+            '<html><head><title>Home</title></head><body>'
+            '<a href="https://www.example.com/page">Page</a>'
+            '</body></html>'
+        )
+        mapper = _homepage_mapper(html, url="https://example.com/")
+        urls = await mapper._scan_homepage(
+            "example.com", "example.com", DomainMapperConfig()
+        )
+        assert any(u == "https://www.example.com/page" for u in urls)
+
+        # www.example.com homepage links to https://example.com/page
+        html = (
+            '<html><head><title>Home</title></head><body>'
+            '<a href="https://example.com/page">Page</a>'
+            '</body></html>'
+        )
+        mapper = _homepage_mapper(html, url="https://www.example.com/")
+        urls = await mapper._scan_homepage(
+            "www.example.com", "example.com", DomainMapperConfig()
+        )
+        assert any(u == "https://example.com/page" for u in urls)
+
+    @pytest.mark.asyncio
+    async def test_base_domain_only_anchors_still_admitted(self):
+        """Regression guard: when ``host == base_domain`` (the eTLD+1 case
+        covered by the existing unit tests), the exact-host filter must NOT
+        regress — same-host <a href> and <link> URLs must still survive."""
+        html = (
+            '<html><head><title>Home</title></head>'
+            '<link rel="next" href="/docs">'
+            '<link rel="alternate" hreflang="x" href="/alt">'
+            '</head><body>'
+            '<a href="/about">About</a>'
+            '<a href="https://external.com/x">External</a>'
+            '</body></html>'
+        )
+        mapper = _homepage_mapper(html, url="https://example.com/")
+        from crawl4ai.async_configs import DomainMapperConfig
+        urls = await mapper._scan_homepage(
+            "example.com", "example.com", DomainMapperConfig()
+        )
+        assert any(u == "https://example.com/about" for u in urls)
+        assert any(u == "https://example.com/docs" for u in urls)
+        assert any(u == "https://example.com/alt" for u in urls)
+        assert all(urlparse(u).netloc.lower() == "example.com" for u in urls)
+
+    @pytest.mark.asyncio
+    async def test_relative_anchor_resolves_under_scanned_host(self):
+        """Relative <a href> links must still resolve against the fetched
+        page URL and be admitted when their resolved netloc == scanned host.
+        Guards against the filter being too aggressive on relative URLs."""
+        html = (
+            '<html><head><title>App</title></head><body>'
+            '<a href="/dashboard">Dashboard</a>'
+            '<a href="/blog/post">Post</a>'
+            '</body></html>'
+        )
+        mapper = _homepage_mapper(html, url="https://app.example.com/")
+        from crawl4ai.async_configs import DomainMapperConfig
+        urls = await mapper._scan_homepage(
+            "app.example.com", "example.com", DomainMapperConfig()
+        )
+        assert "https://app.example.com/dashboard" in urls
+        assert "https://app.example.com/blog/post" in urls
+
+    @pytest.mark.asyncio
+    async def test_port_stripped_for_host_comparison(self):
+        """A URL with an explicit port on the scanned host must still be
+        admitted (the predicate strips ``:port`` from both sides)."""
+        html = (
+            '<html><head><title>App</title></head><body>'
+            '<a href="https://app.example.com:8443/admin">Admin</a>'
+            '</body></html>'
+        )
+        mapper = _homepage_mapper(html, url="https://app.example.com/")
+        from crawl4ai.async_configs import DomainMapperConfig
+        urls = await mapper._scan_homepage(
+            "app.example.com", "example.com", DomainMapperConfig()
+        )
+        assert "https://app.example.com:8443/admin" in urls
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  scan()-level host attribution invariant
+#
+#  End-to-end coverage for the bug report: at the public ``scan()`` surface,
+#  every record's ``host`` field must equal the netloc of its ``url`` (after
+#  ``www.``-strip) regardless of which subdomain's homepage surfaced it.
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestScanHostAttributionInvariant:
+
+    @pytest.mark.asyncio
+    async def test_scan_never_misattributes_url_to_other_host(self):
+        """Reproduces the bug report's end-to-end scenario and asserts the
+        invariant: ``r["host"] == netloc(r["url"])`` for every record in
+        the public ``scan()`` output, including the case where a subdomain
+        homepage links to a page on the parent domain that the parent
+        domain's own sources do NOT surface (the bug's deterministic case).
+        """
+        from crawl4ai.async_configs import DomainMapperConfig
+
+        app_home_html = (
+            '<html><head><title>App</title></head><body>'
+            '<a href="https://example.com/secret-page">Secret</a>'
+            '<a href="/local">Local</a>'
+            '<a href="https://api.example.com/sibling">Sibling</a>'
+            '<link rel="next" href="https://example.com/next-page">'
+            '<link rel="alternate" hreflang="x" href="/alt">'
+            '</body></html>'
+        )
+        base_home_html = (
+            '<html><head><title>Base</title></head><body>'
+            '<a href="/about">About</a>'
+            '</body></html>'
+        )
+        api_home_html = (
+            '<html><head><title>API</title></head><body>'
+            '<a href="/v1">v1</a>'
+            '</body></html>'
+        )
+
+        async def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.url = url
+            if url == "https://app.example.com/":
+                r.status_code = 200
+                r.text = app_home_html
+            elif url == "https://example.com/":
+                r.status_code = 200
+                r.text = base_home_html
+            elif url == "https://api.example.com/":
+                r.status_code = 200
+                r.text = api_home_html
+            else:
+                r.status_code = 404
+                r.text = ""
+            return r
+
+        async def fake_head(url, *args, **kwargs):
+            raise Exception("head not used in this test")
+
+        mapper = DomainMapper.__new__(DomainMapper)
+        mapper.logger = None
+        mapper.client = MagicMock()
+        mapper.client.get = AsyncMock(side_effect=fake_get)
+        mapper.client.head = AsyncMock(side_effect=fake_head)
+        mapper._host_schemes = {
+            "app.example.com": "https",
+            "example.com": "https",
+            "api.example.com": "https",
+        }
+
+        with patch.object(
+            DomainMapper, "_discover_hosts",
+            AsyncMock(return_value={"app.example.com", "example.com",
+                                    "api.example.com"}),
+        ):
+            results = await mapper.scan(
+                "example.com",
+                DomainMapperConfig(
+                    source="homepage",
+                    include_subdomains=True,
+                    extract_head=False,
+                    max_urls=-1,
+                    soft_404_detection=False,
+                    filter_nonsense_urls=False,
+                ),
+            )
+
+        # Headline invariant: every record's host matches its URL's netloc.
+        def _norm(h: str) -> str:
+            return h.lower().split(":")[0].replace("www.", "")
+
+        misattributed = [
+            r for r in results
+            if _norm(urlparse(r["url"]).netloc) != _norm(r["host"])
+        ]
+        assert not misattributed, (
+            f"misattributed records: {misattributed}; "
+            f"all results: {results}"
+        )
+
+        # The bug-report reproduction: example.com/secret-page linked only
+        # from app.example.com's homepage must NOT be misattributed to
+        # app.example.com. Either it is absent (correct-host duplicate does
+        # not exist) or it appears with host == example.com.
+        secret_records = [r for r in results
+                          if r["url"] == "https://example.com/secret-page"]
+        for r in secret_records:
+            assert r["host"] == "example.com", (
+                f"secret-page misattributed to {r['host']}: {r}"
+            )
+
+        # Cross-host <link rel="next"> must likewise not leak through.
+        next_records = [r for r in results
+                        if r["url"] == "https://example.com/next-page"]
+        for r in next_records:
+            assert r["host"] == "example.com"
+
+        # Sanity: same-host URLs from each host's own homepage survive.
+        host_by_url = {r["url"]: r["host"] for r in results}
+        assert host_by_url.get("https://app.example.com/local") == "app.example.com"
+        assert host_by_url.get("https://app.example.com/alt") == "app.example.com"
+        assert host_by_url.get("https://example.com/about") == "example.com"
+        assert host_by_url.get("https://api.example.com/v1") == "api.example.com"
