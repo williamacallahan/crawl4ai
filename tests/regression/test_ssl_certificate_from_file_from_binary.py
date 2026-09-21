@@ -18,6 +18,9 @@ network or filesystem fixtures beyond a temporary directory are required.
 """
 
 import base64
+import hashlib
+import json
+import re
 
 import pytest
 
@@ -115,7 +118,7 @@ def test_documented_methods_are_present_on_class():
 
 
 @pytest.mark.parametrize("format_name", ["DER", "PEM"])
-def test_from_binary_returns_certificate(x509_cert, format_name, request):
+def test_from_binary_returns_certificate(x509_cert, format_name, request, der_bytes):
     data = request.getfixturevalue(format_name.lower() + "_bytes")
     cert = SSLCertificate.from_binary(data)
 
@@ -126,7 +129,13 @@ def test_from_binary_returns_certificate(x509_cert, format_name, request):
     assert cert.issuer == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
     assert cert.valid_from == "20061127202342Z"
     assert cert.valid_until == "20261127205342Z"
-    assert cert.fingerprint == x509_cert.digest("sha256").hex()
+    # Fingerprint must match an independent SHA-256 of the DER bytes -- not the
+    # tautological ``x509.digest("sha256").hex()`` oracle the original test
+    # used (that transform is itself the bug: it re-hex-encodes the ASCII
+    # bytes of the colon-separated uppercase hex string into a 190-char
+    # mangled value). See ``test_fingerprint_is_sha256_lowercase_hex_of_der``
+    # below for the full format contract.
+    assert cert.fingerprint == hashlib.sha256(der_bytes).hexdigest()
     assert cert["serial_number"] == hex(1164660820)
 
 
@@ -195,3 +204,112 @@ def test_from_file_returns_none_for_missing_file(capsys):
     result = SSLCertificate.from_file("/no/such/path/cert.der")
     assert result is None
     assert capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 4. fingerprint contract: 64-char lowercase-hex SHA-256 digest of the DER
+# ---------------------------------------------------------------------------
+#
+# The public docs (``docs/md_v2/advanced/ssl-certificate.md`` and the mirrored
+# ``deploy/docker/c4ai-doc-context.md``) state:
+#
+#     5. ``fingerprint`` (str)
+#        - The SHA-256 digest (lowercase hex).
+#        - E.g. "d14d2e..."
+#
+# The original implementation computed it as ``x509.digest("sha256").hex()``.
+# ``X509.digest("sha256")`` does NOT return the raw 32-byte digest -- it returns
+# ASCII bytes holding a *colon-separated uppercase* hex string
+# (``b"8D:2C:1B:..."``, 95 bytes). Calling ``bytes.hex()`` re-hex-encodes every
+# ASCII byte (each ``:`` literal ``0x3A`` included), producing a 190-character
+# mangled string that is not a valid SHA-256 hex digest by any convention.
+#
+# These tests pin the documented contract using independent oracles
+# (``hashlib.sha256(der).hexdigest()`` and the openssl-CLI-emitted form
+# normalized to lowercase hex) so the bug cannot silently return.
+
+
+@pytest.mark.parametrize("format_name", ["DER", "PEM"])
+def test_fingerprint_is_sha256_lowercase_hex_of_der(format_name, request, der_bytes, x509_cert):
+    """The fingerprint must be the lowercase-hex SHA-256 digest of the DER
+    bytes, matching the documented contract.
+
+    Guards against the original ``x509.digest("sha256").hex()`` bug, which
+    re-hex-encoded the ASCII of the colon-separated uppercase form and yielded
+    a 190-character string. The mixing of length, regex, and two independent
+    value oracles ensures a regression cannot pass: the broken value fails
+    the length check, the regex check, the ``hashlib`` oracle, and the
+    openssl-CLI-normalized oracle simultaneously.
+    """
+    data = request.getfixturevalue(format_name.lower() + "_bytes")
+    cert = SSLCertificate.from_binary(data)
+
+    fp = cert.fingerprint
+    assert isinstance(fp, str)
+
+    # Format contract: exactly 64 lowercase hex chars (no colons, no 0x prefix).
+    assert len(fp) == 64, f"expected 64-char hex; got {len(fp)}-char {fp!r}"
+    assert re.fullmatch(r"[0-9a-f]{64}", fp), f"not lowercase-hex: {fp!r}"
+    assert fp == fp.lower(), f"not lowercase: {fp!r}"
+    assert ":" not in fp, f"contains colons: {fp!r}"
+
+    # Independent oracle 1: hashlib SHA-256 of the canonical DER bytes. This is
+    # exactly what the docs say the value should be (and what a user comparing
+    # ``cert.to_json()`` output to ``hashlib.sha256(open(pem,'rb').read())
+    # .hexdigest()`` or an audit/secrets-database cross-reference would need).
+    assert fp == hashlib.sha256(der_bytes).hexdigest()
+
+    # Independent oracle 2: the colon-separated uppercase form emitted by
+    # ``openssl x509 -fingerprint -sha256`` (``X509.digest("sha256")`` in
+    # pyOpenSSL), normalized to lowercase-hex. This pins cross-tool parity
+    # with the standard openssl fingerprint output.
+    openssl_normalized = (
+        x509_cert.digest("sha256").decode("ascii").replace(":", "").lower()
+    )
+    assert fp == openssl_normalized
+
+    # Negative regression: the buggy 190-char transform must NOT be produced.
+    buggy = x509_cert.digest("sha256").hex()
+    assert fp != buggy, "regression: fingerprint reverted to the buggy 190-char mangling"
+    assert len(buggy) == 190  # documents the shape of the old bug
+
+
+def test_fingerprint_survives_to_json_round_trip(der_bytes):
+    """The deployed REST API serializes ``CrawlResult.ssl_certificate`` to
+    JSON via the inherited-``dict`` ``json.dumps`` path (see
+    ``crawl4ai/models.py:116`` and ``deploy/docker/server.py:971``). The
+    fingerprint must survive a JSON round-trip unchanged -- otherwise an
+    audit/secrets-database consumer of ``cert.to_json()`` output would receive
+    a mismatched or mangled value.
+    """
+    cert = SSLCertificate.from_binary(der_bytes)
+    expected = hashlib.sha256(der_bytes).hexdigest()
+
+    # cert["fingerprint"]: dict-item access path consumers use directly.
+    assert cert["fingerprint"] == expected
+
+    # cert.fingerprint: property access path (same underlying dict value).
+    assert cert.fingerprint == expected
+
+    # cert.to_json(): the export path the REST API/audit consumers use.
+    json_str = cert.to_json()
+    assert isinstance(json_str, str)
+    loaded = json.loads(json_str)
+    assert loaded["fingerprint"] == expected
+
+    # The dict subclass instance must also be directly JSON-serializable
+    # without a custom encoder (this is the path the REST API uses).
+    direct = json.loads(json.dumps(cert))
+    assert direct["fingerprint"] == expected
+
+
+def test_fingerprint_is_independent_of_input_format(der_bytes, pem_bytes):
+    """A certificate parsed from PEM bytes and from DER bytes must yield the
+    same fingerprint, since the value is a hash of the normalized DER (not
+    of the input). A naive implementation hashing the *input* bytes would
+    diverge here.
+    """
+    from_der = SSLCertificate.from_binary(der_bytes).fingerprint
+    from_pem = SSLCertificate.from_binary(pem_bytes).fingerprint
+    assert from_der == from_pem
+    assert re.fullmatch(r"[0-9a-f]{64}", from_der)
