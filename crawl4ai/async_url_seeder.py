@@ -859,19 +859,36 @@ class AsyncUrlSeeder:
         retries = (1, 3, 7)
         self._log("info", "Fetching CC URLs for {domain} from Common Crawl index: {url}",
                   params={"domain": domain, "url": url}, tag="URL_SEED")
+        # Stream into a sibling temp file and atomically rename only after the
+        # full response lands. A mid-stream failure (transport reset, malformed
+        # line, caller cancellation via ``max_urls``-triggered ``GeneratorExit``,
+        # etc.) must never leave a truncated file at ``path``: the cache-read
+        # path trusts any existing ``path`` as the complete URL set for the
+        # domain, and a truncated cache would be served forever.
+        tmp = path.with_suffix(path.suffix + ".tmp")
         for i, d in enumerate(retries+(-1,)):  # last -1 means don't retry
             try:
                 async with self.client.stream("GET", url) as r:
                     r.raise_for_status()
-                    async with aiofiles.open(path, "w") as fp:
+                    async with aiofiles.open(tmp, "w") as fp:
                         async for line in r.aiter_lines():
                             rec = json.loads(line)
                             u = rec["url"]
                             await fp.write(u+"\n")
                             if _match(u, pattern):
                                 yield u
+                # Full stream consumed — atomically promote the temp file to
+                # the live cache. ``Path.replace`` overwrites any pre-existing
+                # cache in one step on POSIX/Windows.
+                tmp.replace(path)
                 return
             except httpx.HTTPStatusError as e:
+                # 503 may be raised by ``raise_for_status`` before any bytes
+                # were written; drop any (zero-byte) temp and retry/back off.
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 if e.response.status_code == 503 and i < len(retries):
                     self._log("warning", "Common Crawl API returned 503 for {domain}. Retrying in {delay}s.",
                               params={"domain": domain, "delay": retries[i]}, tag="URL_SEED")
@@ -880,7 +897,19 @@ class AsyncUrlSeeder:
                 self._log("error", "HTTP error fetching CC index for {domain}: {error}",
                           params={"domain": domain, "error": str(e)}, tag="URL_SEED")
                 raise
-            except Exception as e:
+            except BaseException as e:
+                # Roll back any partially written temp file. Catching
+                # ``BaseException`` (not just ``Exception``) is deliberate so
+                # that ``GeneratorExit`` injected by an early ``aclose()`` and
+                # ``asyncio.CancelledError`` also unlink the temp — only the
+                # temp is touched, so a previously-completed good cache (if
+                # any) is preserved for the next call to reuse or refetch.
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if isinstance(e, (GeneratorExit, asyncio.CancelledError)):
+                    raise
                 self._log("error", "Error fetching CC index for {domain}: {error}",
                           params={"domain": domain, "error": str(e)}, tag="URL_SEED")
                 raise
