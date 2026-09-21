@@ -479,6 +479,51 @@ IFRAME_HTML = """\
 </html>"""
 
 
+# A page with an http(s)-scheme (same-origin) iframe plus a top-level
+# console.log. Used by the UndetectedAdapter console-capture regression: the
+# init script installed via `add_init_script` fires on every http(s)-scheme
+# document (including iframes), so the child frame has its own populated
+# `window.__capturedConsole` buffer that the adapter must drain via
+# `page.frames` iteration. The srcdoc-only `IFRAME_HTML` above does NOT
+# exercise this path (patchright's route-based injection skips srcdoc).
+# The page carries enough visible text to clear Crawl4AI's anti-bot
+# `minimal_text` check so a real crawl returns success=True.
+IFRAME_HTTP_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><title>Page with HTTP Iframe</title></head>
+<body>
+    <h1>Undetected Adapter Iframe Console Capture Regression</h1>
+    <p>This page exists to verify that console messages emitted from inside
+    an http-scheme iframe are surfaced on the crawl response when the
+    UndetectedAdapter is in use. The top-level document logs a message and
+    embeds a same-origin iframe that also logs a message and raises an
+    uncaught error. Both must reach AsyncCrawlResponse.console_messages.</p>
+    <iframe id="http_frame" src="/iframe-child" width="400" height="200"></iframe>
+    <script>console.log("FROM_MAIN");</script>
+</body>
+</html>"""
+
+IFRAME_CHILD_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><title>HTTP Iframe Child</title></head>
+<body>
+    <h2>Iframe Child Document</h2>
+    <p>This child frame is served over http and carries a small amount of
+    visible text so the crawl does not reject it as an empty placeholder.
+    It logs a console message and then raises an uncaught error after a
+    zero-second timeout, both of which the adapter must capture.</p>
+    <script>
+        console.log("FROM_HTTP_IFRAME");
+        setTimeout(function () {
+            throw new Error("FROM_HTTP_IFRAME_ERROR");
+        }, 0);
+    </script>
+</body>
+</html>"""
+
+
 # ---------------------------------------------------------------------------
 # Server Handlers
 # ---------------------------------------------------------------------------
@@ -522,6 +567,12 @@ async def _large_handler(request):
 
 async def _iframe_handler(request):
     return await _serve_html(IFRAME_HTML)
+
+async def _iframe_http_handler(request):
+    return await _serve_html(IFRAME_HTTP_HTML)
+
+async def _iframe_child_handler(request):
+    return await _serve_html(IFRAME_CHILD_HTML)
 
 async def _redirect_handler(request):
     raise web.HTTPFound("/")
@@ -607,6 +658,8 @@ def _create_app():
     app.router.add_get("/regex-test", _regex_test_handler)
     app.router.add_get("/large", _large_handler)
     app.router.add_get("/iframe-page", _iframe_handler)
+    app.router.add_get("/iframe-http-page", _iframe_http_handler)
+    app.router.add_get("/iframe-child", _iframe_child_handler)
     app.router.add_get("/redirect", _redirect_handler)
     app.router.add_get("/not-found", _not_found_handler)
     app.router.add_get("/slow", _slow_handler)

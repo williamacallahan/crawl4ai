@@ -1001,3 +1001,204 @@ async def test_undetected_adapter_injects_both_init_scripts_when_paired():
     # this is the script that was silently skipped before the fix.
     assert "addEventListener('error'" in error_script
     assert "addEventListener('unhandledrejection'" in error_script
+
+
+# ---------------------------------------------------------------------------
+# Regression for the main-frame-only retrieval bug in
+# `UndetectedAdapter.retrieve_console_messages`.
+#
+# `add_init_script` installs a per-frame `window.__capturedConsole` /
+# `window.__capturedErrors` buffer in every http(s)-scheme document that
+# loads, including same-origin and cross-origin iframes and sandboxed-with-
+# scripts iframes. `retrieve_console_messages` used to call
+# `page.evaluate(...)` which only drains the top-level frame, so every
+# http(s)-subframe message was silently dropped. `cleanup_console_capture`
+# delegates to `retrieve_console_messages` and inherits the same fix.
+#
+# The doubles below model a page whose `frames` attribute exposes a list of
+# frame objects each with their own buffer pair, mirroring the surface the
+# fixed `retrieve_console_messages` touches: `frame.evaluate(expression,
+# isolated_context=False)`. The real patchright `Page.frames` always
+# includes the main frame as `frames[0]`; the doubles preserve that shape.
+# ---------------------------------------------------------------------------
+
+
+class _CapturingFrame:
+    """Frame double for `UndetectedAdapter.retrieve_console_messages`.
+
+    Models one frame's `window.__capturedConsole` / `window.__capturedErrors`
+    buffers. `evaluate(expression, arg=None, *, isolated_context=...)`
+    dispatches on the buffer name embedded in the expression, drains and
+    clears it (matching the JS `() => { const x = window.__X || [];
+    window.__X = []; return x; }` semantics), and records every call so the
+    tests can pin the isolation kwarg and the drain-once behavior. `error`
+    lets a test simulate a detached-frame eval failure.
+    """
+
+    def __init__(self, console=None, errors=None, error=None):
+        self._console = list(console or [])
+        self._errors = list(errors or [])
+        self._error = error
+        self.eval_calls = []
+
+    async def evaluate(self, expression, arg=None, *, isolated_context=None):
+        self.eval_calls.append((expression, isolated_context))
+        if self._error is not None:
+            e, self._error = self._error, None
+            raise e
+        if "__capturedConsole" in expression:
+            msgs, self._console = self._console, []
+            return msgs
+        if "__capturedErrors" in expression:
+            errs, self._errors = self._errors, []
+            return errs
+        return None
+
+    @property
+    def console_buffer(self):
+        return self._console
+
+    @property
+    def error_buffer(self):
+        return self._errors
+
+
+class _FramedPage:
+    """Page double exposing `frames` (a list of `_CapturingFrame`).
+
+    Models the production surface the fixed `retrieve_console_messages`
+    touches (`page.frames` + per-frame `frame.evaluate`), AND the pre-fix
+    surface (`page.evaluate`) so a test run against the buggy version fails
+    for the *real* reason (subframe buffer never drained) rather than an
+    incidental `AttributeError`. `page.evaluate` delegates to `frames[0]`
+    — the main frame — mirroring how `page.evaluate` runs only in the top
+    frame on the real patchright `Page`. The real `Page.frames` always
+    includes the main frame as `frames[0]`; the double preserves that shape.
+    """
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+
+    async def evaluate(self, expression, arg=None, *, isolated_context=None):
+        return await self.frames[0].evaluate(
+            expression, arg, isolated_context=isolated_context
+        )
+
+
+@pytest.mark.asyncio
+async def test_undetected_adapter_retrieve_drains_console_and_errors_from_all_frames():
+    """The fix iterates `page.frames`, so console messages AND errors buffered
+    in a subframe are surfaced alongside the main frame's. Pre-fix only the
+    main frame (`frames[0]`) was drained and `FROM_IFRAME` / `IFRAME_ERR`
+    were silently dropped."""
+    main = _CapturingFrame(
+        console=[{"type": "log", "text": "FROM_MAIN", "timestamp": 2000}],
+        errors=[],
+    )
+    sub = _CapturingFrame(
+        console=[{"type": "log", "text": "FROM_IFRAME", "timestamp": 3000}],
+        errors=[
+            {"type": "error", "text": "IFRAME_ERR", "stack": "ReferenceError", "timestamp": 4000},
+        ],
+    )
+    page = _FramedPage([main, sub])
+
+    messages = await UndetectedAdapter().retrieve_console_messages(page)
+
+    texts = sorted(m["text"] for m in messages)
+    assert texts == ["FROM_IFRAME", "FROM_MAIN", "IFRAME_ERR"]
+    # Timestamps are converted from JS ms to Python seconds.
+    assert {m["text"]: m["timestamp"] for m in messages} == {
+        "FROM_MAIN": 2.0,
+        "FROM_IFRAME": 3.0,
+        "IFRAME_ERR": 4.0,
+    }
+    # Each frame's buffer was drained-and-cleared.
+    assert main.console_buffer == []
+    assert main.error_buffer == []
+    assert sub.console_buffer == []
+    assert sub.error_buffer == []
+
+
+@pytest.mark.asyncio
+async def test_undetected_adapter_retrieve_passes_isolated_context_false_to_each_frame():
+    """The fix must preserve the `isolated_context=False` kwarg on every
+    per-frame eval (the buffers live in the main world, not an isolated
+    context). A regression that drops the kwarg would silently read empty
+    buffers on the real patchright `Frame.evaluate`."""
+    main = _CapturingFrame(console=[{"type": "log", "text": "M", "timestamp": 1}])
+    sub = _CapturingFrame(console=[{"type": "log", "text": "S", "timestamp": 1}])
+    page = _FramedPage([main, sub])
+
+    await UndetectedAdapter().retrieve_console_messages(page)
+
+    for frame in (main, sub):
+        for _expression, isolated_context in frame.eval_calls:
+            assert isolated_context is False, (
+                "frame.evaluate must be called with isolated_context=False"
+            )
+        # Two evals per frame: console then errors.
+        assert len(frame.eval_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_undetected_adapter_retrieve_drains_once_across_repeated_calls():
+    """Drain-and-clear means a second `retrieve_console_messages` returns
+    nothing for messages already drained. This pins the contract the
+    pre-response retrieval (`async_crawler_strategy.py:1208`) and the
+    finally-block `cleanup_console_capture` (`:1243`) rely on so messages
+    are surfaced on the response exactly once rather than duplicated."""
+    main = _CapturingFrame(console=[{"type": "log", "text": "X", "timestamp": 1}])
+    sub = _CapturingFrame(console=[{"type": "log", "text": "Y", "timestamp": 1}])
+    page = _FramedPage([main, sub])
+
+    first = await UndetectedAdapter().retrieve_console_messages(page)
+    second = await UndetectedAdapter().retrieve_console_messages(page)
+
+    assert [m["text"] for m in first] == ["X", "Y"]
+    assert second == []
+
+
+@pytest.mark.asyncio
+async def test_undetected_adapter_retrieve_treats_null_subframe_buffer_as_noop():
+    """A subframe whose init script never installed the buffer (e.g. a
+    srcdoc/data:/about:blank iframe — out of scope for this fix but a real
+    production case) returns `null` from `frame.evaluate`. `extend(None or
+    [])` is a no-op so the main frame's messages still surface and no
+    exception propagates."""
+    main = _CapturingFrame(console=[{"type": "log", "text": "MAIN", "timestamp": 1}])
+    uninstalled_subframe = _CapturingFrame(console=None, errors=None)
+    # Force the subframe to report `null` for both buffers by emptying them;
+    # the JS `window.__X || []` returns [] for an undefined buffer, but a
+    # patchright eval may also return None — model the None path directly.
+    uninstalled_subframe._console = None
+    uninstalled_subframe._errors = None
+    page = _FramedPage([main, uninstalled_subframe])
+
+    messages = await UndetectedAdapter().retrieve_console_messages(page)
+
+    assert [m["text"] for m in messages] == ["MAIN"]
+
+
+@pytest.mark.asyncio
+async def test_undetected_adapter_retrieve_returns_partial_results_if_a_frame_raises():
+    """A per-frame eval may raise (detached frame during teardown). The outer
+    `except Exception: pass` must swallow it and return whatever was drained
+    so far — the crawl must not crash and the main frame's messages must
+    still reach the response. The subframe that raises is skipped, so its
+    messages are lost, matching the documented best-effort contract."""
+    main = _CapturingFrame(
+        console=[{"type": "log", "text": "MAIN_BEFORE", "timestamp": 1}],
+        errors=[],
+    )
+    detached_sub = _CapturingFrame(
+        console=[{"type": "log", "text": "NEVER_DRAINED", "timestamp": 1}],
+        error=RuntimeError("Frame was detached"),
+    )
+    page = _FramedPage([main, detached_sub])
+
+    messages = await UndetectedAdapter().retrieve_console_messages(page)
+
+    # The main frame's console buffer was drained before the subframe raised.
+    assert "MAIN_BEFORE" in [m["text"] for m in messages]
+    assert "NEVER_DRAINED" not in [m["text"] for m in messages]
