@@ -211,8 +211,6 @@ class DefaultMarkdownGenerator(MarkdownGenerationStrategy):
             except Exception as e:
                 raw_markdown = f"Error converting HTML to markdown: {str(e)}"
 
-            raw_markdown = raw_markdown.replace("    ```", "```")
-
             # Convert links to citations
             markdown_with_citations: str = raw_markdown
             references_markdown: str = ""

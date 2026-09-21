@@ -1080,6 +1080,7 @@ class CustomHTML2Text(HTML2Text):
         self.preserved_content = []
         self.preserve_depth = 0
         self.handle_code_in_pre = handle_code_in_pre
+        self._pre_prefix = None
 
         # Configuration options
         self.skip_internal_links = False
@@ -1153,12 +1154,28 @@ class CustomHTML2Text(HTML2Text):
         # Handle pre tags
         if tag == "pre":
             if start:
-                lang = attrs.get("data-language", "")
-                self.o(f"\n```{lang}\n")  # Markdown code block start
+                lang = attrs.get("data-language", "") if attrs else ""
                 self.inside_pre = True
+                content_col = 0
+                parent_name = None
+                for li in self.list:
+                    content_col += (
+                        3 if parent_name == "ol" and li.name == "ul" else 2
+                    )
+                    if li.name == "ul":
+                        content_col += len(self.ul_item_mark) + 1
+                    else:
+                        content_col += len(str(li.num)) + 2
+                    parent_name = li.name
+                self._pre_prefix = (
+                    ">" * self.blockquote + " " if self.blockquote else ""
+                ) + " " * content_col
+                self.o("\n" + self._pre_prefix + "```" + lang + "\n")
             else:
-                self.o("\n```\n")  # Markdown code block end
+                self.o("\n" + self._pre_prefix + "```")
                 self.inside_pre = False
+                self._pre_prefix = None
+                self.p()
         elif tag == "code":
             if self.inside_pre and not self.handle_code_in_pre:
                 # Ignore code tags inside pre blocks if handle_code_in_pre is False
@@ -1186,7 +1203,9 @@ class CustomHTML2Text(HTML2Text):
 
         if self.inside_pre:
             # Output the raw content for pre blocks, including content inside code tags
-            self.o(data)  # Directly output the data as-is (preserve newlines)
+            prefix = self._pre_prefix or ""
+            lines = data.split("\n")
+            self.out("\n".join((prefix + line if line else line) for line in lines))
             return
         if self.inside_code:
             # Inline code: no newlines allowed

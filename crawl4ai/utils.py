@@ -1114,7 +1114,6 @@ def get_content_of_website(
         h = CustomHTML2Text()
         h.ignore_links = True
         markdown = h.handle(cleaned_html)
-        markdown = markdown.replace("    ```", "```")
 
         try:
             meta = extract_metadata(html, soup)
@@ -1473,7 +1472,6 @@ def get_content_of_website_optimized(
     h = CustomHTML2Text()
     h.ignore_links = True
     markdown = h.handle(cleaned_html)
-    markdown = markdown.replace("    ```", "```")
 
     try:
         meta = extract_metadata(html, soup)
