@@ -399,6 +399,14 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                                             with open(final_path, 'wb') as f:
                                                 f.write(data)
                                             logger.warning(f"Saved raw image data to {final_path}")
+                                            images.append({
+                                                "format": "bin",
+                                                "width": width,
+                                                "height": height,
+                                                "color_space": str(color_space),
+                                                "bits_per_component": xobj.get('/BitsPerComponent', 1),
+                                                "path": str(final_path),
+                                            })
                                         else:
                                             image_data = base64.b64encode(data).decode('utf-8')
                                             images.append({
