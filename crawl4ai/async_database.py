@@ -324,14 +324,25 @@ class AsyncDatabaseManager:
                 }
 
                 for field, hash_value in content_fields.items():
-                    if hash_value:
-                        content = await self._load_content(
-                            hash_value,
-                            field.split("_")[0],  # Get content type from field name
-                        )
-                        row_dict[field] = content or ""
-                    else:
+                    if not hash_value:
+                        # No hash stored for this field -> legitimately empty.
                         row_dict[field] = ""
+                        continue
+                    content = await self._load_content(
+                        hash_value,
+                        field.split("_")[0],  # Get content type from field name
+                    )
+                    if content is None:
+                        # A non-empty hash was stored but the content file is
+                        # missing/unreadable -- the cache row is corrupted (e.g.
+                        # the content directory was cleaned up while the SQLite
+                        # row survived).  Returning the row with silently-empty
+                        # fields would let ``arun`` serve it as a ``cache_status
+                        # == "hit"`` with no content (silent data loss).  Instead,
+                        # treat this as a cache miss so the caller falls through
+                        # to a fresh crawl and re-persists a healthy row.
+                        return None
+                    row_dict[field] = content or ""
 
                 # Parse JSON fields. Markdown is reconstructed separately by
                 # _parse_cached_markdown: its stored form is a MarkdownGenerationResult
@@ -662,12 +673,19 @@ class AsyncDatabaseManager:
         try:
             async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                 return await f.read()
-        except:
+        except (OSError, UnicodeDecodeError) as e:
+            # Narrow the catch: a bare ``except:`` also swallows
+            # ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit``
+            # (all ``BaseException`` subclasses in 3.8+), masking cancellation.
+            # ``OSError`` covers FileNotFoundError / PermissionError / IsADirectory
+            # / OSError-level read failures; ``UnicodeDecodeError`` covers a
+            # corrupted/truncated UTF-8 file.  Any other error propagates so the
+            # outer ``aget_cached_url`` ``except Exception`` logs and returns None.
             self.logger.error(
-                message="Failed to load content: {file_path}",
+                message="Failed to load content {file_path}: {error}",
                 tag="ERROR",
                 force_verbose=True,
-                params={"file_path": file_path},
+                params={"file_path": file_path, "error": str(e)},
             )
             return None
 
