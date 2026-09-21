@@ -1,6 +1,7 @@
 from pathlib import Path
 import asyncio
 from dataclasses import asdict
+from datetime import datetime
 from crawl4ai.async_logger import AsyncLogger
 from crawl4ai.async_crawler_strategy import AsyncCrawlerStrategy
 from crawl4ai.models import AsyncCrawlResponse, ScrapingResult 
@@ -35,6 +36,29 @@ def set_peer_ip_validator(fn):
     """Install a connected-peer check: fn(ip: str) -> None, raises to block."""
     global _peer_ip_validator
     _peer_ip_validator = fn
+
+
+def _metadata_as_jsonable_dict(meta) -> dict:
+    """Flatten ``PDFMetadata`` into a JSON-serializable dict.
+
+    ``PDFMetadata.created`` / ``modified`` are typed ``Optional[datetime]``
+    and ``_parse_pdf_date`` populates them with native ``datetime`` objects
+    when the PDF carries a ``/CreationDate`` / ``/ModDate``. ``dataclasses.asdict``
+    preserves those objects verbatim, and the resulting dict flows unchanged
+    into ``CrawlResult.metadata``. The content-cache writer later calls the
+    stdlib ``json.dumps(result.metadata or {})`` (no ``default=`` handler),
+    which would otherwise raise ``TypeError: Object of type datetime is not
+    JSON serializable`` and drop the cache row for any such crawl. Coercing
+    the datetimes to ISO-8601 strings at the strategy boundary keeps the typed
+    dataclass honest to its declared type while guaranteeing the dict the
+    cache writer receives is JSON-native.
+    """
+    d = asdict(meta)
+    for key in ("created", "modified"):
+        value = d.get(key)
+        if isinstance(value, datetime):
+            d[key] = value.isoformat()
+    return d
 
 
 class PDFCrawlerStrategy(AsyncCrawlerStrategy):
@@ -169,7 +193,7 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
                 success=True,
                 media=media,
                 links=links,
-                metadata=asdict(result.metadata)
+                metadata=_metadata_as_jsonable_dict(result.metadata)
             )
         finally:
             # Cleanup temp file if downloaded
