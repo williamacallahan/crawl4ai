@@ -113,6 +113,17 @@ _STYLE_TAG_RE = re.compile(r'<style\b[\s\S]*?</style>', re.IGNORECASE)
 _SCRIPT_BLOCK_RE = re.compile(r'<script\b[\s\S]*?</script>', re.IGNORECASE)
 _TAG_RE = re.compile(r'<[^>]+>')
 
+# Block-page-only Tier 1 markers that live exclusively inside <script> tags.
+# The large-page deep scan strips <script> blocks before re-running the Tier 1
+# pattern list (a deliberate false-positive guard for the site-wide sensors
+# window._pxAppId / captcha-delivery.com / KPSDK.scriptStart on legitimate
+# large 200 articles). That strip also deletes these two block-page-only
+# markers, so a second pass iterates the script blocks themselves and searches
+# their content for just these. Site-wide markers are deliberately excluded
+# here so the false-positive guard keeps working for legitimate articles.
+_PX_CAPTCHA_RE = re.compile(r"captcha\.px-cdn\.net", re.IGNORECASE)
+_CF_ORCHESTRATE_RE = re.compile(r'/cdn-cgi/challenge-platform/\S+orchestrate', re.IGNORECASE)
+
 # Inline-CSS declarations that hide an element. Hidden-subtree removal is
 # parser-based (lxml) rather than regex: a regex cannot pair nested tags
 # (an inner </div> ends the match early, leaving padding "visible") and the
@@ -338,6 +349,16 @@ def is_blocked(
         for pattern, reason in _TIER1_PATTERNS:
             if pattern.search(_deep_snippet):
                 return True, reason
+        # Block-page-only markers live inside <script> tags, which the strip
+        # above destroys. Iterate the script blocks and search their content
+        # for those markers only. Site-wide sensor markers (window._pxAppId,
+        # captcha-delivery.com, KPSDK.scriptStart) are deliberately excluded
+        # so legitimate large 200 pages on PerimeterX/DataDome/Kasada-
+        # protected sites keep their existing false-positive guard.
+        for _blk in _SCRIPT_BLOCK_RE.finditer(html[:500000]):
+            _blob = _blk.group(0)
+            if _PX_CAPTCHA_RE.search(_blob) or _CF_ORCHESTRATE_RE.search(_blob):
+                return True, "Anti-bot script marker in <script>"
 
     # --- HTTP 403/503 — always blocked for non-data HTML responses ---
     # Rationale: 403/503 are never the content the user wants. Modern block pages

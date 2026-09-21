@@ -608,7 +608,181 @@ check("503 rss-widget lookalike is blocked",
 
 
 # =========================================================================
-# SUMMARY
+# LARGE-PAGE DEEP SCAN — script-embedded block markers (HTTP 200)
+# =========================================================================
+# Commit 254ef05 added a large-page Tier 1 deep scan that strips
+# <script>...</script> blocks before re-running _TIER1_PATTERNS. Two Tier 1
+# markers (captcha.px-cdn.net and /cdn-cgi/challenge-platform/.../orchestrate)
+# exist ONLY inside <script> tags, so the strip deleted the very strings the
+# scan then searched for, making large HTTP-200 challenge pages silently pass
+# as unblocked when the marker was past the 15000-byte raw-snippet window.
+# The fix keeps the script-stripped pass (a deliberate FP guard for the
+# site-wide sensors window._pxAppId / captcha-delivery.com / KPSDK.scriptStart
+# on legitimate large 200 articles) and adds a second pass that iterates the
+# script blocks themselves, searching their content for the block-page-only
+# markers only.
+#
+# The constructed pages must escape Tier 3 (structural integrity) so the deep
+# scan is the load-bearing check: visible_text >= 50 chars (in non-content
+# elements like <div>/<span> so content_elements == 0), html_len in 15-50 KB
+# so the single-signal-only-blocks-under-5000 rule does not fire.
+
+def _px_captcha_page_past_window():
+    """PX captcha page whose <script src=captcha.px-cdn.net> is past 15000."""
+    page = '<html><head><style>' + ('a:b;' * 5000) + '</style></head><body>'
+    page += '<div>' + ('P ' * 80) + 'Please verify you are human by completing the captcha below. ' + '</div>'
+    page += '<script src="https://captcha.px-cdn.net/PX12345/captcha.js"></script>'
+    page += '</body></html>'
+    assert page.index('captcha.px-cdn.net') > 15000, "marker must land past the raw-snippet window"
+    assert len(page) > 15000
+    return page
+
+def _cf_orchestrate_page_past_window():
+    """CF challenge page whose <script src=...orchestrate> is past 15000,
+    with no <form action=...orchestrate> (so the form-survives-strip path is
+    not the catch — the new script-block pass is)."""
+    page = '<html><head><style>' + ('a:b;' * 5500) + '</style></head><body>'
+    page += '<div>' + ('C ' * 80) + 'Checking your browser before accessing the site. ' + '</div>'
+    page += '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1"></script>'
+    page += '</body></html>'
+    assert page.index('orchestrate') > 15000, "marker must land past the raw-snippet window"
+    assert len(page) > 15000
+    return page
+
+def _px_legit_article_sensor_past_window():
+    """Legit PerimeterX-protected article with the site-wide window._pxAppId
+    sensor past 15000. The script-strip FP guard must keep this unblocked."""
+    page = '<html><head><style>' + ('a:b;' * 5000) + '</style></head><body>'
+    page += '<article><h1>Real Article About Technology</h1>'
+    page += '<p>Real article content here discussing web security and bot detection systems.</p>'
+    page += '<p>More genuine paragraph content for a legitimate article page.</p>'
+    page += '</article>'
+    page += '<script>window._pxAppId = "PX12345";</script>'
+    page += '</body></html>'
+    assert page.index('_pxAppId') > 15000
+    assert len(page) > 15000
+    return page
+
+def _dd_legit_article_sensor_past_window():
+    """Legit DataDome-protected article with captcha-delivery.com past 15000."""
+    page = '<html><head><style>' + ('a:b;' * 5000) + '</style></head><body>'
+    page += '<article><h1>DataDome Security Blog</h1>'
+    page += '<p>Legitimate article about the DataDome bot protection service.</p>'
+    page += '<p>More content about how modern bot detection works in practice.</p>'
+    page += '</article>'
+    page += '<script src="https://geo.captcha-delivery.com/abc.js"></script>'
+    page += '</body></html>'
+    assert page.index('captcha-delivery.com') > 15000
+    assert len(page) > 15000
+    return page
+
+def _ks_legit_article_sensor_past_window():
+    """Legit Kasada-protected article with KPSDK.scriptStart past 15000."""
+    page = '<html><head><style>' + ('a:b;' * 5000) + '</style></head><body>'
+    page += '<article><h1>Article About Kasada</h1>'
+    page += '<p>Legitimate article discussing the Kasada bot-defense platform.</p>'
+    page += '<p>More genuine content about client-side fingerprinting techniques.</p>'
+    page += '</article>'
+    page += '<script>KPSDK.scriptStart = KPSDK.now();</script>'
+    page += '</body></html>'
+    assert page.index('KPSDK.scriptStart') > 15000
+    assert len(page) > 15000
+    return page
+
+print("\n=== LARGE-PAGE DEEP SCAN (script markers, HTTP 200) ===\n")
+
+# --- Bug fix: block-page-only markers past 15000 must now be caught ---
+check("PX captcha past 15000 (200) caught via script-block pass",
+    is_blocked(200, _px_captcha_page_past_window()),
+    True, "Anti-bot script marker in <script>")
+
+check("CF orchestrate past 15000 (200, no form) caught via script-block pass",
+    is_blocked(200, _cf_orchestrate_page_past_window()),
+    True, "Anti-bot script marker in <script>")
+
+# --- Differential: the same markers in the first 15000 bytes are caught by
+#     Tier 1 raw-snippet (not the deep scan), pinning the reason so the fix
+#     does not silently switch detection paths. ---
+check("PX captcha in window (200) caught by Tier 1 raw snippet",
+    is_blocked(200,
+        '<html><body><div>Please verify you are human by completing the captcha below.</div>'
+        '<script src="https://captcha.px-cdn.net/PX12345/captcha.js"></script></body></html>'),
+    True, "PerimeterX captcha")
+
+check("CF orchestrate in window (200) caught by Tier 1 raw snippet",
+    is_blocked(200,
+        '<html><body><div>Checking your browser.</div>'
+        '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1"></script></body></html>'),
+    True, "Cloudflare JS challenge")
+
+# --- FP guard preserved: legitimate large 200 articles with site-wide
+#     sensors past 15000 must still NOT be flagged. The fix's script-block
+#     pass searches only for the block-page-only markers, not the sensors,
+#     so these keep their existing true-negative behavior. ---
+check("Legit PX article (_pxAppId past 15000, 200) not blocked (FP guard)",
+    is_blocked(200, _px_legit_article_sensor_past_window()),
+    False)
+
+check("Legit DataDome article (captcha-delivery past 15000, 200) not blocked (FP guard)",
+    is_blocked(200, _dd_legit_article_sensor_past_window()),
+    False)
+
+check("Legit Kasada article (KPSDK past 15000, 200) not blocked (FP guard)",
+    is_blocked(200, _ks_legit_article_sensor_past_window()),
+    False)
+
+# --- CF form still detected by the script-stripped pass (form survives strip) ---
+check("CF orchestrate in <form action> past 15000 (200) caught by stripped pass",
+    is_blocked(200,
+        '<html><head><style>' + ('a:b;' * 5000) + '</style></head><body>'
+        '<div>' + ('C ' * 80) + 'Checking your browser. ' + '</div>'
+        '<form id="challenge-form" action="/cdn-cgi/challenge-platform/h/g/orchestrate/x">'
+        '<input type="hidden" name="jschl_vc" value="test"/></form>'
+        '</body></html>'),
+    True, "Cloudflare")
+
+# 403 large page WITHOUT any anti-bot script marker — the always-block rule
+# must still fire (the new script-block pass must not change that). This is the
+# only 403 test large enough (>15KB) to exercise the deep scan before the
+# always-block rule.
+check("403 large page without anti-bot markers still blocked by always-block",
+    is_blocked(403,
+        '<html><head><style>' + ('a:b;' * 5000) + '</style></head><body>'
+        '<div>' + ('P ' * 80) + 'Some generic error page content here. ' + '</div>'
+        '</body></html>'),
+    True, "403")
+
+# --- Boundary: marker just past 15000 (deep scan fires; raw snippet misses;
+#     new script-block pass catches it) ---
+_px_boundary = ('<html><head><style>' + ('a:b;' * 3700) + '</style></head><body>'
+    + '<div>' + ('P ' * 60) + 'Please verify you are human. ' + '</div>'
+    + '<script src="https://captcha.px-cdn.net/PX12345/captcha.js"></script>'
+    + '</body></html>')
+assert _px_boundary.index('captcha.px-cdn.net') > 15000, "boundary marker must be past 15000"
+assert len(_px_boundary) > 15000, "deep scan must fire"
+check("PX captcha just past 15000 boundary (200) caught",
+    is_blocked(200, _px_boundary),
+    True, "Anti-bot script marker in <script>")
+
+# --- Boundary: marker just inside 15000 (deep scan does NOT fire; raw snippet
+#     catches it via Tier 1, not the script-block pass) ---
+_px_in_window = ('<html><head><style>' + ('a:b;' * 3664) + '</style></head><body>'
+    + '<div>' + ('P ' * 60) + 'Please verify you are human. ' + '</div>'
+    + '<script src="https://captcha.px-cdn.net/PX12345/captcha.js"></script>'
+    + '</body></html>')
+assert _px_in_window.index('captcha.px-cdn.net') < 15000, "marker must be in the raw-snippet window"
+assert len(_px_in_window) <= 15000, "deep scan must NOT fire"
+check("PX captcha just inside 15000 boundary (200) caught by raw snippet",
+    is_blocked(200, _px_in_window),
+    True, "PerimeterX captcha")
+
+# --- Data exemption must not be broken by the new script-block pass ---
+check("Large 200 JSON feed not blocked despite large size",
+    is_blocked(200, '{"items":[' + ('{"id":1,"name":"item","category":"test","price":9.99},' * 700) + '{"id":701}]}'),
+    False)
+
+
+
 # =========================================================================
 print(f"\n{'=' * 60}")
 print(f"RESULTS: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")
@@ -746,3 +920,34 @@ def test_bom_does_not_reclassify_html_as_data():
     assert _looks_like_data(bom + '{"k":1}') is True
     assert _looks_like_data(bom + '\n<rss version="2.0"><channel/></rss>') is True
     assert _looks_like_data('\n' + bom + '{"k":1}') is True
+
+
+# =========================================================================
+# pytest-style regression test for the large-page deep-scan script-marker fix.
+#
+# Per this file's convention (see the comment above the foster-parenting
+# tests), the `is_blocked`-level shapes for this fix are covered by the
+# `check()` cases in the LARGE-PAGE DEEP SCAN section above. The single
+# function below covers the one guard that is NOT otherwise exercised there:
+# the script-block pass must scope to the two block-page-only markers and
+# ignore a script block that contains only a site-wide sensor.
+# =========================================================================
+
+
+def test_script_block_pass_ignores_sensor_only_script():
+    # A large 200 page whose only script is a site-wide sensor (not a
+    # block-page-only marker) must not be flagged by the new pass. This is the
+    # isolated scoping assertion: the three FP-guard `check()` cases above
+    # prove it from the legitimate-article angle; this proves it from the
+    # pass-implementation angle by making the sensor the ONLY script content.
+    page = ('<html><head><style>' + ('a:b;' * 5000) + '</style></head><body>'
+            + '<article><h1>News Article</h1>'
+            + '<p>A legitimate news article with real prose content for readers.</p>' * 3
+            + '</article>'
+            + '<script>var dd = {rt:"i",cid:"abc",host:"geo.captcha-delivery.com"};</script>'
+            + '</body></html>')
+    assert page.index('captcha-delivery.com') > 15000
+    assert 'captcha.px-cdn.net' not in page
+    assert 'orchestrate' not in page
+    assert is_blocked(200, page) == (False, "")
+
