@@ -2559,8 +2559,12 @@ def is_external_url(url: str, base_domain: str) -> bool:
         url_domain = parsed.netloc.lower().split(":")[0].replace("www.", "")
         base = base_domain.lower().split(":")[0].replace("www.", "")
 
-        # Check if URL domain ends with base domain
-        return not url_domain.endswith(base)
+        # Check if URL domain is the same as, or a subdomain of, the base
+        # domain. Enforce a label boundary so lookalike hosts whose hostname
+        # merely string-ends with the base (e.g. "notexample.com" vs
+        # "example.com") are correctly classified as external. Mirrors the
+        # check used by DomainFilter._is_subdomain.
+        return not (url_domain == base or url_domain.endswith("." + base))
     except Exception:
         return False
 
