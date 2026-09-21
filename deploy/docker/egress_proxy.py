@@ -92,12 +92,23 @@ def _no_proxy_match(host: str, ip: str, port: int) -> bool:
     for entry in entries:
         if entry == "*":
             return True
-        try:
-            if ipaddress.ip_address(ip) in ipaddress.ip_network(entry, strict=False):
-                return True
+        # IP/CIDR branch: try the full entry first, then a port-stripped
+        # retry for unambiguous IPv4:port / CIDR:port / [IPv6]:port forms.
+        match = _ip_match(ip, entry)
+        if match is True:
+            return True
+        if match is False:
+            # Entry parsed as a valid IP/CIDR but the pin IP is not in it;
+            # preserve the original try/continue semantics by NOT falling
+            # through to the hostname branch for IP-form entries.
             continue
-        except ValueError:
-            pass
+        candidate = _strip_port(entry, port)
+        if candidate is not None:
+            retry = _ip_match(ip, candidate)
+            if retry is True:
+                return True
+            if retry is False:
+                continue
         suffix = entry.lower().lstrip(".")
         head, separator, port_part = suffix.rpartition(":")
         if separator and port_part.isdigit():
@@ -108,6 +119,45 @@ def _no_proxy_match(host: str, ip: str, port: int) -> bool:
         if lowered == suffix or lowered.endswith("." + suffix):
             return True
     return False
+
+
+def _ip_match(ip: str, net: str) -> bool | None:
+    """True if `ip` is in network `net`; False if `net` is a valid IP/CIDR but
+    `ip` is not in it; None if `net` is not a valid IP/CIDR (e.g. a hostname
+    suffix or an entry carrying a `:port`)."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(net, strict=False)
+    except ValueError:
+        return None
+
+
+def _strip_port(entry: str, want_port: int) -> str | None:
+    """Strip an unambiguous trailing port from a NO_PROXY entry, returning the
+    port-stripped candidate (or None).
+
+    `:` is ambiguous between an IPv6 group separator and a port delimiter, so
+    only IPv4/CIDR (exactly one colon) and bracketed IPv6 (`[addr]:port`) forms
+    are split. A port mismatch returns None so the caller falls through to the
+    hostname-branch port check rather than matching against the wrong IP.
+    """
+    if entry.startswith("["):
+        close = entry.find("]")
+        if close == -1:
+            return None
+        addr = entry[1:close]
+        port_part = entry[close + 1:].lstrip(":")
+        if not port_part.isdigit():
+            return None  # bare [IPv6] (no :port) -> leave to full-entry branch
+        if int(port_part) != want_port:
+            return None  # port mismatch
+        return addr
+    if entry.count(":") == 1:
+        head, sep, port_part = entry.rpartition(":")
+        if sep and port_part.isdigit():
+            if int(port_part) != want_port:
+                return None
+            return head
+    return None
 
 
 def _use_upstream(pin):
