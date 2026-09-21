@@ -252,7 +252,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             # 2) Or if exclude_external_images=True and it's an external domain, remove.
             if (img_domain in exclude_domains) or (
                 kwargs.get("exclude_external_images", False)
-                and is_external_url(src, base_domain)
+                and self._is_image_external(img, base_domain)
             ):
                 parent = img.getparent()
                 if parent is not None:
@@ -322,6 +322,56 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 return current.text_content().strip()
             current = current.getparent()
         return None
+
+    def _is_image_external(self, img: lhtml.HtmlElement, base_domain: str) -> bool:
+        """Return whether an ``<img>`` is external for ``exclude_external_images``.
+
+        Inspects the same attribute surface as :meth:`process_image`:
+        ``src``, ``data-src``, ``srcset``, ``data-srcset``, ``<picture><source>``
+        srcsets, and framework-specific ``data-*`` attributes carrying a URL.
+        ``data:`` URIs are inline content rather than external resources, so an
+        image is external only if it has at least one real (non-``data:``) URL
+        candidate and every such candidate is external. A ``data:``-only ``<img>``
+        and a lazy-loaded ``<img>`` whose real URL in ``data-src``/``srcset`` is
+        same-domain are not external; an external URL carried in ``data-src`` is.
+        """
+        candidates = set()
+
+        for attr in ("src", "data-src"):
+            value = img.get(attr) or ""
+            if value and not value.startswith("data:"):
+                candidates.add(value)
+
+        for attr in ("srcset", "data-srcset"):
+            for variant in parse_srcset(img.get(attr) or ""):
+                url = variant["url"]
+                if url and not url.startswith("data:"):
+                    candidates.add(url)
+
+        picture = img.xpath("./ancestor::picture[1]")
+        if picture:
+            for source in picture[0].xpath(".//source"):
+                for variant in parse_srcset(source.get("srcset") or ""):
+                    url = variant["url"]
+                    if url and not url.startswith("data:"):
+                        candidates.add(url)
+                for variant in parse_srcset(source.get("data-srcset") or ""):
+                    url = variant["url"]
+                    if url and not url.startswith("data:"):
+                        candidates.add(url)
+
+        for attr, value in img.attrib.items():
+            if (
+                attr.startswith("data-")
+                and ("src" in attr or "srcset" in attr)
+                and "http" in value
+                and not value.startswith("data:")
+            ):
+                candidates.add(value)
+
+        return bool(candidates) and all(
+            is_external_url(c, base_domain) for c in candidates
+        )
 
     def process_image(
         self, img: lhtml.HtmlElement, url: str, index: int, total_images: int, **kwargs
