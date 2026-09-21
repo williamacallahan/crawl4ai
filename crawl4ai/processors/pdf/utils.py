@@ -208,8 +208,7 @@ def clean_pdf_text_to_html(page_number, text):
     # Fix escaped characters
     html_output = html_output.replace('\\ud835', '').replace('\\u2020', '†')
     
-    # Remove leftover hyphens and fix spacing
-    html_output = re.sub(r'\s+-\s+', '', html_output)
+    # Fix spacing before punctuation
     html_output = re.sub(r'\s+([.,!?)])', r'\1', html_output)
     
     return html_output
@@ -346,9 +345,8 @@ def clean_pdf_text(page_number, text):
     # Fix escaped characters
     markdown = markdown.replace('\\ud835', '').replace('\\u2020', '†')
     
-    # Remove leftover hyphens and fix spacing
-    markdown = re.sub(r'\s+-\s+', '', markdown)  # Join hyphenated words
-    markdown = re.sub(r'\s+([.,!?)])', r'\1', markdown)  # Fix punctuation spacing
+    # Fix punctuation spacing
+    markdown = re.sub(r'\s+([.,!?)])', r'\1', markdown)
     
     
     return markdown
