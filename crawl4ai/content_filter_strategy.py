@@ -818,9 +818,9 @@ class LLMContentFilter(RelevantContentFilter):
         sig = inspect.signature(self.__init__)
         all_params = sig.parameters  # Dictionary of parameter names and their details
 
-        if name in self._UNWANTED_PROPS and value is not all_params[name].default:
+        if name in self._UNWANTED_PROPS and value != all_params[name].default:
             raise AttributeError(f"Setting '{name}' is deprecated. {self._UNWANTED_PROPS[name]}")
-        
+
         super().__setattr__(name, value)  
         
     def _get_cache_key(self, html: str, instruction: str) -> str:
