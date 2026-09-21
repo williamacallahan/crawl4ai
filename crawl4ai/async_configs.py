@@ -2548,10 +2548,26 @@ class CrawlerRunConfig():
                 cache_mode=CacheMode.BYPASS,
                 verbose=True
             )
+
+            # Override the c4a_script while preserving the rest of the config:
+            # the previously-compiled js_code from the original c4a_script is
+            # dropped so __init__ recompiles from the new c4a_script.
+            updated = config.clone(c4a_script='WAIT "loaded" 5')
             ```
+
+        Note:
+            When ``c4a_script`` is overridden without an explicit ``js_code``
+            override, the previously-compiled ``js_code`` carried by
+            ``to_dict()`` is dropped from the cloned dict so that
+            ``__init__``'s compile gate (``if self.c4a_script and not
+            self.js_code``) recompiles the new script. Passing an explicit
+            ``js_code`` alongside ``c4a_script`` still wins, preserving the
+            existing "explicit ``js_code`` wins" precedence rule.
         """
         config_dict = self.to_dict()
         config_dict.update(kwargs)
+        if "c4a_script" in kwargs and "js_code" not in kwargs:
+            config_dict.pop("js_code", None)
         return CrawlerRunConfig.from_kwargs(config_dict)
 
 class LLMConfig:
