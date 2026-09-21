@@ -426,6 +426,7 @@ class AsyncWebCrawler:
                     _proxy_list = config._get_proxy_list()
                     _original_proxy_config = config.proxy_config
                     _block_reason = ""
+                    _block_reason_for_result = ""
                     _done = False
                     _target_outcome = False
                     crawl_result = None
@@ -493,6 +494,7 @@ class AsyncWebCrawler:
                                         _blocked, _block_reason = is_blocked(
                                             async_response.status_code, html)
                                     _target_outcome = _blocked
+                                    _block_reason_for_result = _block_reason
 
                                     if not _blocked:
                                         self.logger.url_status(
@@ -663,7 +665,7 @@ class AsyncWebCrawler:
                             _target_outcome = _blocked
                             if _blocked:
                                 crawl_result.success = False
-                                crawl_result.error_message = f"Blocked by anti-bot protection: {_block_reason}"
+                                crawl_result.error_message = f"Blocked by anti-bot protection: {_block_reason_for_result}"
                         crawl_result.crawl_stats = _crawl_stats
                     else:
                         # All proxies threw exceptions and fallback either wasn't
