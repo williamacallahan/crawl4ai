@@ -278,14 +278,15 @@ class Crawl4aiDockerClient:
                         async for line in response.aiter_lines():
                             if line.strip():
                                 result = json.loads(line)
+                                if result.get("status") == "completed":
+                                    continue
+                                if result.get("status") == "failed":
+                                    raise RequestError(f"Streaming crawl failed: {result.get('error', 'Unknown error')}")
                                 if "error" in result:
                                     self.logger.error_status(url=result.get("url", "unknown"), error=result["error"])
                                     continue
                                 self.logger.url_status(url=result.get("url", "unknown"), success=True, timing=result.get("timing", 0.0))
-                                if result.get("status") == "completed":
-                                    continue
-                                else:
-                                    yield CrawlResult(**_decode_pdf(result))
+                                yield CrawlResult(**_decode_pdf(result))
                 except httpx.TimeoutException as e:
                     raise ConnectionError(f"Request timed out: {str(e)}")
                 except httpx.RequestError as e:

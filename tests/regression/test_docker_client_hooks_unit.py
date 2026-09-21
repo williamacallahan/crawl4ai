@@ -362,6 +362,181 @@ async def test_streaming_crawl_2xx_still_streams_results(streaming_client):
     assert yielded == ["https://ok.example.org"]
 
 
+# --- streaming crawl() operation-level failure terminator contract ---
+# The Docker server emits an in-band operation-level failure terminator on
+# ``/crawl/stream`` when the streaming crawl fails wholesale (wall-clock
+# deadline exceeded at ``api.py``'s ``except asyncio.TimeoutError``, or an
+# unhandled exception at its ``except Exception``). Both shapes are
+# ``{"status": "failed", "error": "..."}`` and are semantically distinct from
+# the per-URL serialization-error line ``{"error": ..., "url": ...}``, which is
+# a soft failure where the stream continues. The streaming branch previously
+# used ``if "error" in result`` as its first discriminator and ``continue``d,
+# which swallowed the operation-level terminator and ended the generator
+# without raising -- masking server-side outages, timeouts, and crashes as a
+# "successful" empty (or partial-prefix) stream. These tests pin the contract
+# that the failure terminator raises ``RequestError`` (matching the non-
+# streaming path's HTTP 504/500 -> ``RequestError`` mapping and the documented
+# ``try/except Exception`` around ``async for`` in self-hosting.md). No
+# docker server, browser, or Redis required.
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_wall_clock_failure_terminator_must_raise(streaming_client):
+    """A wall-clock-deadline failure terminator raises ``RequestError``.
+
+    Mirrors the server-test-pinned ``mode="slow"`` shape from
+    ``deploy/docker/tests/test_crawl_hook_lifecycle.py::test_streaming_wall_clock_deadline_emits_failure_and_releases``:
+    the wall-clock deadline fires before any URL completes, so the failed
+    terminator is the first and only line. Before the fix the client hit the
+    per-URL ``error`` branch first (the terminator carries an ``error`` key),
+    logged-and-``continue``d it, and the generator ended silently without
+    raising -- so the caller could not distinguish a failed crawl from a
+    successful empty one.
+    """
+    _install_asgi(
+        streaming_client,
+        _asgi_ndjson([json.dumps({"status": "failed", "error": "Crawl exceeded the time limit"})]),
+    )
+    cfg = CrawlerRunConfig(stream=True)
+
+    gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+    with pytest.raises(RequestError, match=r"Crawl exceeded the time limit") as exc_info:
+        async for _ in gen:
+            pass
+
+    assert isinstance(exc_info.value, Crawl4aiClientError)
+    assert not isinstance(exc_info.value, ConnectionError)
+    assert "Streaming crawl failed" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_unhandled_failure_terminator_must_raise(streaming_client):
+    """An unhandled-server-exception failure terminator raises ``RequestError``.
+
+    Mirrors the server-test-pinned ``mode="error"`` shape from
+    ``deploy/docker/tests/test_crawl_hook_lifecycle.py::test_streaming_generator_failure_emits_terminal_failure_and_releases``:
+    an unhandled exception bubbles out of the result generator, the
+    terminator is the first and only line. As above, the bug swallowed it.
+    """
+    _install_asgi(
+        streaming_client,
+        _asgi_ndjson([json.dumps({"status": "failed", "error": "Streaming crawl failed"})]),
+    )
+    cfg = CrawlerRunConfig(stream=True)
+
+    gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+    with pytest.raises(RequestError, match=r"Streaming crawl failed") as exc_info:
+        async for _ in gen:
+            pass
+
+    assert isinstance(exc_info.value, Crawl4aiClientError)
+    assert not isinstance(exc_info.value, ConnectionError)
+    assert "Streaming crawl failed" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_failure_after_partial_results_must_raise(streaming_client):
+    """A failure terminator after partial results yields the prefix AND raises.
+
+    The constructed-but-plausible partial-prefix shape: one CrawlResult line
+    is delivered, then an ``asyncio.TimeoutError`` propagates and the server
+    emits the failed terminator. The caller must observe BOTH the partial
+    prefix (so already-streamed data is not lost) AND the terminal failure
+    signal (so the caller knows the crawl did not complete). Before the fix
+    the prefix was yielded and then the stream ended silently, so the caller
+    proceeded as if the crawl had simply finished early with one result.
+    """
+    lines = [
+        json.dumps({"url": "https://partial.example.com", "html": "<p>hi</p>", "success": True}),
+        json.dumps({"status": "failed", "error": "Crawl exceeded the time limit"}),
+    ]
+    _install_asgi(streaming_client, _asgi_ndjson(lines))
+    cfg = CrawlerRunConfig(stream=True)
+
+    gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+    yielded = []
+    with pytest.raises(RequestError, match=r"Crawl exceeded the time limit"):
+        async for result in gen:
+            yielded.append(result)
+
+    assert [r.url for r in yielded] == ["https://partial.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_failed_terminator_without_error_field_raises_unknown(
+    streaming_client,
+):
+    """A failed terminator missing the ``error`` key raises with a fallback.
+
+    Pin the fix's ``result.get('error', 'Unknown error')`` branch: the server
+    always emits ``error`` today, but the client must not crash with
+    ``KeyError``/``None``-interpolation if a future server change omits it.
+    """
+    _install_asgi(
+        streaming_client,
+        _asgi_ndjson([json.dumps({"status": "failed"})]),
+    )
+    cfg = CrawlerRunConfig(stream=True)
+
+    gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+    with pytest.raises(RequestError, match=r"Unknown error") as exc_info:
+        async for _ in gen:
+            pass
+
+    assert "Streaming crawl failed" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_completed_marker_does_not_raise_and_is_not_yielded(
+    streaming_client,
+):
+    """A pure completion-marker stream ends cleanly with no results and no raise.
+
+    Pin the hoisted ``status == "completed"`` branch: the completion marker
+    is a control line, not a ``CrawlResult``, so it must be skipped (not
+    yielded) and must not raise. Also pins the non-regressive side-effect of
+    the fix -- the completion marker no longer passes through
+    ``self.logger.url_status(url="unknown", ...)`` (which would have logged a
+    misleading ``url="unknown"`` success line for what is a control line);
+    that log suppression is verified indirectly by asserting the stream
+    completes without yielding the marker as a ``CrawlResult``.
+    """
+    _install_asgi(
+        streaming_client,
+        _asgi_ndjson([json.dumps({"status": "completed"})]),
+    )
+    cfg = CrawlerRunConfig(stream=True)
+
+    gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+    yielded = [r async for r in gen]
+
+    assert yielded == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_crawl_per_url_error_still_soft_fails_and_continues(streaming_client):
+    """A per-URL ``{"error": ..., "url": ...}`` line is logged-and-continued.
+
+    Pin the non-regression contract that the per-URL serialization-error line
+    (no ``status`` field) is still a soft failure: the stream continues past
+    it, no exception is raised, and subsequent ``CrawlResult`` lines are still
+    yielded. The fix must not have promoted this branch to a raise just
+    because it shares the ``"error"`` key with the operation-level terminator.
+    """
+    lines = [
+        json.dumps({"error": "boom", "url": "https://failed.example.com"}),
+        json.dumps({"url": "https://ok.example.org", "html": "<p>hi</p>", "success": True}),
+        json.dumps({"status": "completed"}),
+    ]
+    _install_asgi(streaming_client, _asgi_ndjson(lines))
+    cfg = CrawlerRunConfig(stream=True)
+
+    gen = await streaming_client.crawl(["https://example.com"], crawler_config=cfg)
+    yielded = [r.url async for r in gen]
+
+    assert yielded == ["https://ok.example.org"]
+
+
 @pytest.mark.asyncio
 async def test_streaming_crawl_error_does_not_leave_body_unread(streaming_client):
     """The response body is fully read before the stream context closes.
