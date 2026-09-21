@@ -1,7 +1,16 @@
 # // File: tests/deep_crawling/test_filters.py
-import pytest
+import asyncio
+import gc
+import warnings
 from urllib.parse import urlparse
-from crawl4ai import ContentTypeFilter, DomainFilter, URLPatternFilter, URLFilter
+import pytest
+from crawl4ai import (
+    ContentTypeFilter,
+    DomainFilter,
+    FilterChain,
+    URLPatternFilter,
+    URLFilter,
+)
 
 # Minimal URLFilter base class stub if not already importable directly for tests
 # In a real scenario, this would be imported from the library
@@ -169,3 +178,147 @@ class TestDomainFilter:
     def test_allowed_domains_with_port(self, url, expected):
         f = DomainFilter(allowed_domains=["example.com"])
         assert f.apply(url) is expected
+
+
+# ---------------------------------------------------------------------------
+# Deterministic in-process filter stubs for FilterChain tests (no network).
+# ---------------------------------------------------------------------------
+
+
+class _SyncFilter(URLFilter):
+    """A sync filter that returns a fixed boolean and records every call."""
+
+    def __init__(self, name, result):
+        super().__init__(name=name)
+        self._result = result
+        self.calls = []
+
+    def apply(self, url):
+        self.calls.append(url)
+        self._update_stats(self._result)
+        return self._result
+
+
+class _AsyncFilter(URLFilter):
+    """An async filter that returns a fixed boolean and tracks coroutine state.
+
+    ``body_started`` / ``finally_ran`` distinguish whether the coroutine was
+    actually awaited (gathered) versus only ``close()``d without running.
+    """
+
+    def __init__(self, name, result):
+        super().__init__(name=name)
+        self._result = result
+        self.body_started = False
+        self.finally_ran = False
+
+    async def apply(self, url):
+        try:
+            self.body_started = True
+            await asyncio.sleep(0)  # yield once so it's a genuine coroutine
+            self._update_stats(self._result)
+            return self._result
+        finally:
+            self.finally_ran = True
+
+
+def _assert_no_never_awaited_warnings(recorded):
+    leaked = [
+        str(w.message)
+        for w in recorded
+        if issubclass(w.category, RuntimeWarning)
+        and "was never awaited" in str(w.message)
+    ]
+    assert (
+        not leaked
+    ), f"Expected no un-awaited-coroutine RuntimeWarnings, got: {leaked}"
+
+
+class TestFilterChain:
+    """Regression coverage for FilterChain.apply over async+sync mixes.
+
+    Prior to the fix, a synchronous filter rejecting *after* one or more
+    async filter coroutines had already been collected into ``tasks`` caused
+    those coroutines to be abandoned (never awaited / closed). Python emits
+    ``RuntimeWarning: coroutine '...' was never awaited`` when they were
+    garbage-collected. These tests pin down that the coroutines are now
+    properly disposed of via ``.close()`` on the short-circuit path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sync_rejection_closes_pending_async_coroutine(self):
+        # The exact trigger: async filter before a rejecting sync filter.
+        async_ok = _AsyncFilter("async-pass", True)
+        sync_reject = _SyncFilter("sync-reject", False)
+        chain = FilterChain([async_ok, sync_reject])
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = await chain.apply("https://example.com/report.pdf")
+            gc.collect()
+
+        assert result is False
+        # The sync filter was actually evaluated and short-circuited the chain.
+        assert sync_reject.calls == ["https://example.com/report.pdf"]
+        # The async coroutine was disposed without running its body (cheap
+        # short-circuit: no work performed for an already-rejected URL).
+        assert async_ok.body_started is False
+        # No coroutine leaked -> no RuntimeWarning.
+        _assert_no_never_awaited_warnings(caught)
+        # Chain-level stats: total=1, passed=0, rejected=1.
+        assert chain.stats.total_urls == 1
+        assert chain.stats.passed_urls == 0
+        assert chain.stats.rejected_urls == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_rejection_closes_multiple_pending_async_coroutines(self):
+        a1 = _AsyncFilter("async-1", True)
+        a2 = _AsyncFilter("async-2", False)
+        a3 = _AsyncFilter("async-3", True)
+        sync_reject = _SyncFilter("sync-reject", False)
+        chain = FilterChain([a1, a2, a3, sync_reject])
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = await chain.apply("https://example.com/x.zip")
+            gc.collect()
+
+        assert result is False
+        for f in (a1, a2, a3):
+            assert f.body_started is False
+        _assert_no_never_awaited_warnings(caught)
+        assert chain.stats.rejected_urls == 1
+        assert chain.stats.total_urls == 1
+
+    @pytest.mark.asyncio
+    async def test_real_content_relevance_filter_short_circuit_no_warning(self):
+        # End-to-end against a real async filter (ContentRelevanceFilter) with
+        # its network call patched out, to confirm the production async filter
+        # path also benefits from the cleanup.
+        from crawl4ai.deep_crawling.filters import ContentRelevanceFilter
+        from crawl4ai import utils as _c4ai_utils
+
+        async def _fake_peek_html(url):
+            return (
+                "<html><head><title>AI defence</title>"
+                "<meta name='description' content='AI defence systems'>"
+                "</head></html>"
+            )
+
+        original = _c4ai_utils.HeadPeekr.peek_html
+        _c4ai_utils.HeadPeekr.peek_html = _fake_peek_html
+        try:
+            crf = ContentRelevanceFilter(query="AI defence", threshold=0.0)
+            sync_reject = _SyncFilter("sync-reject", False)
+            chain = FilterChain([crf, sync_reject])
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = await chain.apply("https://techcrunch.com/2025/report.pdf")
+                gc.collect()
+
+            assert result is False
+            # Body never ran because the sync filter short-circuited first.
+            _assert_no_never_awaited_warnings(caught)
+        finally:
+            _c4ai_utils.HeadPeekr.peek_html = original

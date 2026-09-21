@@ -99,6 +99,8 @@ class FilterChain:
             if inspect.isawaitable(result):
                 tasks.append(result)  # Collect async tasks
             elif not result:  # Sync rejection
+                for t in tasks:
+                    t.close()  # Dispose un-awaited async coroutines
                 self.stats._counters[2] += 1  # Sync rejected
                 return False
 
