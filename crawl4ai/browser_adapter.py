@@ -354,33 +354,43 @@ class UndetectedAdapter(BrowserAdapter):
         return None  # No handler function needed for undetected browser
     
     async def retrieve_console_messages(self, page: UndetectedPage) -> List[Dict]:
-        """Retrieve captured console messages and errors from the page"""
+        """Retrieve captured console messages and errors from the page.
+
+        Drains the per-frame `window.__capturedConsole` / `window.__capturedErrors`
+        buffers installed by `setup_console_capture` / `setup_error_capture`.
+        `add_init_script` runs in every http(s)-scheme document (including
+        iframes), so each frame has its own buffer; iterating `page.frames`
+        ensures subframe messages are surfaced alongside the main frame's.
+        `page.frames` always includes the main frame as its first element, so
+        single-document pages behave exactly as before.
+        """
         messages = []
-        
+
         try:
-            # Get console messages
-            console_messages = await page.evaluate(
-                "() => { const msgs = window.__capturedConsole || []; window.__capturedConsole = []; return msgs; }",
-                isolated_context=False
-            )
-            messages.extend(console_messages)
-            
-            # Get errors
-            errors = await page.evaluate(
-                "() => { const errs = window.__capturedErrors || []; window.__capturedErrors = []; return errs; }",
-                isolated_context=False
-            )
-            messages.extend(errors)
-            
+            for frame in page.frames:
+                # Get console messages
+                console_messages = await frame.evaluate(
+                    "() => { const msgs = window.__capturedConsole || []; window.__capturedConsole = []; return msgs; }",
+                    isolated_context=False
+                )
+                messages.extend(console_messages or [])
+
+                # Get errors
+                errors = await frame.evaluate(
+                    "() => { const errs = window.__capturedErrors || []; window.__capturedErrors = []; return errs; }",
+                    isolated_context=False
+                )
+                messages.extend(errors or [])
+
             # Convert timestamps from JS to Python format
             for msg in messages:
                 if 'timestamp' in msg and isinstance(msg['timestamp'], (int, float)):
                     msg['timestamp'] = msg['timestamp'] / 1000.0  # Convert from ms to seconds
-                    
+
         except Exception:
-            # If retrieval fails, return empty list
+            # If retrieval fails, return whatever was collected so far
             pass
-        
+
         return messages
     
     async def cleanup_console_capture(self, page: UndetectedPage, handle_console: Optional[Callable], handle_error: Optional[Callable]):
