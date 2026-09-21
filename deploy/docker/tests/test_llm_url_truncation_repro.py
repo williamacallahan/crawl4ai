@@ -353,7 +353,9 @@ def test_percent_decoding(stock_client, server_module, monkeypatch):
     assert captured["pre_slice_urls"] == [page_url]
 
 
-def test_convention_a_fused_form_non_regression(stock_client, server_module, monkeypatch):
+# Traefik path sanitizing merges "//" before the app sees the path.
+@pytest.mark.parametrize("path", ["/llm/https://example.com", "/llm/https:/example.com"])
+def test_convention_a_fused_form_non_regression(stock_client, server_module, monkeypatch, path):
     """The documented unencoded fused form continues to work.
 
     Per ``docs/md_v2/assets/llm.txt/txt/docker.txt:172-174``::
@@ -402,7 +404,7 @@ def test_convention_a_fused_form_non_regression(stock_client, server_module, mon
     monkeypatch.setattr(server_module, "redis", PermitRedis())
 
     response = stock_client.get(
-        "/llm/https://example.com",
+        path,
         params={"q": "What is this page about?"},
         headers=_auth_header(),
     )

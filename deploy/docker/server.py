@@ -1022,8 +1022,9 @@ async def llm_endpoint(
     # derived server-side from the provider name only.
     if not q:
         raise HTTPException(400, "Query parameter 'q' is required")
-    if not url.startswith(("http://", "https://")) and not url.startswith(("raw:", "raw://")):
-        url = "https://" + url
+    # Ingress path sanitizing merges "//", so /llm/https://host arrives as
+    # "https:/host"; restore the scheme separator before validation.
+    url = re.sub(r"^(https?):/(?!/)", r"\1://", url)
     answer = await handle_llm_qa(
         url,
         q,
