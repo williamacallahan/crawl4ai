@@ -486,11 +486,17 @@ def _eligible_nodes() -> tuple[frozenset[str], frozenset[str]]:
 
 
 _SLEEP_UNITS = {"s": 1, "m": 60, "h": 3_600, "d": 86_400}
-# One GNU sleep interval as a single quoted argument: an optionally-signed,
-# optionally-fractional decimal number followed by an optional single
-# s/m/h/d suffix. ``re.fullmatch`` (not ``re.match``) keeps multi-component
-# values such as ``1m30s`` or ``1d2h`` from parsing as their first component.
-_SLEEP_INTERVAL = re.compile(r"([+]?(?:\d+(?:\.\d*)?|\.\d+))([smhd])?")
+# One GNU sleep interval as a single quoted argument: optional leading
+# whitespace (GNU sleep's strtod skips it), an optionally-signed,
+# optionally-fractional decimal number, and an optional single s/m/h/d suffix.
+# ``re.fullmatch`` (not ``re.match``) keeps multi-component values such as
+# ``1m30s`` or ``1d2h`` from parsing as their first component, and the absence
+# of trailing ``\s*`` rejects trailing whitespace that GNU sleep itself rejects
+# (the container's ``sleep "${VAR:-2}"`` exits 1 on ``"2 "`` or ``"  2  "``,
+# aborting the drain trap before it can SIGTERM supervisord). The leading
+# ``\s*`` mirrors sleep's own leading-whitespace tolerance so the verifier
+# never fails the deploy on a value the container would honor.
+_SLEEP_INTERVAL = re.compile(r"\s*([+]?(?:\d+(?:\.\d*)?|\.\d+))([smhd])?")
 
 
 def _parse_sleep_seconds(value: str) -> int:
@@ -498,12 +504,14 @@ def _parse_sleep_seconds(value: str) -> int:
 
     entrypoint.sh runs ``sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"``, so the
     deployed value reaches ``sleep`` as a single quoted argument. GNU sleep
-    accepts one (optionally fractional) number with an optional single
-    ``s``/``m``/``h``/``d`` suffix; anything else is rejected here so the deploy
-    fails loudly rather than silently falling back to the entrypoint literal.
-    Falling back when the operator has set a value would undermeasure the real
-    shutdown and let a rolling update SIGKILL a task mid-drain — the exact
-    data-loss class the STOP_GRACE_NS gate exists to prevent.
+    skips leading whitespace (a strtod artifact), then accepts one (optionally
+    fractional) number with an optional single ``s``/``m``/``h``/``d`` suffix;
+    trailing whitespace it rejects. Anything ``sleep`` would reject is rejected
+    here too so the deploy fails loudly rather than silently falling back to the
+    entrypoint literal. Falling back when the operator has set a value would
+    undermeasure the real shutdown and let a rolling update SIGKILL a task
+    mid-drain — the exact data-loss class the STOP_GRACE_NS gate exists to
+    prevent.
     """
     match = _SLEEP_INTERVAL.fullmatch(value)
     if match is None:
@@ -541,11 +549,17 @@ def _drain_budget_ns(environment: Any) -> int:
     )
     if not stop_waits or not fallback:
         raise ValueError("container drain budget is no longer readable from its own sources")
-    deployed = _environment_values(environment).get("CRAWL4AI_DRAIN_DELAY_SECONDS", "").strip()
-    if deployed:
-        drain = _parse_sleep_seconds(deployed)
-    else:
+    raw = _environment_values(environment).get("CRAWL4AI_DRAIN_DELAY_SECONDS", "")
+    # Only the "is the variable unset?" test may strip: a pure-whitespace value
+    # is treated as unset and falls back to the entrypoint literal. The raw
+    # value is what reaches the container's ``sleep``, so it is what
+    # _parse_sleep_seconds must see — stripping here would re-form ``"2 "`` or
+    # ``"  2  "`` into ``"2"``, slipping a value sleep will reject at drain time
+    # past the loud-reject contract this gate exists to enforce.
+    if not raw.strip():
         drain = int(fallback.group(1))
+    else:
+        drain = _parse_sleep_seconds(raw)
     return (max(int(value) for value in stop_waits) + drain) * 1_000_000_000
 
 

@@ -303,6 +303,12 @@ def test_stop_grace_covers_the_shipped_container_drain_budget(monkeypatch):
         ("1.5h", 5400), (".5s", 0),
         # Leading '+' with a suffix.
         ("+1m", 60), ("+1.5m", 90),
+        # Leading whitespace the container's sleep honors (strtod skips it).
+        # _drain_budget_ns used to .strip() the deployed value before parsing,
+        # masking this shape from the strict regex; the leading \s* in
+        # _SLEEP_INTERVAL mirrors sleep so the verifier never fails the deploy
+        # on a value the container would honor.
+        (" 2", 2), ("  2", 2), (" 5s", 5), (" 1m", 60), (" +2", 2), (" +1.5m", 90),
     ],
 )
 def test_parse_sleep_seconds_accepts_the_sleep_intervals_the_container_honors(value, seconds):
@@ -329,6 +335,14 @@ def test_parse_sleep_seconds_accepts_the_sleep_intervals_the_container_honors(va
         # infinite sleep would always SIGKILL the task, so reject loudly so the
         # operator's typo can never slip past the gate unmeasured.
         "inf", "nan", "1.5e2", "0x10",
+        # Trailing or wrapped whitespace: GNU sleep rejects these with exit 1
+        # (trailing whitespace is the one shape strtod does NOT skip), and so
+        # must the verifier. _drain_budget_ns used to .strip() these into clean
+        # numbers that passed the gate — the exact data-loss class the
+        # STOP_GRACE_NS gate exists to prevent. The leading \s* in
+        # _SLEEP_INTERVAL must not bleed into trailing tolerance: fullmatch with
+        # no trailing \s* keeps these rejected.
+        "2 ", "  2  ", " 5 ", "5s ", " 5s ", "2\t",
     ],
 )
 def test_parse_sleep_seconds_rejects_non_intervals_loudly(value):
@@ -348,7 +362,14 @@ def test_drain_budget_ns_falls_back_only_when_the_delay_is_unset(drain):
 
 @pytest.mark.parametrize(
     "drain",
-    ["abc", "1m30s", "1d2h", "-2", "1.5.5", "1M", "1_000", "inf", "nan", "1.5e2"],
+    [
+        "abc", "1m30s", "1d2h", "-2", "1.5.5", "1M", "1_000", "inf", "nan", "1.5e2",
+        # Whitespace-padded numeric values the container's sleep rejects but
+        # _drain_budget_ns used to .strip() into clean numbers that passed the
+        # gate (the bug): trailing-or-wrapped whitespace aborts `sleep` with
+        # exit 1 at drain time, so the trap SIGKILLs before supervisord drains.
+        "2 ", "  2  ", " 5 ", "5s ", " 5s ", "2\t",
+    ],
 )
 def test_drain_budget_ns_raises_loudly_when_a_set_delay_is_unparseable(drain):
     # The original bug fell back to the entrypoint literal 2 whenever isdigit
@@ -367,6 +388,86 @@ def test_policy_blocks_a_rollout_whose_drain_delay_meets_or_exceeds_the_stop_gra
     raised["env"] += f"\nCRAWL4AI_DRAIN_DELAY_SECONDS={drain}"
     with pytest.raises(ValueError, match="drain budget"):
         rollout._policy(raised)
+
+
+@pytest.mark.parametrize(
+    "drain", ["2 ", "  2  ", " 5 ", "5s ", " 5s ", "2\t"]
+)
+def test_drain_budget_ns_rejects_trailing_whitespace_the_containers_sleep_rejects(drain):
+    # Regression for the .strip() bug: _drain_budget_ns used to .strip() the
+    # deployed value before _parse_sleep_seconds saw it, so "2 " or "  2  "
+    # was re-formed to "2" and passed the gate. The container's
+    # `sleep "2 "` exits 1 (GNU sleep rejects trailing whitespace — the one
+    # shape strtod does not skip), which under `set -e` in entrypoint.sh's
+    # begin_drain trap aborts before `kill -TERM supervisord`, so the task is
+    # SIGKILLed mid-drain — the data-loss class the STOP_GRACE_NS gate exists
+    # to prevent. _drain_budget_ns must fail the deploy loudly on the raw
+    # value sleep will actually receive.
+    sleep_rejects = subprocess.run(
+        ["sleep", drain], check=False
+    ).returncode != 0
+    assert sleep_rejects, f"container sleep unexpectedly accepted {drain!r}"
+    with pytest.raises(ValueError, match="CRAWL4AI_DRAIN_DELAY_SECONDS"):
+        rollout._drain_budget_ns(f"CRAWL4AI_DRAIN_DELAY_SECONDS={drain}")
+
+
+@pytest.mark.parametrize(
+    ("drain", "seconds"),
+    [(" 0", 0), (" 0s", 0), (" 2", 2), (" +2", 2), (" 5s", 5), (" 1m", 60)]
+)
+def test_drain_budget_ns_honors_leading_whitespace_the_containers_sleep_honors(
+    drain, seconds,
+):
+    # Parity guard: GNU sleep skips leading whitespace (a strtod artifact), so
+    # " 2" sleeps 2 seconds. The pre-bug _drain_budget_ns .strip()ed the value
+    # to "2" and passed the gate that way; the fix keeps the raw value and
+    # relies on _SLEEP_INTERVAL's leading \s* to model sleep faithfully, so a
+    # deploy is never failed loudly on a value the container would honor.
+    # Cross-check the container's sleep end-to-end only for 0-second rows (a
+    # nonzero interval would stall the suite); strtod's leading-whitespace
+    # handling is uniform, so the 0-second proof generalizes to " 2", " 5s"
+    # and " 1m", whose verifier side is pinned by the budget assertion below.
+    if seconds == 0:
+        sleep_exit = subprocess.run(["sleep", drain], check=False).returncode
+        assert sleep_exit == 0, f"container sleep rejected {drain!r} (exit {sleep_exit})"
+    budget = rollout._drain_budget_ns(
+        f"LLM_PROVIDER={rollout.LLM_PROVIDER}\n"
+        f"LLM_BASE_URL={rollout.LLM_BASE_URL}\n"
+        f"LLM_API_KEY=secret\nCRAWL4AI_DRAIN_DELAY_SECONDS={drain}"
+    )
+    assert budget == (360 + seconds) * 1_000_000_000
+
+
+def test_drain_budget_ns_passes_the_raw_value_untrimmed_to_the_parser(monkeypatch):
+    # The bug was a .strip() between _environment_values and _parse_sleep_seconds
+    # that re-formed "2 " into "2". Lock the contract: the parser receives the
+    # exact bytes the container's sleep will receive, so any future re-introduction
+    # of an upstream trim is caught immediately.
+    seen = {}
+    def fake_parse(value):
+        seen["value"] = value
+        raise ValueError("stop")
+    monkeypatch.setattr(rollout, "_parse_sleep_seconds", fake_parse)
+    with pytest.raises(ValueError, match="stop"):
+        rollout._drain_budget_ns(
+            "LLM_PROVIDER=x\nLLM_BASE_URL=y\nLLM_API_KEY=k"
+            "\nCRAWL4AI_DRAIN_DELAY_SECONDS=  2  "
+        )
+    assert seen["value"] == "  2  "
+
+
+def test_drain_budget_ns_falls_back_only_when_the_delay_is_unset_pure_whitespace_too(
+    monkeypatch,
+):
+    # Pure-whitespace values ("   ") must still fall back to the entrypoint
+    # literal — the "is the variable unset?" test is the one place .strip() is
+    # still permitted. A loud reject here would be a regression on the existing
+    # fallback contract documented by test_drain_budget_ns_falls_back_only_when
+    # _the_delay_is_unset, so pin it next to that test.
+    def refuse(value):
+        raise AssertionError(f"pure whitespace must not reach the parser, got {value!r}")
+    monkeypatch.setattr(rollout, "_parse_sleep_seconds", refuse)
+    assert rollout._drain_budget_ns("CRAWL4AI_DRAIN_DELAY_SECONDS=   ") == 362_000_000_000
 
 
 def test_policy_accepts_only_stock_docker_image_configuration():
