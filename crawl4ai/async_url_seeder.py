@@ -1668,46 +1668,7 @@ class AsyncUrlSeeder:
         ]
         if any(path.endswith(f'/{file}') for file in utility_files):
             return True
-        
-        # # 4. Feed files
-        # if path.endswith(('.rss', '.atom', '/feed', '/rss', '/atom', '/feed.xml', '/rss.xml')):
-        #     return True
-        
-        # # 5. API endpoints and data files
-        # api_patterns = ['/api/', '/v1/', '/v2/', '/v3/', '/graphql', '/.json', '/.xml']
-        # if any(pattern in path for pattern in api_patterns):
-        #     return True
-        
-        # # 6. Archive and download files
-        # download_extensions = [
-        #     '.zip', '.tar', '.gz', '.rar', '.7z', '.bz2',
-        #     '.exe', '.dmg', '.pkg', '.deb', '.rpm',
-        #     '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-        #     '.csv', '.tsv', '.sql', '.db', '.sqlite'
-        # ]
-        # if any(path.endswith(ext) for ext in download_extensions):
-        #     return True
-        
-        # # 7. Media files (often not useful for text content)
-        # media_extensions = [
-        #     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico',
-        #     '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm',
-        #     '.mp3', '.wav', '.ogg', '.m4a', '.flac',
-        #     '.woff', '.woff2', '.ttf', '.eot', '.otf'
-        # ]
-        # if any(path.endswith(ext) for ext in media_extensions):
-        #     return True
-        
-        # # 8. Source code and config files
-        # code_extensions = [
-        #     '.js', '.css', '.scss', '.sass', '.less',
-        #     '.map', '.min.js', '.min.css',
-        #     '.py', '.rb', '.php', '.java', '.cpp', '.h',
-        #     '.yaml', '.yml', '.toml', '.ini', '.conf', '.config'
-        # ]
-        # if any(path.endswith(ext) for ext in code_extensions):
-        #     return True
-        
+
         # 9. Hidden files and directories
         path_parts = path.split('/')
         if any(part.startswith('.') for part in path_parts if part):
