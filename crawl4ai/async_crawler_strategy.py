@@ -911,48 +911,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 if not config.ignore_body_visibility:
                     raise Error(f"Body element is hidden: {visibility_info}")
 
-            # try:
-            #     await page.wait_for_selector("body", state="attached", timeout=30000)
-
-            #     await page.wait_for_function(
-            #         """
-            #         () => {
-            #             const body = document.body;
-            #             const style = window.getComputedStyle(body);
-            #             return style.display !== 'none' &&
-            #                 style.visibility !== 'hidden' &&
-            #                 style.opacity !== '0';
-            #         }
-            #     """,
-            #         timeout=30000,
-            #     )
-            # except Error as e:
-            #     visibility_info = await page.evaluate(
-            #         """
-            #         () => {
-            #             const body = document.body;
-            #             const style = window.getComputedStyle(body);
-            #             return {
-            #                 display: style.display,
-            #                 visibility: style.visibility,
-            #                 opacity: style.opacity,
-            #                 hasContent: body.innerHTML.length,
-            #                 classList: Array.from(body.classList)
-            #             }
-            #         }
-            #     """
-            #     )
-
-            #     if self.config.verbose:
-            #         self.logger.debug(
-            #             message="Body visibility info: {info}",
-            #             tag="DEBUG",
-            #             params={"info": visibility_info},
-            #         )
-
-            #     if not config.ignore_body_visibility:
-            #         raise Error(f"Body element is hidden: {visibility_info}")
-
             # Handle content loading and viewport adjustment
             if not self.browser_config.text_mode and (
                 config.wait_for_images or config.adjust_viewport_to_content
@@ -1990,20 +1948,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     # then wait for the new page to load before continuing
                     result = None
                     try:
-                        # OLD VERSION:
-                        # result = await page.evaluate(
-                        #     f"""
-                        # (async () => {{
-                        #     try {{
-                        #         const script_result = {script};
-                        #         return {{ success: true, result: script_result }};
-                        #     }} catch (err) {{
-                        #         return {{ success: false, error: err.toString(), stack: err.stack }};
-                        #     }}
-                        # }})();
-                        # """
-                        # )
-                        
                         # """ NEW VERSION:
                         # When {script} contains statements (e.g., const link = …; link.click();), 
                         # this forms invalid JavaScript, causing Playwright execution error: SyntaxError: Unexpected token 'const'.
