@@ -10,11 +10,9 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Set, Tuple, Any, Union
 from dataclasses import dataclass, field
 import asyncio
-import pickle
-import os
 import json
 import math
-from collections import defaultdict, Counter
+from collections import defaultdict
 import re
 from pathlib import Path
 
@@ -303,11 +301,6 @@ class CrawlStrategy(ABC):
 class StatisticalStrategy(CrawlStrategy):
     """Pure statistical approach - no LLM, no embeddings"""
     
-    def __init__(self):
-        self.idf_cache = {}
-        self.bm25_k1 = 1.2  # BM25 parameter
-        self.bm25_b = 0.75  # BM25 parameter
-        
     async def calculate_confidence(self, state: CrawlState) -> float:
         """Calculate confidence using coverage, consistency, and saturation"""
         if not state.knowledge_base:
@@ -580,7 +573,6 @@ class EmbeddingStrategy(CrawlStrategy):
         self.embedding_model = embedding_model or "sentence-transformers/all-MiniLM-L6-v2"
         self.llm_config = llm_config
         self.query_llm_config = query_llm_config
-        self._embedding_cache = {}
         self._link_embedding_cache = {}  # Cache for link embeddings
         self._validation_passed = False  # Track if validation passed
         
