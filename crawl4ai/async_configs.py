@@ -32,7 +32,7 @@ from .markdown_generation_strategy import (
 )
 from .proxy_strategy import ProxyRotationStrategy
 from .table_extraction import DefaultTableExtraction, TableExtractionStrategy
-from .user_agent_generator import UAGen, ValidUAGenerator  # , OnlineUAGenerator
+from .user_agent_generator import UAGen, ValidUAGenerator
 
 # Type alias for URL matching
 UrlMatcher = Union[str, Callable[[str], bool], List[Union[str, Callable[[str], bool]]]]
