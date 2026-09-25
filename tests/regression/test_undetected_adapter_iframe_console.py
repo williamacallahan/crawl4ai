@@ -33,6 +33,23 @@ def _console_texts(result):
     return [m.get("text") for m in (result.console_messages or [])]
 
 
+def _console_timestamps(result):
+    return [
+        m.get("timestamp")
+        for m in (result.console_messages or [])
+        if isinstance(m.get("timestamp"), (int, float))
+    ]
+
+
+# `Date.now()` ms for dates between ~2001 and ~2100 falls in [1e12, 4e12); the
+# same dates in seconds (the unit `PlaywrightAdapter`'s `time.time()` and the
+# `UndetectedAdapter` ms/1000 conversion establish) fall in [1e9, 4e9). A
+# timestamp below this threshold therefore pins the seconds unit and rejects
+# raw-ms values (1000x too large) regardless of the current wall clock.
+_SECONDS_LOWER = 1e9
+_SECONDS_UPPER = 1e11
+
+
 @pytest.mark.asyncio
 @pytest.mark.browser
 async def test_undetected_adapter_captures_console_from_http_iframe(local_server):
@@ -41,6 +58,9 @@ async def test_undetected_adapter_captures_console_from_http_iframe(local_server
     `AsyncCrawlResponse.console_messages`. Pre-fix only the main-frame
     message (`FROM_MAIN`) reached the response; `FROM_HTTP_IFRAME` was
     silently discarded because `page.evaluate` drained only the top frame.
+
+    Captured timestamps must be in seconds (matching `PlaywrightAdapter`'s
+    `time.time()`), not raw JS milliseconds — i.e. below the ms threshold.
     """
     strategy = AsyncPlaywrightCrawlerStrategy(
         browser_config=BrowserConfig(headless=True, verbose=False),
@@ -62,6 +82,11 @@ async def test_undetected_adapter_captures_console_from_http_iframe(local_server
     assert "FROM_MAIN" in texts, f"main-frame console.log missing: {texts}"
     assert "FROM_HTTP_IFRAME" in texts, (
         f"http-iframe console.log missing (the bug): {texts}"
+    )
+    timestamps = _console_timestamps(result)
+    assert timestamps, f"no numeric timestamps on messages: {result.console_messages!r}"
+    assert all(_SECONDS_LOWER < ts < _SECONDS_UPPER for ts in timestamps), (
+        f"timestamp not in seconds (expected ~1e9, got raw ms ~1e12?): {timestamps!r}"
     )
 
 

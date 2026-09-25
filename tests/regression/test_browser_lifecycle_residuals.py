@@ -1186,7 +1186,12 @@ async def test_undetected_adapter_retrieve_returns_partial_results_if_a_frame_ra
     `except Exception: pass` must swallow it and return whatever was drained
     so far — the crawl must not crash and the main frame's messages must
     still reach the response. The subframe that raises is skipped, so its
-    messages are lost, matching the documented best-effort contract."""
+    messages are lost, matching the documented best-effort contract.
+
+    The ms->s timestamp conversion must have already been applied to the
+    drained batch before the later frame raised, so partial results carry
+    seconds (matching the happy path and `PlaywrightAdapter`'s `time.time()`)
+    rather than raw JS milliseconds."""
     main = _CapturingFrame(
         console=[{"type": "log", "text": "MAIN_BEFORE", "timestamp": 1}],
         errors=[],
@@ -1202,3 +1207,9 @@ async def test_undetected_adapter_retrieve_returns_partial_results_if_a_frame_ra
     # The main frame's console buffer was drained before the subframe raised.
     assert "MAIN_BEFORE" in [m["text"] for m in messages]
     assert "NEVER_DRAINED" not in [m["text"] for m in messages]
+    # The drained message's timestamp was converted from JS ms (1) to
+    # Python seconds (0.001) before the later frame raised, so partial
+    # results match the happy-path unit — not raw ms (1).
+    assert messages[0]["timestamp"] == 0.001, (
+        f"expected 0.001 s (ms 1 / 1000), got {messages[0]['timestamp']!r}"
+    )
