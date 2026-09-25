@@ -1204,8 +1204,9 @@ class CustomHTML2Text(HTML2Text):
         if self.inside_pre:
             # Output the raw content for pre blocks, including content inside code tags
             prefix = self._pre_prefix or ""
+            bq = ">" * self.blockquote
             lines = data.split("\n")
-            self.out("\n".join((prefix + line if line else line) for line in lines))
+            self.out("\n".join((prefix + line if line else bq for line in lines)))
             return
         if self.inside_code:
             # Inline code: no newlines allowed
