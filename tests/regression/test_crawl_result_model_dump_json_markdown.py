@@ -24,6 +24,7 @@ Run with:
 import json
 
 import pytest
+from pydantic import BaseModel
 
 from crawl4ai.models import (
     CrawlResult,
@@ -33,6 +34,15 @@ from crawl4ai.models import (
 
 URL = "https://example.com"
 HTML = "<html><head><title>x</title></head><body><p>hello</p></body></html>"
+
+
+class _Outer(BaseModel):
+    """Reference model that carries a ``MarkdownGenerationResult`` as a
+    *standard* nested field. Used to assert that ``CrawlResult``'s injected
+    ``markdown`` sub-object matches pydantic's own field-serialization path
+    under each forwarded serialization option."""
+
+    inner: MarkdownGenerationResult
 
 
 def _md(raw="hello", citations="c", refs="r", fit="fm", fithtml="<p>fh</p>"):
@@ -217,3 +227,92 @@ class TestNoRegressionOnOtherFields:
         out = json.loads(cr.model_dump_json())
         assert "fit_markdown" not in out
         assert "markdown_v2" not in out
+
+
+class TestSerializationOptionForwarding:
+    """The ``@model_serializer(mode="wrap")`` must forward the full
+    ``SerializationInfo`` option set to the nested
+    ``MarkdownGenerationResult.model_dump(...)`` call — not just ``mode``.
+
+    Before the fix the wrap serializer only forwarded ``mode`` (and the
+    flat ``include``/``exclude`` membership check), silently dropping
+    ``exclude_none`` / ``exclude_defaults`` / ``exclude_unset`` /
+    ``by_alias`` / ``round_trip``. The injected ``markdown`` sub-object
+    therefore violated those serialization options while the rest of the
+    model honored them.
+
+    The strongest guarantee here is *parity with a standard nested pydantic
+    model*: serializing a ``CrawlResult`` carrying a ``MarkdownGenerationResult``
+    under a given option must produce the same ``markdown`` sub-object that
+    serializing a reference ``_Outer`` model carrying that same object as a
+    regular nested field would produce. This contract is asserted directly
+    against pydantic's own field-serialization path on both the dict and JSON
+    surfaces for the three boolean exclusion flags; ``by_alias`` and
+    ``round_trip`` (no-ops for this alias-less model) are exercised to pin
+    the forwarding behavior and the ``by_alias=None`` default.
+    """
+
+    def test_exclude_none_matches_standard_nested_model(self):
+        """Under ``exclude_none`` the injected ``markdown`` sub-object must
+        equal what a standard nested pydantic field carrying the same
+        ``MarkdownGenerationResult`` would emit, on both the dict and JSON
+        surfaces. This is the headline regression: previously
+        ``"fit_markdown": null`` / ``"fit_html": null`` survived inside the
+        injected ``markdown`` sub-object."""
+        md = MarkdownGenerationResult(
+            raw_markdown="# Hi", markdown_with_citations="c",
+            references_markdown="r", fit_markdown=None, fit_html=None,
+        )
+        cr = _result(md=md)
+        outer = _Outer(inner=md)
+        assert cr.model_dump(exclude_none=True)["markdown"] == outer.model_dump(exclude_none=True)["inner"]
+        assert (
+            json.loads(cr.model_dump_json(exclude_none=True))["markdown"]
+            == json.loads(outer.model_dump_json(exclude_none=True))["inner"]
+        )
+
+    def test_exclude_defaults_matches_standard_nested_model(self):
+        """``exclude_defaults`` drops markdown sub-fields whose values equal
+        their defaults (``fit_markdown``/``fit_html`` default to ``None``).
+        The injected sub-object must match a standard nested field's
+        behavior on both surfaces."""
+        md = _md(raw="# Hi", citations="c", refs="r", fit=None, fithtml=None)
+        cr = _result(md=md)
+        outer = _Outer(inner=md)
+        assert cr.model_dump(exclude_defaults=True)["markdown"] == outer.model_dump(exclude_defaults=True)["inner"]
+
+    def test_exclude_unset_matches_standard_nested_model(self):
+        """``exclude_unset`` drops markdown sub-fields that were not explicitly
+        provided when building the ``MarkdownGenerationResult``. The injected
+        sub-object must match a standard nested field's behavior on both
+        surfaces."""
+        md = MarkdownGenerationResult(
+            raw_markdown="# Hi", markdown_with_citations="c", references_markdown="r"
+        )
+        cr = _result(md=md)
+        outer = _Outer(inner=md)
+        assert cr.model_dump(exclude_unset=True)["markdown"] == outer.model_dump(exclude_unset=True)["inner"]
+
+    def test_by_alias_forwarding_is_noop_without_aliases(self):
+        """``MarkdownGenerationResult`` declares no aliases, so
+        ``by_alias=True`` must be a no-op for the injected ``markdown``
+        sub-object and must not raise. This pins that the forwarded
+        ``by_alias`` flag (which is ``None`` by default, not ``False``) is
+        passed through without corrupting the un-aliased path."""
+        cr = _result(md=_md())
+        assert cr.model_dump(by_alias=True)["markdown"] == cr.model_dump()["markdown"]
+        assert (
+            json.loads(cr.model_dump_json(by_alias=True))["markdown"]
+            == json.loads(cr.model_dump_json())["markdown"]
+        )
+
+    def test_round_trip_forwarding_preserves_markdown(self):
+        """``round_trip=True`` must serialize the ``markdown`` sub-object in
+        a way that round-trips back through ``model_validate``."""
+        cr = _result(md=_md(raw="# Hi", citations="c", refs="r", fit="fm", fithtml="<a>"))
+        dumped = cr.model_dump(round_trip=True)
+        rebuilt = CrawlResult.model_validate(dumped)
+        assert rebuilt._markdown is not None
+        assert rebuilt._markdown.raw_markdown == "# Hi"
+        assert rebuilt._markdown.fit_markdown == "fm"
+        assert rebuilt._markdown.fit_html == "<a>"
