@@ -318,27 +318,196 @@ async def test_migration_is_idempotent_direct_rerun(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_migration_rerun_with_missing_content_files_does_not_corrupt(
+    tmp_path, monkeypatch
+):
+    """Re-running the migration when content files are missing must not re-hash.
+
+    Core regression for the silent-corruption bug: the DB holds valid hash
+    pointers but the ``*_content/`` files are gone (e.g. a deployment that
+    persisted only ``crawl4ai.db`` while the marker + ``*_content/`` dirs lived
+    on ephemeral storage). On the next launch ``needs_migration()`` is True and
+    the migration re-fires. Before the fix the ``_is_content_hash`` guard gated
+    on backing-file existence, so the missing file made the guard return False,
+    ``_store_content`` re-hashed the 16-char hash *string*, wrote a NEW file
+    whose body was that hash string, and updated the column to the
+    hash-of-hash -- a cache HIT that then served the hash string as the page's
+    HTML. After the fix the pointer is left intact and the missing file
+    self-heals as a cache miss (``aget_cached_url`` returns None -> re-crawl).
+    """
+    _set_version(monkeypatch, "0.9.3")
+    mgr = _new_manager(tmp_path)
+    await mgr.initialize()
+    mgr._initialized = True
+    url = "https://e.com/missing-files"
+    original_html = "<html><body><h1>Real original content</h1></body></html>"
+    await mgr.acache_url(_result(url, html=original_html))
+
+    hash_before = await _db_column(mgr, url, "html")
+    assert _is_hash(hash_before), f"html should be a hash, got {hash_before!r}"
+    html_file_before = os.path.join(mgr.content_paths["html"], hash_before)
+    assert os.path.exists(html_file_before)
+    cached = await mgr.aget_cached_url(url)
+    assert cached is not None and cached.html == original_html
+
+    # Simulate the failure mode: the DB persists but the content file is lost.
+    os.remove(html_file_before)
+    assert not os.path.exists(html_file_before)
+
+    # Remove the marker so the one-time migration re-fires (e.g. operator
+    # restored only crawl4ai.db, or the marker lived on ephemeral storage).
+    os.remove(mgr.version_manager.migration_marker)
+    assert mgr.version_manager.needs_migration() is True
+
+    # Re-run the migration through the production entry point. Before the fix
+    # this re-hashed the hash string and wrote a hash-of-hash file.
+    await run_migration(mgr.db_path)
+
+    # 1. The hash pointer must NOT have been re-hashed into a hash-of-hash.
+    hash_after = await _db_column(mgr, url, "html")
+    assert hash_after == hash_before, (
+        f"hash pointer was re-hashed {hash_before} -> {hash_after}; the "
+        f"migration re-hashed an already-migrated pointer because its backing "
+        f"file was missing"
+    )
+
+    # 2. No (hash-of-hash) backing file must have been written with the old
+    #    hash string as its body -- the only sound recovery for a missing file
+    #    is a cache miss, not a rewritten pointer.
+    assert not os.path.exists(
+        os.path.join(mgr.content_paths["html"], hash_after)
+    ), "a backing file was (re)created for an intact pointer; the migration re-hashed the hash string"
+
+    # 3. The cache must self-heal as a MISS (None), not serve the 16-char hash
+    #    string as the page's HTML via a cache HIT.
+    cached_after = await mgr.aget_cached_url(url)
+    assert cached_after is None, (
+        f"cache returned {getattr(cached_after, 'html', cached_after)!r} "
+        f"instead of a self-healing miss; the hash string was served as page content"
+    )
+
+    # 4. Re-crawling restores a healthy row: acache_url overwrites the
+    #    (unchanged) pointer with a fresh hash-backed file and reads back the
+    #    original content -- confirming the self-heal completes end-to-end.
+    await mgr.acache_url(_result(url, html=original_html))
+    cached_healed = await mgr.aget_cached_url(url)
+    assert cached_healed is not None
+    assert cached_healed.html == original_html
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "column, read_key",
+    [
+        pytest.param("html", "html", id="html"),
+        pytest.param("cleaned_html", "cleaned", id="cleaned_html"),
+        pytest.param("markdown", "markdown", id="markdown"),
+        pytest.param("extracted_content", "extracted", id="extracted_content"),
+        pytest.param("screenshot", "screenshot", id="screenshot"),
+    ],
+)
+async def test_migration_rerun_missing_file_leaves_each_content_column_intact(
+    tmp_path, monkeypatch, column, read_key
+):
+    """G5: every content column's hash pointer is left intact when its file is missing.
+
+    The destructive re-hash failure mode is not specific to the ``html`` column:
+    ``migrate_database`` calls ``_store_content`` for all five content columns
+    (html, cleaned_html, markdown, extracted_content, screenshot). For each
+    column this test builds a pre-migrated row whose target column holds a real
+    16-hex hash pointer backed by a content file, deletes that file, removes the
+    marker so the one-time migration re-fires, re-runs ``run_migration``, and
+    asserts: the column pointer is unchanged (no hash-of-hash), no new backing
+    file was (re)created, and ``aget_cached_url`` self-heals as a cache miss.
+    """
+    _set_version(monkeypatch, "0.9.3")
+    mgr = _new_manager(tmp_path)
+    await mgr.initialize()
+    mgr._initialized = True
+    url = f"https://e.com/cols/{column}"
+    sample = f"SAMPLE original content for {column}"
+    h = generate_content_hash(sample)
+    assert _is_hash(h), f"expected 16-hex hash, got {h!r}"
+
+    # Pre-migrated state: the target column holds the hash; its backing file
+    # (under the cache-read content dir for this field) holds the original.
+    backing = os.path.join(mgr.content_paths[read_key], h)
+    with open(backing, "w") as f:
+        f.write(sample)
+    fields = {
+        "html": "",
+        "cleaned_html": "",
+        "markdown": "",
+        "extracted_content": "",
+        "screenshot": "",
+    }
+    fields[column] = h
+    await _insert_raw_blob_row(mgr, url, **fields)
+    assert (await _db_column(mgr, url, column)) == h
+
+    # Cache HIT before the file is removed: the row serves the original content.
+    assert await mgr.aget_cached_url(url) is not None, (
+        f"{column}: expected a cache HIT before deleting the backing file"
+    )
+
+    # The failure mode: DB persists, the backing file + the marker are lost.
+    os.remove(backing)
+    os.remove(mgr.version_manager.migration_marker)
+    assert mgr.version_manager.needs_migration() is True
+
+    await run_migration(mgr.db_path)
+
+    # 1. The pointer must NOT have been re-hashed into a hash-of-hash.
+    after = await _db_column(mgr, url, column)
+    assert after == h, (
+        f"{column}: pointer was re-hashed {h} -> {after} when its backing "
+        f"file was missing"
+    )
+    # 2. No backing file was (re)created for the intact pointer (the only sound
+    #    recovery for a missing file is a cache miss, not a rewritten pointer).
+    assert not os.path.exists(backing), (
+        f"{column}: a backing file was recreated at the (unchanged) pointer path"
+    )
+    # 3. The cache self-heals as a MISS, not a HIT serving the hash string.
+    assert await mgr.aget_cached_url(url) is None, (
+        f"{column}: cache served content instead of a self-healing miss after "
+        f"the migration re-fired with the backing file missing"
+    )
+
+
+@pytest.mark.asyncio
 async def test_is_content_hash_guard():
-    """DatabaseMigration._is_content_hash detects stored hash pointers."""
+    """DatabaseMigration._is_content_hash detects stored hash pointers.
+
+    A value is classified as an already-migrated content-hash pointer purely
+    by its shape (16 hex chars matching the xxh64 hexdigest format), NOT by
+    whether the backing file currently exists. Gating on file existence would
+    re-hash already-migrated rows whose backing file is missing (the
+    silent-corruption failure mode this guards against), so the pointer is
+    recognised regardless of file presence and a missing file is left to
+    self-heal as a cache miss on read.
+    """
     dm = DatabaseMigration.__new__(DatabaseMigration)
     dm.content_paths = {"html": "/", "markdown": "/"}
-    # 16-hex-char string is the xxh64 hexdigest shape.
-    assert dm._is_content_hash("1e32d216f47f664f", "html") in (False, True)
+    # A 16-hex-char string is recognised as a hash pointer even when no
+    # backing file exists (path "/" here has no such file).
+    assert dm._is_content_hash("1e32d216f47f664f", "html") is True
     # Non-hex / wrong-length / empty are never hashes.
     assert dm._is_content_hash("", "html") is False
     assert dm._is_content_hash("not-a-hash", "html") is False
     assert dm._is_content_hash("12345", "html") is False  # too short
     assert dm._is_content_hash("zzzzzzzzzzzzzzzz", "html") is False  # not hex
-    # A real content-hash pointer is only recognized if its file exists.
+    # Recognition is independent of backing-file existence: a missing file
+    # must self-heal as a cache miss, not trigger a destructive re-hash.
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         dm.content_paths = {"html": d}
         h = generate_content_hash("hello")
         assert len(h) == 16
-        assert dm._is_content_hash(h, "html") is False  # file absent
+        assert dm._is_content_hash(h, "html") is True  # file absent
         with open(os.path.join(d, h), "w") as f:
             f.write("hello")
-        assert dm._is_content_hash(h, "html") is True
+        assert dm._is_content_hash(h, "html") is True  # file present
 
 
 # ---------------------------------------------------------------------------
