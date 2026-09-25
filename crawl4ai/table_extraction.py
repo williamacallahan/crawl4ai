@@ -269,6 +269,13 @@ class DefaultTableExtraction(TableExtractionStrategy):
             pending = {}  # col_index -> (value, rows_remaining)
             current_group = None
             header_row_data = []
+            # Widest resolved <thead> row. The leaf row can be narrower than an
+            # earlier (e.g. top) <thead> row when a top-row <th rowspan="1">
+            # covers a column the leaf leaves uncovered. Keys off
+            # ``len(headers)`` for body alignment would then drop trailing
+            # body cells; track the full header-grid width and pad the leaf
+            # headers so ``max_columns`` reflects the grid, not the leaf.
+            header_grid_width = 0
             for row in thead_rows:
                 row_group = row.getparent()
                 if row_group is not current_group:
@@ -314,8 +321,11 @@ class DefaultTableExtraction(TableExtractionStrategy):
                         row_data.append("")
                         col += 1
                 if row_data:
+                    header_grid_width = max(header_grid_width, len(row_data))
                     header_row_data = row_data
-            headers = list(header_row_data)
+            headers = list(header_row_data) + [""] * (
+                header_grid_width - len(header_row_data)
+            )
         else:
             # Only adopt the first row as headers when it is all <th>; a row
             # mixing <th> (row label) with <td> data must stay data, otherwise
