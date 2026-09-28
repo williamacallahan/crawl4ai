@@ -13,6 +13,7 @@ from crawl4ai.utils import (
     normalize_url,
     normalize_url_for_deep_crawl,
     efficient_normalize_url_for_deep_crawl,
+    quick_extract_links,
     sanitize_input_encode,
     generate_content_hash,
 )
@@ -344,6 +345,206 @@ class TestNormalizeUrlForDeepCrawl:
         """Hostname should be lowercased."""
         result = normalize_url_for_deep_crawl("/page", "http://EXAMPLE.COM")
         assert "example.com" in result
+
+    # -- blank-value query parameters (keep_blank_values agreement) ----------
+
+    def test_blank_value_param_preserved(self):
+        """A blank-value query param (e.g. ?q=) must survive in the dedup key.
+
+        Regression for the bug where ``parse_qs(query)`` (default
+        ``keep_blank_values=False``) silently dropped blank-value params,
+        collapsing ``/page?q=`` and ``/page`` into one dedup key while the
+        fetched URL preserved the distinction via ``urljoin``.
+        """
+        result = normalize_url_for_deep_crawl("/page?q=", "http://x.com")
+        assert result == "http://x.com/page?q=", (
+            f"Blank-value param 'q=' must be preserved, got: {result}"
+        )
+
+    def test_blank_value_distinct_from_absent(self):
+        """``/page`` and ``/page?q=`` must produce distinct dedup keys.
+
+        This is the core guarantee: two hrefs the fetcher would visit as
+        distinct URIs must also be treated as distinct by the ``visited``
+        set, modulo only the intended tracking-param coarsening.
+        """
+        base = "http://x.com"
+        bare = normalize_url_for_deep_crawl("/page", base)
+        blank = normalize_url_for_deep_crawl("/page?q=", base)
+        assert bare != blank, (
+            f"Bare /page and /page?q= must have distinct dedup keys: "
+            f"{bare!r} == {blank!r}"
+        )
+
+    def test_blank_value_with_tracking_stripped(self):
+        """Tracking params are stripped but blank-value params are kept.
+
+        ``/page?utm_source=x&q=`` should dedup to ``/page?q=``: the tracking
+        param ``utm_source`` is removed (intended coarsening), while the
+        blank-value param ``q=`` is preserved (matches ``normalize_url``).
+        """
+        result = normalize_url_for_deep_crawl(
+            "/page?utm_source=x&q=", "http://x.com"
+        )
+        assert result == "http://x.com/page?q=", (
+            f"Tracking stripped, blank kept: expected 'http://x.com/page?q=', "
+            f"got {result!r}"
+        )
+
+    def test_blank_value_collapses_with_tracking_variant(self):
+        """``/page?utm_source=x&q=`` and ``/page?q=`` must dedup equally.
+
+        Both should normalize to the same key once the tracking param is
+        stripped; the blank-value param survives in both.
+        """
+        base = "http://x.com"
+        a = normalize_url_for_deep_crawl("/page?utm_source=x&q=", base)
+        b = normalize_url_for_deep_crawl("/page?q=", base)
+        assert a == b, (
+            f"Tracking-tagged blank and bare blank must dedup equally: "
+            f"{a!r} vs {b!r}"
+        )
+
+    def test_blank_value_cross_function_agreement(self):
+        """Dedup key and normalize_url must agree on blank-value params.
+
+        ``normalize_url`` (used to build the href the scraper emits and the
+        crawler fetches) parses with ``parse_qsl(keep_blank_values=True)``.
+        ``normalize_url_for_deep_crawl`` (used as the dedup key) must use the
+        same parser so the two never disagree, modulo tracking-param
+        stripping. The in-code comment in ``normalize_url_for_deep_crawl``
+        promises this alignment ("Keep this set in sync with the
+        ``default_tracking`` set in ``normalize_url``").
+        """
+        base = "http://x.com"
+        for href, expected in [
+            ("/page?q=", "http://x.com/page?q="),
+            ("/page?utm_source=x&q=", "http://x.com/page?q="),
+            ("/page?q=&a=1", "http://x.com/page?a=1&q="),
+        ]:
+            norm = normalize_url(href, base)
+            dedup = normalize_url_for_deep_crawl(href, base)
+            assert norm == expected, f"normalize_url({href!r}): {norm!r} != {expected!r}"
+            assert dedup == expected, f"dedup({href!r}): {dedup!r} != {expected!r}"
+
+    def test_multiple_blank_value_params_preserved(self):
+        """Multiple blank-value params must all survive dedup normalization."""
+        result = normalize_url_for_deep_crawl(
+            "/page?a=&b=&c=1", "http://x.com"
+        )
+        assert "a=" in result, f"Blank param 'a' dropped: {result}"
+        assert "b=" in result, f"Blank param 'b' dropped: {result}"
+        assert "c=1" in result, f"Non-blank param 'c' dropped: {result}"
+        assert result == "http://x.com/page?a=&b=&c=1", (
+            f"Unexpected normalization: {result}"
+        )
+
+    def test_blank_value_multivalue_order_preserved(self):
+        """Multi-value key order must be preserved (matches normalize_url).
+
+        ``?z=2&z=1`` and ``?z=1&z=2`` are potentially distinct URIs (the
+        server may treat value order within a repeated key as significant),
+        so the dedup key must NOT merge them. Sorting is by key only, not
+        by the full (key, value) tuple.
+        """
+        base = "http://x.com"
+        a = normalize_url_for_deep_crawl("/p?z=2&z=1", base)
+        b = normalize_url_for_deep_crawl("/p?z=1&z=2", base)
+        assert a != b, (
+            f"Multi-value order must be preserved (not merged): {a!r} == {b!r}"
+        )
+        assert a == "http://x.com/p?z=2&z=1", f"Unexpected: {a!r}"
+        assert b == "http://x.com/p?z=1&z=2", f"Unexpected: {b!r}"
+
+    def test_blank_value_only_query_not_dropped(self):
+        """A query consisting solely of a blank-value param must survive.
+
+        Previously ``parse_qs("?q=")`` returned ``{}`` (empty dict), so the
+        entire query was dropped and ``/page?q=`` collapsed to ``/page``.
+        """
+        result = normalize_url_for_deep_crawl("/page?q=", "http://x.com")
+        assert "?" in result, (
+            f"Query with only a blank-value param must not be dropped: {result}"
+        )
+        assert result.endswith("q="), f"Blank param must be preserved: {result}"
+
+
+class TestQuickExtractLinksBlankParam:
+    """Verify quick_extract_links does not collapse blank-value-param URIs.
+
+    ``quick_extract_links`` uses ``normalize_url_for_deep_crawl`` for its
+    per-document ``seen`` set. When a page exposes both ``/page`` and
+    ``/page?q=``, they must both appear in the returned link list (the
+    blank-value param keeps them distinct under the fix).
+    """
+
+    def test_both_bare_and_blank_returned(self):
+        """Both /page and /page?q= must appear in the extracted links."""
+        html = (
+            '<a href="/page?q=">blank</a>'
+            '<a href="/page">bare</a>'
+        )
+        result = quick_extract_links(html, "http://x.com/")
+        hrefs = {link["href"] for link in result["internal"]}
+        assert "http://x.com/page?q=" in hrefs, (
+            f"/page?q= missing from extracted links: {hrefs}"
+        )
+        assert "http://x.com/page" in hrefs, (
+            f"/page missing from extracted links: {hrefs}"
+        )
+        assert len(result["internal"]) == 2, (
+            f"Expected 2 internal links, got {len(result['internal'])}: {hrefs}"
+        )
+
+    def test_both_bare_and_blank_returned_reversed_order(self):
+        """Order-independence: bare first then blank must also yield both."""
+        html = (
+            '<a href="/page">bare</a>'
+            '<a href="/page?q=">blank</a>'
+        )
+        result = quick_extract_links(html, "http://x.com/")
+        hrefs = {link["href"] for link in result["internal"]}
+        assert "http://x.com/page?q=" in hrefs, f"Missing /page?q=: {hrefs}"
+        assert "http://x.com/page" in hrefs, f"Missing /page: {hrefs}"
+
+    def test_tracking_tagged_blank_collapses_to_blank(self):
+        """A tracking-tagged blank dedups with the bare blank, not with bare page.
+
+        ``/page?utm_source=x&q=`` and ``/page?q=`` share the same dedup key
+        (tracking param stripped, blank param kept), so only ONE of them
+        appears in the result — the first one, with its original href preserved
+        (``quick_extract_links`` emits the original href, not the dedup key).
+        A separate ``/page`` link must survive as a distinct entry because its
+        dedup key differs from the blank-param variant.
+        """
+        html = (
+            '<a href="/page?utm_source=x&q=">tracking+blank</a>'
+            '<a href="/page?q=">blank</a>'
+            '<a href="/page">bare</a>'
+        )
+        result = quick_extract_links(html, "http://x.com/")
+        internal = result["internal"]
+        hrefs = {link["href"] for link in internal}
+        # The tracking-tagged variant and the bare blank share one dedup key
+        # (http://x.com/page?q=), so only the first-discovered one is kept.
+        # The bare /page has a distinct key and survives.
+        assert len(internal) == 2, (
+            f"Expected 2 links (blank-variant + bare page), got "
+            f"{len(internal)}: {hrefs}"
+        )
+        # Exactly one href carries a blank param 'q=':
+        blank_hrefs = [h for h in hrefs if "q=" in h]
+        assert len(blank_hrefs) == 1, (
+            f"Expected exactly one blank-param href, got {blank_hrefs}: {hrefs}"
+        )
+        assert "utm_source" in blank_hrefs[0], (
+            f"First-discovered (tracking-tagged) href should be kept: {hrefs}"
+        )
+        # The bare page must survive as a distinct entry.
+        assert "http://x.com/page" in hrefs, (
+            f"Bare /page missing: {hrefs}"
+        )
+
 
 
 class TestEfficientNormalizeUrlForDeepCrawl:
