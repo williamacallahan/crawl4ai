@@ -336,7 +336,7 @@ class PinningProxy:
             return
         port = sp.port or 80
         try:
-            pin = await _resolve_and_pin(f"http://{sp.hostname}:{port}")
+            pin = await _resolve_and_pin(f"http://{_bracket(sp.hostname)}:{port}")
         except EgressBlocked as error:
             _record_dial_outcome(sp.hostname, port, error)
             await self._reply(client_writer, _BLOCKED)
