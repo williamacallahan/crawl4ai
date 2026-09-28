@@ -118,6 +118,15 @@ class FilterChain:
         return True
 
 
+# Sentinel used to mark `**` in a glob *before* `fnmatch.translate` runs.
+# `fnmatch.translate` turns both `*` and `**` into `.*`, so the two are
+# indistinguishable in the translated output. We swap `**` for this single
+# NUL character (which `re.escape`/`fnmatch.translate` leave untouched and
+# which cannot occur in real URL globs), then restore the globstar semantics
+# after translation. See `URLPatternFilter._add_pattern`.
+_GLOBSTAR_SENTINEL = "\x00"
+
+
 class URLPatternFilter(URLFilter):
     """Pattern filter balancing speed and completeness"""
 
@@ -128,7 +137,8 @@ class URLPatternFilter(URLFilter):
         "_simple_suffixes",
         "_simple_prefixes",
         "_domain_patterns",
-        "_path_patterns",
+        "_path_patterns",   # glob-translated patterns; matched against url_path
+        "_regex_patterns",  # raw user regexes; matched against the full url
         "_reverse",
     )
 
@@ -159,6 +169,7 @@ class URLPatternFilter(URLFilter):
         self._simple_prefixes = set()
         self._domain_patterns = []
         self._path_patterns = []
+        self._regex_patterns = []
 
         for pattern in patterns:
             pattern_type = self._categorize_pattern(pattern)
@@ -187,11 +198,13 @@ class URLPatternFilter(URLFilter):
     def _add_pattern(self, pattern: str, pattern_type: int):
         """Add pattern to appropriate matcher"""
         if pattern_type == self.PATTERN_TYPES["REGEX"]:
-            # For regex patterns, compile directly without glob translation
+            # For regex patterns, compile directly without glob translation.
+            # Regexes anchor on the full URL (e.g. `^https?://...`) so they
+            # are matched against `url` (not `url_path`) in apply().
             if isinstance(pattern, str) and (
                 pattern.startswith("^") or pattern.endswith("$") or "\\d" in pattern
             ):
-                self._path_patterns.append(re.compile(pattern))
+                self._regex_patterns.append(re.compile(pattern))
                 return
         elif pattern_type == self.PATTERN_TYPES["SUFFIX"]:
             self._simple_suffixes.add(pattern[2:])
@@ -201,20 +214,47 @@ class URLPatternFilter(URLFilter):
             self._domain_patterns.append(re.compile(pattern.replace("*.", r"[^/]+\.")))
         else:
             if isinstance(pattern, str):
-                # Handle complex glob patterns
-                if "**" in pattern:
-                    pattern = pattern.replace("**", ".*")
+                # Translate the glob *first*. The old code rewrote `**` -> `.*`
+                # and `{a,b}` -> `(a|b)` *before* calling `fnmatch.translate`,
+                # which then escaped the `.`/`(`/`)`/`|` back to literals and
+                # silently broke both features. Translating the raw glob first
+                # keeps fnmatch's `.*`/`.`/`[...]` output intact.
+                #
+                # `**` globstar semantics still need help: fnmatch turns `**`
+                # into a single `.*` and leaves surrounding slashes literal,
+                # so `a/**/b` compiles to `a/.*/b` which requires two slashes
+                # and cannot match `a/b` (zero segments). Mark each `**` with
+                # a sentinel before translation, then post-process it into a
+                # zero-or-more-segment group, ordered so middle/leading/trailing
+                # placements each collapse the right structural slash.
+                pattern = pattern.replace("**", _GLOBSTAR_SENTINEL)
+                pattern = fnmatch.translate(pattern)
+                pattern = pattern.replace(
+                    _GLOBSTAR_SENTINEL + "/", "(?:.*/)?"  # leading & middle `**/`
+                )
+                pattern = pattern.replace(
+                    "/" + _GLOBSTAR_SENTINEL, "(?:/.*)?"  # trailing `/**`
+                )
+                pattern = pattern.replace(_GLOBSTAR_SENTINEL, ".*")  # lone `**`
                 if "{" in pattern:
-                    # Convert {a,b} to (a|b)
+                    # fnmatch.translate escapes `{`/`}` to `\{`/`\}`; match that
+                    # escaped form. Allow backslashes in the captured content so
+                    # that metacharacters fnmatch escaped inside an alternative
+                    # (e.g. `\.` inside `{a.b,c}`) survive into each branch.
                     pattern = re.sub(
-                        r"\{([^}]+)\}",
+                        r"\\\{([^}]+?)\\\}",
                         lambda m: f'({"|".join(m.group(1).split(","))})',
                         pattern,
                     )
-                pattern = fnmatch.translate(pattern)
-            self._path_patterns.append(
-                pattern if isinstance(pattern, Pattern) else re.compile(pattern)
-            )
+                # Globs are path-oriented; apply() matches them against
+                # url_path so hostname dots (e.g. in `127.0.0.1` / `a.b.com`)
+                # cannot satisfy a literal `.` in the glob (the bug report's
+                # "accidental match via hostname dots" masking symptom).
+                self._path_patterns.append(re.compile(pattern))
+            else:
+                # A pre-compiled Pattern supplied directly by the caller is a
+                # raw regex, not a glob; match it against the full URL.
+                self._regex_patterns.append(pattern)
 
     @lru_cache(maxsize=10000)
     def apply(self, url: str) -> bool:
@@ -253,9 +293,18 @@ class URLPatternFilter(URLFilter):
                         self._update_stats(result)
                         return not result if self._reverse else result
 
-        # Complex patterns
+        # Complex glob patterns (matched against url_path so hostname dots
+        # cannot supply a literal `.`/`**`-anchor — the "accidental match via
+        # hostname dots" masking symptom described in the bug report).
         if self._path_patterns:
-            if any(p.search(url) for p in self._path_patterns):
+            if any(p.search(url_path) for p in self._path_patterns):
+                result = True
+                self._update_stats(result)
+                return not result if self._reverse else result
+
+        # Raw user-supplied regexes (anchored on the full URL).
+        if self._regex_patterns:
+            if any(p.search(url) for p in self._regex_patterns):
                 result = True
                 self._update_stats(result)
                 return not result if self._reverse else result
