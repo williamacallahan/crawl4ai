@@ -563,39 +563,75 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         # (launch_persistent_context bakes it into the protocol layer), so
         # changing it here would only desync browser_config from reality.
         # Users should set user_agent or user_agent_mode on BrowserConfig.
+        #
+        # NOTE: ``self.browser_config`` is a single object shared across every
+        # concurrent ``_crawl_web`` invocation (one strategy + one
+        # ``BrowserConfig`` per ``AsyncWebCrawler``, used concurrently by
+        # ``arun``/``arun_many``). The per-crawl UA and client hint MUST be
+        # captured into locals here, BEFORE the ``await self.browser_manager.
+        # get_page(...)`` below: a concurrent crawl can overwrite the shared
+        # fields while this coroutine is suspended at that ``await``, and the
+        # post-``await`` ``page.set_extra_http_headers(...)`` would otherwise
+        # ship the other crawl's UA / sec-ch-ua on this crawl's wire
+        # (TOCTOU on the page-level HTTP User-Agent / sec-ch-ua headers).
         ua_changed = False
+        override_ua = None
+        override_hint = None
         if not self.browser_config.use_persistent_context:
             user_agent_to_override = config.user_agent
             if user_agent_to_override:
-                self.browser_config.user_agent = user_agent_to_override
+                override_ua = user_agent_to_override
                 ua_changed = True
             elif config.magic or config.user_agent_mode == "random":
-                self.browser_config.user_agent = ValidUAGenerator().generate(
+                override_ua = ValidUAGenerator().generate(
                     **(config.user_agent_generator_config or {})
                 )
                 ua_changed = True
 
-        # Keep sec-ch-ua in sync whenever the UA changed
+        # Keep sec-ch-ua in sync whenever the UA changed. Still mutate the
+        # shared ``browser_config`` so ``create_browser_context`` /
+        # ``setup_context`` (which run inside the awaited ``get_page``) see
+        # the per-crawl UA. The locals captured above are what we use for the
+        # page-level HTTP headers AFTER the ``await`` (see ``set_extra_http_
+        # headers`` below), so this mutation does not feed back into the racy
+        # page-level read.
         if ua_changed:
-            self.browser_config.browser_hint = UAGen.generate_client_hints(
-                self.browser_config.user_agent
-            )
-            self.browser_config.headers["sec-ch-ua"] = self.browser_config.browser_hint
+            override_hint = UAGen.generate_client_hints(override_ua)
+            self.browser_config.user_agent = override_ua
+            self.browser_config.browser_hint = override_hint
+            self.browser_config.headers["sec-ch-ua"] = override_hint
 
         page = None
         context = None
         try:
+            # Thread the per-crawl UA / hint into ``get_page`` so the context
+            # created (or reused) for this crawl is baked with THIS crawl's UA
+            # (via ``new_context(user_agent=...)`` - the value that actually
+            # goes on the wire, since Playwright's context-level user_agent
+            # overrides ``page.set_extra_http_headers`` for User-Agent) and so
+            # the config signature includes the per-crawl UA (distinct UAs get
+            # distinct cached contexts). This closes the concurrent
+            # cross-crawl UA-leak at the context-creation surface; the locals
+            # captured above close the page-level set_extra_http_headers race.
+            # When ``ua_changed`` is False, ``override_ua`` / ``override_hint``
+            # are ``None`` and ``get_page`` falls back to ``self.config``.
             page, context = await self.browser_manager.get_page(
-                crawlerRunConfig=config
+                crawlerRunConfig=config,
+                user_agent=override_ua if ua_changed else None,
+                browser_hint=override_hint if ua_changed else None,
             )
 
-            # Push updated UA + sec-ch-ua to the page so the server sees them
+            # Push updated UA + sec-ch-ua to the page so the server sees them.
+            # Use the per-crawl locals captured above the ``await`` (NOT the
+            # shared ``self.browser_config`` fields, which a concurrent crawl
+            # may have overwritten while we were suspended at ``get_page``).
+            # The locals are applied LAST so they win over any stale
+            # ``sec-ch-ua`` / ``User-Agent`` left in the shared ``headers``
+            # dict by a concurrent crawl.
             if ua_changed:
-                combined_headers = {
-                    "User-Agent": self.browser_config.user_agent,
-                    "sec-ch-ua": self.browser_config.browser_hint,
-                }
-                combined_headers.update(self.browser_config.headers)
+                combined_headers = dict(self.browser_config.headers)
+                combined_headers["User-Agent"] = override_ua
+                combined_headers["sec-ch-ua"] = override_hint
                 await page.set_extra_http_headers(combined_headers)
 
             # await page.goto(URL)
