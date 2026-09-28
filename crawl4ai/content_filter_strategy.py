@@ -708,7 +708,7 @@ class PruningContentFilter(RelevantContentFilter):
 
         if self.metric_config["class_id_weight"]:
             class_score = self._compute_class_id_weight(metrics["node"])
-            score += self.metric_weights["class_id_weight"] * max(0, class_score)
+            score += self.metric_weights["class_id_weight"] * class_score
             total_weight += self.metric_weights["class_id_weight"]
 
         if self.metric_config["text_length"]:

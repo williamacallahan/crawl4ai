@@ -131,6 +131,49 @@ def prose_with_inline_links_html():
     """
 
 
+@pytest.fixture
+def class_id_boilerplate_html():
+    """Boilerplate ``<div>`` whose ``class`` AND ``id`` both match the
+    negative-pattern regex (``nav`` / ``footer``). It is a ``<div>`` (not a
+    ``<nav>`` / ``<footer>`` tag), so ``_remove_unwanted_tags`` does not catch it
+    by tag name — only the ``class_id_weight`` penalty can prune it. At the
+    default ``threshold=0.48`` its other metrics put it just above the cutoff, so
+    the penalty is the deciding factor (bug: kept; fix: pruned)."""
+    return """
+    <html><body>
+    <div class="nav" id="footer"><ul>
+    <li><a href="/">Home</a></li>
+    <li><a href="/about">About</a></li>
+    <li><a href="/contact">Contact</a></li>
+    </ul>Menu</div>
+    <main><article><p>This is the genuine main article body with sufficient
+    substantive words to clear the word threshold and remain in the filtered
+    output.</p></article></main>
+    </body></html>
+    """
+
+
+@pytest.fixture
+def class_id_control_html():
+    """Same structure as ``class_id_boilerplate_html`` but with non-boilerplate
+    class/id (``content`` / ``story``). Used as a contrast to show the
+    ``class_id_weight`` penalty targets only negative-pattern matches and does
+    not penalize legitimate containers. In fixed mode this control div survives
+    at ``threshold=0.48`` while its boilerplate twin is pruned."""
+    return """
+    <html><body>
+    <div class="content" id="story"><ul>
+    <li><a href="/">Home</a></li>
+    <li><a href="/about">About</a></li>
+    <li><a href="/contact">Contact</a></li>
+    </ul>Menu</div>
+    <main><article><p>This is the genuine main article body with sufficient
+    substantive words to clear the word threshold and remain in the filtered
+    output.</p></article></main>
+    </body></html>
+    """
+
+
 class TestPruningContentFilter:
     def test_basic_pruning(self, basic_html):
         """Test basic content pruning functionality"""
@@ -300,6 +343,99 @@ class TestPruningContentFilter:
         first_run = filter.filter_content(basic_html)
         second_run = filter.filter_content(basic_html)
         assert first_run == second_run, "Output should be consistent"
+
+
+class TestClassIdWeightPenalty:
+    """Regression tests for the ``class_id_weight`` penalty metric.
+
+    The penalty was previously computed and then discarded by a
+    ``max(0, class_score)`` clamp in ``_compute_composite_score``. Because
+    ``_compute_class_id_weight`` only ever returns ``0`` or negative values,
+    ``max(0, ...)`` was always ``0`` and the metric was a no-op. These tests
+    guard against that clamp returning and verify the penalty actually lowers a
+    boilerplate node's score so it gets pruned without over-pruning legitimate
+    containers.
+    """
+
+    def test_class_id_penalty_lowers_composite_score(self):
+        """For identical structure, a boilerplate class/id node must score
+        strictly lower than a non-boilerplate one. The double-match delta is
+        exactly 0.10 (= weight 0.1 * penalty -1.0 / total_weight 1.0) and the
+        single-match delta 0.05. Fails on the buggy clamp (all three equal)."""
+        from bs4 import BeautifulSoup
+
+        inner = (
+            "<ul><li><a href=\"/\">Home</a></li>"
+            "<li><a href=\"/about\">About</a></li>"
+            "<li><a href=\"/contact\">Contact</a></li></ul>Menu"
+        )
+        f = PruningContentFilter()
+
+        def score(div_html):
+            soup = BeautifulSoup(f"<html><body>{div_html}</body></html>", "lxml")
+            div = soup.find("div")
+            text_len = len(div.get_text(strip=True))
+            tag_len = len(div.encode_contents().decode("utf-8"))
+            link_text_len = sum(
+                len(a.get_text(strip=True)) for a in div.find_all("a")
+            )
+            metrics = {
+                "node": div,
+                "tag_name": div.name,
+                "text_len": text_len,
+                "tag_len": tag_len,
+                "link_text_len": link_text_len,
+            }
+            return f._compute_composite_score(
+                metrics, text_len, tag_len, link_text_len
+            )
+
+        control = score(f'<div class="content" id="story">{inner}</div>')
+        single = score(f'<div class="nav" id="story">{inner}</div>')
+        double = score(f'<div class="nav" id="footer">{inner}</div>')
+
+        assert double < single < control, (
+            "penalty must lower score monotonically with match count"
+        )
+        assert round(control - double, 4) == 0.10, (
+            "double-match penalty delta should be 0.10"
+        )
+        assert round(control - single, 4) == 0.05, (
+            "single-match penalty delta should be 0.05"
+        )
+
+    def test_class_id_penalty_prunes_double_match_boilerplate(
+        self, class_id_boilerplate_html
+    ):
+        """End-to-end: a <div class="nav" id="footer"> boilerplate block that
+        escapes tag-based removal is pruned at the default fixed threshold once
+        the class_id_weight penalty is applied. Fails on the buggy clamp."""
+        f = PruningContentFilter(threshold_type="fixed", threshold=0.48)
+        contents = f.filter_content(class_id_boilerplate_html)
+        combined = " ".join(contents).lower()
+
+        boilerplate_kept = any("<div" in b and "Menu" in b for b in contents)
+        assert not boilerplate_kept, (
+            "class_id_weight penalty was not applied; boilerplate survived"
+        )
+        assert "main article body" in combined, "main content must survive"
+
+    def test_class_id_penalty_does_not_prune_non_boilerplate_control(
+        self, class_id_control_html
+    ):
+        """Contrast: an identical-structure div with non-boilerplate class/id
+        (content / story) is NOT penalized and survives at the same threshold
+        where its boilerplate twin is pruned. Guards against the penalty being
+        over-broad (false positives on legitimate containers)."""
+        f = PruningContentFilter(threshold_type="fixed", threshold=0.48)
+        contents = f.filter_content(class_id_control_html)
+        combined = " ".join(contents).lower()
+
+        control_div_kept = any("<div" in b and "Menu" in b for b in contents)
+        assert control_div_kept, (
+            "non-boilerplate control div should survive at 0.48 (no penalty)"
+        )
+        assert "main article body" in combined, "main content must survive"
 
 
 if __name__ == "__main__":
