@@ -181,8 +181,13 @@ async def run_doctor():
 
 
 def doctor():
-    """Entry point for the doctor command"""
+    """Entry point for the doctor command.
+
+    Exits ``0`` when the health check passes and ``1`` when it fails so that
+    scripted callers (e.g. the ``Dockerfile`` ``&&`` chain) can gate on the
+    exit code.
+    """
     import asyncio
 
-    asyncio.run(run_doctor())
-    sys.exit(0)
+    ok = asyncio.run(run_doctor())
+    sys.exit(0 if ok else 1)
