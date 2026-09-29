@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: docker.iocloudhost.net/crawl4ai
+  IMAGE: registry.haiku.host/crawl4ai
   APPLICATION_ID: YTAj7y39GXOkUtoHpYYXw
 
 jobs:
@@ -49,7 +49,7 @@ jobs:
           redis_container="crawl4ai-ci-redis-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker run --rm --detach --name "$redis_container" \
             --network "container:$HOSTNAME" \
-            docker.io/library/redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf >/dev/null
+            docker.io/library/redis:7.4.11-alpine >/dev/null
           trap 'docker rm --force "$redis_container" >/dev/null 2>&1 || true' EXIT
           # Directory discovery, not a file list: a test added by a PR runs
           # here automatically (issue #72). --ignore is the explicit opt-out
@@ -121,7 +121,7 @@ jobs:
         env:
           REGISTRY_USER: ${{ secrets.NEXUS_DOCKER_USERNAME }}
           REGISTRY_PASS: ${{ secrets.NEXUS_DOCKER_PASSWORD }}
-        run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
+        run: printf '%s' "$REGISTRY_PASS" | docker login registry.haiku.host -u "$REGISTRY_USER" --password-stdin
 
       # --provenance/--sbom off: with attestations the result is an OCI index,
       # and `docker manifest create` refuses to nest one index inside another,
@@ -187,7 +187,7 @@ jobs:
       # stays in ~/.docker/config.json for whatever job lands here next.
       - name: Drop registry credentials
         if: always()
-        run: docker logout docker.iocloudhost.net || true
+        run: docker logout registry.haiku.host || true
 
   merge:
     needs: build
@@ -203,7 +203,7 @@ jobs:
         env:
           REGISTRY_USER: ${{ secrets.NEXUS_DOCKER_USERNAME }}
           REGISTRY_PASS: ${{ secrets.NEXUS_DOCKER_PASSWORD }}
-        run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
+        run: printf '%s' "$REGISTRY_PASS" | docker login registry.haiku.host -u "$REGISTRY_USER" --password-stdin
 
       - name: Publish multi-arch manifest
         id: manifest
@@ -229,7 +229,7 @@ jobs:
 
       - name: Drop registry credentials
         if: always()
-        run: docker logout docker.iocloudhost.net || true
+        run: docker logout registry.haiku.host || true
 
   deploy:
     needs: merge
@@ -254,7 +254,7 @@ jobs:
         env:
           REGISTRY_USER: ${{ secrets.NEXUS_DOCKER_USERNAME }}
           REGISTRY_PASS: ${{ secrets.NEXUS_DOCKER_PASSWORD }}
-        run: printf '%s' "$REGISTRY_PASS" | docker login docker.iocloudhost.net -u "$REGISTRY_USER" --password-stdin
+        run: printf '%s' "$REGISTRY_PASS" | docker login registry.haiku.host -u "$REGISTRY_USER" --password-stdin
 
       - name: Deploy through the native Swarm VIP
         env:
@@ -299,4 +299,4 @@ jobs:
       # stays in ~/.docker/config.json for whatever job lands here next.
       - name: Drop registry credentials
         if: always()
-        run: docker logout docker.iocloudhost.net || true
+        run: docker logout registry.haiku.host || true
