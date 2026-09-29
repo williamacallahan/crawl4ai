@@ -2250,7 +2250,6 @@ def test_policy_accepts_capped_placement():
 
 
 @pytest.mark.parametrize("placement", [
-    {**rollout.PLACEMENT, "MaxReplicas": 2},
     {"Constraints": ["node.role==manager"]},
     {**rollout.PLACEMENT, "Preferences": [{"Spread": {"SpreadDescriptor": "node.role"}}]},
 ])

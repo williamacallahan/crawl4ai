@@ -41,6 +41,7 @@ _SPREAD_PLACEMENT = {
 PLACEMENTS = (
     PLACEMENT, _CAPPED_PLACEMENT, _SPREAD_PLACEMENT,
     {**_SPREAD_PLACEMENT, "MaxReplicas": 1},
+    {**_SPREAD_PLACEMENT, "MaxReplicas": 2},
 )
 RESOURCES = {
     "Reservations": {"NanoCPUs": 500_000_000, "MemoryBytes": 1_073_741_824},
