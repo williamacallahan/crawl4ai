@@ -298,3 +298,65 @@ def test_multirow_thead_nested_subtable_does_not_contaminate_headers():
     assert "nested-one" not in data["headers"]
     assert "nested-two" not in data["headers"]
     assert "2024" not in data["headers"]
+
+
+# ---------------------------------------------------------------------------
+# Body preservation when the top <thead> row is wider than the leaf row.
+#
+# The leaf-row header policy adopted by 3f47843 builds ``headers`` from the
+# last resolved (leaf) <thead> row. For a table whose top <thead> row is
+# wider than the leaf row (a top-row <th rowspan="1"> over a column the
+# leaf leaves uncovered), the leaf ``headers`` is narrower than the
+# header-grid width the top row established. The body-alignment
+# heuristic ``max_columns = len(headers)`` then truncated each body row
+# to the leaf width, silently dropping trailing body cells. The fix
+# tracks the resolved header-grid width and pads leaf ``headers`` to it
+# (with "" for columns the leaf leaves uncovered) so ``max_columns``
+# reflects the full header grid and body cells survive.
+# ---------------------------------------------------------------------------
+
+def test_multirow_thead_body_not_truncated_when_leaf_is_narrower_than_top_row():
+    # The exact reproduction from the bug report: the top <thead> row
+    # establishes a 3-wide grid (Name rowspan=2, Math, Science), but the
+    # leaf row only adds one cell (Extra), so the leaf resolves to 2
+    # columns. Under the bug, the 3-wide body row was truncated to 2 and
+    # the '85' (Science) cell was dropped.
+    table = (
+        "<table><thead>"
+        "<tr><th rowspan='2'>Name</th><th>Math</th><th>Science</th></tr>"
+        "<tr><th>Extra</th></tr>"
+        "</thead><tbody>"
+        "<tr><td>Alice</td><td>90</td><td>85</td></tr>"
+        "</tbody></table>"
+    )
+    is_data_table, data = _extract(table, table_score_threshold=1)
+
+    assert is_data_table is True
+    # Body cells are NOT truncated to the leaf-header width (the bug).
+    assert data["rows"] == [["Alice", "90", "85"]]
+    assert data["metadata"]["column_count"] == 3
+    # Leaf headers are padded to the header-grid width so the trailing
+    # uncovered column carries an empty label rather than collapsing the
+    # grid and dropping body data.
+    assert data["headers"] == ["Name", "Extra", ""]
+
+
+def test_multirow_thead_wider_top_row_end_to_end_via_extract_tables():
+    # End-to-end via the public extract_tables() entry point (the
+    # production path used by content_scraping_strategy.py). The
+    # trailing body column must survive the full pipeline.
+    table_html = (
+        "<table><caption>Scores</caption><thead>"
+        "<tr><th rowspan='2'>Name</th><th>Math</th><th>Science</th></tr>"
+        "<tr><th>Extra</th></tr>"
+        "</thead><tbody>"
+        "<tr><td>Alice</td><td>90</td><td>85</td></tr>"
+        "</tbody></table>"
+    )
+    tables = _extract_all(table_html, table_score_threshold=1)
+
+    assert len(tables) == 1
+    data = tables[0]
+    assert data["rows"] == [["Alice", "90", "85"]]
+    assert data["metadata"]["column_count"] == 3
+    assert data["metadata"]["has_caption"] is True
