@@ -1177,10 +1177,6 @@ Return only a JSON array of extracted tables following the specified format."""
             chunk_html = self._create_chunk_html(header_html, current_chunk_rows, footer_html)
             chunks.append(chunk_html)
         
-        # Ensure minimum rows per chunk
-        if len(chunks) > 1:
-            chunks = self._rebalance_chunks(chunks, self.min_rows_per_chunk)
-        
         if self.verbose:
             self._log("info", f"Created {len(chunks)} chunks for parallel processing")
         
@@ -1205,15 +1201,6 @@ Return only a JSON array of extracted tables following the specified format."""
         html_parts.append('</table>')
         
         return ''.join(html_parts)
-    
-    def _rebalance_chunks(self, chunks: List[str], min_rows: int) -> List[str]:
-        """
-        Rebalance chunks to ensure minimum rows per chunk.
-        Merge small chunks if necessary.
-        """
-        # This is a simplified implementation
-        # In production, you'd want more sophisticated rebalancing
-        return chunks
     
     def _process_chunk(self, chunk_html: str, chunk_index: int, total_chunks: int, has_headers: bool = True) -> Dict[str, Any]:
         """
