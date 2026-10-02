@@ -98,20 +98,6 @@ def _resolve(host: str, port: int):
         raise EgressBlocked()
 
 
-def assert_host_allowed(host: str, port: int = 0) -> None:
-    """Resolve `host` and reject if ANY answer is non-global. Opaque on failure."""
-    if ALLOW_INTERNAL:
-        return
-    if not host:
-        raise EgressBlocked()
-    low = host.lower()
-    if low in _BLOCKED_HOSTNAMES or low.startswith("host.docker.internal"):
-        raise EgressBlocked()
-    for *_, sockaddr in _resolve(host, port):
-        if is_forbidden_ip(sockaddr[0]):
-            raise EgressBlocked()
-
-
 def resolve_and_pin(url: str) -> PinnedTarget:
     """Resolve `url` once, reject if any answer is non-global, and pin one IP.
 
