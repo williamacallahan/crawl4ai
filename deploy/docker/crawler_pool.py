@@ -708,6 +708,21 @@ async def _janitor_pass():
                 except Exception:  # not bare: that would swallow CancelledError and outlive shutdown
                     pass
 
+        # The permanent browser follows the hot tier's idle rule. Otherwise its
+        # only reset is the page-count recycle, which a lightly used replica
+        # never reaches, so one Chromium and its renderers live from container
+        # start until the memory ceiling refuses new browsers. The next
+        # default-config request rebuilds it (see _get_admitted_crawler).
+        permanent_idle = now - LAST_USED.get(DEFAULT_CONFIG_SIG, now)
+        if (
+            PERMANENT is not None
+            and permanent_idle > hot_ttl
+            and _active_requests(PERMANENT) == 0
+            and not _is_recycling(PERMANENT)
+        ):
+            logger.info(f"🧹 Closing permanent browser (idle={permanent_idle:.0f}s)")
+            _close_in_background(_detach_permanent())
+
         # Log pool stats
         if mem_pct > 60:
             logger.info(f"📊 Pool: hot={len(HOT_POOL)}, cold={len(COLD_POOL)}, mem={mem_pct:.1f}%")

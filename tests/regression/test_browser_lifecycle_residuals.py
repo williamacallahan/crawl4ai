@@ -315,6 +315,28 @@ async def test_repeated_cancellation_during_console_cleanup_still_releases_page(
 
 
 @pytest.mark.asyncio
+async def test_headless_crawl_closes_its_last_page():
+    """A non-managed browser never reuses a page, so the last one must close."""
+    context = _Context()
+    page = await context.new_page()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.close = page.close
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+
+    assert page.is_closed(), "the crawl left its page (and renderer) open"
+
+
+@pytest.mark.asyncio
 async def test_recycle_closes_admission_then_restarts_before_waking_waiters():
     config = BrowserConfig(
         use_managed_browser=True,
