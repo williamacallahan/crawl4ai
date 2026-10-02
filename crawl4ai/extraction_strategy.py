@@ -2023,18 +2023,33 @@ class JsonLxmlExtractionStrategy(JsonElementExtractionStrategy):
         self._selector_cache = {}
         self._xpath_cache = {}
         self._result_cache = {}
-        
+
         # Control selector optimization strategy
         self.use_caching = kwargs.get("use_caching", True)
         self.optimize_common_patterns = kwargs.get("optimize_common_patterns", True)
-        
+
         # Load lxml dependencies once
         from lxml import etree, html
         from lxml.cssselect import CSSSelector
         self.etree = etree
         self.html_parser = html
         self.CSSSelector = CSSSelector
-    
+
+    def extract(
+        self, url: str, html_content: str, *q, **kwargs
+    ) -> List[Dict[str, Any]]:
+        """Extract structured data from a single page.
+
+        The element-result cache is scoped to one parse tree: clear it at the
+        start of every page so cached lxml element references from a previous
+        parse cannot leak into this one. HTML ``id`` attributes are unique only
+        within a single document, so without this a strategy instance reused
+        across pages (e.g. ``arun_many``) returns stale results whenever two
+        pages' matched elements share an ``id``.
+        """
+        self._clear_caches()
+        return super().extract(url, html_content, *q, **kwargs)
+
     def _parse_html(self, html_content: str):
         """Parse HTML content with error recovery"""
         try:
@@ -2093,13 +2108,23 @@ class JsonLxmlExtractionStrategy(JsonElementExtractionStrategy):
             # Create the wrapper function that implements the selection strategy
             def selector_func(element, context_sensitive=True):
                 cache_key = None
-                
+
                 # Use result caching if enabled
                 if self.use_caching:
-                    # Create a cache key based on element and selector
-                    element_id = element.get('id', '') or str(hash(element))
-                    cache_key = f"{element_id}::{selector_str}"
-                    
+                    # Key the cache on the element's object identity, not on its
+                    # HTML ``id`` attribute. HTML ids are unique only within a
+                    # single document, so keying on id alone collides across
+                    # pages when one strategy instance is reused (arun_many),
+                    # and even within a page when two elements share an id
+                    # (invalid but common HTML). ``id(element)`` is unique and
+                    # stable for the lifetime of the lxml element object, so it
+                    # isolates both cross-page and within-page selections while
+                    # still hitting the cache when the same element is queried
+                    # twice (within-page memoization). The cache is also cleared
+                    # at the start of every ``extract`` call so entries never
+                    # outlive a single page's parse tree.
+                    cache_key = f"{id(element)}::{selector_str}"
+
                     if cache_key in self._result_cache:
                         return self._result_cache[cache_key]
                 
