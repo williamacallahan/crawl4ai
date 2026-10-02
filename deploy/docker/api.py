@@ -337,6 +337,18 @@ async def handle_llm_qa(
         _raise_for_crawl_failure(result)
         content = result.markdown.fit_markdown or result.markdown.raw_markdown
 
+        # The crawler is no longer needed: only the materialised `content`
+        # string feeds the LLM call below. Release the pooled browser and its
+        # ADMISSION_SEM permit now, before the slow LLM roundtrip, so a
+        # browser-pool slot is not held idle for the whole permit window.
+        # `crawler = None` is load-bearing: release_crawler is not
+        # idempotent for healthy pooled crawlers (it never sets
+        # _docker_admission_released), so the finally block must not
+        # release it a second time -- that would leak a semaphore permit
+        # and over-report pool capacity.
+        await release_crawler(crawler)
+        crawler = None
+
         # Create prompt and get LLM response
         prompt = f"""Use the following content as context to answer the question.
     Content:
@@ -636,6 +648,17 @@ async def handle_markdown_request(
                 "{REQUEST}",
                 query or "Extract main content",
             )
+            # The crawler is no longer needed: only the materialised `prompt`
+            # string feeds the LLM call below. Release the pooled browser and
+            # its ADMISSION_SEM permit now, before the slow LLM roundtrip, so
+            # a browser-pool slot is not held idle for the whole permit window.
+            # `crawler = None` is load-bearing: release_crawler is not
+            # idempotent for healthy pooled crawlers (it never sets
+            # _docker_admission_released), so the finally block must not
+            # release it a second time -- that would leak a semaphore permit
+            # and over-report pool capacity.
+            await release_crawler(crawler)
+            crawler = None
             effective_temperature = (
                 temperature if temperature is not None else llm["temperature"]
             )
