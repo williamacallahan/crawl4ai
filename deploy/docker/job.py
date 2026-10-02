@@ -57,7 +57,7 @@ class LlmJobPayload(BaseModel):
     cache:  bool = False
     provider: str | None = None
     webhook_config: WebhookConfig | None = None
-    temperature: float | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0, description="LLM temperature override (0.0-2.0)")
     # base_url removed: server-derived LLM endpoint only (key-exfil vector).
 
 

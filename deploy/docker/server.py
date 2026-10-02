@@ -1015,7 +1015,7 @@ async def llm_endpoint(
     url: str = Path(...),
     q: str = Query(...),
     provider: Optional[str] = Query(None, description="LLM provider override, e.g. 'openai/gpt-4o-mini'"),
-    temperature: Optional[float] = Query(None, description="LLM temperature override"),
+    temperature: Optional[float] = Query(None, ge=0.0, le=2.0, description="LLM temperature override"),
     _td: Dict = Depends(token_dep),
 ):
     # base_url is intentionally not accepted (key-exfil vector); the endpoint is
