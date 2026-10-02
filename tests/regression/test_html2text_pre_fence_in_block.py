@@ -188,12 +188,53 @@ def test_language_attribute_preserved_for_in_list_pre():
 # ---------------------------------------------------------------------------
 
 
+def test_pre_with_empty_line_in_blockquote_keeps_blockquote_open():
+    html = "<blockquote><pre>import os\n\nimport sys</pre></blockquote>"
+    md = _gen_markdown(html)
+    assert md == "> \n> ```\n> import os\n>\n> import sys\n> ```\n", repr(md)
+    rendered = _render(md)
+    assert rendered.count("<blockquote>") == 1, repr(rendered)
+    assert "<code>import os\n\nimport sys" in rendered, repr(rendered)
+
+
+def test_pre_with_leading_and_trailing_empty_lines_in_blockquote_keeps_open():
+    html = "<blockquote><pre>\n\ncode\n\n</pre></blockquote>"
+    md = _gen_markdown(html)
+    assert "> ```\n>\n>\n> code\n>\n>\n> ```" in md, repr(md)
+    assert "> ```\n>\n>\n> code\n\n\n> ```" not in md, repr(md)
+    rendered = _render(md)
+    assert rendered.count("<blockquote>") == 1, repr(rendered)
+    assert "<pre><code>" in rendered and "code" in rendered, repr(rendered)
+
+
+def test_pre_with_empty_line_in_nested_blockquote_keeps_both_open():
+    html = "<blockquote><blockquote><pre>a\n\nb</pre></blockquote></blockquote>"
+    md = _gen_markdown(html)
+    assert ">> ```\n>> a\n>>\n>> b\n>> ```" in md, repr(md)
+    assert ">> a\n\n>> b" not in md, repr(md)
+    rendered = _render(md)
+    assert rendered.count("<blockquote>") == 2, repr(rendered)
+    assert "<code>a\n\nb" in rendered, repr(rendered)
+
+
+def test_pre_with_empty_line_in_blockquote_plus_list_drops_list_indent_only():
+    html = "<blockquote><ul><li><pre>a\n\nb</pre></li></ul></blockquote>"
+    md = _gen_markdown(html)
+    assert ">     ```\n>     a\n>\n>     b\n>     ```" in md, repr(md)
+    assert ">     a\n\n>     b" not in md, repr(md)
+    assert ">     \n" not in md, repr(md)
+    rendered = _render(md)
+    assert rendered.count("<blockquote>") == 1, repr(rendered)
+    assert "<code>a\n\nb" in rendered, repr(rendered)
+
+
 def test_pre_with_empty_line_in_list_indents_real_lines_only():
     md = _convert("<ul><li><pre>a\n\nb</pre></li></ul>")
     # Non-empty lines must be indented; the empty line between them must NOT
     # be prefixed (an empty "> " line would close the surrounding blockquote,
     # an empty "    " line would add trailing whitespace inside the code).
     assert "    a\n\n    b" in md, repr(md)
+    assert "    a\n    \n    b" not in md, repr(md)
     rendered = _render(md)
     assert "a" in rendered and "b" in rendered
     assert "</li>\n<pre>" not in rendered and "</ul>\n<pre>" not in rendered, repr(rendered)
