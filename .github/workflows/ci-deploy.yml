@@ -13,6 +13,7 @@ on:
       - '.claude/**'
       - '.github/workflows/runner-capacity-dogfood.yml'
       - '.github/workflows/ci-deploy.yml'
+      - '.github/workflows/crawl4ai-recycle.yml'
   workflow_dispatch:
 
 concurrency:
