@@ -115,6 +115,93 @@ class TestURLPatternFilter:
         f = URLPatternFilter(patterns=[pattern])
         assert f.apply(url) is expected
 
+    # Regression guard for the glob-translation bug: `**` and `{a,b}` were
+    # rewritten into regex (`.*` / `(a|b)`) *before* `fnmatch.translate`, which
+    # then escaped those metacharacters back to literals. `{a,b}` compiled to a
+    # literal `(a|b)` match and `**` compiled to a literal-dot anchor (`\..*`)
+    # that broke single-label hosts and middle `**` placements. The fix
+    # translates the glob first and matches globs against the URL path so
+    # hostname dots cannot supply a literal `.`/`**`-anchor.
+    @pytest.mark.parametrize(
+        "pattern, url, expected",
+        [
+            # --- {a,b} alternation compiles to real (a|b), not literal "(a|b)" ---
+            ("foo{a,b}bar", "https://example.com/fooabar", True),
+            ("foo{a,b}bar", "https://example.com/foobbar", True),
+            ("foo{a,b}bar", "https://example.com/foocbar", False),
+            # The compiled regex must NOT match the literal text "(a|b)".
+            ("foo{a,b}bar", "https://example.com/foo(a|b)bar", False),
+
+            # --- ** on single-label hosts (was always broken) ---
+            ("**/foo", "http://localhost/bar/foo", True),
+            ("**/foo", "http://localhost/foo", True),
+            ("a/**/b", "http://localhost/a/x/y/b", True),
+            ("a/**/b", "http://localhost/a/b", True),
+            ("**/.*", "http://localhost/.env", True),
+            ("**/.*", "http://localhost/etc/passwd", False),
+            # Dotted hosts (e.g. 127.0.0.1) must not satisfy a literal dot in
+            # the glob: globs match the URL *path*, so a hostname dot cannot
+            # accidentally anchor `**` (the bug report's masking symptom).
+            ("**/.*", "http://127.0.0.1/.env", True),
+            ("**/.*", "http://127.0.0.1/etc/passwd", False),
+
+            # --- ** middle placement: zero-or-more intermediate segments ---
+            ("a/**/b", "https://example.com/a/x/y/b", True),
+            ("a/**/b", "https://example.com/a/b", True),
+            ("a/**/b", "https://example.com/a/b/c", False),
+
+            # --- ** leading/trailing still match on multi-label hosts ---
+            ("**/foo", "https://example.com/foo", True),
+            ("foo/**", "https://example.com/foo", True),
+            ("foo/**", "https://example.com/foo/a/b", True),
+            ("foo/**", "https://example.com/foobar", False),
+            # --- lone ** matches anything ---
+            ("**", "https://example.com/anything/here", True),
+
+            # --- documented URLPatternFilter(use_glob=True) patterns (docs) ---
+            ("*/blog/{2020,2021,2022,2023,2024}/*",
+             "https://example.com/blog/2023/hello", True),
+            ("*/blog/{2020,2021,2022,2023,2024}/*",
+             "https://example.com/blog/2019/hello", False),
+            ("**/{api,reference}/**/*.html",
+             "https://example.com/api/x.html", True),
+            ("**/{api,reference}/**/*.html",
+             "https://example.com/api/sub/z.html", True),
+            ("**/{api,reference}/**/*.html",
+             "https://example.com/blog/x.html", False),
+
+            # --- single * must NOT gain zero-segment `**` semantics ---
+            ("a/*/b", "https://example.com/a/x/b", True),
+            ("a/*/b", "https://example.com/a/b", False),
+
+            # --- correct negatives ---
+            ("**/foo", "http://localhost/baz/qux", False),
+        ],
+    )
+    def test_glob_double_star_and_brace(self, pattern, url, expected):
+        # apply() is @lru_cache'd; use a fresh instance per case.
+        f = URLPatternFilter(patterns=[pattern])
+        assert f.apply(url) is expected
+
+    @pytest.mark.parametrize(
+        "pattern, must_contain, must_not_contain",
+        [
+            # `**` no longer compiles to the broken literal-dot anchor `\..*`.
+            ("**/foo", "(?:.*/)?foo", "\\..*"),
+            # `{a,b}` no longer compiles to the literal `\(a\|b\)`.
+            ("foo{a,b}bar", "foo(a|b)bar", "\\(a\\|b\\)"),
+        ],
+    )
+    def test_glob_compiled_regex_form(self, pattern, must_contain, must_not_contain):
+        # Pin the compiled regex so the glob translation cannot silently
+        # regress to the escaped-literal form. Substring assertions are used
+        # because the `(?s:...)\Z` wrapper that fnmatch.translate emits varies
+        # across CPython versions.
+        f = URLPatternFilter(patterns=[pattern])
+        compiled = f._path_patterns[0].pattern
+        assert must_contain in compiled
+        assert must_not_contain not in compiled
+
 
 class TestDomainFilter:
     # Regression guard for the port/userinfo/IPv6 stripping bug: a previous
