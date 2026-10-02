@@ -1156,6 +1156,7 @@ class CustomHTML2Text(HTML2Text):
             if start:
                 lang = attrs.get("data-language", "") if attrs else ""
                 self.inside_pre = True
+                self._pre_at_line_start = True
                 content_col = 0
                 parent_name = None
                 for li in self.list:
@@ -1205,7 +1206,12 @@ class CustomHTML2Text(HTML2Text):
             # Output the raw content for pre blocks, including content inside code tags
             prefix = self._pre_prefix or ""
             lines = data.split("\n")
-            self.out("\n".join((prefix + line if line else line) for line in lines))
+            first = lines[0]
+            if getattr(self, "_pre_at_line_start", True) and first:
+                first = prefix + first
+            rest = [(prefix + line if line else line) for line in lines[1:]]
+            self.out("\n".join([first] + rest))
+            self._pre_at_line_start = data.endswith("\n")
             return
         if self.inside_code:
             # Inline code: no newlines allowed
