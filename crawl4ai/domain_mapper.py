@@ -855,9 +855,9 @@ class DomainMapper:
             try:
                 if self._rate_sem:
                     async with self._rate_sem:
-                        return await self._do_probe(url, soft_404_fp, config)
+                        return await self._do_probe(url, host, soft_404_fp, config)
                 else:
-                    return await self._do_probe(url, soft_404_fp, config)
+                    return await self._do_probe(url, host, soft_404_fp, config)
             except Exception:
                 return None
 
@@ -871,9 +871,30 @@ class DomainMapper:
         return valid_urls
 
     async def _do_probe(
-        self, url: str, soft_404_fp: Optional[Soft404Fingerprint], config: "DomainMapperConfig"
+        self, url: str, host: str, soft_404_fp: Optional[Soft404Fingerprint], config: "DomainMapperConfig"
     ) -> Optional[str]:
-        """Probe a single URL: HEAD then GET to check soft-404."""
+        """Probe a single URL: HEAD then GET to check soft-404.
+
+        ``_scan_host`` stamps every returned URL with ``host=<scanned host>``
+        and reports the result set as that host's own URLs, so an off-site
+        redirect destination returned as ``str(resp.url)`` would be
+        misattributed to the scanned host — and, under the default config
+        (``extract_head=True``), fetched again by Phase 3 head extraction. The
+        probe issues the HEAD with ``follow_redirects=True``, so ``resp.url``
+        is the post-redirect final URL. Enforce that the final URL is still on
+        the scanned host (with canonical ``www.``-aliasing) before returning
+        it, mirroring the ``url_host == host`` guard the Wayback branch
+        applies and the ``_on_host`` predicate ``_scan_homepage`` applies.
+        Drop the result (return ``None``) when the redirect lands on a
+        host outside that of the URLs being scanned.
+
+        The guard runs before the soft-404 GET so that, in addition to not
+        emitting a foreign URL, the scanner does not issue an out-of-scope
+        soft-404 GET to the foreign host during the scan. Use anchored
+        ``www.``-prefix stripping (``removeprefix``) rather than unanchored
+        ``replace`` so hosts that merely contain ``www.`` as a substring are
+        not mis-normalized.
+        """
         try:
             resp = await self.client.head(
                 url, timeout=config.http_timeout, follow_redirects=True
@@ -882,6 +903,19 @@ class DomainMapper:
             return None
 
         if resp.status_code >= 400:
+            return None
+
+        # The probe follows redirects, so resp.url is the final destination.
+        # Drop off-host destinations before the soft-404 GET so neither a
+        # foreign URL is misattributed to this host nor a soft-404 GET is
+        # issued to the foreign host during the scan.
+        final_url = str(resp.url)
+        host_norm = host.lower().split(":")[0].removeprefix("www.")
+        try:
+            final_host = urlparse(final_url).netloc.lower().split(":")[0].removeprefix("www.")
+        except Exception:
+            return None
+        if final_host != host_norm:
             return None
 
         # For 2xx responses, verify against soft-404
@@ -898,8 +932,7 @@ class DomainMapper:
             except Exception:
                 pass
 
-        # Return the final URL after redirects
-        return str(resp.url)
+        return final_url
 
     # ──────────────────────── Feed Discovery
 
