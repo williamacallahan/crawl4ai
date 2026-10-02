@@ -44,6 +44,14 @@ PAGE_CLOSE_SECONDS = 30.0
 # Stopping the driver transport is the last resort for a wedged close; its exit
 # handler ends the whole Chromium group. Capped because it can wedge too.
 DRIVER_STOP_SECONDS = 5.0
+# Window during which _get_page_by_target_id keeps polling Playwright for the
+# page identified by target_id. Targets created via raw CDP commands (as a
+# cloud browser service does before handing off context_id + target_id) can
+# take a moment to surface in context.pages, so a short poll is required
+# before giving up and letting get_page create a fresh page. Bounded so a
+# stale/typo target_id surfaces as a missing page (None) rather than silently
+# attaching to an arbitrary tab.
+TARGET_ID_DISCOVERY_SECONDS = 2.0
 
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
@@ -1579,49 +1587,44 @@ class BrowserManager:
         """
         Get an existing page by its CDP target ID.
 
-        This is used when connecting to a pre-created browser context with an existing page.
-        Playwright may not immediately see targets created via raw CDP commands, so we
-        use CDP to get all targets and find the matching one.
+        This is used when connecting to a pre-created browser context with an
+        existing page. Playwright does not expose a target ID on its Page
+        object, so a CDP session is opened per candidate page and the
+        ``targetId`` returned by ``Target.getTargetInfo`` is compared with the
+        requested id. Targets created via raw CDP commands can take a moment
+        to surface in ``context.pages``, so the lookup is retried briefly
+        before giving up.
 
         Args:
             context: The browser context to search in
             target_id: The CDP target ID to find
 
         Returns:
-            Page object if found, None otherwise
+            Page object if found, None otherwise. This method never falls
+            back to an arbitrary page (e.g. ``context.pages[0]``): returning
+            None lets ``get_page`` create a fresh page rather than silently
+            attaching the crawler to the wrong tab when ``target_id`` is
+            stale, mistyped, or belongs to a different context.
         """
         try:
-            # First check if Playwright already sees the page
-            for page in context.pages:
-                # Playwright's internal target ID might match
-                if hasattr(page, '_impl_obj') and hasattr(page._impl_obj, '_target_id'):
-                    if page._impl_obj._target_id == target_id:
+            wait_seconds = getattr(
+                self, "_target_id_wait_seconds", TARGET_ID_DISCOVERY_SECONDS
+            )
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + wait_seconds
+            # Cache each page's targetId for the lifetime of this call so the
+            # poll loop does not re-query pages it has already inspected.
+            checked: Dict[int, Optional[str]] = {}
+            while True:
+                for page in context.pages:
+                    key = id(page)
+                    if key not in checked:
+                        checked[key] = await self._query_page_target_id(context, page)
+                    if checked[key] == target_id:
                         return page
-
-            # If not found, try using CDP to get targets
-            if hasattr(self.browser, '_impl_obj') and hasattr(self.browser._impl_obj, '_connection'):
-                cdp_session = await context.new_cdp_session(context.pages[0] if context.pages else None)
-                if cdp_session:
-                    try:
-                        result = await cdp_session.send("Target.getTargets")
-                        targets = result.get("targetInfos", [])
-                        for target in targets:
-                            if target.get("targetId") == target_id:
-                                # Found the target - if it's a page type, we can use it
-                                if target.get("type") == "page":
-                                    # The page exists, let Playwright discover it
-                                    await asyncio.sleep(0.1)
-                                    # Refresh pages list
-                                    if context.pages:
-                                        return context.pages[0]
-                    finally:
-                        await cdp_session.detach()
-
-            # Fallback: if there are any pages now, return the first one
-            if context.pages:
-                return context.pages[0]
-
-            return None
+                if wait_seconds <= 0 or loop.time() >= deadline:
+                    return None
+                await asyncio.sleep(0.1)
         except Exception as e:
             if self.logger:
                 self.logger.warning(
@@ -1630,6 +1633,32 @@ class BrowserManager:
                     params={"error": str(e)}
                 )
             return None
+
+    async def _query_page_target_id(self, context: BrowserContext, page) -> Optional[str]:
+        """
+        Return the CDP ``targetId`` of ``page`` (when it is a page-type
+        target), or None if the id cannot be queried. A fresh CDP session is
+        opened and detached per call so no per-page state leaks out.
+        """
+        try:
+            session = await context.new_cdp_session(page)
+        except Exception:
+            return None
+        try:
+            result = await session.send("Target.getTargetInfo")
+        except Exception:
+            return None
+        finally:
+            try:
+                await session.detach()
+            except Exception:
+                pass
+        if not isinstance(result, dict):
+            return None
+        info = result.get("targetInfo")
+        if not isinstance(info, dict) or info.get("type") != "page":
+            return None
+        return info.get("targetId")
 
     def _track_background_task(self, task):
         """Retain cleanup started after a caller was cancelled."""
