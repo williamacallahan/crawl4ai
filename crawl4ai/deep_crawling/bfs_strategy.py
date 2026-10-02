@@ -171,12 +171,12 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             if not url_key or url_key in visited:
                 continue
             base_url = urldefrag(urljoin(source_url, url.strip()))[0]
-            if not await self.can_process_url(base_url, next_depth):
+            if not await self.can_process_url(url_key, next_depth):
                 self.stats.urls_skipped += 1
                 continue
 
             # Score the URL if a scorer is provided
-            score = self.url_scorer.score(base_url) if self.url_scorer else 0
+            score = self.url_scorer.score(url_key) if self.url_scorer else 0
             
             # Skip URLs with scores below the threshold
             if score < self.score_threshold:
