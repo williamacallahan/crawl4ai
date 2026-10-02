@@ -128,6 +128,101 @@ class TestSerializationParity:
         assert set(cr.model_dump(include={"markdown"}).keys()) == {"markdown"}
 
 
+class TestNestedDictIncludeExclude:
+    """Pydantic v2's ``include``/``exclude`` accept a dict-valued nested
+    spec (``{'markdown': {'fit_markdown'}}``) to select sub-fields of a
+    nested model. A normal pydantic field of type ``MarkdownGenerationResult``
+    honors this; ``CrawlResult.markdown`` (a ``PrivateAttr`` re-injected by
+    the wrap serializer) must honor it too.
+
+    Regression for the gap introduced in commit 8cfcb25c: the wrap
+    serializer's ``"markdown" in info.include``/``info.exclude`` membership
+    checks treated the dict-valued nested form as whole-field control and
+    never forwarded the sub-field spec to the inner ``model_dump``, so
+    nested-``exclude`` dropped the entire ``markdown`` key and
+    nested-``include`` emitted all sub-fields.
+    """
+
+    def _normal(self):
+        """A plain ``BaseModel`` with a normal ``MarkdownGenerationResult``
+        field, used to pin the behavior ``CrawlResult.markdown`` must match."""
+        from pydantic import BaseModel
+
+        class Normal(BaseModel):
+            n: MarkdownGenerationResult
+
+        return Normal(n=_md())
+
+    def test_nested_exclude_drops_only_named_subfield_model_dump(self):
+        """``exclude={'markdown': {'fit_markdown'}}`` must keep the
+        ``markdown`` key with only ``fit_markdown`` removed — not drop
+        ``markdown`` entirely (the pre-fix behavior)."""
+        cr = _result(md=_md())
+        out = cr.model_dump(mode="json", exclude={"markdown": {"fit_markdown"}})
+        assert "markdown" in out
+        md = out["markdown"]
+        assert set(md.keys()) == {
+            "raw_markdown", "markdown_with_citations",
+            "references_markdown", "fit_html",
+        }
+        assert md["raw_markdown"] == "hello"
+        assert md["fit_html"] == "<p>fh</p>"
+
+    def test_nested_exclude_drops_only_named_subfield_matches_normal_field(self):
+        """The nested-``exclude`` output of ``CrawlResult.markdown`` must
+        match that of a normal pydantic field of the same type."""
+        cr = _result(md=_md())
+        actual = cr.model_dump(mode="json", exclude={"markdown": {"fit_markdown"}})["markdown"]
+        expected = self._normal().model_dump(
+            mode="json", exclude={"n": {"fit_markdown"}}
+        )["n"]
+        assert actual == expected
+
+    def test_nested_include_keeps_only_named_subfield_model_dump(self):
+        """``include={'markdown': {'raw_markdown'}}`` must emit only
+        ``raw_markdown`` under ``markdown`` — not all sub-fields (the
+        pre-fix behavior)."""
+        cr = _result(md=_md())
+        out = cr.model_dump(mode="json", include={"markdown": {"raw_markdown"}})
+        assert set(out.keys()) == {"markdown"}
+        assert set(out["markdown"].keys()) == {"raw_markdown"}
+        assert out["markdown"]["raw_markdown"] == "hello"
+
+    def test_nested_include_keeps_only_named_subfield_matches_normal_field(self):
+        """The nested-``include`` output of ``CrawlResult.markdown`` must
+        match that of a normal pydantic field of the same type."""
+        cr = _result(md=_md())
+        actual = cr.model_dump(mode="json", include={"markdown": {"raw_markdown"}})["markdown"]
+        expected = self._normal().model_dump(
+            mode="json", include={"n": {"raw_markdown"}}
+        )["n"]
+        assert actual == expected
+
+    def test_nested_exclude_on_model_dump_json(self):
+        """Nested-``exclude`` must work on the JSON surface too — the
+        wrap serializer applies to both ``model_dump`` and
+        ``model_dump_json``."""
+        cr = _result(md=_md())
+        out = json.loads(cr.model_dump_json(exclude={"markdown": {"fit_markdown"}}))
+        assert "markdown" in out
+        assert "fit_markdown" not in out["markdown"]
+        assert out["markdown"]["raw_markdown"] == "hello"
+
+    def test_nested_include_on_model_dump_json(self):
+        """Nested-``include`` must work on the JSON surface too."""
+        cr = _result(md=_md())
+        out = json.loads(cr.model_dump_json(include={"markdown": {"raw_markdown"}}))
+        assert set(out.keys()) == {"markdown"}
+        assert set(out["markdown"].keys()) == {"raw_markdown"}
+
+    def test_no_markdown_set_nested_spec_does_not_inject_key(self):
+        """When ``_markdown`` is None, a nested spec on ``markdown`` must
+        not synthesize a spurious ``"markdown": null`` entry."""
+        cr = _result()
+        out = cr.model_dump(mode="json", include={"markdown": {"raw_markdown"}})
+        assert "markdown" not in out
+
+
 class TestRoundTrip:
     """``model_dump_json()`` output must let Pydantic reconstruct
     ``_markdown`` via the existing custom ``__init__`` pop-and-wrap.
