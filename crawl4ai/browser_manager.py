@@ -892,6 +892,9 @@ class BrowserManager:
                 "user_agent": self.config.user_agent or None,
                 "ignore_https_errors": self.config.ignore_https_errors,
                 "accept_downloads": self.config.accept_downloads,
+                # See create_browser_context: a registered service worker keeps a
+                # renderer alive after every page closes.
+                "service_workers": "block",
             }
 
             if self.config.proxy_config:
@@ -1437,6 +1440,12 @@ class BrowserManager:
             "ignore_https_errors": self.config.ignore_https_errors,
             "device_scale_factor": self.config.device_scale_factor,
             "java_script_enabled": self.config.java_script_enabled,
+            # A crawled site's service worker keeps its own renderer process
+            # running after every page of the context closes, and cached
+            # contexts outlive their crawls, so each SW-registering site leaks a
+            # renderer until the browser dies. Service-worker fetches also bypass
+            # the context routes that text_mode/avoid_css blocking relies on.
+            "service_workers": "block",
         }
         
         if self.config.text_mode:
