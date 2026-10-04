@@ -1702,11 +1702,13 @@ class BrowserManager:
                 if task.done():
                     try:
                         return task.result(), cancelled
-                    except BaseException:
-                        raise asyncio.CancelledError from None
-            except BaseException:
+                    except BaseException as error:
+                        # The cancel still wins (uncancel() cleared it above),
+                        # but the task's own failure stays attached as the cause.
+                        raise asyncio.CancelledError from error
+            except BaseException as error:
                 if cancelled:
-                    raise asyncio.CancelledError from None
+                    raise asyncio.CancelledError from error
                 raise
 
     def _abandon_hung_task(self, task, on_abandon) -> None:

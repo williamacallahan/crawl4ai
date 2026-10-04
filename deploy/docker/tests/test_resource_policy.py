@@ -478,6 +478,82 @@ async def test_cancelled_promotion_rolls_back_the_active_request(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_retire_racing_a_cancelled_promotion_returns_the_permit_once(
+    monkeypatch,
+):
+    started = asyncio.Event()
+
+    class Monitor:
+        async def track_janitor_event(self, *_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+    _configure_pool(monkeypatch, lambda **_kwargs: _PoolCrawler())
+    monkeypatch.setattr("monitor.get_monitor", lambda: Monitor())
+    config = BrowserConfig()
+    sig = crawler_pool._sig(config)
+    crawler = _PoolCrawler()
+    crawler_pool.COLD_POOL[sig] = crawler
+    crawler_pool.LAST_USED[sig] = 0
+    crawler_pool.USAGE_COUNT[sig] = 2
+
+    async def janitor_retires_the_promoted_browser():
+        async with crawler_pool.LOCK:
+            if crawler_pool.HOT_POOL.get(sig) is crawler:
+                crawler_pool._close_in_background(
+                    crawler_pool._detach_pool_crawler(crawler_pool.HOT_POOL, sig)
+                )
+
+    acquisition = asyncio.create_task(crawler_pool.get_crawler(config))
+    await started.wait()
+    retire = asyncio.create_task(janitor_retires_the_promoted_browser())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    acquisition.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition
+    await asyncio.wait_for(retire, timeout=1)
+    await _drain_close_tasks()
+
+    # One acquire, one release: an over-release lifts admission above
+    # max_pages for the life of the process.
+    assert crawler_pool.ADMISSION_SEM._value == 2
+    assert crawler.closed
+
+
+@pytest.mark.asyncio
+async def test_permanent_browser_comes_back_while_busy_browsers_fill_the_pool(
+    monkeypatch,
+):
+    created = []
+
+    def factory(**_kwargs):
+        crawler = _PoolCrawler()
+        created.append(crawler)
+        return crawler
+
+    _configure_pool(monkeypatch, factory)
+    monkeypatch.setattr(crawler_pool, "ADMISSION_SEM", asyncio.Semaphore(3))
+    config = BrowserConfig()
+    # The permanent browser was detached for replacement, and pool growth for
+    # other configs took every slot while it was down; each one is serving.
+    crawler_pool.DEFAULT_CONFIG_SIG = crawler_pool._sig(config)
+    for sig in ("busy-a", "busy-b"):
+        busy = _PoolCrawler()
+        busy.active_requests = 1
+        crawler_pool.COLD_POOL[sig] = busy
+        crawler_pool.LAST_USED[sig] = 0
+        crawler_pool.USAGE_COUNT[sig] = 1
+
+    crawler = await asyncio.wait_for(crawler_pool.get_crawler(config), timeout=1)
+
+    assert crawler is crawler_pool.PERMANENT
+    assert created == [crawler]
+    await crawler_pool.release_crawler(crawler)
+    await crawler_pool.close_all()
+
+
+@pytest.mark.asyncio
 async def test_start_failure_schedules_its_wedged_close_outside_the_lock(monkeypatch):
     class FailingCrawler(_BlockingCloseCrawler):
         async def start(self):

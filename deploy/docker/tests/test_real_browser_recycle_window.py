@@ -134,3 +134,66 @@ async def test_real_browser_recycle_keeps_is_live_true_throughout():
         await manager.release_page_with_context(second_page)
     finally:
         await manager.close()
+
+
+def _real_manager(**config_overrides):
+    config = BrowserConfig(headless=True, extra_args=["--no-sandbox"], **config_overrides)
+    manager = BrowserManager(config, logger=None)
+    manager._browser_endpoint_key = f"instance:{id(manager)}"
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_concurrent_get_page_under_real_recycling_never_deadlocks():
+    """Concurrent acquisitions across several real close/start cycles all finish.
+
+    The mock suite stubs ``close``/``start``; only a real recycle shows that
+    the drain barrier, the restart, and the waiters it wakes cannot wedge.
+    """
+    manager = _real_manager(max_pages_before_recycle=3)
+    acquisitions, concurrency = 24, 6
+    browsers = []  # holding each Browser keeps CPython from reusing its id
+    gate = asyncio.Semaphore(concurrency)
+
+    async def acquire_and_release():
+        async with gate:
+            page, _ = await manager.get_page(CrawlerRunConfig())
+            browsers.append(manager.browser)
+            await asyncio.sleep(0.01)
+            await manager.release_page_with_context(page)
+
+    try:
+        await manager.start()
+        await asyncio.wait_for(
+            asyncio.gather(*(acquire_and_release() for _ in range(acquisitions))),
+            timeout=120,
+        )
+        if manager._recycle_task is not None:
+            await asyncio.wait_for(manager._recycle_task, timeout=60)
+
+        assert len({id(browser) for browser in browsers}) > 1, "no real recycle ran under concurrent load"
+        assert not manager._active_acquisitions
+        assert manager._closing is False
+        assert crawler_pool._is_live(_crawler(manager)) is True
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_context_refcount_reaches_zero_after_a_real_browser_crash():
+    manager = _real_manager()
+    try:
+        await manager.start()
+        page, _ = await manager.get_page(CrawlerRunConfig())
+        assert sum(manager._context_refcounts.values()) == 1
+
+        # The browser dies under an in-flight crawl; its release must still
+        # return the context reference and the drain token.
+        await manager.browser.close()
+        await asyncio.wait_for(manager.release_page_with_context(page), timeout=30)
+
+        assert all(count == 0 for count in manager._context_refcounts.values())
+        assert not manager._active_acquisitions
+        assert crawler_pool._is_live(_crawler(manager)) is False
+    finally:
+        await manager.close()

@@ -157,6 +157,11 @@ def _is_live(crawler: AsyncWebCrawler) -> bool:
         manager = crawler.crawler_strategy.browser_manager
         if getattr(manager, "_recycling", False):
             return True
+        # A failed recycle or a close leaves _closing set, and a closed manager
+        # refuses every page even while its browser object still reports
+        # connected; only a replacement brings this config back.
+        if getattr(manager, "_closing", False) is True:
+            return False
         if manager.browser is not None:
             return manager.browser.is_connected()
         return (
@@ -215,8 +220,13 @@ def _browser_count() -> int:
     )
 
 
-def _make_browser_capacity() -> Optional[asyncio.Task]:
-    """Schedule an idle eviction, or wait for an existing close, before growth."""
+def _make_browser_capacity(*, refuse_when_full: bool = True) -> Optional[asyncio.Task]:
+    """Schedule an idle eviction, or wait for an existing close, before growth.
+
+    ``refuse_when_full=False`` is the permanent browser's exemption: it still
+    evicts or waits when it can, but a pool of busy browsers never keeps the
+    default browser down, because nothing else would bring it back.
+    """
     if _browser_count() < MAX_BROWSER_INSTANCES:
         return None
 
@@ -242,6 +252,8 @@ def _make_browser_capacity() -> Optional[asyncio.Task]:
         logger.info(f"🧹 Replaced idle browser at pool capacity (sig={idle_sig[:8]})")
         return _close_in_background(crawler)
 
+    if not refuse_when_full:
+        return None
     raise RuntimeError("Crawler browser pool is at capacity")
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
@@ -349,7 +361,6 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     while True:
         close_task = None
         replace_permanent = False
-        promoted = None
         async with LOCK:
             # Check permanent browser for default config
             if _is_default_config(sig):
@@ -392,17 +403,28 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     LAST_USED[sig] = time.time()
                     USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
                     crawler = COLD_POOL[sig]
-                    _set_active_requests(crawler, _active_requests(crawler) + 1)
 
                     if USAGE_COUNT[sig] >= 3:
                         logger.info(f"⬆️  Promoting to hot pool (sig={sig[:8]}, count={USAGE_COUNT[sig]})")
                         HOT_POOL[sig] = COLD_POOL.pop(sig)
-                        promoted = (crawler, USAGE_COUNT[sig])
+                        # Under LOCK and before this request's lease is counted:
+                        # no retire can return a lease the request has not yet
+                        # handed over, so a cancellation here leaves the permit
+                        # with get_crawler's single release.
+                        try:
+                            from monitor import get_monitor
+
+                            await get_monitor().track_janitor_event(
+                                "promote", sig, {"count": USAGE_COUNT[sig]}
+                            )
+                        except Exception:
+                            pass
                     else:
                         logger.info(f"❄️  Using cold pool browser (sig={sig[:8]})")
-                        return crawler
+                    _set_active_requests(crawler, _active_requests(crawler) + 1)
+                    return crawler
 
-            if not replace_permanent and close_task is None and promoted is None:
+            if not replace_permanent and close_task is None:
                 # Memory check before creating new
                 mem_pct = get_container_memory_percent()
                 if mem_pct >= MEM_LIMIT:
@@ -420,21 +442,6 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     LAST_USED[sig] = time.time()
                     USAGE_COUNT[sig] = 1
                     return crawler
-        if promoted is not None:
-            crawler, count = promoted
-            try:
-                from monitor import get_monitor
-
-                await get_monitor().track_janitor_event(
-                    "promote", sig, {"count": count}
-                )
-            except asyncio.CancelledError:
-                _set_active_requests(crawler, max(0, _active_requests(crawler) - 1))
-                raise
-            except Exception:
-                pass
-            return crawler
-
         if close_task is not None:
             await asyncio.shield(close_task)
         if replace_permanent:
@@ -498,7 +505,7 @@ async def _init_permanent_locked(
         return None, True
     if PERMANENT:
         return _close_in_background(_detach_permanent()), True
-    close_task = _make_browser_capacity()
+    close_task = _make_browser_capacity(refuse_when_full=False)
     if close_task is not None:
         return close_task, True
 
