@@ -64,6 +64,11 @@ class FilterChain:
         self.filters = tuple(filters or [])  # Immutable tuple for speed
         self.stats = FilterStats()
 
+    def add_filter(self, filter_: URLFilter) -> "FilterChain":
+        """Add a filter to the chain"""
+        self.filters = self.filters + (filter_,)
+        return self  # Enable method chaining
+
     async def apply(self, url: str) -> bool:
         """Apply all filters concurrently when possible"""
         self.stats._counters[0] += 1  # Total processed URLs
