@@ -320,7 +320,10 @@ class DefaultTableExtraction(TableExtractionStrategy):
             # Only adopt the first row as headers when it is all <th>; a row
             # mixing <th> (row label) with <td> data must stay data, otherwise
             # the short th-derived header list truncates every data row.
-            first_row = table.xpath("./tr | ./tbody/tr | ./tfoot/tr")
+            # <tfoot> rows are excluded: a footer is never a column header,
+            # and the HTML table model places it last, so a <tfoot> preceding
+            # <tbody> in source must not become first_row[0] here.
+            first_row = table.xpath("./tr | ./tbody/tr")
             if first_row and not first_row[0].xpath("./td"):
                 for cell in first_row[0].xpath("./th"):
                     text = self._cell_text(cell, table_depth)
@@ -330,10 +333,23 @@ class DefaultTableExtraction(TableExtractionStrategy):
         # Extract rows honoring both colspan and rowspan (HTML table model).
         # A cell with rowspan="N" is duplicated down into the N-1 continuation
         # rows it occupies within its row group.
+        # The HTML table model places <tfoot> rows LAST, regardless of source
+        # position (WHATWG "table.rows" getter: thead rows, then body rows
+        # in tree order, then tfoot rows in tree order). lxml preserves the
+        # source position of <tfoot>, so a single document-order XPath union
+        # over all row groups would emit a <tfoot> placed before <tbody>
+        # (valid HTML4/HTML5) at the top of the body. Iterating the non-footer
+        # row groups (<thead>, bare <tr> children, <tbody>) in document order
+        # -- the same union the rowspan carry-down relies on for its group
+        # -transition (current_group / pending.clear()) semantics -- then
+        # appending <tfoot> rows, keeps footer rows at the end while
+        # preserving every existing group-boundary behaviour.
         rows = []
         pending = {}  # col_index -> (value, rows_remaining)
         current_group = None
-        for row in table.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr"):
+        ordered_rows = list(table.xpath("./tr | ./thead/tr | ./tbody/tr"))
+        ordered_rows += list(table.xpath("./tfoot/tr"))
+        for row in ordered_rows:
             row_group = row.getparent()
             if row_group is not current_group:
                 pending.clear()
