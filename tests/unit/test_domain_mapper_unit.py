@@ -753,3 +753,84 @@ class TestScanHostAttributionInvariant:
         assert host_by_url.get("https://app.example.com/alt") == "app.example.com"
         assert host_by_url.get("https://example.com/about") == "example.com"
         assert host_by_url.get("https://api.example.com/v1") == "api.example.com"
+
+    @pytest.mark.asyncio
+    async def test_scan_never_misattributes_probe_redirect_to_other_host(self):
+        """Probe-source counterpart of the homepage invariant test above.
+
+        ``_do_probe`` issues the probe HEAD with ``follow_redirects=True`` and
+        returns ``str(resp.url)`` — the *final* URL after redirects — which
+        ``_scan_host`` then stamps with ``host=<scanned host>``. A probe path
+        that redirects off-host (here ``example.com/login`` -> an external SSO
+        host) would, pre-fix, inject a foreign URL into ``example.com``'s
+        result set with ``host=example.com``. Assert the per-host attribution
+        invariant (``host == netloc(url)`` after ``www.``-strip) holds for the
+        probe source, the foreign URL is absent, and a legitimate on-host
+        probe result (``/about``) still survives.
+
+        This uses ``unittest.mock`` (consistent with the rest of this file)
+        to drive ``_do_probe`` directly; the real-redirect-machinery
+        reproduction lives in ``tests/unit/test_probe_redirect_bug.py``.
+        """
+        from crawl4ai.async_configs import DomainMapperConfig
+
+        def _resp(url: str, status: int):
+            r = MagicMock()
+            r.status_code = status
+            r.url = url
+            return r
+
+        async def fake_head(url, *args, **kwargs):
+            # /login "redirects" off-host to the foreign SSO service.
+            if url.endswith("/login"):
+                return _resp("https://auth.external-sso.com/sso", 200)
+            # /about stays on the scanned host.
+            if url.endswith("/about"):
+                return _resp(url, 200)
+            # Other probe paths -> 4xx -> dropped by the >=400 short-circuit.
+            return _resp(url, 404)
+
+        mapper = DomainMapper.__new__(DomainMapper)
+        mapper.logger = None
+        mapper.client = MagicMock()
+        mapper.client.head = AsyncMock(side_effect=fake_head)
+        mapper._host_schemes = {"example.com": "https"}
+
+        with patch.object(
+            DomainMapper, "_discover_hosts",
+            AsyncMock(return_value={"example.com"}),
+        ):
+            results = await mapper.scan(
+                "example.com",
+                DomainMapperConfig(
+                    source="probe",
+                    include_subdomains=False,
+                    extract_head=False,
+                    max_urls=-1,
+                    soft_404_detection=False,
+                    filter_nonsense_urls=False,
+                    hits_per_sec=0,
+                ),
+            )
+
+        def _norm(h: str) -> str:
+            return h.lower().split(":")[0].removeprefix("www.")
+
+        misattributed = [
+            r for r in results
+            if _norm(urlparse(r["url"]).netloc) != _norm(r["host"])
+        ]
+        assert not misattributed, (
+            f"misattributed records: {misattributed}; all: {results}"
+        )
+
+        foreign = [r for r in results
+                   if urlparse(r["url"]).netloc.lower() == "auth.external-sso.com"]
+        assert foreign == [], f"foreign URL leaked via probe redirect: {foreign}"
+
+        # Sanity: the legitimate on-host probe result survives and is
+        # correctly attributed.
+        about = [r for r in results if r["url"] == "https://example.com/about"]
+        assert about and about[0]["host"] == "example.com", (
+            f"on-host /about missing or misattributed: {results}"
+        )
