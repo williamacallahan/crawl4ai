@@ -43,21 +43,32 @@ def _metadata_as_jsonable_dict(meta) -> dict:
 
     ``PDFMetadata.created`` / ``modified`` are typed ``Optional[datetime]``
     and ``_parse_pdf_date`` populates them with native ``datetime`` objects
-    when the PDF carries a ``/CreationDate`` / ``/ModDate``. ``dataclasses.asdict``
-    preserves those objects verbatim, and the resulting dict flows unchanged
-    into ``CrawlResult.metadata``. The content-cache writer later calls the
-    stdlib ``json.dumps(result.metadata or {})`` (no ``default=`` handler),
-    which would otherwise raise ``TypeError: Object of type datetime is not
-    JSON serializable`` and drop the cache row for any such crawl. Coercing
-    the datetimes to ISO-8601 strings at the strategy boundary keeps the typed
-    dataclass honest to its declared type while guaranteeing the dict the
-    cache writer receives is JSON-native.
+    when the PDF carries a ``/CreationDate`` / ``/ModDate``. ``PDFMetadata``'s
+    text fields are populated by ``NaivePDFProcessorStrategy._extract_metadata``
+    via ``_info_value_as_text``, which already resolves the raw ``pypdf``
+    objects ``reader.metadata.get('/...')`` can return -- a
+    ``TextStringObject`` (``str`` subclass), a ``ByteStringObject`` (``bytes``
+    subclass) or an ``IndirectObject`` (an unresolved reference that can only be
+    dereferenced while the reader's stream is still open) -- to plain
+    ``Optional[str]``. This helper coerces the datetimes to ISO-8601 strings
+    and re-coerces the text fields to ``str`` as a backstop, so that even if a
+    non-JSON-native value ever reaches the dataclass, the dict handed to the
+    cache writer stays JSON-native. The content-cache writer calls the stdlib
+    ``json.dumps(result.metadata or {})`` (no ``default=`` handler), which
+    would otherwise raise ``TypeError`` on a ``datetime``, a
+    ``ByteStringObject`` or an ``IndirectObject`` and drop the cache row for
+    any such crawl. Coercing at the strategy boundary keeps the typed dataclass
+    honest to its declared types while guaranteeing the dict the cache writer
+    receives is JSON-native.
     """
     d = asdict(meta)
     for key in ("created", "modified"):
         value = d.get(key)
         if isinstance(value, datetime):
             d[key] = value.isoformat()
+    for key in ("title", "author", "producer"):
+        value = d.get(key)
+        d[key] = None if value is None else str(value)
     return d
 
 
