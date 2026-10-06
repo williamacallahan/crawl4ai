@@ -239,11 +239,30 @@ class CrawlResult(BaseModel):
         """
         result = handler(self)
         if self._markdown is not None:
-            excluded = bool(info.exclude) and "markdown" in info.exclude
+            def _nested(spec, key):
+                # Forward the sub-field spec only when the value is a dict
+                # (nested form: {'markdown': {'fit_markdown'}}). The set-valued
+                # flat form ({'markdown'}) means whole-field control and there
+                # is nothing to forward to the inner model_dump.
+                if spec is None or key not in spec:
+                    return None
+                return spec[key] if isinstance(spec, dict) else None
+
+            def _whole(spec, key):
+                # True only when the spec names the whole field (set form).
+                # A dict form ('markdown' in spec with a dict value) means
+                # nested sub-field selection, NOT whole-field suppression.
+                if spec is None or key not in spec:
+                    return False
+                return not isinstance(spec, dict)
+
+            excluded = _whole(info.exclude, "markdown")
             included = info.include is None or "markdown" in info.include
             if included and not excluded:
                 result["markdown"] = self._markdown.model_dump(
-                    mode="json" if info.mode_is_json() else "python"
+                    mode="json" if info.mode_is_json() else "python",
+                    include=_nested(info.include, "markdown"),
+                    exclude=_nested(info.exclude, "markdown"),
                 )
         return result
 
