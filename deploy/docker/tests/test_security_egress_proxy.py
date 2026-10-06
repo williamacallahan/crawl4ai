@@ -136,6 +136,7 @@ class TestPinningProxy:
         ("host", "expected"),
         [
             ("refused.example", "net::ERR_CONNECTION_REFUSED"),
+            ("[2001:db8::1]", "net::ERR_CONNECTION_REFUSED"),
             ("unresolvable.example", "net::ERR_NAME_NOT_RESOLVED"),
             ("internal.example", "net::ERR_TUNNEL_CONNECTION_FAILED"),
         ],

@@ -68,7 +68,7 @@ def _dial_failure_code(error: BaseException) -> str | None:
 
 
 def _record_dial_outcome(host: str, port: int, error: BaseException | None) -> None:
-    key = (host.lower(), port)
+    key = (host.strip("[]").lower(), port)  # urlsplit().hostname drops IPv6 brackets
     code = _dial_failure_code(error) if error is not None else None
     if code is None:
         _dial_failures.pop(key, None)
