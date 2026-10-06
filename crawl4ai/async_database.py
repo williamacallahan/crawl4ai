@@ -35,7 +35,7 @@ class AsyncDatabaseManager:
         self._initialized = False
         self.version_manager = VersionManager()
         self.logger = AsyncLogger(
-            log_file=os.path.join(base_directory, ".crawl4ai", "crawler_db.log"),
+            log_file=os.path.join(base_directory, "crawler_db.log"),
             verbose=False,
             tag_width=10,
         )
