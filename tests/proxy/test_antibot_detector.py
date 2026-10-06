@@ -599,6 +599,25 @@ check("200 BOM-prefixed HTML is not data and is not blocked",
     is_blocked(200, _BOM_HTML),
     False)
 
+# BOM-prefixed HTML fragment with no <body> tag — exercises the
+# ``_is_fragment`` carve-out in ``_structural_integrity_check``. ``str.lstrip()``
+# does NOT remove U+FEFF, so without a BOM-aware strip the leading BOM hides the
+# ``<`` prefix, the input falls back to the full-document branch, and it is
+# flagged for "no <body>" despite being a legitimate css_selector-style
+# fragment. The byte-identical BOM-free twin is a known non-block; the BOM
+# twin must not regress it. Only reachable via the opt-in HTTP-only strategy
+# (Playwright drops the BOM), but the detector itself must be correct.
+_BOM_FRAG = _BOM + "<div class='crawl4ai-result'><p>" + ("real content here " * 50) + "</p></div>"
+assert len(_BOM_FRAG) > 100 and len(_BOM_FRAG) < 50000, "must hit the Tier 3 window"
+check("200 BOM HTML fragment (no <body>) is not blocked (fragment exemption)",
+    is_blocked(200, _BOM_FRAG),
+    False)
+# Differential: the byte-identical BOM-free twin already passed before the
+# fix; this pins that the fix did not regress the no-BOM path.
+check("200 no-BOM HTML fragment twin is not blocked",
+    is_blocked(200, _BOM_FRAG[1:]),
+    False)
+
 check("403 feedback-panel lookalike is blocked",
     is_blocked(403, '<feedback-panel>Temporarily unavailable</feedback-panel>'),
     True)
@@ -805,7 +824,11 @@ else:
 # above, so the functions below focus on the helper's own contract and the
 # two guards that are not otherwise exercised here.
 # =========================================================================
-from crawl4ai.antibot_detector import _body_start, _visible_text_len
+from crawl4ai.antibot_detector import (
+    _body_start,
+    _structural_integrity_check,
+    _visible_text_len,
+)
 
 
 
@@ -920,6 +943,29 @@ def test_bom_does_not_reclassify_html_as_data():
     assert _looks_like_data(bom + '{"k":1}') is True
     assert _looks_like_data(bom + '\n<rss version="2.0"><channel/></rss>') is True
     assert _looks_like_data('\n' + bom + '{"k":1}') is True
+
+
+def test_bom_prefixed_fragment_is_not_blocked():
+    # ``_structural_integrity_check`` classifies an HTML fragment vs a full
+    # document by peeking at the leading bytes. ``str.lstrip()`` does NOT
+    # remove U+FEFF, so a BOM-prefixed fragment's leading ``<`` was hidden,
+    # the input fell back to the full-document branch, and it was flagged for
+    # "no <body>" despite being a legitimate body-less fragment. The fix strips
+    # the BOM (and leading whitespace) before slicing, mirroring
+    # ``_looks_like_data``'s ``_BOM_LSTRIP_RE`` usage.
+    bom = "\ufeff"
+    fragment = (
+        '<div class="crawl4ai-result">'
+        + "<p>" + "real product content here " * 50 + "</p>"
+        + '<p>More detail: <a href="/item/42">view item</a> in stock.</p>'
+        + "</div>"
+    )
+    # The BOM-prefixed fragment must NOT be blocked — byte-identical to its
+    # BOM-free twin, which was always a non-block. Assert the helper directly
+    # so a future regression here is attributed precisely.
+    assert _structural_integrity_check(bom + fragment) == (False, "")
+    assert _structural_integrity_check(fragment) == (False, "")
+    assert is_blocked(200, bom + fragment) == (False, "")
 
 
 # =========================================================================
