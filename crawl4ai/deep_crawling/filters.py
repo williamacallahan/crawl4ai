@@ -94,7 +94,12 @@ class FilterChain:
 
         tasks = []
         for f in self.filters:
-            result = f.apply(url)
+            try:
+                result = f.apply(url)
+            except Exception:
+                for t in tasks:
+                    t.close()  # Dispose un-awaited async coroutines
+                raise
 
             if inspect.isawaitable(result):
                 tasks.append(result)  # Collect async tasks
