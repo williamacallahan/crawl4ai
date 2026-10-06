@@ -226,6 +226,9 @@ _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", '
 # legitimately has path segments, whatever is left should not.
 _CONTAINER_PATH = re.compile(r"/(?:app|ms-playwright|home|root|usr|opt|srv|etc|var|tmp|proc)/")
 _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+# Chromium's navigation error code. A withheld message keeps it because it is the
+# one fact a client needs to tell a target-side fault from a transient one.
+_NAVIGATION_ERROR_CODE = re.compile(r"net::ERR_[A-Z0-9_]+")
 
 
 def public_error_detail(error_message: Optional[str]) -> str:
@@ -233,15 +236,19 @@ def public_error_detail(error_message: Optional[str]) -> str:
 
     The library's catch-all error_message (get_error_context) embeds container
     file paths, source snippets and raw exception text; those must never reach
-    a client. Upstream-failure messages (anti-bot, navigation refusal, DNS,
-    timeouts) pass through, capped.
+    a client, so only its bare Chromium `net::ERR_*` code survives. Upstream-
+    failure messages (anti-bot, navigation refusal, DNS, timeouts) pass through,
+    capped.
     """
     message = (error_message or "").strip()
-    if not message or any(marker in message for marker in _INTERNAL_ERROR_MARKERS):
-        return "Crawl failed"
-    if _CONTAINER_PATH.search(_URL.sub("", message)):
-        return "Crawl failed"
-    return message[:500]
+    if (
+        message
+        and not any(marker in message for marker in _INTERNAL_ERROR_MARKERS)
+        and not _CONTAINER_PATH.search(_URL.sub("", message))
+    ):
+        return message[:500]
+    code = _NAVIGATION_ERROR_CODE.search(message)
+    return f"Crawl failed: {code.group()}" if code else "Crawl failed"
 
 
 class CorrelatedError(str):

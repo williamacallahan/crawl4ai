@@ -7,6 +7,8 @@ playground keep the baseline headers but not the strict CSP until they are
 externalized (CSP-compat refactor - tracked separately). CORS is deny-by-default.
 """
 
+import re
+
 import pytest
 
 pytestmark = pytest.mark.posture
@@ -140,6 +142,26 @@ class TestErrorSanitization:
         assert public_crawl_error("Traceback (most recent call last)").startswith(
             "Crawl failed (correlation_id="
         )
+
+    def test_withheld_navigation_failure_keeps_only_its_net_error_code(self):
+        """A navigation failure outside the target-refusal set arrives wrapped in
+        get_error_context; the client keeps the bare Chromium code (target vs
+        transient) and the correlation id, never the path, call log, or source."""
+        from utils import public_crawl_error
+
+        internal = (
+            "Unexpected error in _crawl_web at line 816 in _crawl_web "
+            "(../usr/local/lib/python3.12/site-packages/crawl4ai/async_crawler_strategy.py):\n"
+            "Error: Failed on navigating ACS-GOTO:\nPage.goto: net::ERR_CONNECTION_CLOSED "
+            "at https://example.com/\nCall log:\n  - navigating to \"https://example.com/\"\n\n"
+            "Code context:\n 816 →   raise RuntimeError(...)\n"
+        )
+        public = public_crawl_error(internal, "https://example.com/")
+
+        assert re.fullmatch(
+            r"Crawl failed: net::ERR_CONNECTION_CLOSED \(correlation_id=[0-9a-f]{12}\)", public
+        )
+        assert public.correlation_id
 
     def test_execute_js_result_error_message_is_sanitized(
         self, stock_client, server_module, monkeypatch
