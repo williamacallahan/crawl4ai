@@ -67,9 +67,11 @@ class Crawl4aiDockerClient:
         log_file: Optional[str] = None,
         api_token: Optional[str] = None,
     ):
-        """``api_token`` is the server's static ``CRAWL4AI_API_TOKEN``, sent as
-        a Bearer credential on every request. Use ``authenticate(email)``
-        instead when the server runs with JWT enabled."""
+        """``api_token`` is the server's static ``CRAWL4AI_API_TOKEN``. It is
+        sent as a Bearer credential on every request and also reused as the
+        operator credential when ``authenticate(email)`` mints a JWT on a
+        JWT-enabled server (the ``/token`` handler requires it in the request
+        body)."""
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
         self.logger = AsyncLogger(log_file=log_file, log_level=LogLevel.DEBUG, verbose=verbose)
@@ -82,18 +84,44 @@ class Crawl4aiDockerClient:
         if self._token:
             self._http_client.headers["Authorization"] = f"Bearer {self._token}"
 
-    async def authenticate(self, email: str) -> None:
-        """Authenticate with the server and store the token."""
+    async def authenticate(self, email: str, api_token: Optional[str] = None) -> None:
+        """Authenticate with the server and store the JWT.
+
+        The hardened (0.9.0+) ``/token`` handler requires the server's operator
+        ``CRAWL4AI_API_TOKEN`` in the request body (it mints a JWT over it
+        rather than accepting it as a Bearer credential). Pass it via
+        ``api_token``, or construct the client with ``api_token=`` so the same
+        credential is reused here. Raises ``ConnectionError`` if no operator
+        token is available — the documented bare-constructor
+        ``authenticate(email)`` call cannot succeed against the server
+        without one.
+        """
         url = urljoin(self.base_url, "/token")
+        credential = api_token or self._token
+        if not credential:
+            raise ConnectionError(
+                "authenticate() requires the server's operator API token "
+                "(pass api_token= or construct the client with api_token=)."
+            )
         try:
             self.logger.info(f"Authenticating with email: {email}", tag="AUTH")
-            response = await self._http_client.post(url, json={"email": email})
+            response = await self._http_client.post(
+                url,
+                json={"email": email, "api_token": credential},
+            )
             response.raise_for_status()
             data = response.json()
             self._token = data["access_token"]
             self._http_client.headers["Authorization"] = f"Bearer {self._token}"
             self.logger.success("Authentication successful", tag="AUTH")
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+        except httpx.HTTPStatusError as e:
+            error_msg = (
+                f"Authentication failed: Server error {e.response.status_code}: "
+                f"{_http_error_detail(e.response, e)}"
+            )
+            self.logger.error(error_msg, tag="ERROR")
+            raise ConnectionError(error_msg)
+        except httpx.RequestError as e:
             error_msg = f"Authentication failed: {str(e)}"
             self.logger.error(error_msg, tag="ERROR")
             raise ConnectionError(error_msg)

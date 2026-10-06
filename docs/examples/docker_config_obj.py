@@ -7,6 +7,7 @@ from crawl4ai.deep_crawling.filters import FilterChain
 from crawl4ai.deep_crawling.scorers import CompositeScorer
 from crawl4ai.docker_client import Crawl4aiDockerClient
 import json
+import os
 from rich.console import Console
 from rich.syntax import Syntax
 
@@ -119,8 +120,13 @@ async def part4_client_sdk():
     """
     console.print("\n[bold green]Explanation:[/bold green] The Crawl4aiDockerClient SDK is a time-saver—it takes your configuration objects and turns them into API-ready JSON automatically. This means less manual work and fewer mistakes. You just define your settings, pass them to the SDK, and it handles the rest, making crawling easier and faster.")
     
-    async with Crawl4aiDockerClient(base_url="http://localhost:8000") as client:
-        # You would normally authenticate here if JWT is enabled
+    async with Crawl4aiDockerClient(
+        base_url="http://localhost:8000",
+        api_token=os.environ.get("CRAWL4AI_API_TOKEN", "operator-token"),
+    ) as client:
+        # The hardened (0.9.0+) /token handler requires the server's operator
+        # CRAWL4AI_API_TOKEN in the request body. Passing api_token= to the
+        # constructor lets authenticate() reuse it to mint a JWT.
         await client.authenticate("user@example.com")
         
         # Create configs
