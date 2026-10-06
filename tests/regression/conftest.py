@@ -464,6 +464,25 @@ QUERY_DEDUP_HUB_HTML = """\
 </body>
 </html>"""
 
+# Hub page whose links point to the same path, one with a blank-value query
+# param (?q=) and one without. Used to verify the deep-crawl dedup key does
+# not collapse /blank-dedup/target and /blank-dedup/target?q= into one key
+# (regression for the keep_blank_values=False bug in
+# normalize_url_for_deep_crawl).
+BLANK_DEDUP_HUB_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><title>Blank Param Dedup Hub</title></head>
+<body>
+    <h1>Blank-Param Dedup Hub</h1>
+    <p>Two links to the same target path; one carries a blank-value param.</p>
+    <nav>
+        <a href="/blank-dedup/target?q=">Target with blank param</a>
+        <a href="/blank-dedup/target">Target bare</a>
+    </nav>
+</body>
+</html>"""
+
 IFRAME_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -623,6 +642,10 @@ async def _query_dedup_target_handler(request):
         f"</body></html>"
     )
 
+
+async def _blank_dedup_hub_handler(request):
+    return await _serve_html(BLANK_DEDUP_HUB_HTML)
+
 async def _catch_all_handler(request):
     """Serve a simple page for any unmatched path (useful for link targets)."""
     path = request.path
@@ -669,6 +692,8 @@ def _create_app():
     # Specific routes for query-order dedup e2e test (must precede catch-all).
     app.router.add_get("/query-dedup/hub", _query_dedup_hub_handler)
     app.router.add_get("/target", _query_dedup_target_handler)
+    # Specific route for blank-param dedup e2e test (must precede catch-all).
+    app.router.add_get("/blank-dedup/hub", _blank_dedup_hub_handler)
     # Catch-all for auto-generated pages (internal link targets, etc.)
     app.router.add_get("/{path:.*}", _catch_all_handler)
     return app
