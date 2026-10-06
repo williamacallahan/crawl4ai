@@ -242,13 +242,26 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         """
         Set custom headers for the browser.
 
+        Headers are merged into ``self.browser_config.headers`` — the store
+        read by the crawl path (``_crawl_web`` and ``_handle_http``) and by
+        ``BrowserManager.setup_context`` (which pushes them onto the
+        Playwright context via ``context.set_extra_http_headers``). They are
+        merged rather than replaced so the ``sec-ch-ua`` default seeded in
+        ``BrowserConfig.__init__`` is preserved unless explicitly overridden.
+
+        Note: headers are applied to the Playwright context at context-creation
+        time. Call this before ``start()`` / the first crawl for the headers
+        to take effect on the wire; calling it after a context is already live
+        mutates the config object but does not retroactively push headers onto
+        the existing context.
+
         Args:
             headers (Dict[str, str]): A dictionary of headers to set.
 
         Returns:
             None
         """
-        self.headers = headers
+        self.browser_config.headers.update(headers)
 
     async def smart_wait(self, page: Page, wait_for: str, timeout: float = 30000):
         """
