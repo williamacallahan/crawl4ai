@@ -163,6 +163,14 @@ class TestErrorSanitization:
         )
         assert public.correlation_id
 
+        # A code that only appears in the crawled URL echoed by the call log is not the error.
+        timeout = (
+            "Unexpected error in _crawl_web (/app/crawl4ai/async_crawler_strategy.py):\n"
+            "Error: Failed on navigating ACS-GOTO:\nPage.goto: Timeout 30000ms exceeded.\n"
+            "Call log:\n  - navigating to \"https://x.example/net::ERR_FAILED\"\n"
+        )
+        assert public_crawl_error(timeout).startswith("Crawl failed (correlation_id=")
+
     def test_execute_js_result_error_message_is_sanitized(
         self, stock_client, server_module, monkeypatch
     ):

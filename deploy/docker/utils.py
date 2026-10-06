@@ -227,8 +227,9 @@ _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", '
 _CONTAINER_PATH = re.compile(r"/(?:app|ms-playwright|home|root|usr|opt|srv|etc|var|tmp|proc)/")
 _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 # Chromium's navigation error code. A withheld message keeps it because it is the
-# one fact a client needs to tell a target-side fault from a transient one.
-_NAVIGATION_ERROR_CODE = re.compile(r"net::ERR_[A-Z0-9_]+")
+# one fact a client needs to tell a target-side fault from a transient one. Only
+# Playwright's own goto error line counts: the call log echoes the crawled URL.
+_NAVIGATION_ERROR_CODE = re.compile(r"Page\.goto: (net::ERR_[A-Z0-9_]{1,64})")
 
 
 def public_error_detail(error_message: Optional[str]) -> str:
@@ -248,7 +249,7 @@ def public_error_detail(error_message: Optional[str]) -> str:
     ):
         return message[:500]
     code = _NAVIGATION_ERROR_CODE.search(message)
-    return f"Crawl failed: {code.group()}" if code else "Crawl failed"
+    return f"Crawl failed: {code.group(1)}" if code else "Crawl failed"
 
 
 class CorrelatedError(str):
