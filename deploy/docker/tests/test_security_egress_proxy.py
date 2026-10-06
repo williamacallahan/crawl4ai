@@ -132,6 +132,58 @@ class TestPinningProxy:
         finally:
             await proxy.stop()
 
+    @pytest.mark.parametrize(
+        ("host", "expected"),
+        [
+            ("refused.example", "net::ERR_CONNECTION_REFUSED"),
+            ("unresolvable.example", "net::ERR_NAME_NOT_RESOLVED"),
+            ("internal.example", "net::ERR_TUNNEL_CONNECTION_FAILED"),
+        ],
+    )
+    async def test_dead_target_surfaces_its_own_code_not_the_tunnel_code(
+        self, monkeypatch, host, expected
+    ):
+        """Chromium reports every refused CONNECT as ERR_TUNNEL_CONNECTION_FAILED;
+        the public crawl error restores a dead target's code, while a policy block
+        keeps the tunnel code."""
+        from egress_broker import TargetUnresolvable
+        from utils import public_error_detail
+
+        monkeypatch.setattr(egress_proxy, "_dial_failures", type(egress_proxy._dial_failures)())
+        proxy = PinningProxy()
+        await proxy.start()
+        # A port nothing listens on, taken after the proxy bound its own.
+        closed = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+        closed_port = closed.sockets[0].getsockname()[1]
+        closed.close()
+        await closed.wait_closed()
+
+        def fake_pin(url):
+            if host == "unresolvable.example":
+                raise TargetUnresolvable()
+            if host == "internal.example":
+                raise EgressBlocked()
+            return PinnedTarget("https", host, closed_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT {host}:{closed_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            status = await asyncio.wait_for(r.readline(), timeout=5)
+            assert b"403" in status
+            w.close()
+        finally:
+            await proxy.stop()
+
+        playwright_error = (
+            "Unexpected error in _crawl_web (/app/crawl4ai/async_crawler_strategy.py):\n"
+            "Error: Failed on navigating ACS-GOTO:\n"
+            f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{host}:{closed_port}/\n"
+            f"Call log:\n  - navigating to \"https://{host}:{closed_port}/\"\n"
+        )
+        assert public_error_detail(playwright_error) == f"Crawl failed: {expected}"
+
 
 async def _fake_corporate_proxy(seen):
     """Minimal HTTP proxy: records the CONNECT request line, replies 200, then

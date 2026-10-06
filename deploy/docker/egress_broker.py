@@ -54,6 +54,10 @@ class EgressBlocked(Exception):
         super().__init__(reason)
 
 
+class TargetUnresolvable(EgressBlocked):
+    """The target host has no DNS answer: a dead target, not a policy block."""
+
+
 @dataclass
 class PinnedTarget:
     scheme: str
@@ -95,7 +99,7 @@ def _resolve(host: str, port: int):
     try:
         return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror:
-        raise EgressBlocked()
+        raise TargetUnresolvable()
 
 
 def assert_host_allowed(host: str, port: int = 0) -> None:

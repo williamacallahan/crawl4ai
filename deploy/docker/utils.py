@@ -11,6 +11,8 @@ import dns.resolver
 import yaml
 from fastapi import Request
 
+from egress_proxy import tunnel_failure_code
+
 
 class TaskStatus(str, Enum):
     PROCESSING = "processing"
@@ -229,7 +231,8 @@ _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 # Chromium's navigation error code. A withheld message keeps it because it is the
 # one fact a client needs to tell a target-side fault from a transient one. Only
 # Playwright's own goto error line counts: the call log echoes the crawled URL.
-_NAVIGATION_ERROR_CODE = re.compile(r"Page\.goto: (net::ERR_[A-Z0-9_]{1,64})")
+_NAVIGATION_ERROR_CODE = re.compile(r"Page\.goto: (net::ERR_[A-Z0-9_]{1,64})(?: at (\S+))?")
+_TUNNEL_CONNECTION_FAILED = "net::ERR_TUNNEL_CONNECTION_FAILED"
 
 
 def public_error_detail(error_message: Optional[str]) -> str:
@@ -248,8 +251,15 @@ def public_error_detail(error_message: Optional[str]) -> str:
         and not _CONTAINER_PATH.search(_URL.sub("", message))
     ):
         return message[:500]
-    code = _NAVIGATION_ERROR_CODE.search(message)
-    return f"Crawl failed: {code.group(1)}" if code else "Crawl failed"
+    navigation = _NAVIGATION_ERROR_CODE.search(message)
+    if navigation is None:
+        return "Crawl failed"
+    code, navigated_url = navigation.groups()
+    if code == _TUNNEL_CONNECTION_FAILED and navigated_url:
+        # The pinning proxy dials for the browser, so a dead target surfaces as a
+        # tunnel failure; restore the code a direct dial would have produced.
+        code = tunnel_failure_code(navigated_url) or code
+    return f"Crawl failed: {code}"
 
 
 class CorrelatedError(str):

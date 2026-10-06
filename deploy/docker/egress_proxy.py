@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import ipaddress
 import logging
 import os
+import time
+from collections import OrderedDict
 from urllib.parse import unquote, urlsplit
 
-from egress_broker import EgressBlocked, resolve_and_pin
+from egress_broker import EgressBlocked, TargetUnresolvable, resolve_and_pin
 
 logger = logging.getLogger("crawl4ai.egress")
 
@@ -38,6 +41,57 @@ _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _BLOCKED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
 _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
 _MAX_HEADER_BYTES = 64 * 1024
+
+# Chromium turns every CONNECT answer other than 200/407 into
+# net::ERR_TUNNEL_CONNECTION_FAILED (net/http/http_proxy_client_socket.cc,
+# DoProcessResponseCode), so no reply can tell the browser that the target
+# itself is dead.  The proxy instead records the code a direct connection
+# would have produced, per host:port, and the crawl error path reads it back
+# through tunnel_failure_code().  Policy blocks record nothing and keep the
+# tunnel code.
+_DIAL_FAILURE_TTL_S = 60.0
+_DIAL_FAILURE_CAPACITY = 1024
+_dial_failures: OrderedDict[tuple[str, int], tuple[str, float]] = OrderedDict()
+
+
+def _dial_failure_code(error: BaseException) -> str | None:
+    """The Chromium code for a direct dial that failed with ``error``."""
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return "net::ERR_CONNECTION_TIMED_OUT"
+    if isinstance(error, TargetUnresolvable):
+        return "net::ERR_NAME_NOT_RESOLVED"
+    if isinstance(error, ConnectionRefusedError):
+        return "net::ERR_CONNECTION_REFUSED"
+    if isinstance(error, OSError) and error.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH):
+        return "net::ERR_ADDRESS_UNREACHABLE"
+    return None
+
+
+def _record_dial_outcome(host: str, port: int, error: BaseException | None) -> None:
+    key = (host.lower(), port)
+    code = _dial_failure_code(error) if error is not None else None
+    if code is None:
+        _dial_failures.pop(key, None)
+        return
+    _dial_failures[key] = (code, time.monotonic())
+    _dial_failures.move_to_end(key)
+    while len(_dial_failures) > _DIAL_FAILURE_CAPACITY:
+        _dial_failures.popitem(last=False)
+
+
+def tunnel_failure_code(url: str) -> str | None:
+    """The target-side code behind a recent tunnel failure to ``url``, if any."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
+    if not parsed.hostname:
+        return None
+    recorded = _dial_failures.get((parsed.hostname.lower(), port))
+    if recorded is None or time.monotonic() - recorded[1] > _DIAL_FAILURE_TTL_S:
+        return None
+    return recorded[0]
 
 
 def upstream_proxy(scheme: str = "https"):
@@ -250,9 +304,11 @@ class PinningProxy:
         if not host or not port_s.isdigit():
             await self._reply(client_writer, _BAD)
             return
+        port = int(port_s)
         try:
-            pin = await _resolve_and_pin(f"https://{host}:{port_s}")
-        except EgressBlocked:
+            pin = await _resolve_and_pin(f"https://{host}:{port}")
+        except EgressBlocked as error:
+            _record_dial_outcome(host, port, error)
             await self._reply(client_writer, _BLOCKED)
             return
 
@@ -260,10 +316,13 @@ class PinningProxy:
         await self._drain_headers(client_reader)
 
         try:
-            up_reader, up_writer = await self._dial(pin, int(port_s))
-        except (OSError, ConnectionError, asyncio.TimeoutError):
+            up_reader, up_writer = await self._dial(pin, port)
+        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
+            # A failure reaching an operator upstream proxy is not the target's.
+            _record_dial_outcome(host, port, error if _use_upstream(pin) is None else None)
             await self._reply(client_writer, _BLOCKED)
             return
+        _record_dial_outcome(host, port, None)
 
         client_writer.write(_CONNECT_OK)
         await client_writer.drain()
@@ -278,7 +337,8 @@ class PinningProxy:
         port = sp.port or 80
         try:
             pin = await _resolve_and_pin(f"http://{sp.hostname}:{port}")
-        except EgressBlocked:
+        except EgressBlocked as error:
+            _record_dial_outcome(sp.hostname, port, error)
             await self._reply(client_writer, _BLOCKED)
             return
 
@@ -292,9 +352,11 @@ class PinningProxy:
             up_reader, up_writer = await asyncio.wait_for(
                 asyncio.open_connection(*destination), timeout=30
             )
-        except (OSError, ConnectionError, asyncio.TimeoutError):
+        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
+            _record_dial_outcome(sp.hostname, port, error if upstream is None else None)
             await self._reply(client_writer, _BLOCKED)
             return
+        _record_dial_outcome(sp.hostname, port, None)
         # Direct dials use origin form.  An upstream proxy gets absolute form
         # containing only the pinned IP, never a hostname it could re-resolve.
         if upstream is None:
