@@ -1243,6 +1243,8 @@ class BrowserManager:
         context: BrowserContext,
         crawlerRunConfig: CrawlerRunConfig = None,
         is_default=False,
+        user_agent: Optional[str] = None,
+        browser_hint: Optional[str] = None,
     ):
         """
         Set up a browser context with the configured options.
@@ -1269,6 +1271,14 @@ class BrowserManager:
             context (BrowserContext): The browser context to set up
             crawlerRunConfig (CrawlerRunConfig): Configuration object containing all browser settings
             is_default (bool): Flag indicating if this is the default context
+            user_agent (str): Per-crawl User-Agent override. When provided, used
+                in place of ``self.config.user_agent`` for the context-level
+                HTTP headers so concurrent UA-changing crawls do not race on
+                the shared ``BrowserConfig``. When ``None``, falls back to
+                ``self.config.user_agent`` (existing behavior).
+            browser_hint (str): Per-crawl ``sec-ch-ua`` (client hints) override.
+                When provided, used in place of ``self.config.browser_hint``.
+                When ``None``, falls back to ``self.config.browser_hint``.
         Returns:
             None
         """
@@ -1290,11 +1300,23 @@ class BrowserManager:
                     "downloads_path"
                 ] = self.config.downloads_path
 
-        # Handle user agent and browser hints
-        if self.config.user_agent:
+        # Handle user agent and browser hints. Prefer the per-crawl overrides
+        # (threaded from _crawl_web) over the shared ``self.config`` fields so
+        # concurrent UA-changing crawls do not race on the shared mutable
+        # BrowserConfig (TOCTOU on the context-level HTTP User-Agent / sec-ch-ua
+        # headers, and on ``navigator.userAgent``-dependent state at first
+        # context creation). Fall back to ``self.config`` when no override is
+        # provided (existing behavior for callers that do not thread a UA).
+        effective_ua = (
+            user_agent if user_agent is not None else self.config.user_agent
+        )
+        effective_hint = (
+            browser_hint if browser_hint is not None else self.config.browser_hint
+        )
+        if effective_ua:
             combined_headers = {
-                "User-Agent": self.config.user_agent,
-                "sec-ch-ua": self.config.browser_hint,
+                "User-Agent": effective_ua,
+                "sec-ch-ua": effective_hint,
             }
             combined_headers.update(self.config.headers)
             await context.set_extra_http_headers(combined_headers)
@@ -1346,10 +1368,28 @@ class BrowserManager:
             for script in self.config.init_scripts:
                 await context.add_init_script(script)
 
-    async def create_browser_context(self, crawlerRunConfig: CrawlerRunConfig = None):
+    async def create_browser_context(
+        self,
+        crawlerRunConfig: CrawlerRunConfig = None,
+        user_agent: Optional[str] = None,
+    ):
         """
         Creates and returns a new browser context with configured settings.
         Applies text-only mode settings if text_mode is enabled in config.
+
+        Args:
+            crawlerRunConfig (CrawlerRunConfig): Per-crawl config (e.g. for
+                per-crawl proxy / locale / timezone).
+            user_agent (str): Per-crawl User-Agent override. When provided,
+                baked into the new context via ``new_context(user_agent=...)``
+                - this is the value that actually goes on the wire for the
+                ``User-Agent`` HTTP header (Playwright's context-level
+                ``user_agent`` overrides ``page.set_extra_http_headers`` for
+                User-Agent). Threading the per-crawl UA here (rather than
+                reading the shared, mutable ``self.config.user_agent``) closes
+                the concurrent cross-crawl UA-leak at the context-creation
+                surface. When ``None``, falls back to
+                ``self.config.user_agent`` (existing behavior).
 
         Returns:
             Context: Browser context object with the specified configurations
@@ -1364,10 +1404,17 @@ class BrowserManager:
             raise RuntimeError(
                 "Browser is not available. It may have been closed, crashed, "
                 "or not yet started. Ensure the browser is running before "
-                "creating new contexts."
+                "creating contexts."
             )
-        # Base settings
-        user_agent = self.config.headers.get("User-Agent", self.config.user_agent) 
+        # Base settings. Prefer the threaded per-crawl UA (non-racy local) over
+        # the shared, mutable ``self.config.user_agent`` (which a concurrent
+        # crawl may have overwritten).
+        if user_agent is not None:
+            user_agent_to_bake = user_agent
+        else:
+            user_agent_to_bake = self.config.headers.get(
+                "User-Agent", self.config.user_agent
+            )
         viewport_settings = {
             "width": self.config.viewport_width,
             "height": self.config.viewport_height,
@@ -1432,7 +1479,7 @@ class BrowserManager:
 
         # Common context settings
         context_settings = {
-            "user_agent": user_agent,
+            "user_agent": user_agent_to_bake,
             "viewport": viewport_settings,
             "proxy": proxy_settings,
             "accept_downloads": self.config.accept_downloads,
@@ -1493,13 +1540,25 @@ class BrowserManager:
 
         return context
 
-    def _make_config_signature(self, crawlerRunConfig: CrawlerRunConfig) -> str:
+    def _make_config_signature(
+        self,
+        crawlerRunConfig: CrawlerRunConfig,
+        user_agent: Optional[str] = None,
+    ) -> str:
         """
         Hash ONLY the CrawlerRunConfig fields that affect browser context
         creation (create_browser_context) or context setup (setup_context).
 
         Whitelist approach: fields like css_selector, word_count_threshold,
         screenshot, verbose, etc. do NOT cause a new context to be created.
+
+        ``user_agent``: the per-crawl effective User-Agent to bake into the
+        context. When provided (by ``AsyncPlaywrightCrawlerStrategy._crawl_web``
+        for crawls that override the UA), it is included in the signature so
+        concurrent crawls that request DISTINCT UAs get DISTINCT cached
+        contexts (and each context is baked with the crawl's own UA). When
+        ``None``, falls back to ``self.config.user_agent`` to preserve the
+        existing behavior for callers that do not thread a per-crawl UA.
         """
         import json
 
@@ -1533,6 +1592,18 @@ class BrowserManager:
         sig_dict["override_navigator"] = crawlerRunConfig.override_navigator
         sig_dict["simulate_user"] = crawlerRunConfig.simulate_user
         sig_dict["magic"] = crawlerRunConfig.magic
+
+        # Per-crawl User-Agent flows into create_browser_context() (baked into
+        # the context via ``new_context(user_agent=...)`` - the value that
+        # actually goes on the wire) and into setup_context() (context-level
+        # ``sec-ch-ua`` header). Concurrent UA-changing crawls MUST get
+        # distinct signatures so they do not share a context that was baked
+        # with another crawl's UA. See async_crawler_strategy.py:_crawl_web
+        # for where this is threaded.
+        effective_ua = (
+            user_agent if user_agent is not None else self.config.user_agent
+        )
+        sig_dict["user_agent"] = effective_ua
 
         signature_json = json.dumps(sig_dict, sort_keys=True, default=str)
         return hashlib.sha256(signature_json.encode("utf-8")).hexdigest()
@@ -1773,9 +1844,16 @@ class BrowserManager:
         )
         return page, cancelled
 
-    async def _new_context(self, crawlerRunConfig):
+    async def _new_context(
+        self,
+        crawlerRunConfig,
+        user_agent: Optional[str] = None,
+        browser_hint: Optional[str] = None,
+    ):
         """Create an isolated context and close it before re-raising cancellation."""
-        task = asyncio.create_task(self.create_browser_context(crawlerRunConfig))
+        task = asyncio.create_task(
+            self.create_browser_context(crawlerRunConfig, user_agent=user_agent)
+        )
         context, cancelled = await self._await_task_despite_cancellation(
             task, self._close_context_quietly
         )
@@ -1793,9 +1871,21 @@ class BrowserManager:
                     0, self._context_refcounts[signature] - 1
                 )
 
-    async def _acquire_context(self, crawlerRunConfig):
-        """Acquire one context reference, closing partial contexts on failure."""
-        signature = self._make_config_signature(crawlerRunConfig)
+    async def _acquire_context(
+        self,
+        crawlerRunConfig,
+        user_agent: Optional[str] = None,
+        browser_hint: Optional[str] = None,
+    ):
+        """Acquire one context reference, closing partial contexts on failure.
+
+        ``user_agent`` / ``browser_hint`` are the per-crawl overrides threaded
+        from ``_crawl_web``: they flow into the config signature (so distinct
+        UAs get distinct cached contexts) and into context creation / setup
+        (so each context is baked with the crawl's own UA). When ``None``,
+        callers get the existing behavior (fall back to ``self.config``).
+        """
+        signature = self._make_config_signature(crawlerRunConfig, user_agent=user_agent)
         context = None
         unregistered_context = None
         acquired = False
@@ -1803,9 +1893,18 @@ class BrowserManager:
             async with self._contexts_lock:
                 context = self.contexts_by_config.get(signature)
                 if context is None:
-                    context = await self._new_context(crawlerRunConfig)
+                    context = await self._new_context(
+                        crawlerRunConfig,
+                        user_agent=user_agent,
+                        browser_hint=browser_hint,
+                    )
                     unregistered_context = context
-                    await self.setup_context(context, crawlerRunConfig)
+                    await self.setup_context(
+                        context,
+                        crawlerRunConfig,
+                        user_agent=user_agent,
+                        browser_hint=browser_hint,
+                    )
                     self.contexts_by_config[signature] = context
                     self._context_refcounts[signature] = 0
                     unregistered_context = None
@@ -1990,8 +2089,22 @@ class BrowserManager:
 
         await self._run_cleanup(cleanup())
 
-    async def get_page(self, crawlerRunConfig: CrawlerRunConfig):
-        """Get a page, retaining every partial allocation until it is cleaned up."""
+    async def get_page(
+        self,
+        crawlerRunConfig: CrawlerRunConfig,
+        user_agent: Optional[str] = None,
+        browser_hint: Optional[str] = None,
+    ):
+        """Get a page, retaining every partial allocation until it is cleaned up.
+
+        ``user_agent`` / ``browser_hint`` are the per-crawl UA / client-hint
+        overrides threaded from ``AsyncPlaywrightCrawlerStrategy._crawl_web``
+        for crawls that change the UA. They flow into the context config
+        signature (so distinct UAs get distinct cached contexts) and into
+        context creation / setup (so each context is baked with the crawl's
+        own UA - the value that actually goes on the wire). When ``None``,
+        callers get the existing behavior (the shared ``BrowserConfig`` UA).
+        """
         self._cleanup_expired_sessions()
 
         session_id = crawlerRunConfig.session_id
@@ -2019,7 +2132,11 @@ class BrowserManager:
                 not self.config.use_managed_browser
                 or self.config.create_isolated_context
             ):
-                context, signature = await self._acquire_context(crawlerRunConfig)
+                context, signature = await self._acquire_context(
+                    crawlerRunConfig,
+                    user_agent=user_agent,
+                    browser_hint=browser_hint,
+                )
                 page, cancelled = await self._new_page(context)
                 close_page = True
                 self._page_to_sig[page] = signature
@@ -2038,7 +2155,11 @@ class BrowserManager:
 
                 tmp_context = None
                 try:
-                    tmp_context = await self._new_context(crawlerRunConfig)
+                    tmp_context = await self._new_context(
+                        crawlerRunConfig,
+                        user_agent=user_agent,
+                        browser_hint=browser_hint,
+                    )
                     await clone_runtime_state(
                         tmp_context,
                         context,
