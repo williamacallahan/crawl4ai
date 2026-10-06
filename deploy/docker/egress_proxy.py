@@ -375,7 +375,7 @@ class PinningProxy:
                 for line in headers.split(b"\r\n")
                 if line and not line.lower().startswith(b"connection:")
             ) + b"Connection: close\r\n"
-        out += b"Host: " + sp.hostname.encode("latin-1")
+        out += b"Host: " + _bracket(sp.hostname).encode("latin-1")
         if sp.port:
             out += f":{sp.port}".encode("latin-1")
         out += b"\r\n" + headers + b"\r\n"

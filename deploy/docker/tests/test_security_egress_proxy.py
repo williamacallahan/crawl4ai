@@ -220,13 +220,28 @@ class TestAbsoluteUriIpv6Literal:
 
     async def test_resolve_url_keeps_ipv6_brackets_and_tunnels(self, monkeypatch):
         """The URL handed to ``resolve_and_pin`` retains the IPv6 brackets so
-        ``urlparse`` parses host+port correctly, and the request is tunneled."""
-        up, up_port = await _fake_http_origin()
+        ``urlparse`` parses host+port correctly, the forwarded ``Host`` field is
+        bracketed, and the request is tunneled."""
+        sent = {}
+        up_port = {"port": None}
+
+        async def handle(reader, writer):
+            request = await reader.read(65536)
+            sent["request"] = request
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                b"Connection: close\r\n\r\nhi"
+            )
+            await writer.drain()
+            writer.close()
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        up_port["port"] = server.sockets[0].getsockname()[1]
+
         seen = {}
 
         def fake_pin(url):
             seen["url"] = url
-            return PinnedTarget("http", "2606:4700::1", up_port, "127.0.0.1")
+            return PinnedTarget("http", "2606:4700::1", up_port["port"], "127.0.0.1")
         monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
 
         proxy = PinningProxy()
@@ -234,7 +249,7 @@ class TestAbsoluteUriIpv6Literal:
         try:
             r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
             w.write(
-                f"GET http://[2606:4700::1]:{up_port}/path HTTP/1.1\r\n"
+                f"GET http://[2606:4700::1]:{up_port['port']}/path HTTP/1.1\r\n"
                 f"Host: [2606:4700::1]\r\n\r\n".encode()
             )
             await w.drain()
@@ -243,10 +258,15 @@ class TestAbsoluteUriIpv6Literal:
             w.close()
         finally:
             await proxy.stop()
-            up.close()
+            server.close()
+            await server.wait_closed()
         # Pre-fix the recorded URL was 'http://2606:4700::1:<port>' (no
         # brackets), which urlparse mis-parses. The fix preserves the brackets.
-        assert seen["url"] == f"http://[2606:4700::1]:{up_port}"
+        assert seen["url"] == f"http://[2606:4700::1]:{up_port['port']}"
+        # The forwarded Host field must bracket the IPv6 literal so an origin
+        # that validates Host does not reject the request. The port is appended
+        # by the proxy, so check the bracketed host prefix only.
+        assert b"Host: [2606:4700::1]" in sent["request"]
 
     async def test_global_ipv6_tunnels_through_real_resolve(self, monkeypatch):
         """End-to-end through the REAL ``resolve_and_pin`` (only DNS mocked): a
