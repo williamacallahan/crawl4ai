@@ -442,28 +442,7 @@ def get_llm_base_url(config: Dict, provider: Optional[str] = None) -> Optional[s
 # owns all artifact paths now (see artifacts.py).
 
 
-import ipaddress
 from urllib.parse import urlparse
-
-_BLOCKED_NETWORKS = [
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.0.0.0/24"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("198.18.0.0/15"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-
-_BLOCKED_HOSTNAMES = {
-    "localhost", "metadata.google.internal", "metadata",
-    "kubernetes.default", "kubernetes.default.svc",
-}
 
 
 ALLOW_INTERNAL_URLS = os.environ.get("CRAWL4AI_ALLOW_INTERNAL_URLS", "false").lower() == "true"
@@ -482,21 +461,6 @@ def validate_url_destination(url: str) -> None:
     except ValueError as e:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=f"URL blocked (SSRF protection): {e}")
-
-
-def _expand_ip_candidates(ip):
-    """Return [ip] plus any IPv4 form wrapped inside the IPv6 address.
-    SSRF guards must check the unwrapped form because ::ffff:127.0.0.1 and
-    ::127.0.0.1 route to 127.0.0.1 but would not match IPv4 blocklists directly."""
-    candidates = [ip]
-    if isinstance(ip, ipaddress.IPv6Address):
-        if ip.ipv4_mapped is not None:
-            candidates.append(ip.ipv4_mapped)
-        else:
-            as_int = int(ip)
-            if 0 < as_int < 2**32:
-                candidates.append(ipaddress.IPv4Address(as_int))
-    return candidates
 
 
 def validate_webhook_url(url: str) -> None:
