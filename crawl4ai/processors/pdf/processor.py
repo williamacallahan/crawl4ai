@@ -107,15 +107,18 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                 reader = PdfReader(file)
                 result.metadata = self._extract_metadata(pdf_path, reader)
                 
-                # Handle image directory
+                # Handle image directory. Local variable, not shared instance
+                # state, so concurrent ``process`` calls on one processor
+                # instance cannot delete each other's temp directories.
+                _temp_dir = None
                 image_dir = None
                 if self.extract_images and self.save_images_locally:
                     if self.image_save_dir:
                         image_dir = Path(self.image_save_dir)
                         image_dir.mkdir(exist_ok=True, parents=True)
                     else:
-                        self._temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
-                        image_dir = Path(self._temp_dir)
+                        _temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
+                        image_dir = Path(_temp_dir)
 
                 page_limit = self._page_limit(len(reader.pages))
                 for page_num, page in enumerate(reader.pages):
@@ -128,13 +131,10 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             logger.error(f"Failed to process PDF: {str(e)}")
             raise
         finally:
-            # Cleanup temp directory if it was created
-            if self._temp_dir and not self.image_save_dir:
+            # Cleanup only this call's own temp directory.
+            if _temp_dir is not None:
                 import shutil
-                try:
-                    shutil.rmtree(self._temp_dir)
-                except Exception as e:
-                    logger.error(f"Failed to cleanup temp directory: {str(e)}")
+                shutil.rmtree(_temp_dir, ignore_errors=True)
 
         result.processing_time = time() - start_time
         return result
@@ -169,15 +169,22 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                 result.metadata = self._extract_metadata(pdf_path, reader)
                 total_pages = self._page_limit(len(reader.pages))
 
-            # Handle image directory setup
+            # Handle image directory setup.
+            # The temp directory is tracked in a *local* variable so that
+            # concurrent ``process_batch`` calls on the same processor instance
+            # each clean up only their own directory. Stashing it on
+            # ``self._temp_dir`` (the prior approach) let one call's ``finally``
+            # ``shutil.rmtree`` another call's still-in-use directory, deleting
+            # the victim's images mid-flight while leaking the owner's own dir.
+            _temp_dir = None
             image_dir = None
             if self.extract_images and self.save_images_locally:
                 if self.image_save_dir:
                     image_dir = Path(self.image_save_dir)
                     image_dir.mkdir(exist_ok=True, parents=True)
                 else:
-                    self._temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
-                    image_dir = Path(self._temp_dir)
+                    _temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
+                    image_dir = Path(_temp_dir)
 
             def process_page_safely(page_num: int):
                 # Each thread opens its own file handle
@@ -207,13 +214,12 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             logger.error(f"Failed to process PDF: {str(e)}")
             raise
         finally:
-            # Cleanup temp directory if it was created
-            if self._temp_dir and not self.image_save_dir:
+            # Cleanup temp directory if it was created. Only this call's own
+            # temp directory is touched; ``ignore_errors=True`` keeps cleanup
+            # robust if the directory was already removed by an external caller.
+            if _temp_dir is not None:
                 import shutil
-                try:
-                    shutil.rmtree(self._temp_dir)
-                except Exception as e:
-                    logger.error(f"Failed to cleanup temp directory: {str(e)}")
+                shutil.rmtree(_temp_dir, ignore_errors=True)
 
         result.processing_time = time() - start_time
         return result
