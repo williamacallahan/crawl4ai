@@ -1200,7 +1200,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     params={"delay": delay, "url": url},
                 )
                 await asyncio.sleep(delay)
-                return await page.content()
+                # Return the HTML captured at crawl time. The `finally` block
+                # below may close `page` before this callable is invoked, so
+                # we must not depend on a live `page` here.
+                return html
 
             ###
             # This ensures we capture the current page URL at the time we return the response,

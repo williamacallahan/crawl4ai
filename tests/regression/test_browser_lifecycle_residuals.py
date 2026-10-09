@@ -337,6 +337,95 @@ async def test_headless_crawl_closes_its_last_page():
 
 
 @pytest.mark.asyncio
+async def test_headless_crawl_delayed_content_survives_page_close():
+    """Regression: `get_delayed_content` closes over `page`, but the `finally`
+    block (commit 3714568c) now closes the default-config crawl's only page.
+    The closure must therefore not depend on a live page — it returns the
+    HTML captured at crawl time. Pre-fix, calling it raised Playwright's
+    `TargetClosedError` ("Target page, context or browser has been closed")
+    because `page.content()` ran on the already-closed page."""
+    context = _Context()
+    underlying = await context.new_page()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.close = underlying.close
+
+    # `page.content()` raises once the underlying page is closed, mirroring
+    # real Playwright's TargetClosedError on a closed target.
+    async def content_after_close(*a, **k):
+        if getattr(underlying, "closed", False):
+            raise Exception("Target page, context or browser has been closed")
+        return "<html><body></body></html>"
+
+    crawl_page.content = content_after_close
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+
+    # The finally block closed the only page (the resource-cleanup invariant
+    # from test_headless_crawl_closes_its_last_page still holds).
+    assert underlying.is_closed(), "the crawl left its page (and renderer) open"
+
+    # get_delayed_content must still return the crawled HTML after the page
+    # was closed. Pre-fix this raised TargetClosedError.
+    html = await result.get_delayed_content(0.0)
+    assert "html" in html
+
+
+@pytest.mark.asyncio
+async def test_delayed_content_returns_crawled_html_without_live_page():
+    """The fix removes the dependency on the live page entirely: the returned
+    HTML must equal the `html` captured at crawl time, even when the page is
+    closed before the delayed read. A separately-asserted page content change
+    proves the delayed read does NOT re-read the (now-stale) page."""
+    context = _Context()
+    underlying = await context.new_page()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.close = underlying.close
+
+    calls = {"count": 0}
+
+    async def content_tracker(*a, **k):
+        calls["count"] += 1
+        # After close, a real page.content() would raise; return a sentinel
+        # that would fail the assertion if the closure re-read the page.
+        if getattr(underlying, "closed", False):
+            return "<html>STALE</html>"
+        return "<html><body>crawl-time</body></html>"
+
+    crawl_page.content = content_tracker
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+    assert underlying.is_closed()
+
+    delayed_html = await result.get_delayed_content(0.0)
+    # The delayed read returns the crawl-time HTML, not a stale page re-read.
+    assert "crawl-time" in delayed_html
+    assert "STALE" not in delayed_html
+    # page.content() was called exactly once — during the crawl — and never
+    # again from get_delayed_content.
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_recycle_closes_admission_then_restarts_before_waking_waiters():
     config = BrowserConfig(
         use_managed_browser=True,
