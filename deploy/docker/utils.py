@@ -250,6 +250,22 @@ def public_error_detail(error_message: Optional[str]) -> str:
         and not any(marker in message for marker in _INTERNAL_ERROR_MARKERS)
         and not _CONTAINER_PATH.search(_URL.sub("", message))
     ):
+        # A clean message — but a tunnel failure is not really clean: it is the
+        # pinning proxy masking a dead target with a generic 403. The "All
+        # proxies failed: ..." shape produced when CrawlerRunConfig.max_retries
+        # >= 1 carries no internal marker or container path, so it takes this
+        # early return. Restore the recorded target-side code for it alone;
+        # other clean upstream-failure messages (anti-bot, cert, DNS, timeouts)
+        # still pass through verbatim per the documented pass-through contract.
+        navigation = _NAVIGATION_ERROR_CODE.search(message)
+        if (
+            navigation is not None
+            and navigation.group(1) == _TUNNEL_CONNECTION_FAILED
+            and navigation.group(2)
+        ):
+            swapped = tunnel_failure_code(navigation.group(2))
+            if swapped:
+                return f"Crawl failed: {swapped}"
         return message[:500]
     navigation = _NAVIGATION_ERROR_CODE.search(message)
     if navigation is None:
