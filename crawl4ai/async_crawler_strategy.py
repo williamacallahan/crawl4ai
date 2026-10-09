@@ -1200,7 +1200,17 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     params={"delay": delay, "url": url},
                 )
                 await asyncio.sleep(delay)
-                return await page.content()
+                # When `config.session_id` keeps the page open, read the
+                # current page content so any changes made during the delay
+                # are reflected. Otherwise the `finally` block below may have
+                # closed `page` before this callable runs, so fall back to the
+                # HTML captured at crawl time.
+                if config.session_id and page is not None and not page.is_closed():
+                    try:
+                        return await page.content()
+                    except Exception:
+                        pass
+                return html
 
             ###
             # This ensures we capture the current page URL at the time we return the response,
