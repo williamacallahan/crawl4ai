@@ -426,6 +426,45 @@ async def test_delayed_content_returns_crawled_html_without_live_page():
 
 
 @pytest.mark.asyncio
+async def test_delayed_content_reads_live_session_page():
+    """When `config.session_id` keeps the page open, `get_delayed_content`
+    reads the current `page.content()` after the delay, reflecting changes
+    made after `_crawl_web` returns — instead of the crawl-time snapshot."""
+    context = _Context()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.is_closed = MagicMock(return_value=False)
+
+    content = {"value": "<html><body>crawl-time</body></html>"}
+
+    async def current_content(*a, **k):
+        return content["value"]
+
+    crawl_page.content = current_content
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web(
+        "https://example.test/",
+        CrawlerRunConfig(session_id="delayed-content-session"),
+    )
+
+    content["value"] = "<html><body>updated</body></html>"
+
+    delayed_html = await result.get_delayed_content(0.0)
+
+    assert "updated" in delayed_html
+    assert "crawl-time" not in delayed_html
+
+
+@pytest.mark.asyncio
 async def test_recycle_closes_admission_then_restarts_before_waking_waiters():
     config = BrowserConfig(
         use_managed_browser=True,
