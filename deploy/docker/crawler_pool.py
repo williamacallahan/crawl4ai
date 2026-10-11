@@ -30,6 +30,10 @@ MEM_LIMIT = CONFIG.get("crawler", {}).get("memory_threshold_percent", 95.0)
 # Above this container-memory share the janitor recycles the busiest browser
 # instead of waiting for MEM_LIMIT to refuse new ones.
 RECYCLE_LIMIT = CONFIG.get("crawler", {}).get("recovery_threshold_percent", MEM_LIMIT)
+# All three processes read the same container-wide percent, so each restarts at
+# most one browser per this interval: ten passes at the 30s pressure interval.
+MEMORY_RECYCLE_INTERVAL_SECONDS = 300
+_LAST_MEMORY_RECYCLE = float("-inf")
 BASE_IDLE_TTL = CONFIG.get("crawler", {}).get("pool", {}).get("idle_ttl_sec", 300)
 MAX_ACTIVE_REQUESTS = CONFIG.get("crawler", {}).get("pool", {}).get("max_pages", 30)
 MAX_BROWSER_INSTANCES = CONFIG.get("crawler", {}).get("pool", {}).get(
@@ -668,9 +672,13 @@ async def _recycle_busiest_browser() -> None:
     returned by restarting the browser process. A replica under steady traffic
     keeps its browsers busy, so idle eviction never reaches them and the page
     budget alone left them running for the whole six-hour recycle window. A
-    browser must have spent a tenth of its page budget since its last start, so
-    pressure the browsers cannot relieve does not restart them every pass.
+    browser must have spent half its page budget since its last start, and the
+    process waits MEMORY_RECYCLE_INTERVAL_SECONDS between restarts, so pressure
+    the browsers cannot relieve does not restart them every pass.
     """
+    global _LAST_MEMORY_RECYCLE
+    if time.monotonic() - _LAST_MEMORY_RECYCLE < MEMORY_RECYCLE_INTERVAL_SECONDS:
+        return
     candidates = [
         crawler.crawler_strategy.browser_manager
         for crawler in (PERMANENT, *HOT_POOL.values(), *COLD_POOL.values())
@@ -682,13 +690,14 @@ async def _recycle_busiest_browser() -> None:
     worn = [
         manager
         for manager in candidates
-        if manager._pages_served >= max(1, manager.config.max_pages_before_recycle // 10)
+        if manager._pages_served >= max(1, manager.config.max_pages_before_recycle // 2)
     ]
     if not worn:
         return
     busiest = max(worn, key=lambda manager: manager._pages_served)
     pages_served = busiest._pages_served
     if await busiest.request_recycle():
+        _LAST_MEMORY_RECYCLE = time.monotonic()
         logger.warning(f"Memory pressure: recycling a browser after {pages_served} pages")
 
 
