@@ -551,6 +551,14 @@ def get_container_memory_percent() -> float:
             limit_path = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
 
         usage = int(usage_path.read_text())
+        # Working set, the share the container memory alert measures: the
+        # kernel reclaims inactive page cache before the limit, so counting it
+        # recycled and refused browsers on replicas holding 1.5 GiB of cache.
+        stat_path = usage_path.with_name("memory.stat")
+        if stat_path.exists():
+            stat = dict(line.split() for line in stat_path.read_text().splitlines())
+            cgroup_v2 = usage_path.name == "memory.current"
+            usage -= int(stat["inactive_file" if cgroup_v2 else "total_inactive_file"])
         limit_raw = limit_path.read_text().strip()
         if limit_raw == "max":
             limit = psutil.virtual_memory().total
