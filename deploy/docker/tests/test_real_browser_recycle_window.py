@@ -197,3 +197,49 @@ async def test_context_refcount_reaches_zero_after_a_real_browser_crash():
         assert crawler_pool._is_live(_crawler(manager)) is False
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_pressure_janitor_pass_restarts_a_worn_browser(monkeypatch):
+    """Above the recovery threshold the janitor restarts the busiest browser.
+
+    The page budget is far away (100 pages), so only memory pressure can
+    restart this browser; the replacement must still serve pages.
+    """
+    manager = _real_manager(max_pages_before_recycle=100)
+    monkeypatch.setattr(crawler_pool, "PERMANENT", _crawler(manager))
+    monkeypatch.setattr(crawler_pool, "HOT_POOL", {})
+    monkeypatch.setattr(crawler_pool, "COLD_POOL", {})
+    monkeypatch.setattr(
+        crawler_pool, "get_container_memory_percent", lambda: crawler_pool.RECYCLE_LIMIT
+    )
+    real_sleep = asyncio.sleep
+
+    async def janitor_pass_without_its_interval():
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "sleep", lambda _delay: real_sleep(0))
+            await crawler_pool._janitor_pass()
+
+    try:
+        await manager.start()
+        first_browser = manager.browser
+        for _ in range(10):
+            page, _ = await manager.get_page(CrawlerRunConfig())
+            await manager.release_page_with_context(page)
+        assert manager._recycle_task is None
+
+        await janitor_pass_without_its_interval()
+        assert manager._recycle_task is not None
+        await asyncio.wait_for(manager._recycle_task, timeout=60)
+
+        assert manager.browser is not first_browser
+        assert manager.browser.is_connected() is True
+        page, _ = await asyncio.wait_for(manager.get_page(CrawlerRunConfig()), timeout=10)
+        await manager.release_page_with_context(page)
+
+        # A fresh browser has nothing to give back; pressure leaves it alone.
+        restarted = manager._recycle_task
+        await janitor_pass_without_its_interval()
+        assert manager._recycle_task is restarted
+    finally:
+        await manager.close()

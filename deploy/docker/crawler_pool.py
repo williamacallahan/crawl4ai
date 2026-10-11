@@ -1,5 +1,7 @@
 # crawler_pool.py - Smart browser pool with tiered management
 import asyncio
+import ctypes
+import ctypes.util
 import hashlib
 import json
 import logging
@@ -25,6 +27,9 @@ LOCK = asyncio.Lock()
 
 # Config
 MEM_LIMIT = CONFIG.get("crawler", {}).get("memory_threshold_percent", 95.0)
+# Above this container-memory share the janitor recycles the busiest browser
+# instead of waiting for MEM_LIMIT to refuse new ones.
+RECYCLE_LIMIT = CONFIG.get("crawler", {}).get("recovery_threshold_percent", MEM_LIMIT)
 BASE_IDLE_TTL = CONFIG.get("crawler", {}).get("pool", {}).get("idle_ttl_sec", 300)
 MAX_ACTIVE_REQUESTS = CONFIG.get("crawler", {}).get("pool", {}).get("max_pages", 30)
 MAX_BROWSER_INSTANCES = CONFIG.get("crawler", {}).get("pool", {}).get(
@@ -53,6 +58,17 @@ STALE_CEILING = _pos(CONFIG.get("crawler", {}).get("pool", {}).get("stale_lease_
 # and still returns 200 while get_crawler refuses, so recovering a wedged
 # replica is an operator/scheduled-restart action, not an automatic one.
 LAST_JANITOR_PASS = 0.0
+
+# glibc gives every thread that mallocs its own arena (up to 8 x cores) and
+# never returns their freed interior pages. Scraping and markdown generation run
+# on asyncio.to_thread workers, so each crawl process grew 16-26 such arenas
+# holding 118-290 MiB, against 10-43 MiB of live Python objects (measured from
+# /proc/<pid>/smaps on production replicas). Two arenas let freed blocks be
+# reused across threads, and the janitor's malloc_trim hands free pages back.
+# Set at import, before the event loop starts any executor thread.
+_M_ARENA_MAX = -8
+_LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+_LIBC.mallopt(_M_ARENA_MAX, 2)
 
 
 def get_pool_snapshot() -> dict:
@@ -645,6 +661,37 @@ async def retire_pool_crawlers(
     return retired
 
 
+async def _recycle_busiest_browser() -> None:
+    """Drain and restart the browser that served the most pages.
+
+    Renderer and network-service memory grows with pages served and is only
+    returned by restarting the browser process. A replica under steady traffic
+    keeps its browsers busy, so idle eviction never reaches them and the page
+    budget alone left them running for the whole six-hour recycle window. A
+    browser must have spent a tenth of its page budget since its last start, so
+    pressure the browsers cannot relieve does not restart them every pass.
+    """
+    candidates = [
+        crawler.crawler_strategy.browser_manager
+        for crawler in (PERMANENT, *HOT_POOL.values(), *COLD_POOL.values())
+        if crawler is not None
+        and not getattr(crawler, "_docker_request_owned", False)
+        and _is_live(crawler)
+        and not _is_recycling(crawler)
+    ]
+    worn = [
+        manager
+        for manager in candidates
+        if manager._pages_served >= max(1, manager.config.max_pages_before_recycle // 10)
+    ]
+    if not worn:
+        return
+    busiest = max(worn, key=lambda manager: manager._pages_served)
+    pages_served = busiest._pages_served
+    if await busiest.request_recycle():
+        logger.warning(f"Memory pressure: recycling a browser after {pages_served} pages")
+
+
 async def janitor():
     """Adaptive cleanup based on memory pressure."""
     global LAST_JANITOR_PASS
@@ -659,6 +706,7 @@ async def janitor():
             await asyncio.sleep(10)
         else:
             LAST_JANITOR_PASS = time.time()
+        _LIBC.malloc_trim(0)
 
 
 async def _janitor_pass():
@@ -729,6 +777,9 @@ async def _janitor_pass():
         ):
             logger.info(f"🧹 Closing permanent browser (idle={permanent_idle:.0f}s)")
             _close_in_background(_detach_permanent())
+
+        if mem_pct >= RECYCLE_LIMIT:
+            await _recycle_busiest_browser()
 
         # Log pool stats
         if mem_pct > 60:

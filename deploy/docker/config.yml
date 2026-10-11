@@ -122,7 +122,7 @@ crawler:
     batch_process: 300.0  # Timeout for batch processing
   pool:
     max_pages: 12                          # ← Per-worker GLOBAL_SEM and dispatcher permits
-    max_browser_instances: 12              # ← Per-worker browser-process ceiling
+    max_browser_instances: 4               # ← Per-process browser ceiling; gunicorn + 2 job workers share one 4 GiB container
     idle_ttl_sec: 300                     # ← 30 min janitor cutoff
     stale_lease_s: 0                      # leak backstop ceiling; 0 = auto: max(2 x limits.wall_clock_s, 21600).
                                           # If you set wall_clock_s: 0 for very long crawls, raise this above
@@ -132,7 +132,9 @@ crawler:
       headless: true
       text_mode: true
       memory_saving_mode: true
-      max_pages_before_recycle: 500
+      # ~330 pages reach one process's browser per 6h at production load, so a
+      # 500-page budget never restarted a browser before the replica recycle.
+      max_pages_before_recycle: 100
       # Current macOS Chrome in UA-reduced form: real Chrome freezes the minor
       # version (major.0.0.0) and the macOS platform token. The SDK default is
       # Chrome/116 (2023), which age-based WAF rules flag.
@@ -150,6 +152,9 @@ crawler:
       - "--disable-dev-shm-usage"
       - "--disable-gpu"
       - "--disable-software-rasterizer"
+      # Up to max_pages concurrent pages share at most this many renderer
+      # processes per browser instead of one renderer each.
+      - "--renderer-process-limit=4"
       # --disable-web-security removed for security (enables cross-origin access)
       # --allow-insecure-localhost / --ignore-certificate-errors removed: they
       # disabled TLS verification for every crawl (MITM / SSRF-to-internal-TLS).
