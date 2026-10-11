@@ -2166,6 +2166,27 @@ class BrowserManager:
         if cancelled:
             raise asyncio.CancelledError
 
+    async def request_recycle(self) -> bool:
+        """Recycle the browser process once in-flight pages drain.
+
+        Runs the same drain-then-restart cycle as an exhausted
+        ``max_pages_before_recycle`` budget, for callers that see memory
+        pressure before the page budget runs out. Returns whether a recycle
+        was scheduled: a browser that served no page since its last start has
+        nothing to give back, and sessions keep their browser until they end.
+        """
+        async with self._recycle_lock:
+            if (
+                self._closing
+                or self._recycling
+                or self._pages_served == 0
+                or not self._owns_browser_process()
+            ):
+                return False
+            self._recycle_due = True
+            self._close_admission_if_recycle_due_locked()
+            return not self.sessions
+
     def _should_recycle(self) -> bool:
         """Only an owned browser process can honor process recycling."""
         limit = self.config.max_pages_before_recycle
