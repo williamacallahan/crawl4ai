@@ -558,7 +558,8 @@ def get_container_memory_percent() -> float:
         if stat_path.exists():
             stat = dict(line.split() for line in stat_path.read_text().splitlines())
             cgroup_v2 = usage_path.name == "memory.current"
-            usage -= int(stat["inactive_file" if cgroup_v2 else "total_inactive_file"])
+            inactive = stat.get("inactive_file" if cgroup_v2 else "total_inactive_file", 0)
+            usage = max(0, usage - int(inactive))
         limit_raw = limit_path.read_text().strip()
         if limit_raw == "max":
             limit = psutil.virtual_memory().total

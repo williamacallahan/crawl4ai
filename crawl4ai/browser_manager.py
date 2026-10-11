@@ -15,7 +15,7 @@ import psutil
 from playwright.async_api import BrowserContext
 
 from .async_configs import BrowserConfig, CrawlerRunConfig
-from .config import DOWNLOAD_PAGE_TIMEOUT
+from .config import DOWNLOAD_PAGE_TIMEOUT, PAGE_TIMEOUT
 from .js_snippet import load_js_script
 from .utils import get_chromium_path
 
@@ -27,17 +27,18 @@ CANCELLATION_GRACE_SECONDS = 20.0
 # wedges the whole browser rather than degrading it.
 RECYCLE_CLOSE_SECONDS = 60.0
 RECYCLE_START_SECONDS = 120.0
-# A due recycle waits this long for in-flight pages to release, then restarts
+# A due recycle waits for in-flight pages to release for as long as the longest
+# page_timeout this browser has admitted, within these bounds, then restarts
 # anyway. A page that never released held admission closed for 50 minutes on a
 # production replica, failing every request on that browser after 235s.
-RECYCLE_DRAIN_SECONDS = 60.0
+RECYCLE_DRAIN_MIN_SECONDS = PAGE_TIMEOUT / 1000
+RECYCLE_DRAIN_MAX_SECONDS = 5 * RECYCLE_DRAIN_MIN_SECONDS
 # The whole worst-case legitimate recycle: a close that runs its cap, one
 # absorbed cancellation inside it, the driver-stop fallback, a launch, and
 # margin. Derived rather than picked, so a waiter cannot start failing while a
 # healthy recycle is still running.
 RECYCLE_WAIT_SECONDS = (
-    RECYCLE_DRAIN_SECONDS
-    + RECYCLE_CLOSE_SECONDS
+    RECYCLE_CLOSE_SECONDS
     + CANCELLATION_GRACE_SECONDS
     + 5.0
     + RECYCLE_START_SECONDS
@@ -765,6 +766,7 @@ class BrowserManager:
         self._page_to_admission = {}
         self._recycle_task = None
         self._drain_deadline = None
+        self._drain_seconds = RECYCLE_DRAIN_MIN_SECONDS
         self._background_tasks = set()
 
         # Stealth adapter for stealth mode
@@ -1838,10 +1840,15 @@ class BrowserManager:
                 )
             raise
 
-    async def _admit_page_acquisition(self):
+    async def _admit_page_acquisition(self, page_timeout_ms=PAGE_TIMEOUT):
         """Issue a drain token only while the browser admits new pages."""
+        self._drain_seconds = max(
+            self._drain_seconds,
+            min(page_timeout_ms / 1000, RECYCLE_DRAIN_MAX_SECONDS),
+        )
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + RECYCLE_WAIT_SECONDS
+        wait_seconds = self._drain_seconds + RECYCLE_WAIT_SECONDS
+        deadline = loop.time() + wait_seconds
         while True:
             try:
                 remaining = deadline - loop.time()
@@ -1855,7 +1862,7 @@ class BrowserManager:
                 # it - PERMANENT has no janitor backstop.
                 raise RuntimeError(
                     "Browser recycle did not finish within "
-                    f"{RECYCLE_WAIT_SECONDS:.0f}s"
+                    f"{wait_seconds:.0f}s"
                 ) from None
             async with self._recycle_lock:
                 if self._closing:
@@ -1894,7 +1901,7 @@ class BrowserManager:
         Their crawls fail when the browser closes under them; their late
         releases find no token and only re-check admission.
         """
-        await asyncio.sleep(RECYCLE_DRAIN_SECONDS)
+        await asyncio.sleep(self._drain_seconds)
         async with self._recycle_lock:
             self._drain_deadline = None
             if (
@@ -2039,7 +2046,9 @@ class BrowserManager:
                 pass
             return page, context
 
-        token = await self._admit_page_acquisition()
+        token = await self._admit_page_acquisition(
+            crawlerRunConfig.page_timeout or PAGE_TIMEOUT
+        )
         context = None
         page = None
         signature = None
@@ -2211,6 +2220,7 @@ class BrowserManager:
             if (
                 self._closing
                 or self._recycling
+                or self._recycle_due
                 or self._pages_served == 0
                 or not self._owns_browser_process()
             ):
@@ -2240,11 +2250,15 @@ class BrowserManager:
             self._track_background_task(asyncio.create_task(self._kill_session(sid)))
 
     async def _close_contexts(self) -> None:
-        contexts = list(self.contexts_by_config.values())
-        self.contexts_by_config.clear()
-        self._context_refcounts.clear()
-        self._context_last_used.clear()
-        self._page_to_sig.clear()
+        # Under the lock, so a context _acquire_context is creating is either
+        # in this snapshot or created after it, never dropped from the registry
+        # while it lives on in the restarted browser.
+        async with self._contexts_lock:
+            contexts = list(self.contexts_by_config.values())
+            self.contexts_by_config.clear()
+            self._context_refcounts.clear()
+            self._context_last_used.clear()
+            self._page_to_sig.clear()
         for context in contexts:
             await self._close_context_quietly(context)
 

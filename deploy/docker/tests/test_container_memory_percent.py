@@ -92,6 +92,22 @@ def test_cgroup_v1_excludes_inactive_page_cache(monkeypatch):
     assert utils.get_container_memory_percent() == pytest.approx(50.0)
 
 
+def test_memory_stat_without_inactive_file_counts_full_usage(monkeypatch):
+    _patch_fs(
+        monkeypatch,
+        {_V2_USAGE: "800", _V2_LIMIT: "1000", _V2_STAT: "anon 800\n"},
+    )
+    assert utils.get_container_memory_percent() == pytest.approx(80.0)
+
+
+def test_inactive_file_above_usage_reads_zero_not_negative(monkeypatch):
+    _patch_fs(
+        monkeypatch,
+        {_V1_USAGE: "100", _V1_LIMIT: "1000", _V1_STAT: "total_inactive_file 300\n"},
+    )
+    assert utils.get_container_memory_percent() == pytest.approx(0.0)
+
+
 def test_cgroup_v2_unlimited_uses_host_total_not_host_pressure(monkeypatch):
     host_total = 12 * 1024**3
     container_usage = 1024**3
