@@ -243,3 +243,28 @@ async def test_memory_pressure_janitor_pass_restarts_a_worn_browser(monkeypatch)
         assert manager._recycle_task is restarted
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_a_page_that_never_releases_cannot_hold_a_due_recycle(monkeypatch):
+    """A due recycle restarts after the drain bound even if a page never releases.
+
+    The unreleased page stands for a crawl whose release never runs; before the
+    bound, every later request on the browser failed after the recycle wait.
+    """
+    import crawl4ai.browser_manager as browser_manager_module
+
+    monkeypatch.setattr(browser_manager_module, "RECYCLE_DRAIN_SECONDS", 0.5)
+    manager = _real_manager(max_pages_before_recycle=1)
+    try:
+        await manager.start()
+        first_browser = manager.browser
+        await manager.get_page(CrawlerRunConfig())  # never released
+
+        page, _ = await asyncio.wait_for(manager.get_page(CrawlerRunConfig()), timeout=60)
+
+        assert manager.browser is not first_browser
+        assert manager.browser.is_connected() is True
+        await manager.release_page_with_context(page)
+    finally:
+        await manager.close()
