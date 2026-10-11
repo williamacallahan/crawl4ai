@@ -29,7 +29,9 @@ _V2_USAGE = "/sys/fs/cgroup/memory.current"
 _V2_LIMIT = "/sys/fs/cgroup/memory.max"
 _V1_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
 _V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-_INTERCEPT = {_V2_USAGE, _V2_LIMIT, _V1_USAGE, _V1_LIMIT}
+_V2_STAT = "/sys/fs/cgroup/memory.stat"
+_V1_STAT = "/sys/fs/cgroup/memory/memory.stat"
+_INTERCEPT = {_V2_USAGE, _V2_LIMIT, _V1_USAGE, _V1_LIMIT, _V2_STAT, _V1_STAT}
 
 
 def _patch_fs(monkeypatch, files, exists_paths=None):
@@ -64,6 +66,30 @@ def _patch_vm(monkeypatch, total, percent, used=None):
 def test_cgroup_v2_capped_returns_usage_over_limit(monkeypatch):
     _patch_fs(monkeypatch, {_V2_USAGE: "800", _V2_LIMIT: "1000"})
     assert utils.get_container_memory_percent() == pytest.approx(80.0)
+
+
+def test_cgroup_v2_excludes_inactive_page_cache(monkeypatch):
+    _patch_fs(
+        monkeypatch,
+        {
+            _V2_USAGE: "800",
+            _V2_LIMIT: "1000",
+            _V2_STAT: "anon 400\nfile 400\ninactive_file 300\nactive_file 100\n",
+        },
+    )
+    assert utils.get_container_memory_percent() == pytest.approx(50.0)
+
+
+def test_cgroup_v1_excludes_inactive_page_cache(monkeypatch):
+    _patch_fs(
+        monkeypatch,
+        {
+            _V1_USAGE: "800",
+            _V1_LIMIT: "1000",
+            _V1_STAT: "cache 400\ninactive_file 1\ntotal_inactive_file 300\n",
+        },
+    )
+    assert utils.get_container_memory_percent() == pytest.approx(50.0)
 
 
 def test_cgroup_v2_unlimited_uses_host_total_not_host_pressure(monkeypatch):
