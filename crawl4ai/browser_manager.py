@@ -27,12 +27,17 @@ CANCELLATION_GRACE_SECONDS = 20.0
 # wedges the whole browser rather than degrading it.
 RECYCLE_CLOSE_SECONDS = 60.0
 RECYCLE_START_SECONDS = 120.0
+# A due recycle waits this long for in-flight pages to release, then restarts
+# anyway. A page that never released held admission closed for 50 minutes on a
+# production replica, failing every request on that browser after 235s.
+RECYCLE_DRAIN_SECONDS = 60.0
 # The whole worst-case legitimate recycle: a close that runs its cap, one
 # absorbed cancellation inside it, the driver-stop fallback, a launch, and
 # margin. Derived rather than picked, so a waiter cannot start failing while a
 # healthy recycle is still running.
 RECYCLE_WAIT_SECONDS = (
-    RECYCLE_CLOSE_SECONDS
+    RECYCLE_DRAIN_SECONDS
+    + RECYCLE_CLOSE_SECONDS
     + CANCELLATION_GRACE_SECONDS
     + 5.0
     + RECYCLE_START_SECONDS
@@ -759,6 +764,7 @@ class BrowserManager:
         self._active_acquisitions = set()
         self._page_to_admission = {}
         self._recycle_task = None
+        self._drain_deadline = None
         self._background_tasks = set()
 
         # Stealth adapter for stealth mode
@@ -1869,11 +1875,37 @@ class BrowserManager:
         ):
             return
         self._recycle_done.clear()
-        if self._active_acquisitions or self._recycling:
+        if self._recycling:
             return
+        if self._active_acquisitions:
+            if self._drain_deadline is None:
+                self._drain_deadline = asyncio.create_task(self._end_drain_at_deadline())
+            return
+        if self._drain_deadline is not None:
+            self._drain_deadline.cancel()
+            self._drain_deadline = None
         self._recycling = True
         self._recycle_task = asyncio.create_task(self._recycle_browser())
         self._recycle_task.add_done_callback(self._consume_recycle_result)
+
+    async def _end_drain_at_deadline(self) -> None:
+        """Restart without the pages that did not release within the drain bound.
+
+        Their crawls fail when the browser closes under them; their late
+        releases find no token and only re-check admission.
+        """
+        await asyncio.sleep(RECYCLE_DRAIN_SECONDS)
+        async with self._recycle_lock:
+            self._drain_deadline = None
+            if (
+                not self._recycle_due
+                or self._recycling
+                or self._closing
+                or self.sessions
+            ):
+                return
+            self._active_acquisitions.clear()
+            self._close_admission_if_recycle_due_locked()
 
     def _consume_recycle_result(self, task) -> None:
         try:
@@ -2340,6 +2372,9 @@ class BrowserManager:
             if not _for_recycle:
                 self.sessions.clear()
                 async with self._recycle_lock:
+                    if self._drain_deadline is not None:
+                        self._drain_deadline.cancel()
+                        self._drain_deadline = None
                     self._active_acquisitions.clear()
                     self._recycle_due = False
                     self._recycling = False
