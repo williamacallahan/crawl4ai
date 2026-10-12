@@ -187,6 +187,28 @@ class TestErrorSanitization:
             "Blocked by anti-bot protection at https://example.com/Data/thing"
         ) == "Blocked by anti-bot protection at https://example.com/Data/thing"
 
+    def test_public_error_detail_redacts_digit_starting_container_path_prefixes(self):
+        """Top-level directory names may begin with a digit (e.g. /123/...,
+        /0tmp/...). _CONTAINER_PATH must match those too, otherwise the bare
+        str(e) the dispatcher stores (async_dispatcher.py:357 and :769) would
+        leak the path to the client. URL path segments under a digit-starting
+        dir are still stripped first and must pass through intact."""
+        from utils import public_error_detail
+
+        for path in (
+            "/123/profile-abc123",
+            "/0tmp/browser-profile-abc123",
+            "/9cache/ms-playwright/chromium-1148/chrome",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"digit-prefix FileNotFoundError leaked: {path}"
+        # URL path under a digit-starting top-level dir is stripped first and
+        # must not be mistaken for a container path.
+        assert public_error_detail(
+            "Blocked by anti-bot protection at https://example.com/123/thing"
+        ) == "Blocked by anti-bot protection at https://example.com/123/thing"
+
     def test_public_error_detail_still_redacts_default_dockerfile_prefixes(self):
         """No regression for the default deployment, which keeps all assets
         under the prefixes the original allowlist covered. Marker-bearing
