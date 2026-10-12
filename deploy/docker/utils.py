@@ -222,11 +222,14 @@ logger = logging.getLogger(__name__)
 
 _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", 'File "', ".py")
 # The markers above only recognize the library's get_error_context shape. Its
-# dispatcher reports a bare str(e) instead (crawl4ai/async_dispatcher.py:342,
-# :346), so a path-bearing OSError carries no marker at all. Match the
-# container filesystem directly, after removing the crawled URL — a URL
-# legitimately has path segments, whatever is left should not.
-_CONTAINER_PATH = re.compile(r"/(?:app|ms-playwright|home|root|usr|opt|srv|etc|var|tmp|proc)/")
+# dispatcher reports a bare str(e) instead (crawl4ai/async_dispatcher.py:357
+# and :769), so a path-bearing OSError carries no marker at all. Match any
+# absolute container path directly, after removing the crawled URL — a URL
+# legitimately has path segments, but whatever is left should not. A fixed
+# prefix allowlist would miss operator overrides of standard env vars (e.g.
+# PLAYWRIGHT_BROWSERS_PATH=/data/..., TMPDIR=/mnt/...) under unlisted
+# top-level dirs, leaking them to the client, so any /word/ segment is matched.
+_CONTAINER_PATH = re.compile(r"/(?:[a-z][a-z0-9_.-]*)/(?:\S)")
 _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 # Chromium's navigation error code. A withheld message keeps it because it is the
 # one fact a client needs to tell a target-side fault from a transient one. Only

@@ -129,6 +129,88 @@ class TestErrorSanitization:
         upstream = "Blocked by anti-bot protection at https://example.com/app/login"
         assert public_error_detail(upstream) == upstream
 
+    def test_public_error_detail_redacts_unlisted_container_path_prefixes(self):
+        """Operators routinely override PLAYWRIGHT_BROWSERS_PATH / TMPDIR to
+        top-level dirs absent from the default Dockerfile layout (e.g. /data,
+        /mnt). The bare str(e) the dispatcher stores (async_dispatcher.py:357
+        and :769) carries no get_error_context marker, so _CONTAINER_PATH is
+        the only defense; it must match any absolute path, not a fixed
+        allowlist of prefixes. Covers both exploit shapes: a missing browser
+        binary (PLAYWRIGHT_BROWSERS_PATH) and a failed profile dir (TMPDIR)."""
+        from utils import public_error_detail
+
+        # FileNotFoundError shape under unlisted prefixes (the original hardcoded
+        # denylist missed every one of these) and its "Failed to start browser"
+        # re-raise shape from browser_manager.py.
+        for path in (
+            "/data/browsers/chrome-linux/chrome",
+            "/mnt/cache/chrome-linux/chrome",
+            "/scratch/tmp/browser-profile-abc123",
+            "/cache/ms-playwright/chromium-1148/chrome",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"unlisted-prefix FileNotFoundError leaked: {path}"
+            assert public_error_detail(
+                f"Failed to start browser: [Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"unlisted-prefix re-raise leaked: {path}"
+        # TMPDIR override: the profile dir lives under an unlisted prefix and
+        # Chromium fails on it — a different message shape than FileNotFoundError.
+        assert public_error_detail(
+            "Failed to start browser: could not create profile dir "
+            "/data/tmp/browser-profile-abc123: Permission denied"
+        ) == "Crawl failed"
+        assert public_error_detail(
+            "user_data_dir /scratch/tmp/crawl4ai-persistent-xyz is not empty: abort"
+        ) == "Crawl failed"
+
+    def test_public_error_detail_still_redacts_default_dockerfile_prefixes(self):
+        """No regression for the default deployment, which keeps all assets
+        under the prefixes the original allowlist covered. Marker-bearing
+        payloads are avoided so this exercises the path regex, not the marker
+        denylist."""
+        from utils import public_error_detail
+
+        for path in (
+            "/ms-playwright/chromium-1148/chrome",
+            "/home/appuser/.cache/ms-playwright/chrome",
+            "/app/server.log",
+            "/tmp/browser-profile-abc123",
+            "/usr/local/bin/chrome",
+            "/opt/crawl4ai/runtime/chrome",
+            "/var/log/crawl4ai/server.log",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/root/.cache/ms-playwright/chrome",
+            "/srv/www/index.html",
+            "/proc/1/status",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"regression: previously-listed prefix now leaks: {path}"
+
+    def test_public_error_detail_url_path_segments_do_not_trip_filter(self):
+        """A crawled URL legitimately carries path segments — including under
+        unlisted top-level dirs — and is stripped before the path check, so an
+        upstream anti-bot / navigation message must pass through intact. This
+        is the false-positive guard against over-broadening the regex."""
+        from utils import public_error_detail
+
+        for case in (
+            # URL path uses a listed prefix; must still pass (existing case).
+            "Blocked by anti-bot protection at https://example.com/app/login",
+            # URL path uses an unlisted top-level dir; the URL is stripped first.
+            "Blocked by anti-bot protection at https://example.com/data/thing",
+            "Blocked at https://example.com/mnt/cache/login then retry",
+            # Plain upstream reasons with no absolute path at all.
+            "Blocked by anti-bot protection: Cloudflare JS challenge",
+            "net::ERR_CONNECTION_RESET",
+            "Page.goto: Timeout 30000ms exceeded.",
+            "DNS_PROBE_FINISHED_NXDOMAIN",
+        ):
+            assert public_error_detail(case) == case[:500], (
+                f"upstream reason incorrectly redacted: {case!r}"
+            )
+
     def test_correlation_id_is_minted_only_when_something_was_withheld(self):
         from utils import public_crawl_error
 
