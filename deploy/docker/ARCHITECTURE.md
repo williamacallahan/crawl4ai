@@ -150,6 +150,9 @@ def get_container_memory_percent() -> float:
     try:
         # Try cgroup v2 first
         current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+        # Subtract inactive file cache → working set (not reclaimable cache)
+        stat = dict(line.split() for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines())
+        current -= int(stat.get("inactive_file", 0))
         max_raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
         # "max" (unlimited) → measure against host total
         max_mem = psutil.virtual_memory().total if max_raw == "max" else int(max_raw)
@@ -157,6 +160,9 @@ def get_container_memory_percent() -> float:
     except:
         # Fallback to cgroup v1
         usage = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text())
+        # Subtract inactive file cache → working set (not reclaimable cache)
+        stat = dict(line.split() for line in Path("/sys/fs/cgroup/memory/memory.stat").read_text().splitlines())
+        usage -= int(stat.get("total_inactive_file", 0))
         limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text())
         return (usage / limit) * 100
     except:
