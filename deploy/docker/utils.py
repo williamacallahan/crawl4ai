@@ -229,7 +229,10 @@ _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", '
 # prefix allowlist would miss operator overrides of standard env vars (e.g.
 # PLAYWRIGHT_BROWSERS_PATH=/data/..., TMPDIR=/mnt/...) under unlisted
 # top-level dirs, leaking them to the client, so any /word/ segment is matched.
-_CONTAINER_PATH = re.compile(r"/(?:[a-z][a-z0-9_.-]*)/(?:\S)")
+# Directory names may begin with an uppercase letter too (e.g. /DATA/...),
+# so both cases are accepted; the URL is stripped first to keep URL path
+# segments from being mistaken for a container path.
+_CONTAINER_PATH = re.compile(r"/(?:[a-zA-Z][a-zA-Z0-9_.-]*)/(?:\S)")
 _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 # Chromium's navigation error code. A withheld message keeps it because it is the
 # one fact a client needs to tell a target-side fault from a transient one. Only

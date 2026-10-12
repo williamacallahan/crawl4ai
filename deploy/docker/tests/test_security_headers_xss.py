@@ -164,6 +164,29 @@ class TestErrorSanitization:
             "user_data_dir /scratch/tmp/crawl4ai-persistent-xyz is not empty: abort"
         ) == "Crawl failed"
 
+    def test_public_error_detail_redacts_uppercase_container_path_prefixes(self):
+        """Directory names may begin with an uppercase letter (e.g. /DATA/...,
+        /CACHE/...). _CONTAINER_PATH must match those too, otherwise the bare
+        str(e) the dispatcher stores (async_dispatcher.py:357 and :769) would
+        leak the path to the client. URL path segments under an uppercase dir
+        are still stripped first and must pass through intact."""
+        from utils import public_error_detail
+
+        for path in (
+            "/DATA/profile-abc123",
+            "/CACHE/ms-playwright/chromium-1148/chrome",
+            "/Tmp/browser-profile-abc123",
+            "/Home/appuser/.cache/ms-playwright/chrome",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"uppercase-prefix FileNotFoundError leaked: {path}"
+        # URL path under an uppercase top-level dir is stripped first and must
+        # not be mistaken for a container path.
+        assert public_error_detail(
+            "Blocked by anti-bot protection at https://example.com/Data/thing"
+        ) == "Blocked by anti-bot protection at https://example.com/Data/thing"
+
     def test_public_error_detail_still_redacts_default_dockerfile_prefixes(self):
         """No regression for the default deployment, which keeps all assets
         under the prefixes the original allowlist covered. Marker-bearing
