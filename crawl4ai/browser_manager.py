@@ -1614,13 +1614,20 @@ class BrowserManager:
             deadline = loop.time() + wait_seconds
             # Cache each page's targetId for the lifetime of this call so the
             # poll loop does not re-query pages it has already inspected.
-            checked: Dict[int, Optional[str]] = {}
+            checked: Dict[int, tuple[object, str]] = {}
             while True:
                 for page in context.pages:
                     key = id(page)
-                    if key not in checked:
-                        checked[key] = await self._query_page_target_id(context, page)
-                    if checked[key] == target_id:
+                    cached = checked.get(key)
+                    if cached is not None and cached[0] is page:
+                        page_target_id = cached[1]
+                    else:
+                        page_target_id = await self._query_page_target_id(context, page)
+                        # Failed probes are intentionally not cached: a target
+                        # can surface in CDP after the page list does.
+                        if page_target_id is not None:
+                            checked[key] = (page, page_target_id)
+                    if page_target_id == target_id:
                         return page
                 if wait_seconds <= 0 or loop.time() >= deadline:
                     return None

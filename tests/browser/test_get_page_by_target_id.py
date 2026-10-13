@@ -257,6 +257,34 @@ async def test_target_id_queried_once_per_page_within_call():
 
 
 @pytest.mark.asyncio
+async def test_transient_target_info_failure_retries():
+    page = FakePage("late", "tid-late")
+    attempts = 0
+
+    class EventuallyReadySession:
+        async def send(self, method, *args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("cdp not ready")
+            return {"targetInfo": {"targetId": page.target_id, "type": "page"}}
+
+        async def detach(self):
+            return None
+
+    ctx = FakeContext([page])
+
+    async def session(_page):
+        return EventuallyReadySession()
+
+    ctx.new_cdp_session = session
+    manager = _make_manager(wait_seconds=0.2)
+
+    assert await manager._get_page_by_target_id(ctx, "tid-late") is page
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
 async def test_new_cdp_session_failure_returns_none():
     """If context.new_cdp_session raises for every page, the method returns
     None instead of propagating or falling back to pages[0]."""
