@@ -72,7 +72,13 @@ class DefaultTableExtraction(TableExtractionStrategy):
     It handles colspan and rowspan attributes to preserve table structure.
     """
     
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        table_score_threshold: int = 7,
+        min_rows: int = 0,
+        min_cols: int = 0,
+        **kwargs,
+    ):
         """
         Initialize the default table extraction strategy.
         
@@ -80,12 +86,12 @@ class DefaultTableExtraction(TableExtractionStrategy):
             table_score_threshold (int): Minimum score for a table to be considered a data table (default: 7)
             min_rows (int): Minimum number of rows for a valid table (default: 0)
             min_cols (int): Minimum number of columns for a valid table (default: 0)
-            **kwargs: Additional parameters passed to parent class
+            **kwargs: Additional parameters passed to parent class (e.g. verbose, logger)
         """
         super().__init__(**kwargs)
-        self.table_score_threshold = kwargs.get("table_score_threshold", 7)
-        self.min_rows = kwargs.get("min_rows", 0)
-        self.min_cols = kwargs.get("min_cols", 0)
+        self.table_score_threshold = kwargs.get("table_score_threshold", table_score_threshold)
+        self.min_rows = kwargs.get("min_rows", min_rows)
+        self.min_cols = kwargs.get("min_cols", min_cols)
 
     @staticmethod
     def _cell_span(cell: etree.Element, attribute: str) -> int:
