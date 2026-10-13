@@ -138,6 +138,7 @@ class URLPatternFilter(URLFilter):
         "_simple_prefixes",
         "_domain_patterns",
         "_path_patterns",   # glob-translated patterns; matched against url_path
+        "_full_url_patterns",  # globs that include authority/query/fragment
         "_regex_patterns",  # raw user regexes; matched against the full url
         "_reverse",
     )
@@ -169,6 +170,7 @@ class URLPatternFilter(URLFilter):
         self._simple_prefixes = set()
         self._domain_patterns = []
         self._path_patterns = []
+        self._full_url_patterns = []
         self._regex_patterns = []
 
         for pattern in patterns:
@@ -214,6 +216,9 @@ class URLPatternFilter(URLFilter):
             self._domain_patterns.append(re.compile(pattern.replace("*.", r"[^/]+\.")))
         else:
             if isinstance(pattern, str):
+                full_url_glob = any(marker in pattern for marker in ("://", "?", "#", "=")) or bool(
+                    re.search(r"[A-Za-z0-9-]+\.[A-Za-z]{2,}", pattern)
+                )
                 # Translate the glob *first*. The old code rewrote `**` -> `.*`
                 # and `{a,b}` -> `(a|b)` *before* calling `fnmatch.translate`,
                 # which then escaped the `.`/`(`/`)`/`|` back to literals and
@@ -246,11 +251,14 @@ class URLPatternFilter(URLFilter):
                         lambda m: f'({"|".join(m.group(1).split(","))})',
                         pattern,
                     )
-                # Globs are path-oriented; apply() matches them against
-                # url_path so hostname dots (e.g. in `127.0.0.1` / `a.b.com`)
-                # cannot satisfy a literal `.` in the glob (the bug report's
-                # "accidental match via hostname dots" masking symptom).
-                self._path_patterns.append(re.compile(pattern))
+                compiled = re.compile(pattern)
+                # Preserve both documented full-URL globs (for example
+                # ``*example.com*``) and path-oriented globs. The path check
+                # keeps the existing path behavior; the full-URL check keeps
+                # authority/query patterns from silently dropping matches.
+                self._path_patterns.append(compiled)
+                if full_url_glob:
+                    self._full_url_patterns.append(compiled)
             else:
                 # A pre-compiled Pattern supplied directly by the caller is a
                 # raw regex, not a glob; match it against the full URL.
@@ -298,6 +306,12 @@ class URLPatternFilter(URLFilter):
         # hostname dots" masking symptom described in the bug report).
         if self._path_patterns:
             if any(p.search(url_path) for p in self._path_patterns):
+                result = True
+                self._update_stats(result)
+                return not result if self._reverse else result
+
+        if self._full_url_patterns:
+            if any(p.search(url) for p in self._full_url_patterns):
                 result = True
                 self._update_stats(result)
                 return not result if self._reverse else result

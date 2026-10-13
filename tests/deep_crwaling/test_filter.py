@@ -97,6 +97,17 @@ class TestURLPatternFilter:
     @pytest.mark.parametrize(
         "pattern, url, expected",
         [
+            ("*example.com*", "https://example.com/download?format=pdf", True),
+            ("*format=pdf", "https://example.com/download?format=pdf", True),
+            ("*example.com*", "https://other.example/download?format=pdf", False),
+        ],
+    )
+    def test_complex_globs_keep_full_url_authority_and_query(self, pattern, url, expected):
+        assert URLPatternFilter(patterns=[pattern]).apply(url) is expected
+
+    @pytest.mark.parametrize(
+        "pattern, url, expected",
+        [
             # Multi-part suffix patterns (the regression: a stored suffix that
             # itself contains a dot must match the filename's dotted tail, not
             # only its last dot-segment).
