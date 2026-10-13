@@ -2338,7 +2338,7 @@ def normalize_url(
 
 def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_scheme=None):
     """Build a crawl deduplication key; preserve the discovered URL for fetching."""
-    from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
+    from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
     # Handle None or empty values
     if not href:
@@ -2370,9 +2370,14 @@ def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_
     # Normalize query parameters if needed
     query = parsed.query
     if query:
-        # Parse query parameters
-        params = parse_qs(query)
-        
+        # Parse query parameters, preserving blank-value params (e.g. ?q=) so
+        # the dedup key matches normalize_url, which the scraper uses to build
+        # the href. Keep this parsing in sync with normalize_url's parse_qsl
+        # call; previously parse_qs(..., keep_blank_values=False) silently
+        # dropped blank-value params, collapsing /page and /page?q= into one
+        # dedup key while the fetched URL preserved the distinction.
+        params = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)]
+
         # Remove tracking parameters. Keep this set in sync with the
         # `default_tracking` set in `normalize_url` so deep-crawl deduplication
         # matches the general URL normalizer.
@@ -2380,12 +2385,14 @@ def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_
             'utm_source', 'utm_medium', 'utm_campaign', 'utm_term',
             'utm_content', 'gclid', 'fbclid', 'ref', 'ref_src'
         }
-        for param in list(params.keys()):
-            if param.lower() in tracking_params:
-                del params[param]
-                
-        # Rebuild query string, sorted for consistency
-        query = urlencode(sorted(params.items()), doseq=True)
+        params = [(k, v) for k, v in params if k.lower() not in tracking_params]
+
+        # Rebuild query string, sorted for consistency. Sort by key only
+        # (matching normalize_url) so value order within a repeated key is
+        # preserved — ?z=2&z=1 and ?z=1&z=2 stay distinct, since the server may
+        # treat them as distinct URIs.
+        params.sort(key=lambda kv: kv[0])
+        query = urlencode(params, doseq=True) if params else ''
     
     # Build normalized URL
     normalized = urlunparse((
