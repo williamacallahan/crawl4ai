@@ -1,5 +1,6 @@
 import os
 import asyncio
+import tempfile
 from pathlib import Path
 import aiosqlite
 from typing import Optional
@@ -81,8 +82,36 @@ class DatabaseMigration:
         file_path = os.path.join(self.content_paths[content_type], content_hash)
 
         if not os.path.exists(file_path):
-            async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
-                await f.write(content)
+            # Write atomically: stage the content into a temp file in the same
+            # directory, then ``os.replace`` it onto ``file_path`` only after
+            # the full write succeeds. ``aiofiles.open(file_path, "w")``
+            # truncates/creates ``file_path`` *before* the awaited write
+            # completes, so a failed/interrupted write (ENOSPC, OOM-kill,
+            # power loss) leaves an empty/partial file at ``file_path``; the
+            # migration then rolls back, but the partial file persists on
+            # disk. On the documented partial-failure recovery re-run, the
+            # same blob re-hashes to the same key, the ``os.path.exists``
+            # dedup check above sees the leftover file and *skips* writing,
+            # and the column is committed as a pointer to an empty/partial
+            # file -- silent data loss for cached content. Staging to a temp
+            # file and replacing atomically means a failed write leaves the
+            # temp file behind but never creates/truncates ``file_path``, so
+            # the dedup check stays sound: a present ``file_path`` always
+            # holds complete content, and a recovery re-run re-attempts the
+            # write instead of skipping it.
+            fd, tmp_path = tempfile.mkstemp(dir=self.content_paths[content_type])
+            os.close(fd)
+            try:
+                async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+                    await f.write(content)
+                os.replace(tmp_path, file_path)
+            except BaseException:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                raise
 
         return content_hash
 
