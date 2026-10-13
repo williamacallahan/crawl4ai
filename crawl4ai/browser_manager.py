@@ -1480,6 +1480,7 @@ class BrowserManager:
             "viewport": viewport_settings,
             "proxy": proxy_settings,
             "accept_downloads": self.config.accept_downloads,
+            "service_workers": "block",
             "storage_state": self.config.storage_state,
             "ignore_https_errors": self.config.ignore_https_errors,
             "device_scale_factor": self.config.device_scale_factor,
@@ -2120,6 +2121,7 @@ class BrowserManager:
             if (
                 not self.config.use_managed_browser
                 or self.config.create_isolated_context
+                or user_agent is not None
             ):
                 context, signature = await self._acquire_context(
                     crawlerRunConfig,
