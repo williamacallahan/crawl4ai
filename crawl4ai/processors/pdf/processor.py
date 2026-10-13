@@ -101,6 +101,7 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             pages=[],
             version="1.1"
         )
+        _temp_dir = None
 
         try:
             with pdf_path.open('rb') as file:
@@ -110,7 +111,6 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                 # Handle image directory. Local variable, not shared instance
                 # state, so concurrent ``process`` calls on one processor
                 # instance cannot delete each other's temp directories.
-                _temp_dir = None
                 image_dir = None
                 if self.extract_images and self.save_images_locally:
                     if self.image_save_dir:
@@ -161,6 +161,7 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             pages=[],
             version="1.1" 
         )
+        _temp_dir = None
 
         try:
             # Get metadata and page count from main thread
@@ -176,7 +177,6 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             # ``self._temp_dir`` (the prior approach) let one call's ``finally``
             # ``shutil.rmtree`` another call's still-in-use directory, deleting
             # the victim's images mid-flight while leaking the owner's own dir.
-            _temp_dir = None
             image_dir = None
             if self.extract_images and self.save_images_locally:
                 if self.image_save_dir:

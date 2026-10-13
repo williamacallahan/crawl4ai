@@ -461,6 +461,19 @@ def test_process_non_batch_sibling_also_cleans_up_own_temp_dir(monkeypatch, tmp_
     )
 
 
+@pytest.mark.parametrize("method_name", ["process", "process_batch"])
+def test_pdf_open_failure_preserves_original_error(method_name, tmp_path):
+    """Cleanup must not replace an error raised before temp-dir setup."""
+    processor = NaivePDFProcessorStrategy(
+        extract_images=True,
+        save_images_locally=True,
+        image_save_dir=None,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        getattr(processor, method_name)(tmp_path / "missing.pdf")
+
+
 if __name__ == "__main__":
     import sys
 
