@@ -1269,11 +1269,15 @@ class CustomHTML2Text(HTML2Text):
             self._emit_pre_fence_open()
             # Output the raw content for pre blocks, including content inside code tags
             prefix = self._pre_prefix or ""
+            bq = ">" * self.blockquote
             lines = data.split("\n")
             first = lines[0]
-            if getattr(self, "_pre_at_line_start", True) and first:
-                first = prefix + first
-            rest = [(prefix + line if line else line) for line in lines[1:]]
+            if first:
+                if getattr(self, "_pre_at_line_start", True):
+                    first = prefix + first
+            else:
+                first = bq
+            rest = [(prefix + line if line else bq) for line in lines[1:]]
             self.out("\n".join([first] + rest))
             self._pre_at_line_start = data.endswith("\n")
             return
