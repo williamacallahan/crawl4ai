@@ -185,6 +185,70 @@ class TestPinningProxy:
         )
         assert public_error_detail(playwright_error) == f"Crawl failed: {expected}"
 
+    @pytest.mark.parametrize(
+        ("host", "expected"),
+        [
+            ("refused.example", "net::ERR_CONNECTION_REFUSED"),
+            ("[2001:db8::1]", "net::ERR_CONNECTION_REFUSED"),
+            ("unresolvable.example", "net::ERR_NAME_NOT_RESOLVED"),
+            ("internal.example", None),
+        ],
+    )
+    async def test_dead_target_surfaces_its_own_code_not_the_tunnel_code_all_proxies_failed_shape(
+        self, monkeypatch, host, expected
+    ):
+        """Regression: the "All proxies failed: ..." message shape produced when
+        CrawlerRunConfig.max_retries >= 1 (async_crawler_strategy.py:816 ->
+        async_webcrawler.py:677) carries no internal-error marker and no
+        container path, so it takes public_error_detail's early-return branch.
+        The tunnel-code swap must still fire there, otherwise a dead target
+        surfaces the misleading ERR_TUNNEL_CONNECTION_FAILED verbatim. A policy
+        block records no dial outcome, so it keeps the verbatim pass-through."""
+        from egress_broker import TargetUnresolvable
+        from utils import public_error_detail
+
+        monkeypatch.setattr(egress_proxy, "_dial_failures", type(egress_proxy._dial_failures)())
+        proxy = PinningProxy()
+        await proxy.start()
+        closed = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+        closed_port = closed.sockets[0].getsockname()[1]
+        closed.close()
+        await closed.wait_closed()
+
+        def fake_pin(url):
+            if host == "unresolvable.example":
+                raise TargetUnresolvable()
+            if host == "internal.example":
+                raise EgressBlocked()
+            return PinnedTarget("https", host, closed_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT {host}:{closed_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            status = await asyncio.wait_for(r.readline(), timeout=5)
+            assert b"403" in status
+            w.close()
+        finally:
+            await proxy.stop()
+
+        # The path-B shape: str(RuntimeError(...)) prefixed with "All proxies
+        # failed: ", clean of every marker and container path.
+        playwright_line = (
+            f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{host}:{closed_port}/\n"
+            f"Call log:\n  - navigating to \"https://{host}:{closed_port}/\"\n"
+        )
+        runtime_err = str(RuntimeError(f"Failed on navigating ACS-GOTO:\n{playwright_line}"))
+        message = f"All proxies failed: {runtime_err}"
+
+        if expected is not None:
+            assert public_error_detail(message) == f"Crawl failed: {expected}"
+        else:
+            # Policy block: nothing recorded -> swap no-ops -> verbatim pass-through
+            # (public_error_detail strips then caps at 500).
+            assert public_error_detail(message) == message.strip()[:500]
+
 
 async def _fake_corporate_proxy(seen):
     """Minimal HTTP proxy: records the CONNECT request line, replies 200, then

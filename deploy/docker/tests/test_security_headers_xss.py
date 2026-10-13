@@ -129,6 +129,98 @@ class TestErrorSanitization:
         upstream = "Blocked by anti-bot protection at https://example.com/app/login"
         assert public_error_detail(upstream) == upstream
 
+    def test_tunnel_swap_fires_for_clean_all_proxies_failed_message(self, monkeypatch):
+        """Regression for the max_retries >= 1 path: the "All proxies failed: ..."
+        shape is clean of every internal marker and container path, so it reaches
+        public_error_detail's early-return branch. A recorded dead-target dial
+        outcome must still drive the ERR_TUNNEL_CONNECTION_FAILED -> real code
+        swap there; without a recording the message passes through verbatim."""
+        import time
+        import egress_proxy
+        from utils import public_error_detail
+
+        # Fresh dial-failure map so this test never sees or leaks state.
+        failures = type(egress_proxy._dial_failures)()
+        monkeypatch.setattr(egress_proxy, "_dial_failures", failures)
+
+        def _all_proxies_failed(url):
+            line = f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at {url}\n"
+            return f"All proxies failed: Failed on navigating ACS-GOTO:\n{line}"
+
+        # No recording: a transient proxy fault surfaces verbatim (pass-through).
+        transient = _all_proxies_failed("https://transient.example:443/")
+        assert public_error_detail(transient) == transient.strip()[:500]
+
+        # Record a refused dial outcome for the same host:port -> swap fires.
+        failures[("dead.example", 443)] = ("net::ERR_CONNECTION_REFUSED", time.monotonic())
+        refused = _all_proxies_failed("https://dead.example:443/")
+        assert public_error_detail(refused) == "Crawl failed: net::ERR_CONNECTION_REFUSED"
+
+        # Default https port (443) is inferred when the URL omits the port.
+        failures.clear()
+        failures[("dead.example", 443)] = ("net::ERR_NAME_NOT_RESOLVED", time.monotonic())
+        unresolvable = _all_proxies_failed("https://dead.example/")
+        assert public_error_detail(unresolvable) == "Crawl failed: net::ERR_NAME_NOT_RESOLVED"
+
+        # An expired recording (past the TTL) no-ops -> verbatim pass-through.
+        failures.clear()
+        failures[("stale.example", 443)] = (
+            "net::ERR_ADDRESS_UNREACHABLE",
+            time.monotonic() - egress_proxy._DIAL_FAILURE_TTL_S - 1,
+        )
+        stale = _all_proxies_failed("https://stale.example:443/")
+        assert public_error_detail(stale) == stale.strip()[:500]
+
+    def test_clean_non_tunnel_navigation_error_still_passes_through(self, monkeypatch):
+        """A clean navigation error that is NOT ERR_TUNNEL_CONNECTION_FAILED
+        (e.g. a cert error) must continue to pass through verbatim even though it
+        takes the same early-return branch — the swap is tunnel-failure-only."""
+        import egress_proxy
+        from utils import public_error_detail
+
+        failures = type(egress_proxy._dial_failures)()
+        monkeypatch.setattr(egress_proxy, "_dial_failures", failures)
+
+        cert = (
+            "All proxies failed: Failed on navigating ACS-GOTO:\n"
+            "Page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://self-signed.example/\n"
+        )
+        assert public_error_detail(cert) == cert.strip()[:500]
+
+    def test_public_crawl_error_mints_correlation_id_when_tunnel_swap_rewrites_clean_message(
+        self, monkeypatch
+    ):
+        """When the tunnel swap rewrites a clean "All proxies failed" message,
+        something is withheld (the verbatim message was replaced), so
+        public_crawl_error must mint a correlation id — mirroring the contract
+        that a correlation id is minted only when something was withheld."""
+        import time
+        import egress_proxy
+        from utils import public_crawl_error
+
+        failures = type(egress_proxy._dial_failures)()
+        monkeypatch.setattr(egress_proxy, "_dial_failures", failures)
+        failures[("dead.example", 443)] = ("net::ERR_CONNECTION_REFUSED", time.monotonic())
+
+        message = (
+            "All proxies failed: Failed on navigating ACS-GOTO:\n"
+            "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://dead.example:443/\n"
+        )
+        public = public_crawl_error(message, "https://dead.example:443/")
+        assert re.fullmatch(
+            r"Crawl failed: net::ERR_CONNECTION_REFUSED \(correlation_id=[0-9a-f]{12}\)",
+            public,
+        )
+        assert public.correlation_id
+
+        # No recording -> verbatim pass-through -> NO correlation id minted.
+        failures.clear()
+        transient = (
+            "All proxies failed: Failed on navigating ACS-GOTO:\n"
+            "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://transient.example:443/\n"
+        )
+        assert public_crawl_error(transient) == transient.strip()
+
     def test_correlation_id_is_minted_only_when_something_was_withheld(self):
         from utils import public_crawl_error
 
