@@ -18,6 +18,8 @@ logger = AsyncLogger(log_level=LogLevel.DEBUG, verbose=True)
 
 
 class DatabaseMigration:
+    _POINTER_TABLE = "crawl4ai_content_pointers"
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.content_paths = self._ensure_content_dirs(os.path.dirname(db_path))
@@ -48,34 +50,50 @@ class DatabaseMigration:
         """Return True if ``content`` is already a stored content-hash pointer.
 
         After the blob->hash migration has run on a row, the DB column holds an
-        xxh64 hex string (16 chars) naming an existing file under
+        xxh64 hex string (16 chars) naming a file under
         ``content_paths[content_type]``. Re-running the migration must detect
         this and leave the pointer intact, otherwise it re-hashes the hash
         string, updates the column to the new (hash-of-hash) pointer and
-        orphans the original content file on disk. Implementation of the
-        recommended fix: "skip rows whose column value already names an
-        existing ``*_content/<hash>`` file".
+        orphans the original content file on disk.
+
+        Classification is based purely on the value's shape (a 16-char hex
+        string matching the xxh64 hexdigest format) and deliberately does NOT
+        gate on whether the backing ``*_content/<hash>`` file currently
+        exists. A row whose file is missing (e.g. the DB survived but the
+        ``*_content/`` directory was lost) is still an already-migrated row;
+        re-hashing its pointer would write a new file whose body is the old
+        hash string and leave the cache serving that hash string as content on
+        a hit. The correct recovery for a missing backing file is a
+        self-healing cache miss (``aget_cached_url`` returns ``None`` when
+        ``_load_content`` cannot find the file), not a destructive re-hash.
         """
         if not content or len(content) != 16:
             return False
         # xxh64 hexdigest is 16 hex chars; reject non-hex strings of that
-        # length so a 16-char raw blob that happens to exist as a file name
-        # under a different content dir is not misclassified.
+        # length so a 16-char raw blob is not misclassified as a pointer.
         try:
             int(content, 16)
         except (TypeError, ValueError):
             return False
-        return os.path.exists(os.path.join(self.content_paths[content_type], content))
+        # A 16-hex-char value is a hash pointer regardless of whether the
+        # backing file currently exists; a missing file self-heals as a cache
+        # miss, never via a destructive re-hash into a hash-of-hash pointer.
+        return True
 
-    async def _store_content(self, content: str, content_type: str) -> str:
+    async def _store_content(
+        self, content: str, content_type: str, *, force: bool = False
+    ) -> str:
         if not content:
             return ""
 
         # Idempotency guard: if the column already holds a content-hash
         # pointer (the migration has already run on this row), keep it as-is
         # instead of re-hashing the hash string. This makes ``migrate_database``
-        # safe to re-run after a partial failure or a stale marker.
-        if self._is_content_hash(content, content_type):
+        # safe to re-run after a partial failure or a stale marker, including
+        # when the backing ``*_content/`` file is missing (the row self-heals
+        # as a cache miss on read rather than being corrupted into a
+        # hash-of-hash pointer whose new file body is the old hash string).
+        if not force and self._is_content_hash(content, content_type):
             return content
 
         content_hash = self._generate_content_hash(content)
@@ -129,6 +147,18 @@ class DatabaseMigration:
                 ) as cursor:
                     rows = await cursor.fetchall()
 
+                await db.execute(
+                    f"""CREATE TABLE IF NOT EXISTS {self._POINTER_TABLE} (
+                        url TEXT NOT NULL,
+                        content_type TEXT NOT NULL,
+                        PRIMARY KEY (url, content_type)
+                    )"""
+                )
+                async with db.execute(
+                    f"SELECT url, content_type FROM {self._POINTER_TABLE}"
+                ) as cursor:
+                    known_pointers = set(await cursor.fetchall())
+
                 migrated_count = 0
                 for row in rows:
                     (
@@ -141,15 +171,44 @@ class DatabaseMigration:
                     ) = row
 
                     # Store content in files and get hashes
-                    html_hash = await self._store_content(html, "html")
-                    cleaned_hash = await self._store_content(cleaned_html, "cleaned")
-                    markdown_hash = await self._store_content(markdown, "markdown")
-                    extracted_hash = await self._store_content(
-                        extracted_content, "extracted"
-                    )
-                    screenshot_hash = await self._store_content(
-                        screenshot, "screenshots"
-                    )
+                    content_values = {
+                        "html": html,
+                        "cleaned": cleaned_html,
+                        "markdown": markdown,
+                        "extracted": extracted_content,
+                        "screenshots": screenshot,
+                    }
+                    stored_hashes = {}
+                    for content_type, value in content_values.items():
+                        pointer_key = (url, content_type)
+                        backing_file = (
+                            os.path.join(self.content_paths[content_type], value)
+                            if value
+                            else ""
+                        )
+                        known = pointer_key in known_pointers
+                        legacy_pointer = (
+                            self._is_content_hash(value, content_type)
+                            and os.path.exists(backing_file)
+                        )
+                        stored_hashes[content_type] = await self._store_content(
+                            value,
+                            content_type,
+                            force=not (known or legacy_pointer),
+                        )
+                        if value and pointer_key not in known_pointers:
+                            await db.execute(
+                                f"INSERT OR IGNORE INTO {self._POINTER_TABLE} "
+                                "(url, content_type) VALUES (?, ?)",
+                                pointer_key,
+                            )
+                            known_pointers.add(pointer_key)
+
+                    html_hash = stored_hashes["html"]
+                    cleaned_hash = stored_hashes["cleaned"]
+                    markdown_hash = stored_hashes["markdown"]
+                    extracted_hash = stored_hashes["extracted"]
+                    screenshot_hash = stored_hashes["screenshots"]
 
                     # Update database with hashes
                     await db.execute(
@@ -222,10 +281,11 @@ async def run_migration(db_path: Optional[str] = None):
     """Run the one-time blob->hash database migration.
 
     The migration is idempotent: rows whose content columns already hold a
-    content-hash pointer (naming an existing ``*_content/<hash>`` file) are
-    skipped by ``DatabaseMigration._store_content``, so a re-run after a
-    partial failure or a stale marker does not re-hash already-migrated
-    content.
+    content-hash pointer (a 16-char xxh64 hex string naming a
+    ``*_content/<hash>`` file, whether or not that file currently exists on
+    disk) are skipped by ``DatabaseMigration._store_content``, so a re-run
+    after a partial failure or a stale marker does not re-hash
+    already-migrated content.
     """
     if db_path is None:
         db_path = os.path.join(Path.home(), ".crawl4ai", "crawl4ai.db")
