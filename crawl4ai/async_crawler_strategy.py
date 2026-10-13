@@ -1208,8 +1208,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 if config.session_id and page is not None and not page.is_closed():
                     try:
                         return await page.content()
-                    except Exception:
-                        pass
+                    except Error as error:
+                        if "closed" in str(error).lower():
+                            return html
+                        raise
                 return html
 
             ###

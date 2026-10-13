@@ -10,6 +10,7 @@ from crawl4ai import browser_manager as browser_manager_module
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.browser_adapter import UndetectedAdapter
 from crawl4ai.browser_manager import BrowserManager
+from playwright.async_api import Error as PlaywrightError
 
 
 class _Page:
@@ -354,7 +355,7 @@ async def test_headless_crawl_delayed_content_survives_page_close():
     # real Playwright's TargetClosedError on a closed target.
     async def content_after_close(*a, **k):
         if getattr(underlying, "closed", False):
-            raise Exception("Target page, context or browser has been closed")
+            raise PlaywrightError("Target page, context or browser has been closed")
         return "<html><body></body></html>"
 
     crawl_page.content = content_after_close
@@ -462,6 +463,42 @@ async def test_delayed_content_reads_live_session_page():
 
     assert "updated" in delayed_html
     assert "crawl-time" not in delayed_html
+
+
+@pytest.mark.asyncio
+async def test_delayed_content_propagates_live_page_failures():
+    context = _Context()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.is_closed = MagicMock(return_value=False)
+
+    calls = 0
+
+    async def failed_content(*a, **k):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "<html><body>crawl-time</body></html>"
+        raise RuntimeError("content protocol failed")
+
+    crawl_page.content = failed_content
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web(
+        "https://example.test/",
+        CrawlerRunConfig(session_id="delayed-content-error-session"),
+    )
+
+    with pytest.raises(RuntimeError, match="content protocol failed"):
+        await result.get_delayed_content(0.0)
 
 
 @pytest.mark.asyncio
