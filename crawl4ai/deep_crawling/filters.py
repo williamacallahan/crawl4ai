@@ -92,15 +92,33 @@ class FilterChain:
         """Apply all filters concurrently when possible"""
         self.stats._counters[0] += 1  # Total processed URLs
 
+        async def dispose_pending(pending):
+            futures = []
+            for result in pending:
+                if inspect.iscoroutine(result):
+                    result.close()
+                elif isinstance(result, asyncio.Future):
+                    result.cancel()
+                    futures.append(result)
+                else:
+                    future = asyncio.ensure_future(result)
+                    future.cancel()
+                    futures.append(future)
+            if futures:
+                await asyncio.gather(*futures, return_exceptions=True)
+
         tasks = []
         for f in self.filters:
-            result = f.apply(url)
+            try:
+                result = f.apply(url)
+            except Exception:
+                await dispose_pending(tasks)
+                raise
 
             if inspect.isawaitable(result):
                 tasks.append(result)  # Collect async tasks
             elif not result:  # Sync rejection
-                for t in tasks:
-                    t.close()  # Dispose un-awaited async coroutines
+                await dispose_pending(tasks)
                 self.stats._counters[2] += 1  # Sync rejected
                 return False
 
