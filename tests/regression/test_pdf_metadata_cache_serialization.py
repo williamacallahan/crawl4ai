@@ -435,6 +435,18 @@ def test_metadata_as_jsonable_dict_backstops_non_native_text_fields():
     assert d["author"] == "an author"
 
 
+def test_info_value_as_text_surfaces_malformed_indirect_object():
+    from crawl4ai.processors.pdf.processor import NaivePDFProcessorStrategy
+    from pypdf.generic import IndirectObject
+
+    class BrokenIndirect(IndirectObject):
+        def get_object(self):
+            raise ValueError("malformed indirect object")
+
+    with pytest.raises(ValueError, match="malformed indirect object"):
+        NaivePDFProcessorStrategy._info_value_as_text(BrokenIndirect.__new__(BrokenIndirect))
+
+
 @pytest.mark.asyncio
 async def test_e2e_bytestring_pdf_writes_cache_row(tmp_path, bytestring_pdf):
     """End-to-end (shape A): a PDF with ``ByteStringObject`` /Info values,

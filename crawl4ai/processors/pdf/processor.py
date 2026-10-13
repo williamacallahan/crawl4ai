@@ -476,24 +476,24 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
         stream is closed. Resolving here (rather than later in the cache writer)
         keeps ``PDFMetadata``'s ``Optional[str]`` text fields honest to their
         declared type and guarantees the dict the cache writer receives is
-        JSON-native. ``None`` (key absent) is passed through unchanged; any
-        resolution/decoding error degrades the single field to ``None`` rather
-        than propagating, so one bad /Info value can never drop the cache row.
+        JSON-native. ``None`` (key absent) is passed through unchanged.
+        Malformed indirect objects raise their original error so callers do not
+        silently lose metadata or mistake a failed conversion for an absent
+        field.
         """
         if value is None:
             return None
-        try:
-            from pypdf.generic import IndirectObject
-        except ImportError:
-            return None
-        try:
-            if isinstance(value, IndirectObject):
-                value = value.get_object()
-                if value is None:
-                    return None
-            return str(value)
-        except Exception:
-            return None
+        from pypdf.generic import IndirectObject
+
+        if isinstance(value, bytes):
+            return value.decode("latin-1")
+        if isinstance(value, IndirectObject):
+            value = value.get_object()
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                return value.decode("latin-1")
+        return str(value)
 
     def _parse_pdf_date(self, date_str: str) -> Optional[datetime]:
         try:
