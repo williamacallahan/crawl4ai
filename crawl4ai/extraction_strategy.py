@@ -2123,7 +2123,10 @@ class JsonLxmlExtractionStrategy(JsonElementExtractionStrategy):
                     # twice (within-page memoization). The cache is also cleared
                     # at the start of every ``extract`` call so entries never
                     # outlive a single page's parse tree.
-                    cache_key = f"{id(element)}::{selector_str}"
+                    # Retain the element object in the key so lxml proxy
+                    # identity cannot be recycled for a different node while
+                    # this parse tree is cached.
+                    cache_key = (element, selector_str)
 
                     if cache_key in self._result_cache:
                         return self._result_cache[cache_key]
