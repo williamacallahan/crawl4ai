@@ -307,12 +307,17 @@ class StatisticalStrategy(CrawlStrategy):
         self.idf_cache = {}
         self.bm25_k1 = 1.2  # BM25 parameter
         self.bm25_b = 0.75  # BM25 parameter
-        
+        # Default config so the strategy is usable standalone (matching the
+        # const weights used historically). ``AdaptiveCrawler.digest`` overwrites
+        # this with the user's ``AdaptiveConfig`` before any calculate_confidence
+        # call site, so user-configured sub-metric weights take effect.
+        self.config: AdaptiveConfig = AdaptiveConfig()
+
     async def calculate_confidence(self, state: CrawlState) -> float:
         """Calculate confidence using coverage, consistency, and saturation"""
         if not state.knowledge_base:
             return 0.0
-            
+
         coverage = self._calculate_coverage(state)
         consistency = self._calculate_consistency(state)
         saturation = self._calculate_saturation(state)
@@ -322,9 +327,11 @@ class StatisticalStrategy(CrawlStrategy):
         state.metrics['consistency'] = consistency
         state.metrics['saturation'] = saturation
 
-        # Weighted combination (weights from config not accessible here, using defaults)
-        confidence = 0.4 * coverage + 0.3 * consistency + 0.3 * saturation
-        
+        # Weighted combination honoring user-configured sub-metric weights.
+        confidence = (self.config.coverage_weight * coverage
+                    + self.config.consistency_weight * consistency
+                    + self.config.saturation_weight * saturation)
+
         return confidence
     
     def _calculate_coverage(self, state: CrawlState) -> float:
@@ -1211,7 +1218,9 @@ class AdaptiveCrawler:
     def _create_strategy(self, strategy_name: str) -> CrawlStrategy:
         """Create strategy instance based on name"""
         if strategy_name == "statistical":
-            return StatisticalStrategy()
+            strategy = StatisticalStrategy()
+            strategy.config = self.config  # Pass config to strategy
+            return strategy
         elif strategy_name == "embedding":
             strategy = EmbeddingStrategy(
                 embedding_model=self.config.embedding_model,

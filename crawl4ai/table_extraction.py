@@ -72,7 +72,13 @@ class DefaultTableExtraction(TableExtractionStrategy):
     It handles colspan and rowspan attributes to preserve table structure.
     """
     
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        table_score_threshold: int = 7,
+        min_rows: int = 0,
+        min_cols: int = 0,
+        **kwargs,
+    ):
         """
         Initialize the default table extraction strategy.
         
@@ -80,12 +86,12 @@ class DefaultTableExtraction(TableExtractionStrategy):
             table_score_threshold (int): Minimum score for a table to be considered a data table (default: 7)
             min_rows (int): Minimum number of rows for a valid table (default: 0)
             min_cols (int): Minimum number of columns for a valid table (default: 0)
-            **kwargs: Additional parameters passed to parent class
+            **kwargs: Additional parameters passed to parent class (e.g. verbose, logger)
         """
         super().__init__(**kwargs)
-        self.table_score_threshold = kwargs.get("table_score_threshold", 7)
-        self.min_rows = kwargs.get("min_rows", 0)
-        self.min_cols = kwargs.get("min_cols", 0)
+        self.table_score_threshold = kwargs.get("table_score_threshold", table_score_threshold)
+        self.min_rows = kwargs.get("min_rows", min_rows)
+        self.min_cols = kwargs.get("min_cols", min_cols)
 
     @staticmethod
     def _cell_span(cell: etree.Element, attribute: str) -> int:
@@ -269,6 +275,13 @@ class DefaultTableExtraction(TableExtractionStrategy):
             pending = {}  # col_index -> (value, rows_remaining)
             current_group = None
             header_row_data = []
+            # Widest resolved <thead> row. The leaf row can be narrower than an
+            # earlier (e.g. top) <thead> row when a top-row <th rowspan="1">
+            # covers a column the leaf leaves uncovered. Keys off
+            # ``len(headers)`` for body alignment would then drop trailing
+            # body cells; track the full header-grid width and pad the leaf
+            # headers so ``max_columns`` reflects the grid, not the leaf.
+            header_grid_width = 0
             for row in thead_rows:
                 row_group = row.getparent()
                 if row_group is not current_group:
@@ -314,13 +327,19 @@ class DefaultTableExtraction(TableExtractionStrategy):
                         row_data.append("")
                         col += 1
                 if row_data:
+                    header_grid_width = max(header_grid_width, len(row_data))
                     header_row_data = row_data
-            headers = list(header_row_data)
+            headers = list(header_row_data) + [""] * (
+                header_grid_width - len(header_row_data)
+            )
         else:
             # Only adopt the first row as headers when it is all <th>; a row
             # mixing <th> (row label) with <td> data must stay data, otherwise
             # the short th-derived header list truncates every data row.
-            first_row = table.xpath("./tr | ./tbody/tr | ./tfoot/tr")
+            # <tfoot> rows are excluded: a footer is never a column header,
+            # and the HTML table model places it last, so a <tfoot> preceding
+            # <tbody> in source must not become first_row[0] here.
+            first_row = table.xpath("./tr | ./tbody/tr")
             if first_row and not first_row[0].xpath("./td"):
                 for cell in first_row[0].xpath("./th"):
                     text = self._cell_text(cell, table_depth)
@@ -330,10 +349,23 @@ class DefaultTableExtraction(TableExtractionStrategy):
         # Extract rows honoring both colspan and rowspan (HTML table model).
         # A cell with rowspan="N" is duplicated down into the N-1 continuation
         # rows it occupies within its row group.
+        # The HTML table model places <tfoot> rows LAST, regardless of source
+        # position (WHATWG "table.rows" getter: thead rows, then body rows
+        # in tree order, then tfoot rows in tree order). lxml preserves the
+        # source position of <tfoot>, so a single document-order XPath union
+        # over all row groups would emit a <tfoot> placed before <tbody>
+        # (valid HTML4/HTML5) at the top of the body. Iterating the non-footer
+        # row groups (<thead>, bare <tr> children, <tbody>) in document order
+        # -- the same union the rowspan carry-down relies on for its group
+        # -transition (current_group / pending.clear()) semantics -- then
+        # appending <tfoot> rows, keeps footer rows at the end while
+        # preserving every existing group-boundary behaviour.
         rows = []
         pending = {}  # col_index -> (value, rows_remaining)
         current_group = None
-        for row in table.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr"):
+        ordered_rows = list(table.xpath("./tr | ./thead/tr | ./tbody/tr"))
+        ordered_rows += list(table.xpath("./tfoot/tr"))
+        for row in ordered_rows:
             row_group = row.getparent()
             if row_group is not current_group:
                 pending.clear()

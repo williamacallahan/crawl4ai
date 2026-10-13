@@ -266,7 +266,7 @@ def clean_pdf_text(page_number, text):
                     
         # Detect numbered headers like "2.1 Background"
         numbered_header = re.match(r'^(\d+(?:\.\d+)*)\s+(.+)$', line)
-        if not lines[i-1].strip() and numbered_header:
+        if i > 0 and not lines[i-1].strip() and numbered_header:
             flush_paragraph()
             level = numbered_header.group(1).count('.') + 1  # Convert 2.1 → level 2
             header_text = numbered_header.group(2)

@@ -371,6 +371,16 @@ class Compiler:
 
     def _apply_set_vars(self,ir):
         def sub(s): return re.sub(r"\$(\w+)",lambda m:str(self.vars.get(m.group(1),m.group(0))) ,s) if isinstance(s,str) else s
+        def walk(c):
+            if c is None: return c
+            if c.op in ("TYPE","EVAL","SET"):
+                c.args=[sub(a) for a in c.args]
+            elif c.op=="IF":
+                c.args[1]=walk(c.args[1])
+                if c.args[2] is not None: c.args[2]=walk(c.args[2])
+            elif c.op=="REPEAT":
+                c.args[0]=walk(c.args[0])
+            return c
         out=[]
         for c in ir:
             if isinstance(c,Cmd):
@@ -378,8 +388,8 @@ class Compiler:
                     # Store variable
                     self.vars[c.args[0].lstrip('$')]=c.args[1]
                 else:
-                    # Apply variable substitution to commands that use them
-                    if c.op in("TYPE","EVAL","SET"): c.args=[sub(a) for a in c.args]
+                    # Apply variable substitution, recursing into IF/REPEAT bodies
+                    walk(c)
                     out.append(c)
         return out
 

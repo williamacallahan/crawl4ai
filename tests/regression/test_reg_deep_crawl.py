@@ -682,6 +682,57 @@ async def test_prefetch_deep_crawl_query_order_dedup(local_server):
     )
 
 
+@pytest.mark.browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch", [False, True], ids=["full-scrape", "prefetch"])
+async def test_prefetch_deep_crawl_blank_param_distinct(local_server, prefetch):
+    """End-to-end: BFS must fetch BOTH /blank-dedup/target and ?q= variant.
+
+    Regression for the blank-value query param dedup bug. The hub page exposes
+    two links to the same target path: one bare (``/blank-dedup/target``) and
+    one with a blank-value param (``/blank-dedup/target?q=``). Before the fix,
+    ``normalize_url_for_deep_crawl`` used ``parse_qs`` (``keep_blank_values=False``),
+    dropping ``q=`` and collapsing both hrefs into one dedup key, so only one was
+    fetched. With the fix, the blank param is preserved and both are fetched.
+
+    Tested in both the full-scrape and prefetch (``quick_extract_links``) paths,
+    since ``quick_extract_links`` uses the same function for its per-document
+    ``seen`` set.
+    """
+    base = _to_ip_url(local_server)
+    hub_url = base + "/blank-dedup/hub"
+    strategy = BFSDeepCrawlStrategy(max_depth=1, max_pages=10)
+    config = CrawlerRunConfig(
+        deep_crawl_strategy=strategy, prefetch=prefetch, verbose=False
+    )
+
+    async with AsyncWebCrawler(
+        config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])
+    ) as crawler:
+        results = await crawler.arun(url=hub_url, config=config)
+        result_list = list(results)
+
+    target_results = [
+        r for r in result_list
+        if r.url.split("?")[0].endswith("/blank-dedup/target")
+    ]
+    # Both distinct URIs must be fetched: one bare, one with ?q=.
+    assert len(target_results) == 2, (
+        f"Both /blank-dedup/target and /blank-dedup/target?q= must be fetched, "
+        f"got {len(target_results)}: {[r.url for r in target_results]}"
+    )
+    query_strings = {
+        r.url.split("?", 1)[1] if "?" in r.url else ""
+        for r in target_results
+    }
+    assert "" in query_strings, (
+        f"Bare /blank-dedup/target not fetched: {[r.url for r in target_results]}"
+    )
+    assert "q=" in query_strings, (
+        f"/blank-dedup/target?q= not fetched: {[r.url for r in target_results]}"
+    )
+
+
 def test_deep_crawl_efficient_normalization():
     """efficient_normalize_url_for_deep_crawl should produce consistent results."""
     base = "http://example.com/deep/hub"

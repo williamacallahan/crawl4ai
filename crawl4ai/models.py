@@ -243,7 +243,12 @@ class CrawlResult(BaseModel):
             included = info.include is None or "markdown" in info.include
             if included and not excluded:
                 result["markdown"] = self._markdown.model_dump(
-                    mode="json" if info.mode_is_json() else "python"
+                    mode="json" if info.mode_is_json() else "python",
+                    exclude_none=info.exclude_none,
+                    exclude_defaults=info.exclude_defaults,
+                    exclude_unset=info.exclude_unset,
+                    by_alias=info.by_alias,
+                    round_trip=info.round_trip,
                 )
         return result
 

@@ -379,7 +379,7 @@ class AsyncFileLogger(AsyncLoggerBase):
         """Log URL fetch status to file."""
         status = "SUCCESS" if success else "FAILED"
         message = f"{url[:url_length]}... | Status: {status} | Time: {timing:.2f}s"
-        level = "URL_STATUS" if success else "ERROR"
+        level = "SUCCESS" if success else "ERROR"
         self._write_to_file(level, message, tag)
 
     def error_status(self, url: str, error: str, tag: str = "ERROR", url_length: int = 100):

@@ -30,11 +30,13 @@ env:
 jobs:
   test:
     runs-on: [self-hosted, Linux, X64, williamacallahan]
+    timeout-minutes: 30
     steps:
       # persist-credentials:false — the runners are long-lived, so the default
       # would leave a usable GITHUB_TOKEN in .git/config after the job ends.
       - uses: actions/checkout@v6
         with:
+          clean: false
           persist-credentials: false
 
       - name: Install uv
@@ -111,9 +113,11 @@ jobs:
           - arch: arm64
             runner_arch: ARM64
     runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}", williamacallahan]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
+          clean: false
           persist-credentials: false
 
       # Secrets arrive via env, never interpolated into the shell line, so they
@@ -193,11 +197,13 @@ jobs:
   merge:
     needs: build
     runs-on: [self-hosted, Linux, X64, williamacallahan]
+    timeout-minutes: 30
     outputs:
       image_digest: ${{ steps.manifest.outputs.image_digest }}
     steps:
       - uses: actions/checkout@v6
         with:
+          clean: false
           persist-credentials: false
 
       - name: Registry login
@@ -235,9 +241,11 @@ jobs:
   deploy:
     needs: merge
     runs-on: [self-hosted, Linux, X64, williamacallahan, canonical-haiku-0]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
+          clean: false
           persist-credentials: false
 
       - name: Install uv
