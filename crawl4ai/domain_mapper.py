@@ -827,7 +827,7 @@ class DomainMapper:
         seeder = await self._get_seeder()
         for sm_url in sitemap_urls:
             try:
-                async for u in seeder._iter_sitemap(sm_url):
+                async for u in seeder._iter_sitemap(sm_url, allowed_host=host):
                     urls.append(u)
             except Exception as e:
                 self._log("warning", "Error parsing sitemap {url}: {err}",
@@ -950,6 +950,10 @@ class DomainMapper:
                 if resp.status_code != 200:
                     continue
 
+                final_host = urlparse(str(resp.url)).hostname
+                if final_host is None or final_host.lower().removeprefix("www.") != host.lower().removeprefix("www."):
+                    continue
+
                 content_type = resp.headers.get("content-type", "").lower()
                 body = resp.text
 
@@ -959,7 +963,12 @@ class DomainMapper:
                    "<rss" not in body[:500] and "<feed" not in body[:500]:
                     continue
 
-                feed_urls = self._parse_feed_xml(body, str(resp.url))
+                feed_urls = [
+                    candidate
+                    for candidate in self._parse_feed_xml(body, str(resp.url))
+                    if (urlparse(candidate).hostname or "").lower().removeprefix("www.")
+                    == host.lower().removeprefix("www.")
+                ]
                 if feed_urls:
                     self._log("info", "Feed {path} on {host}: {count} URLs",
                               params={"path": feed_path, "host": host,

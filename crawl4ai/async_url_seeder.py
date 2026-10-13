@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 import fnmatch
@@ -1147,7 +1147,7 @@ class AsyncUrlSeeder:
             for u in regular_urls:
                 yield u
 
-    async def _iter_sitemap(self, url: str):
+    async def _iter_sitemap(self, url: str, allowed_host: Optional[str] = None):
         try:
             r = await self.client.get(url, timeout=15, follow_redirects=True)
             r.raise_for_status()
@@ -1167,6 +1167,15 @@ class AsyncUrlSeeder:
         data = gzip.decompress(r.content) if url.endswith(".gz") else r.content
         base_url = str(r.url)
 
+        def _on_allowed_host(candidate: str) -> bool:
+            if allowed_host is None:
+                return True
+            actual = urlparse(candidate).hostname
+            return bool(actual) and actual.lower().removeprefix("www.") == allowed_host.lower().removeprefix("www.")
+
+        if not _on_allowed_host(base_url):
+            return
+
         def _normalize_loc(raw: Optional[str]) -> Optional[str]:
             if not raw:
                 return None
@@ -1174,7 +1183,7 @@ class AsyncUrlSeeder:
             normalized = urljoin(base_url, cleaned)
             if not normalized:
                 return None
-            return normalized
+            return normalized if _on_allowed_host(normalized) else None
 
         # Detect if this is a sitemap index by checking for <sitemapindex> or presence of <sitemap> elements
         is_sitemap_index = False
@@ -1294,7 +1303,7 @@ class AsyncUrlSeeder:
                     self._log(
                         "debug", "Processing sub-sitemap: {url}", params={"url": sitemap_url}, tag="URL_SEED")
                     # Recursively process sub-sitemap
-                    async with aclosing(self._iter_sitemap(sitemap_url)) as stream:
+                    async with aclosing(self._iter_sitemap(sitemap_url, allowed_host=allowed_host)) as stream:
                         async for u in stream:
                             await result_queue.put(u)  # Will block if queue is full
                 except Exception as e:
