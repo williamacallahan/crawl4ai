@@ -222,6 +222,15 @@ class TestNestedDictIncludeExclude:
         out = cr.model_dump(mode="json", include={"markdown": {"raw_markdown"}})
         assert "markdown" not in out
 
+    def test_whole_field_markers_match_normal_pydantic_field(self):
+        cr = _result(md=_md())
+        assert cr.model_dump(mode="json", include={"markdown": ...}) == {
+            "markdown": self._normal().model_dump(mode="json")["n"]
+        }
+        assert "markdown" not in cr.model_dump(
+            mode="json", exclude={"markdown": ...}
+        )
+
 
 class TestRoundTrip:
     """``model_dump_json()`` output must let Pydantic reconstruct
