@@ -140,10 +140,10 @@ async def test_authenticate_reuses_constructor_api_token_in_body():
     "construct with ``api_token=`` then call ``authenticate(email)``" sends the
     constructor's operator token in the body, matching the explicit-arg path.
     """
-    captured = {}
+    captured = []
 
     def handler(request):
-        captured["body"] = request.read().decode()
+        captured.append(json.loads(request.read().decode()))
         return httpx.Response(
             200, json={"email": "u@x.com", "access_token": "jwt", "token_type": "bearer"}
         )
@@ -155,9 +155,11 @@ async def test_authenticate_reuses_constructor_api_token_in_body():
     _install_mock(client, handler)
     try:
         await client.authenticate("u@x.com")
-        body = json.loads(captured["body"])
-        assert body["email"] == "u@x.com"
-        assert body["api_token"] == "constructor-token-0123456789"
+        await client.authenticate("second@x.com")
+        assert captured == [
+            {"email": "u@x.com", "api_token": "constructor-token-0123456789"},
+            {"email": "second@x.com", "api_token": "constructor-token-0123456789"},
+        ]
     finally:
         if not client._http_client.is_closed:
             await client._http_client.aclose()

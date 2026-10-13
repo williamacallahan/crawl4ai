@@ -80,9 +80,10 @@ class Crawl4aiDockerClient:
             verify=verify_ssl,
             headers={"Content-Type": "application/json"}
         )
+        self._api_token: Optional[str] = api_token
         self._token: Optional[str] = api_token
-        if self._token:
-            self._http_client.headers["Authorization"] = f"Bearer {self._token}"
+        if api_token:
+            self._http_client.headers["Authorization"] = f"Bearer {api_token}"
 
     async def authenticate(self, email: str, api_token: Optional[str] = None) -> None:
         """Authenticate with the server and store the JWT.
@@ -97,7 +98,7 @@ class Crawl4aiDockerClient:
         without one.
         """
         url = urljoin(self.base_url, "/token")
-        credential = api_token or self._token
+        credential = api_token or self._api_token
         if not credential:
             raise ConnectionError(
                 "authenticate() requires the server's operator API token "
