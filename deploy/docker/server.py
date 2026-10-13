@@ -40,6 +40,7 @@ from auth import (
 from auth_gate import AuthGateMiddleware
 from crawler_pool import close_all, get_crawler, janitor, release_crawler
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import (
@@ -646,6 +647,16 @@ async def _http_exception_handler(request: Request, exc: _StarletteHTTPException
         status_code=exc.status_code,
         headers=getattr(exc, "headers", None),
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return JSON-safe validation details without echoing untrusted inputs."""
+    detail = [
+        {key: value for key, value in error.items() if key != "input"}
+        for error in exc.errors()
+    ]
+    return JSONResponse({"detail": detail}, status_code=422)
 
 
 @app.exception_handler(Exception)
