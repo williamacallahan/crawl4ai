@@ -1,5 +1,7 @@
 # crawler_pool.py - Smart browser pool with tiered management
 import asyncio
+import ctypes
+import ctypes.util
 import hashlib
 import json
 import logging
@@ -25,6 +27,13 @@ LOCK = asyncio.Lock()
 
 # Config
 MEM_LIMIT = CONFIG.get("crawler", {}).get("memory_threshold_percent", 95.0)
+# Above this container-memory share the janitor recycles the busiest browser
+# instead of waiting for MEM_LIMIT to refuse new ones.
+RECYCLE_LIMIT = CONFIG.get("crawler", {}).get("recovery_threshold_percent", MEM_LIMIT)
+# All three processes read the same container-wide percent, so each restarts at
+# most one browser per this interval: ten passes at the 30s pressure interval.
+MEMORY_RECYCLE_INTERVAL_SECONDS = 300
+_LAST_MEMORY_RECYCLE = float("-inf")
 BASE_IDLE_TTL = CONFIG.get("crawler", {}).get("pool", {}).get("idle_ttl_sec", 300)
 MAX_ACTIVE_REQUESTS = CONFIG.get("crawler", {}).get("pool", {}).get("max_pages", 30)
 MAX_BROWSER_INSTANCES = CONFIG.get("crawler", {}).get("pool", {}).get(
@@ -53,6 +62,17 @@ STALE_CEILING = _pos(CONFIG.get("crawler", {}).get("pool", {}).get("stale_lease_
 # and still returns 200 while get_crawler refuses, so recovering a wedged
 # replica is an operator/scheduled-restart action, not an automatic one.
 LAST_JANITOR_PASS = 0.0
+
+# glibc gives every thread that mallocs its own arena (up to 8 x cores) and
+# never returns their freed interior pages. Scraping and markdown generation run
+# on asyncio.to_thread workers, so each crawl process grew 16-26 such arenas
+# holding 118-290 MiB, against 10-43 MiB of live Python objects (measured from
+# /proc/<pid>/smaps on production replicas). Two arenas let freed blocks be
+# reused across threads, and the janitor's malloc_trim hands free pages back.
+# Set at import, before the event loop starts any executor thread.
+_M_ARENA_MAX = -8
+_LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+_LIBC.mallopt(_M_ARENA_MAX, 2)
 
 
 def get_pool_snapshot() -> dict:
@@ -157,6 +177,11 @@ def _is_live(crawler: AsyncWebCrawler) -> bool:
         manager = crawler.crawler_strategy.browser_manager
         if getattr(manager, "_recycling", False):
             return True
+        # A failed recycle or a close leaves _closing set, and a closed manager
+        # refuses every page even while its browser object still reports
+        # connected; only a replacement brings this config back.
+        if getattr(manager, "_closing", False) is True:
+            return False
         if manager.browser is not None:
             return manager.browser.is_connected()
         return (
@@ -215,8 +240,13 @@ def _browser_count() -> int:
     )
 
 
-def _make_browser_capacity() -> Optional[asyncio.Task]:
-    """Schedule an idle eviction, or wait for an existing close, before growth."""
+def _make_browser_capacity(*, refuse_when_full: bool = True) -> Optional[asyncio.Task]:
+    """Schedule an idle eviction, or wait for an existing close, before growth.
+
+    ``refuse_when_full=False`` is the permanent browser's exemption: it still
+    evicts or waits when it can, but a pool of busy browsers never keeps the
+    default browser down, because nothing else would bring it back.
+    """
     if _browser_count() < MAX_BROWSER_INSTANCES:
         return None
 
@@ -242,6 +272,8 @@ def _make_browser_capacity() -> Optional[asyncio.Task]:
         logger.info(f"🧹 Replaced idle browser at pool capacity (sig={idle_sig[:8]})")
         return _close_in_background(crawler)
 
+    if not refuse_when_full:
+        return None
     raise RuntimeError("Crawler browser pool is at capacity")
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
@@ -349,7 +381,6 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     while True:
         close_task = None
         replace_permanent = False
-        promoted = None
         async with LOCK:
             # Check permanent browser for default config
             if _is_default_config(sig):
@@ -392,17 +423,28 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     LAST_USED[sig] = time.time()
                     USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
                     crawler = COLD_POOL[sig]
-                    _set_active_requests(crawler, _active_requests(crawler) + 1)
 
                     if USAGE_COUNT[sig] >= 3:
                         logger.info(f"⬆️  Promoting to hot pool (sig={sig[:8]}, count={USAGE_COUNT[sig]})")
                         HOT_POOL[sig] = COLD_POOL.pop(sig)
-                        promoted = (crawler, USAGE_COUNT[sig])
+                        # Under LOCK and before this request's lease is counted:
+                        # no retire can return a lease the request has not yet
+                        # handed over, so a cancellation here leaves the permit
+                        # with get_crawler's single release.
+                        try:
+                            from monitor import get_monitor
+
+                            await get_monitor().track_janitor_event(
+                                "promote", sig, {"count": USAGE_COUNT[sig]}
+                            )
+                        except Exception:
+                            pass
                     else:
                         logger.info(f"❄️  Using cold pool browser (sig={sig[:8]})")
-                        return crawler
+                    _set_active_requests(crawler, _active_requests(crawler) + 1)
+                    return crawler
 
-            if not replace_permanent and close_task is None and promoted is None:
+            if not replace_permanent and close_task is None:
                 # Memory check before creating new
                 mem_pct = get_container_memory_percent()
                 if mem_pct >= MEM_LIMIT:
@@ -420,21 +462,6 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     LAST_USED[sig] = time.time()
                     USAGE_COUNT[sig] = 1
                     return crawler
-        if promoted is not None:
-            crawler, count = promoted
-            try:
-                from monitor import get_monitor
-
-                await get_monitor().track_janitor_event(
-                    "promote", sig, {"count": count}
-                )
-            except asyncio.CancelledError:
-                _set_active_requests(crawler, max(0, _active_requests(crawler) - 1))
-                raise
-            except Exception:
-                pass
-            return crawler
-
         if close_task is not None:
             await asyncio.shield(close_task)
         if replace_permanent:
@@ -498,7 +525,7 @@ async def _init_permanent_locked(
         return None, True
     if PERMANENT:
         return _close_in_background(_detach_permanent()), True
-    close_task = _make_browser_capacity()
+    close_task = _make_browser_capacity(refuse_when_full=False)
     if close_task is not None:
         return close_task, True
 
@@ -638,6 +665,42 @@ async def retire_pool_crawlers(
     return retired
 
 
+async def _recycle_busiest_browser() -> None:
+    """Drain and restart the browser that served the most pages.
+
+    Renderer and network-service memory grows with pages served and is only
+    returned by restarting the browser process. A replica under steady traffic
+    keeps its browsers busy, so idle eviction never reaches them and the page
+    budget alone left them running for the whole six-hour recycle window. A
+    browser must have spent half its page budget since its last start, and the
+    process waits MEMORY_RECYCLE_INTERVAL_SECONDS between restarts, so pressure
+    the browsers cannot relieve does not restart them every pass.
+    """
+    global _LAST_MEMORY_RECYCLE
+    if time.monotonic() - _LAST_MEMORY_RECYCLE < MEMORY_RECYCLE_INTERVAL_SECONDS:
+        return
+    candidates = [
+        crawler.crawler_strategy.browser_manager
+        for crawler in (PERMANENT, *HOT_POOL.values(), *COLD_POOL.values())
+        if crawler is not None
+        and not getattr(crawler, "_docker_request_owned", False)
+        and _is_live(crawler)
+        and not _is_recycling(crawler)
+    ]
+    worn = [
+        manager
+        for manager in candidates
+        if manager._pages_served >= max(1, manager.config.max_pages_before_recycle // 2)
+    ]
+    if not worn:
+        return
+    busiest = max(worn, key=lambda manager: manager._pages_served)
+    pages_served = busiest._pages_served
+    if await busiest.request_recycle():
+        _LAST_MEMORY_RECYCLE = time.monotonic()
+        logger.warning(f"Memory pressure: recycling a browser after {pages_served} pages")
+
+
 async def janitor():
     """Adaptive cleanup based on memory pressure."""
     global LAST_JANITOR_PASS
@@ -652,6 +715,7 @@ async def janitor():
             await asyncio.sleep(10)
         else:
             LAST_JANITOR_PASS = time.time()
+        _LIBC.malloc_trim(0)
 
 
 async def _janitor_pass():
@@ -707,6 +771,24 @@ async def _janitor_pass():
                     await get_monitor().track_janitor_event(f"close_{tier}", sig, {"idle_seconds": int(idle_time), "ttl": ttl})
                 except Exception:  # not bare: that would swallow CancelledError and outlive shutdown
                     pass
+
+        # The permanent browser follows the hot tier's idle rule. Otherwise its
+        # only reset is the page-count recycle, which a lightly used replica
+        # never reaches, so one Chromium and its renderers live from container
+        # start until the memory ceiling refuses new browsers. The next
+        # default-config request rebuilds it (see _get_admitted_crawler).
+        permanent_idle = now - LAST_USED.get(DEFAULT_CONFIG_SIG, now)
+        if (
+            PERMANENT is not None
+            and permanent_idle > hot_ttl
+            and _active_requests(PERMANENT) == 0
+            and not _is_recycling(PERMANENT)
+        ):
+            logger.info(f"🧹 Closing permanent browser (idle={permanent_idle:.0f}s)")
+            _close_in_background(_detach_permanent())
+
+        if mem_pct >= RECYCLE_LIMIT:
+            await _recycle_busiest_browser()
 
         # Log pool stats
         if mem_pct > 60:

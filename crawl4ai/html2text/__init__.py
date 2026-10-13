@@ -53,6 +53,10 @@ class HTML2Text(html.parser.HTMLParser):
         self.split_next_td = False
         self.td_count = 0
         self.table_start = False
+        # Depth of nesting inside <td>/<th> cells on the GFM (non-bypass,
+        # non-ignore) table path. <br> inside a cell must stay inline so the
+        # GFM row remains on a single physical line.
+        self.in_table_cell = 0
         self.unicode_snob = config.UNICODE_SNOB  # covered in cli
 
         self.escape_snob = config.ESCAPE_SNOB  # covered in cli
@@ -387,7 +391,13 @@ class HTML2Text(html.parser.HTMLParser):
                 self.p()
 
         if tag == "br" and start:
-            if self.blockquote > 0:
+            if self.in_table_cell:
+                # GFM table rows must occupy a single physical line; emit a
+                # cell-safe raw inline <br> instead of a hard line break so
+                # the cell is not split across lines (and the row/column
+                # structure is preserved for GFM-compliant consumers).
+                self.o("<br>")
+            elif self.blockquote > 0:
                 self.o("  \n> ")
             else:
                 self.o("  \n")
@@ -768,6 +778,10 @@ class HTML2Text(html.parser.HTMLParser):
                     self.table_start = False
                 if tag in ["td", "th"] and start:
                     self.td_count += 1
+                    self.in_table_cell += 1
+                if tag in ["td", "th"] and not start:
+                    if self.in_table_cell > 0:
+                        self.in_table_cell -= 1
 
         if tag == "pre":
             if start:
@@ -1081,6 +1095,16 @@ class CustomHTML2Text(HTML2Text):
         self.preserve_depth = 0
         self.handle_code_in_pre = handle_code_in_pre
         self._pre_prefix = None
+        # Opening-fence emission is deferred until the first child of <pre> is
+        # seen, so the fence language can be recovered from a child
+        # <code class="language-..."> when the <pre>'s own data-language
+        # attribute has been stripped (the default crawl path runs
+        # remove_unwanted_attributes_fast with keep_data_attributes=False,
+        # which drops data-language but keeps class because class is in
+        # IMPORTANT_ATTRS). See crawl4ai/content_scraping_strategy.py
+        # (mermaid placeholder) and crawl4ai/config.py (IMPORTANT_ATTRS).
+        self._pre_fence_pending = False
+        self._pre_lang = ""
 
         # Configuration options
         self.skip_internal_links = False
@@ -1105,6 +1129,20 @@ class CustomHTML2Text(HTML2Text):
                 self.handle_code_in_pre = value
             else:
                 setattr(self, key, value)
+
+    def _emit_pre_fence_open(self):
+        """Emit the deferred opening fence of a ``<pre>`` block.
+
+        Called the first time a child of ``<pre>`` is seen (a ``<code>`` tag
+        or raw text), or at ``</pre>`` for an empty ``<pre>``. Deferring lets
+        ``self._pre_lang`` fall back to a child ``<code class="language-...">``
+        when the ``<pre>`` carried no ``data-language``. This is a no-op if the
+        fence was already emitted (it clears the pending flag idempotently).
+        """
+        if not self._pre_fence_pending:
+            return
+        self.o("\n" + self._pre_prefix + "```" + self._pre_lang + "\n")
+        self._pre_fence_pending = False
 
     def handle_tag(self, tag, attrs, start):
         # Handle <base> tag to update base URL for relative links
@@ -1156,6 +1194,7 @@ class CustomHTML2Text(HTML2Text):
             if start:
                 lang = attrs.get("data-language", "") if attrs else ""
                 self.inside_pre = True
+                self._pre_at_line_start = True
                 content_col = 0
                 parent_name = None
                 for li in self.list:
@@ -1170,16 +1209,39 @@ class CustomHTML2Text(HTML2Text):
                 self._pre_prefix = (
                     ">" * self.blockquote + " " if self.blockquote else ""
                 ) + " " * content_col
-                self.o("\n" + self._pre_prefix + "```" + lang + "\n")
+                # Defer the opening fence until the first child is seen, so the
+                # language label can fall back to a child <code
+                # class="language-..."> when data-language is absent (e.g.
+                # stripped on the default crawl path). Emitting at <pre> start
+                # would lock in an empty label before the <code> is parsed.
+                self._pre_lang = lang or ""
+                self._pre_fence_pending = True
             else:
+                self._emit_pre_fence_open()
                 self.o("\n" + self._pre_prefix + "```")
                 self.inside_pre = False
                 self._pre_prefix = None
+                self._pre_fence_pending = False
+                self._pre_lang = ""
                 self.p()
         elif tag == "code":
-            if self.inside_pre and not self.handle_code_in_pre:
-                # Ignore code tags inside pre blocks if handle_code_in_pre is False
-                return
+            if self.inside_pre:
+                if self._pre_fence_pending:
+                    # Recover the fence language from the inner <code
+                    # class="language-..." (GitHub convention) when the <pre>
+                    # carried no data-language. The scraper writes this class
+                    # and it survives attribute stripping because class is in
+                    # IMPORTANT_ATTRS, so it is the reliable signal here.
+                    if not self._pre_lang and attrs:
+                        for c in (attrs.get("class") or "").split():
+                            if c.startswith("language-"):
+                                self._pre_lang = c[len("language-") :]
+                                break
+                    self._emit_pre_fence_open()
+                if not self.handle_code_in_pre:
+                    # Ignore code tags inside pre blocks if handle_code_in_pre
+                    # is False
+                    return
             if start:
                 if not self.inside_link:
                     self.o("`")  # Only output backtick if not inside a link
@@ -1202,11 +1264,22 @@ class CustomHTML2Text(HTML2Text):
             return
 
         if self.inside_pre:
+            # Flush a deferred opening fence (e.g. a <pre> with no <code>
+            # child whose text starts arriving directly).
+            self._emit_pre_fence_open()
             # Output the raw content for pre blocks, including content inside code tags
             prefix = self._pre_prefix or ""
             bq = ">" * self.blockquote
             lines = data.split("\n")
-            self.out("\n".join((prefix + line if line else bq for line in lines)))
+            first = lines[0]
+            if first:
+                if getattr(self, "_pre_at_line_start", True):
+                    first = prefix + first
+            else:
+                first = bq
+            rest = [(prefix + line if line else bq) for line in lines[1:]]
+            self.out("\n".join([first] + rest))
+            self._pre_at_line_start = data.endswith("\n")
             return
         if self.inside_code:
             # Inline code: no newlines allowed

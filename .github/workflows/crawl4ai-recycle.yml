@@ -1,9 +1,15 @@
-# Nightly rolling recycle of the crawl4ai Swarm service.
+# Six-hourly rolling recycle of the crawl4ai Swarm service.
 #
 # Belt-and-suspenders behind the browser-pool reclamation fixes: even with the
 # janitor sweeping every process, a long-lived Chromium is never recycled by the
 # pool itself (the permanent browser's process is only ever replaced when the
 # task restarts), so a periodic recycle bounds any residual growth.
+#
+# A daily recycle was too slow: renderer processes accumulate under the
+# never-recycled permanent browser and the Python workers grow with traffic, so
+# replicas reached 90-99% of the 4 GiB limit about 20h after each recycle and
+# refused new browsers. Six hours keeps every replica well under the 80%
+# admission threshold.
 #
 # `docker service update --force` re-creates the tasks under the service's own
 # UpdateConfig -- Parallelism 1, 400s Delay, start-first, FailureAction rollback
@@ -19,7 +25,7 @@ name: crawl4ai recycle
 
 on:
   schedule:
-    - cron: "0 4 * * *" # 04:00 UTC daily
+    - cron: "17 */6 * * *" # every 6h, off the top of the hour
   workflow_dispatch:
 
 concurrency:

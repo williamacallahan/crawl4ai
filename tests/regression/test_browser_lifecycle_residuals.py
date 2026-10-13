@@ -315,6 +315,28 @@ async def test_repeated_cancellation_during_console_cleanup_still_releases_page(
 
 
 @pytest.mark.asyncio
+async def test_headless_crawl_closes_its_last_page():
+    """A non-managed browser never reuses a page, so the last one must close."""
+    context = _Context()
+    page = await context.new_page()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.close = page.close
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+
+    assert page.is_closed(), "the crawl left its page (and renderer) open"
+
+
+@pytest.mark.asyncio
 async def test_recycle_closes_admission_then_restarts_before_waking_waiters():
     config = BrowserConfig(
         use_managed_browser=True,
@@ -445,6 +467,34 @@ async def test_a_hung_allocation_stops_absorbing_its_caller_cancellation(monkeyp
 
     forever.set()
     hung.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_failure_racing_a_cancel_keeps_its_cause():
+    manager = _manager()
+    absorbing, fail_launch = asyncio.Event(), asyncio.Event()
+
+    async def launch():
+        await fail_launch.wait()
+        raise RuntimeError("browser launch failed")
+
+    launch_task = asyncio.create_task(launch())
+
+    async def caller():
+        absorbing.set()
+        return await manager._await_task_despite_cancellation(launch_task)
+
+    request = asyncio.create_task(caller())
+    await absorbing.wait()
+    await asyncio.sleep(0)
+    request.cancel()
+    await asyncio.sleep(0)
+    fail_launch.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await asyncio.wait_for(request, timeout=1)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "browser launch failed"
 
 
 @pytest.mark.asyncio

@@ -271,6 +271,38 @@ class TestJanitorSweep:
         assert "sig-idle" not in crawler_pool.COLD_POOL
 
     @pytest.mark.asyncio
+    async def test_closes_an_idle_permanent_browser_past_hot_ttl(self, monkeypatch):
+        """The permanent browser must not outlive the hot tier's idle rule."""
+        c = FakeCrawler(0)
+        crawler_pool.PERMANENT = c
+        crawler_pool.DEFAULT_CONFIG_SIG = "sig-default"
+        crawler_pool.LAST_USED["sig-default"] = crawler_pool.time.time() - 700  # > hot_ttl (600)
+        self._patch(monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await crawler_pool.janitor()
+        await _drain_close_tasks()
+
+        assert c.closed is True, "idle permanent browser was never closed"
+        assert crawler_pool.PERMANENT is None
+        assert crawler_pool.DEFAULT_CONFIG_SIG == "sig-default"
+
+    @pytest.mark.asyncio
+    async def test_keeps_a_busy_permanent_browser_past_hot_ttl(self, monkeypatch):
+        c = FakeCrawler(1)
+        crawler_pool.PERMANENT = c
+        crawler_pool.DEFAULT_CONFIG_SIG = "sig-default"
+        crawler_pool.LAST_USED["sig-default"] = crawler_pool.time.time() - 700
+        self._patch(monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await crawler_pool.janitor()
+        await _drain_close_tasks()
+
+        assert c.closed is False, "closed a permanent browser that was serving a request"
+        assert crawler_pool.PERMANENT is c
+
+    @pytest.mark.asyncio
     async def test_a_hung_close_does_not_block_the_sweep(self, monkeypatch):
         """Regression: close() on a wedged browser must never freeze the janitor (it used
         to be awaited while holding the pool LOCK)."""

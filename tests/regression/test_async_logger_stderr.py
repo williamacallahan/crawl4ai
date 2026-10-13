@@ -162,6 +162,47 @@ class TestAsyncLoggerSeverity:
         assert len(lines) == 3
         assert all("[ERROR]" in line for line in lines)
 
+    def test_file_logger_success_branch_is_success(self, tmp_path):
+        """``AsyncFileLogger.url_status(success=True, ...)`` must emit the
+        canonical ``[SUCCESS]`` severity token (a member of ``LogLevel``),
+        not the legacy ``[URL_STATUS]`` token. This aligns the file-only
+        logger with ``AsyncLogger.url_status`` (which uses
+        ``LogLevel.SUCCESS``) and with ``AsyncFileLogger.success()``, and
+        ensures every ``[{level}]`` field it emits is parsable as a
+        ``LogLevel``."""
+        log_file = tmp_path / "severity_success.log"
+        logger = AsyncFileLogger(str(log_file))
+
+        logger.url_status("https://example.com", True, 1.23, tag="FETCH")
+
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1, f"Expected 1 line, got {len(lines)}: {lines!r}"
+        line = lines[0]
+        assert "[SUCCESS]" in line, (
+            f"Successful url_status must be tagged [SUCCESS], got: {line!r}"
+        )
+        assert "[URL_STATUS]" not in line, (
+            f"Legacy non-LogLevel token [URL_STATUS] leaked into file log: "
+            f"{line!r}"
+        )
+        # The structured severity token must be one of the LogLevel members.
+        valid_levels = {level.name for level in LogLevel}
+        # Parse [timestamp] [level] [tag] message -> level is the second field.
+        fields = line.split("] [")
+        assert len(fields) >= 3, f"Malformed log line: {line!r}"
+        level_token = fields[1]
+        assert level_token in valid_levels, (
+            f"Severity {level_token!r} is not a LogLevel member "
+            f"(valid: {sorted(valid_levels)}); line: {line!r}"
+        )
+        # Message-body content must still report the SUCCESS status.
+        assert "Status: SUCCESS" in line, (
+            f"Message body lost the SUCCESS status text: {line!r}"
+        )
+        assert "1.23s" in line, (
+            f"Timing value lost from message body: {line!r}"
+        )
+
     def test_filtered_messages_are_not_formatted(self):
         logger = AsyncLogger(log_level=LogLevel.WARNING)
 
