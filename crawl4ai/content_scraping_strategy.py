@@ -269,6 +269,11 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             except Exception as e:
                 self._log("error", f"Error processing image: {str(e)}", "SCRAPE")
 
+            # Strip external URL candidates from a kept mixed-domain image so
+            # they do not leak into cleaned_html via src / data-src / srcset.
+            if kwargs.get("exclude_external_images", False):
+                self._strip_external_image_urls(img, base_domain)
+
         # Process videos and audios
         for media_type in ["video", "audio"]:
             for elem in element.xpath(f".//{media_type}"):
@@ -373,6 +378,87 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             is_external_url(c, base_domain) for c in candidates
         )
 
+    def _strip_external_image_urls(self, img: lhtml.HtmlElement, base_domain: str) -> None:
+        """Remove external URL candidates from a kept mixed ``<img>`` element.
+
+        ``exclude_external_images`` keeps an ``<img>`` whenever at least one
+        real candidate URL is same-domain (see :meth:`_is_image_external`), so
+        a mixed-domain image's external candidates would otherwise survive into
+        ``cleaned_html`` through attributes that
+        :meth:`remove_unwanted_attributes_fast` preserves (``src`` always;
+        ``data-src``/``data-srcset`` when ``keep_data_attributes`` is set). For
+        such a kept image, rewrite ``src`` to the first same-domain candidate
+        when one is available (otherwise drop it), drop an external
+        ``data-src``, and filter ``srcset``/``data-srcset`` to their same-domain
+        and inline ``data:`` variants (dropping the attribute if none remain).
+        """
+        same_domain_candidates: List[str] = []
+        seen = set()
+
+        def consider(value: str) -> None:
+            if (
+                value
+                and not value.startswith("data:")
+                and not is_external_url(value, base_domain)
+                and value not in seen
+            ):
+                seen.add(value)
+                same_domain_candidates.append(value)
+
+        consider(img.get("data-src") or "")
+        for attr in ("srcset", "data-srcset"):
+            for variant in parse_srcset(img.get(attr) or ""):
+                consider(variant["url"])
+
+        picture = img.xpath("./ancestor::picture[1]")
+        if picture:
+            for source in picture[0].xpath(".//source"):
+                for variant in parse_srcset(source.get("srcset") or ""):
+                    consider(variant["url"])
+                for variant in parse_srcset(source.get("data-srcset") or ""):
+                    consider(variant["url"])
+
+        for attr, value in img.attrib.items():
+            if (
+                attr.startswith("data-")
+                and ("src" in attr or "srcset" in attr)
+                and "http" in value
+                and not value.startswith("data:")
+            ):
+                consider(value)
+
+        src = img.get("src") or ""
+        if src and not src.startswith("data:") and is_external_url(src, base_domain):
+            if same_domain_candidates:
+                img.set("src", same_domain_candidates[0])
+            else:
+                img.attrib.pop("src", None)
+
+        data_src = img.get("data-src") or ""
+        if (
+            data_src
+            and not data_src.startswith("data:")
+            and is_external_url(data_src, base_domain)
+        ):
+            img.attrib.pop("data-src", None)
+
+        for attr in ("srcset", "data-srcset"):
+            value = img.get(attr)
+            if not value:
+                continue
+            kept = []
+            for entry in value.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                url = entry.split()[0] if entry.split() else ""
+                if not url or url.startswith("data:") or not is_external_url(url, base_domain):
+                    kept.append(entry)
+            if kept:
+                img.set(attr, ", ".join(kept))
+            else:
+                img.attrib.pop(attr, None)
+
     def process_image(
         self, img: lhtml.HtmlElement, url: str, index: int, total_images: int, **kwargs
     ) -> Optional[List[Dict]]:
@@ -445,8 +531,13 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             "format": detected_format,
         }
 
+        exclude_external = kwargs.get("exclude_external_images", False)
+        base_domain = kwargs.get("base_domain") or get_base_domain(url)
+
         def add_variant(src: str, width: Optional[str] = None):
             if src and not src.startswith("data:") and src not in unique_urls:
+                if exclude_external and is_external_url(src, base_domain):
+                    return
                 unique_urls.add(src)
                 variant = {**base_info, "src": src}
                 if width:
