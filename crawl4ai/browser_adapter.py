@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Callable
 import time
 import json
+import weakref
 
 # Import both, but use conditionally
 try:
@@ -255,8 +256,8 @@ class UndetectedAdapter(BrowserAdapter):
     """Adapter for undetected browser automation with stealth features"""
     
     def __init__(self):
-        self._console_script_injected = {}
-        self._error_script_injected = {}
+        self._console_script_injected = weakref.WeakKeyDictionary()
+        self._error_script_injected = weakref.WeakKeyDictionary()
     
     async def evaluate(self, page: UndetectedPage, expression: str, arg: Any = None) -> Any:
         """Undetected browser evaluate with isolated context"""
