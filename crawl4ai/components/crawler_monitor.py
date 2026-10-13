@@ -299,8 +299,8 @@ class TerminalUI:
         display_count = min(len(task_stats), 20)  # Display up to 20 tasks
         
         # Add rows for each task
-        for task_id, stats in sorted(
-            list(task_stats.items())[:display_count],
+        sorted_tasks = sorted(
+            task_stats.items(),
             # Sort: 1. IN_PROGRESS first, 2. QUEUED, 3. COMPLETED/FAILED by recency
             key=lambda x: (
                 0 if x[1]['status'] == CrawlStatus.IN_PROGRESS.name else 
@@ -308,7 +308,8 @@ class TerminalUI:
                 2,
                 -1 * (x[1].get('end_time', 0) or 0)  # Most recent first
             )
-        ):
+        )
+        for task_id, stats in sorted_tasks[:display_count]:
             # Truncate task_id and URL for display
             short_id = task_id[:8]
             url = stats['url']
