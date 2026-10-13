@@ -457,15 +457,49 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
         modified = self._parse_pdf_date(meta.get('/ModDate', ''))
         
         return PDFMetadata(
-            title=meta.get('/Title'),
-            author=meta.get('/Author'),
-            producer=meta.get('/Producer'),
+            title=self._info_value_as_text(meta.get('/Title')),
+            author=self._info_value_as_text(meta.get('/Author')),
+            producer=self._info_value_as_text(meta.get('/Producer')),
             created=created,
             modified=modified,
             pages=len(reader.pages),
             encrypted=reader.is_encrypted,
             file_size=pdf_path.stat().st_size
         )
+
+    @staticmethod
+    def _info_value_as_text(value) -> Optional[str]:
+        """Resolve a raw ``reader.metadata`` /Info value to a JSON-safe ``str``.
+
+        ``reader.metadata.get('/...')`` can hand back non-JSON-native ``pypdf``
+        objects: a ``TextStringObject`` (``str`` subclass), a
+        ``ByteStringObject`` (``bytes`` subclass that ``str()`` decodes via a
+        charset fallback), or an ``IndirectObject`` (an unresolved indirect
+        reference). An ``IndirectObject`` can only be dereferenced while the
+        ``PdfReader``'s underlying stream is open -- ``get_object()`` seeks that
+        stream -- so this must be called from ``_extract_metadata`` inside the
+        caller's ``with open(...)`` block, before the reader is released and the
+        stream is closed. Resolving here (rather than later in the cache writer)
+        keeps ``PDFMetadata``'s ``Optional[str]`` text fields honest to their
+        declared type and guarantees the dict the cache writer receives is
+        JSON-native. ``None`` (key absent) is passed through unchanged.
+        Malformed indirect objects raise their original error so callers do not
+        silently lose metadata or mistake a failed conversion for an absent
+        field.
+        """
+        if value is None:
+            return None
+        from pypdf.generic import IndirectObject
+
+        if isinstance(value, bytes):
+            return value.decode("latin-1")
+        if isinstance(value, IndirectObject):
+            value = value.get_object()
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                return value.decode("latin-1")
+        return str(value)
 
     def _parse_pdf_date(self, date_str: str) -> Optional[datetime]:
         try:
