@@ -262,6 +262,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             None
         """
         self.browser_config.headers.update(headers)
+        self._custom_headers_set = True
 
     async def smart_wait(self, page: Page, wait_for: str, timeout: float = 30000):
         """
@@ -612,7 +613,11 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             override_hint = UAGen.generate_client_hints(override_ua)
             self.browser_config.user_agent = override_ua
             self.browser_config.browser_hint = override_hint
-            self.browser_config.headers["sec-ch-ua"] = override_hint
+            headers = getattr(self.browser_config, "headers", None)
+            if headers is None:
+                headers = {}
+                self.browser_config.headers = headers
+            headers["sec-ch-ua"] = override_hint
 
         page = None
         context = None
@@ -637,8 +642,9 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # Push configured headers to the live page so headers added after
             # context creation reach the wire. Per-crawl UA locals are applied
             # last so a concurrent crawl cannot overwrite this crawl's values.
-            if ua_changed or self.browser_config.headers:
-                combined_headers = dict(self.browser_config.headers)
+            configured_headers = getattr(self.browser_config, "headers", {})
+            if ua_changed or getattr(self, "_custom_headers_set", False):
+                combined_headers = dict(configured_headers)
                 if ua_changed:
                     combined_headers["User-Agent"] = override_ua
                     combined_headers["sec-ch-ua"] = override_hint
