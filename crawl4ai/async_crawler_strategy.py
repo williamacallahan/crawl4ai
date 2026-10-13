@@ -602,11 +602,16 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 crawlerRunConfig=config
             )
 
-            # Push updated UA + sec-ch-ua to the page so the server sees them
-            if ua_changed:
+            # Push configured headers to the live page so headers added after
+            # context creation (including set_custom_headers()) reach the wire.
+            if ua_changed or self.browser_config.headers:
                 combined_headers = {
-                    "User-Agent": self.browser_config.user_agent,
-                    "sec-ch-ua": self.browser_config.browser_hint,
+                    key: value
+                    for key, value in {
+                        "User-Agent": self.browser_config.user_agent,
+                        "sec-ch-ua": self.browser_config.browser_hint,
+                    }.items()
+                    if value
                 }
                 combined_headers.update(self.browser_config.headers)
                 await page.set_extra_http_headers(combined_headers)
