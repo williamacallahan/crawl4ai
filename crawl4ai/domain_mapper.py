@@ -41,7 +41,7 @@ except ImportError:
     HAS_BM25 = False
 
 from .async_logger import AsyncLoggerBase, AsyncLogger
-from .async_url_seeder import AsyncUrlSeeder, _parse_head
+from .async_url_seeder import AsyncUrlSeeder, _parse_head, _QpsLimiter
 from .utils import (
     normalize_url,
     quick_extract_links,
@@ -245,7 +245,7 @@ class DomainMapper:
         )
 
         self._seeder: Optional[AsyncUrlSeeder] = None
-        self._rate_sem: Optional[asyncio.Semaphore] = None
+        self._rate_sem: Optional[_QpsLimiter] = None
         self._host_schemes: Dict[str, str] = {}
 
     # ──────────────────────── lifecycle
@@ -320,7 +320,7 @@ class DomainMapper:
 
         # Rate limiter
         if config.hits_per_sec and config.hits_per_sec > 0:
-            self._rate_sem = asyncio.Semaphore(config.hits_per_sec)
+            self._rate_sem = _QpsLimiter(config.hits_per_sec)
         else:
             self._rate_sem = None
 

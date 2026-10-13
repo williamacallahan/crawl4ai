@@ -1,6 +1,7 @@
 # // File: tests/deep_crawling/test_filters.py
 import asyncio
 import gc
+import re
 import warnings
 from urllib.parse import urlparse
 import pytest
@@ -97,6 +98,17 @@ class TestURLPatternFilter:
     @pytest.mark.parametrize(
         "pattern, url, expected",
         [
+            ("*example.com*", "https://example.com/download?format=pdf", True),
+            ("*format=pdf", "https://example.com/download?format=pdf", True),
+            ("*example.com*", "https://other.example/download?format=pdf", False),
+        ],
+    )
+    def test_complex_globs_keep_full_url_authority_and_query(self, pattern, url, expected):
+        assert URLPatternFilter(patterns=[pattern]).apply(url) is expected
+
+    @pytest.mark.parametrize(
+        "pattern, url, expected",
+        [
             # Multi-part suffix patterns (the regression: a stored suffix that
             # itself contains a dot must match the filename's dotted tail, not
             # only its last dot-segment).
@@ -114,6 +126,93 @@ class TestURLPatternFilter:
         # results across parametrized runs.
         f = URLPatternFilter(patterns=[pattern])
         assert f.apply(url) is expected
+
+    # Regression guard for the glob-translation bug: `**` and `{a,b}` were
+    # rewritten into regex (`.*` / `(a|b)`) *before* `fnmatch.translate`, which
+    # then escaped those metacharacters back to literals. `{a,b}` compiled to a
+    # literal `(a|b)` match and `**` compiled to a literal-dot anchor (`\..*`)
+    # that broke single-label hosts and middle `**` placements. The fix
+    # translates the glob first and matches globs against the URL path so
+    # hostname dots cannot supply a literal `.`/`**`-anchor.
+    @pytest.mark.parametrize(
+        "pattern, url, expected",
+        [
+            # --- {a,b} alternation compiles to real (a|b), not literal "(a|b)" ---
+            ("foo{a,b}bar", "https://example.com/fooabar", True),
+            ("foo{a,b}bar", "https://example.com/foobbar", True),
+            ("foo{a,b}bar", "https://example.com/foocbar", False),
+            # The compiled regex must NOT match the literal text "(a|b)".
+            ("foo{a,b}bar", "https://example.com/foo(a|b)bar", False),
+
+            # --- ** on single-label hosts (was always broken) ---
+            ("**/foo", "http://localhost/bar/foo", True),
+            ("**/foo", "http://localhost/foo", True),
+            ("a/**/b", "http://localhost/a/x/y/b", True),
+            ("a/**/b", "http://localhost/a/b", True),
+            ("**/.*", "http://localhost/.env", True),
+            ("**/.*", "http://localhost/etc/passwd", False),
+            # Dotted hosts (e.g. 127.0.0.1) must not satisfy a literal dot in
+            # the glob: globs match the URL *path*, so a hostname dot cannot
+            # accidentally anchor `**` (the bug report's masking symptom).
+            ("**/.*", "http://127.0.0.1/.env", True),
+            ("**/.*", "http://127.0.0.1/etc/passwd", False),
+
+            # --- ** middle placement: zero-or-more intermediate segments ---
+            ("a/**/b", "https://example.com/a/x/y/b", True),
+            ("a/**/b", "https://example.com/a/b", True),
+            ("a/**/b", "https://example.com/a/b/c", False),
+
+            # --- ** leading/trailing still match on multi-label hosts ---
+            ("**/foo", "https://example.com/foo", True),
+            ("foo/**", "https://example.com/foo", True),
+            ("foo/**", "https://example.com/foo/a/b", True),
+            ("foo/**", "https://example.com/foobar", False),
+            # --- lone ** matches anything ---
+            ("**", "https://example.com/anything/here", True),
+
+            # --- documented URLPatternFilter(use_glob=True) patterns (docs) ---
+            ("*/blog/{2020,2021,2022,2023,2024}/*",
+             "https://example.com/blog/2023/hello", True),
+            ("*/blog/{2020,2021,2022,2023,2024}/*",
+             "https://example.com/blog/2019/hello", False),
+            ("**/{api,reference}/**/*.html",
+             "https://example.com/api/x.html", True),
+            ("**/{api,reference}/**/*.html",
+             "https://example.com/api/sub/z.html", True),
+            ("**/{api,reference}/**/*.html",
+             "https://example.com/blog/x.html", False),
+
+            # --- single * must NOT gain zero-segment `**` semantics ---
+            ("a/*/b", "https://example.com/a/x/b", True),
+            ("a/*/b", "https://example.com/a/b", False),
+
+            # --- correct negatives ---
+            ("**/foo", "http://localhost/baz/qux", False),
+        ],
+    )
+    def test_glob_double_star_and_brace(self, pattern, url, expected):
+        # apply() is @lru_cache'd; use a fresh instance per case.
+        f = URLPatternFilter(patterns=[pattern])
+        assert f.apply(url) is expected
+
+    @pytest.mark.parametrize(
+        "pattern, must_contain, must_not_contain",
+        [
+            # `**` no longer compiles to the broken literal-dot anchor `\..*`.
+            ("**/foo", "(?:.*/)?foo", "\\..*"),
+            # `{a,b}` no longer compiles to the literal `\(a\|b\)`.
+            ("foo{a,b}bar", "foo(a|b)bar", "\\(a\\|b\\)"),
+        ],
+    )
+    def test_glob_compiled_regex_form(self, pattern, must_contain, must_not_contain):
+        # Pin the compiled regex so the glob translation cannot silently
+        # regress to the escaped-literal form. Substring assertions are used
+        # because the `(?s:...)\Z` wrapper that fnmatch.translate emits varies
+        # across CPython versions.
+        f = URLPatternFilter(patterns=[pattern])
+        compiled = f._path_patterns[0].pattern
+        assert must_contain in compiled
+        assert must_not_contain not in compiled
 
 
 class TestDomainFilter:
@@ -222,6 +321,50 @@ class _AsyncFilter(URLFilter):
             self.finally_ran = True
 
 
+class _RaisingSyncFilter(URLFilter):
+    """A sync filter that violates the ``apply -> bool`` contract by raising.
+
+    Records every call so tests can confirm the raising filter was actually
+    evaluated and that the original exception propagates unchanged through
+    the disposal re-raise in ``FilterChain.apply``.
+
+    Raises a *fresh* exception on every call (storing only the type and
+    message) rather than retaining an exception instance. This is deliberate:
+    a retained exception object keeps its ``__traceback__`` alive, which
+    keeps the suspended ``FilterChain.apply`` frame (and its ``tasks`` list
+    of collected coroutines) alive, so the coroutines would NOT be collected
+    by the in-window ``gc.collect()`` and the "was never awaited" warning
+    would slip past ``warnings.catch_warnings(record=True)`` to
+    ``sys.unraisablehook``. A fresh exception is released at the end of the
+    ``except`` block (PEP 3110), so the coroutines become collectible and any
+    leak is captured deterministically.
+    """
+
+    def __init__(self, name, exc_type, exc_msg):
+        super().__init__(name=name)
+        self._exc_type = exc_type
+        self._exc_msg = exc_msg
+        self.calls = []
+
+    def apply(self, url):
+        self.calls.append(url)
+        raise self._exc_type(self._exc_msg)
+
+
+class _TaskFilter(URLFilter):
+    def __init__(self):
+        super().__init__(name="task")
+        self.task = None
+
+    async def _run(self):
+        await asyncio.sleep(60)
+        return True
+
+    def apply(self, url):
+        self.task = asyncio.create_task(self._run())
+        return self.task
+
+
 def _assert_no_never_awaited_warnings(recorded):
     leaked = [
         str(w.message)
@@ -232,6 +375,37 @@ def _assert_no_never_awaited_warnings(recorded):
     assert (
         not leaked
     ), f"Expected no un-awaited-coroutine RuntimeWarnings, got: {leaked}"
+
+
+async def _apply_raising_and_collect_warnings(chain, url, exc_type, exc_match):
+    """Await ``chain.apply(url)`` expecting it to raise ``exc_type``.
+
+    The exception is caught and its type/message asserted *inside* the
+    ``except`` block while the exception value is still bound. PEP 3110 then
+    auto-clears the bound name at the end of the ``except`` block, releasing
+    the exception's traceback frame -- which holds ``FilterChain.apply``'s
+    ``tasks`` list of collected coroutines. Only after that release is
+    ``gc.collect()`` called, *inside* the active ``warnings.catch_warnings``
+    recording window, so any un-awaited-coroutine ``RuntimeWarning`` is
+    reliably captured in the returned list rather than leaking later to
+    ``sys.unraisablehook``.
+
+    (``with pytest.raises(...)`` instead retains the exception in its
+    RaisesContext through the ``gc.collect()`` call, keeping the coroutines
+    alive and the warning out of the recorded list -- which is why this
+    helper uses ``try/except``.)
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            await chain.apply(url)
+        except exc_type as e:
+            assert re.search(exc_match, str(e)), (
+                f"expected {exc_match!r} to match {str(e)!r}"
+            )
+        gc.collect()
+    return caught
+
 
 
 class TestFilterChain:
@@ -269,6 +443,15 @@ class TestFilterChain:
         assert chain.stats.total_urls == 1
         assert chain.stats.passed_urls == 0
         assert chain.stats.rejected_urls == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_rejection_cancels_pending_task(self):
+        pending = _TaskFilter()
+        chain = FilterChain([pending, _SyncFilter("sync-reject", False)])
+
+        assert await chain.apply("https://example.com/report.pdf") is False
+        assert pending.task is not None
+        assert pending.task.cancelled()
 
     @pytest.mark.asyncio
     async def test_sync_rejection_closes_multiple_pending_async_coroutines(self):
@@ -319,6 +502,98 @@ class TestFilterChain:
 
             assert result is False
             # Body never ran because the sync filter short-circuited first.
+            _assert_no_never_awaited_warnings(caught)
+        finally:
+            _c4ai_utils.HeadPeekr.peek_html = original
+
+    # ------------------------------------------------------------------
+    # Regression: a trailing sync filter that *raises* (rather than
+    # returning False) after async coroutines have already been collected
+    # into ``tasks`` must likewise dispose of those coroutines via
+    # ``.close()``, instead of leaving them never-awaited. Without the
+    # try/except disposal in the collection loop, CPython emits
+    # ``RuntimeWarning: coroutine '...' was never awaited`` for each
+    # collected coroutine when it is garbage-collected during the unwind.
+    #
+    # These tests use ``_apply_raising_and_collect_warnings`` (a
+    # ``try/except`` that releases the exception before ``gc.collect()``)
+    # rather than ``with pytest.raises(...)``: the latter retains the
+    # exception/traceback -- and thus the frame holding ``tasks`` -- through
+    # ``gc.collect()``, so the leaked warning slips past the recording
+    # window to ``sys.unraisablehook`` instead of being captured in
+    # ``caught``. The ``try/except`` form makes the failure deterministic.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sync_filter_raising_closes_pending_async_coroutine(self):
+        # The commit hardened the `return False` trailing-sync case; the
+        # raising case of the same trailing sync filter must likewise dispose
+        # of the already-collected async coroutines, not leave them
+        # never-awaited.
+        async_ok = _AsyncFilter("async-pass", True)
+        sync_raising = _RaisingSyncFilter("sync-raising", ValueError, "boom")
+        chain = FilterChain([async_ok, sync_raising])
+
+        caught = await _apply_raising_and_collect_warnings(
+            chain, "https://example.com/x", ValueError, "boom"
+        )
+
+        # The async coroutine was disposed of (close()'d) without running.
+        assert async_ok.body_started is False
+        assert async_ok.finally_ran is False
+        # The raising sync filter was actually evaluated before the unwind.
+        assert sync_raising.calls == ["https://example.com/x"]
+        # No coroutine leaked -> no RuntimeWarning.
+        _assert_no_never_awaited_warnings(caught)
+
+    @pytest.mark.asyncio
+    async def test_sync_filter_raising_closes_multiple_pending_async_coroutines(self):
+        # Multiple async coroutines collected before the raising sync filter
+        # must all be disposed of.
+        a1 = _AsyncFilter("async-1", True)
+        a2 = _AsyncFilter("async-2", False)
+        a3 = _AsyncFilter("async-3", True)
+        sync_raising = _RaisingSyncFilter("sync-raising", ValueError, "kaboom")
+        chain = FilterChain([a1, a2, a3, sync_raising])
+
+        caught = await _apply_raising_and_collect_warnings(
+            chain, "https://example.com/x.zip", ValueError, "kaboom"
+        )
+
+        for f in (a1, a2, a3):
+            assert f.body_started is False
+            assert f.finally_ran is False
+        assert sync_raising.calls == ["https://example.com/x.zip"]
+        _assert_no_never_awaited_warnings(caught)
+
+    @pytest.mark.asyncio
+    async def test_real_content_relevance_filter_raising_sync_no_warning(self):
+        # End-to-end against a real async filter (ContentRelevanceFilter)
+        # with its network call patched out, followed by a raising sync
+        # filter. The real async coroutine must be disposed of via the
+        # exception-path cleanup, not left never-awaited.
+        from crawl4ai.deep_crawling.filters import ContentRelevanceFilter
+        from crawl4ai import utils as _c4ai_utils
+
+        async def _fake_peek_html(url):
+            return (
+                "<html><head><title>AI defence</title>"
+                "<meta name='description' content='AI defence systems'>"
+                "</head></html>"
+            )
+
+        original = _c4ai_utils.HeadPeekr.peek_html
+        _c4ai_utils.HeadPeekr.peek_html = _fake_peek_html
+        try:
+            crf = ContentRelevanceFilter(query="AI defence", threshold=0.0)
+            sync_raising = _RaisingSyncFilter("sync-raising", ValueError, "bad")
+            chain = FilterChain([crf, sync_raising])
+
+            caught = await _apply_raising_and_collect_warnings(
+                chain, "https://techcrunch.com/2025/report.pdf", ValueError, "bad"
+            )
+
+            assert sync_raising.calls == ["https://techcrunch.com/2025/report.pdf"]
             _assert_no_never_awaited_warnings(caught)
         finally:
             _c4ai_utils.HeadPeekr.peek_html = original

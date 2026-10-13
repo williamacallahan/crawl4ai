@@ -1200,7 +1200,19 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     params={"delay": delay, "url": url},
                 )
                 await asyncio.sleep(delay)
-                return await page.content()
+                # When `config.session_id` keeps the page open, read the
+                # current page content so any changes made during the delay
+                # are reflected. Otherwise the `finally` block below may have
+                # closed `page` before this callable runs, so fall back to the
+                # HTML captured at crawl time.
+                if config.session_id and page is not None and not page.is_closed():
+                    try:
+                        return await page.content()
+                    except Error as error:
+                        if "closed" in str(error).lower():
+                            return html
+                        raise
+                return html
 
             ###
             # This ensures we capture the current page URL at the time we return the response,
@@ -1287,16 +1299,16 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     except Exception:
                         pass
 
-                    # Close the page unless it's the last one in a headless/managed browser.
+                    # Keep only a managed browser's last page: get_page reuses
+                    # it. Every other page is freshly created per crawl, so a
+                    # kept one is never reused and its renderer lives as long
+                    # as the browser.
                     try:
                         all_contexts = page.context.browser.contexts
                         total_pages = sum(len(context.pages) for context in all_contexts)
                         if not (
                             total_pages <= 1
-                            and (
-                                self.browser_config.use_managed_browser
-                                or self.browser_config.headless
-                            )
+                            and self.browser_config.use_managed_browser
                         ):
                             await page.close()
                     except asyncio.CancelledError:

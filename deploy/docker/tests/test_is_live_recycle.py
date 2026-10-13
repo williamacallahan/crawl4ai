@@ -431,3 +431,60 @@ async def test_failed_recycle_is_treated_as_dead_and_replaced(monkeypatch):
 
     await crawler_pool.release_crawler(crawler)
     await _drain_close_tasks()
+
+
+@pytest.mark.asyncio
+async def test_failed_recycle_with_a_still_connected_browser_is_replaced(monkeypatch):
+    """A restart that fails after its browser connected still bricks the manager.
+
+    ``start()`` assigns ``browser`` before ``_started_browser()`` clears
+    ``_closing``; a failure in between leaves a connected browser on a manager
+    that refuses every page. Liveness must follow ``_closing``, not the socket.
+    """
+    created = []
+    _configure_pool(monkeypatch, _live_factory(created))
+
+    config = BrowserConfig(headless=True)
+    sig = crawler_pool._sig(config)
+
+    manager = _manager(
+        BrowserConfig(
+            use_managed_browser=True, headless=True, max_pages_before_recycle=1
+        )
+    )
+    manager.default_context = _Context()
+    manager.browser = _Browser(connected=True)
+
+    async def start_fails_after_connecting():
+        manager.browser = _Browser(connected=True)
+        manager.default_context = _Context()
+        raise RuntimeError("context setup failed")
+
+    async def close(_for_recycle=False):
+        manager.browser = None
+        manager.default_context = None
+
+    manager.start = start_fails_after_connecting
+    manager.close = close
+
+    page, _ = await manager.get_page(CrawlerRunConfig())
+    await manager.release_page_with_context(page)
+    await manager._recycle_task
+
+    assert manager._closing is True
+    assert manager.browser.is_connected()
+    with pytest.raises(RuntimeError, match="closed"):
+        await manager.get_page(CrawlerRunConfig())
+
+    dead = _crawler_with_manager(manager)
+    crawler_pool.PERMANENT = dead
+    crawler_pool.DEFAULT_CONFIG_SIG = sig
+
+    crawler = await asyncio.wait_for(crawler_pool.get_crawler(config), timeout=1)
+    assert crawler is not dead
+    assert created == [crawler]
+    assert crawler_pool.PERMANENT is crawler
+
+    await crawler_pool.release_crawler(crawler)
+    await _drain_close_tasks()
+    assert dead.closed

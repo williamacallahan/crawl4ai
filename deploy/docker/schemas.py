@@ -68,7 +68,7 @@ class MarkdownRequest(BaseModel):
     q:   str | None = Field(None,  description="Query string used by BM25/LLM filters")
     c:   str | None = Field("0",   description="Cache‑bust / revision counter")
     provider: str | None = Field(None, description="LLM provider override (e.g., 'anthropic/claude-3-opus')")
-    temperature: float | None = Field(None, description="LLM temperature override (0.0-2.0)")
+    temperature: float | None = Field(None, ge=0.0, le=2.0, description="LLM temperature override (0.0-2.0)")
     # base_url removed: a request-supplied LLM endpoint was a credential-exfil
     # vector. The endpoint is derived server-side from the provider name.
 

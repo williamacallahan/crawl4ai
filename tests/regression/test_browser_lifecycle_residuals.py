@@ -10,6 +10,7 @@ from crawl4ai import browser_manager as browser_manager_module
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.browser_adapter import UndetectedAdapter
 from crawl4ai.browser_manager import BrowserManager
+from playwright.async_api import Error as PlaywrightError
 
 
 class _Page:
@@ -315,6 +316,192 @@ async def test_repeated_cancellation_during_console_cleanup_still_releases_page(
 
 
 @pytest.mark.asyncio
+async def test_headless_crawl_closes_its_last_page():
+    """A non-managed browser never reuses a page, so the last one must close."""
+    context = _Context()
+    page = await context.new_page()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.close = page.close
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+
+    assert page.is_closed(), "the crawl left its page (and renderer) open"
+
+
+@pytest.mark.asyncio
+async def test_headless_crawl_delayed_content_survives_page_close():
+    """Regression: `get_delayed_content` closes over `page`, but the `finally`
+    block (commit 3714568c) now closes the default-config crawl's only page.
+    The closure must therefore not depend on a live page — it returns the
+    HTML captured at crawl time. Pre-fix, calling it raised Playwright's
+    `TargetClosedError` ("Target page, context or browser has been closed")
+    because `page.content()` ran on the already-closed page."""
+    context = _Context()
+    underlying = await context.new_page()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.close = underlying.close
+
+    # `page.content()` raises once the underlying page is closed, mirroring
+    # real Playwright's TargetClosedError on a closed target.
+    async def content_after_close(*a, **k):
+        if getattr(underlying, "closed", False):
+            raise PlaywrightError("Target page, context or browser has been closed")
+        return "<html><body></body></html>"
+
+    crawl_page.content = content_after_close
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+
+    # The finally block closed the only page (the resource-cleanup invariant
+    # from test_headless_crawl_closes_its_last_page still holds).
+    assert underlying.is_closed(), "the crawl left its page (and renderer) open"
+
+    # get_delayed_content must still return the crawled HTML after the page
+    # was closed. Pre-fix this raised TargetClosedError.
+    html = await result.get_delayed_content(0.0)
+    assert "html" in html
+
+
+@pytest.mark.asyncio
+async def test_delayed_content_returns_crawled_html_without_live_page():
+    """The fix removes the dependency on the live page entirely: the returned
+    HTML must equal the `html` captured at crawl time, even when the page is
+    closed before the delayed read. A separately-asserted page content change
+    proves the delayed read does NOT re-read the (now-stale) page."""
+    context = _Context()
+    underlying = await context.new_page()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.close = underlying.close
+
+    calls = {"count": 0}
+
+    async def content_tracker(*a, **k):
+        calls["count"] += 1
+        # After close, a real page.content() would raise; return a sentinel
+        # that would fail the assertion if the closure re-read the page.
+        if getattr(underlying, "closed", False):
+            return "<html>STALE</html>"
+        return "<html><body>crawl-time</body></html>"
+
+    crawl_page.content = content_tracker
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+    assert underlying.is_closed()
+
+    delayed_html = await result.get_delayed_content(0.0)
+    # The delayed read returns the crawl-time HTML, not a stale page re-read.
+    assert "crawl-time" in delayed_html
+    assert "STALE" not in delayed_html
+    # page.content() was called exactly once — during the crawl — and never
+    # again from get_delayed_content.
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_delayed_content_reads_live_session_page():
+    """When `config.session_id` keeps the page open, `get_delayed_content`
+    reads the current `page.content()` after the delay, reflecting changes
+    made after `_crawl_web` returns — instead of the crawl-time snapshot."""
+    context = _Context()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.is_closed = MagicMock(return_value=False)
+
+    content = {"value": "<html><body>crawl-time</body></html>"}
+
+    async def current_content(*a, **k):
+        return content["value"]
+
+    crawl_page.content = current_content
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web(
+        "https://example.test/",
+        CrawlerRunConfig(session_id="delayed-content-session"),
+    )
+
+    content["value"] = "<html><body>updated</body></html>"
+
+    delayed_html = await result.get_delayed_content(0.0)
+
+    assert "updated" in delayed_html
+    assert "crawl-time" not in delayed_html
+
+
+@pytest.mark.asyncio
+async def test_delayed_content_propagates_live_page_failures():
+    context = _Context()
+    crawl_page = _mock_crawl_page()
+    crawl_page.context.browser.contexts = [context]
+    crawl_page.is_closed = MagicMock(return_value=False)
+
+    calls = 0
+
+    async def failed_content(*a, **k):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "<html><body>crawl-time</body></html>"
+        raise RuntimeError("content protocol failed")
+
+    crawl_page.content = failed_content
+
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True)
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(
+        return_value=(crawl_page, context)
+    )
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+
+    result = await strategy._crawl_web(
+        "https://example.test/",
+        CrawlerRunConfig(session_id="delayed-content-error-session"),
+    )
+
+    with pytest.raises(RuntimeError, match="content protocol failed"):
+        await result.get_delayed_content(0.0)
+
+
+@pytest.mark.asyncio
 async def test_recycle_closes_admission_then_restarts_before_waking_waiters():
     config = BrowserConfig(
         use_managed_browser=True,
@@ -445,6 +632,34 @@ async def test_a_hung_allocation_stops_absorbing_its_caller_cancellation(monkeyp
 
     forever.set()
     hung.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_failure_racing_a_cancel_keeps_its_cause():
+    manager = _manager()
+    absorbing, fail_launch = asyncio.Event(), asyncio.Event()
+
+    async def launch():
+        await fail_launch.wait()
+        raise RuntimeError("browser launch failed")
+
+    launch_task = asyncio.create_task(launch())
+
+    async def caller():
+        absorbing.set()
+        return await manager._await_task_despite_cancellation(launch_task)
+
+    request = asyncio.create_task(caller())
+    await absorbing.wait()
+    await asyncio.sleep(0)
+    request.cancel()
+    await asyncio.sleep(0)
+    fail_launch.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await asyncio.wait_for(request, timeout=1)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "browser launch failed"
 
 
 @pytest.mark.asyncio
@@ -1186,7 +1401,12 @@ async def test_undetected_adapter_retrieve_returns_partial_results_if_a_frame_ra
     `except Exception: pass` must swallow it and return whatever was drained
     so far — the crawl must not crash and the main frame's messages must
     still reach the response. The subframe that raises is skipped, so its
-    messages are lost, matching the documented best-effort contract."""
+    messages are lost, matching the documented best-effort contract.
+
+    The ms->s timestamp conversion must have already been applied to the
+    drained batch before the later frame raised, so partial results carry
+    seconds (matching the happy path and `PlaywrightAdapter`'s `time.time()`)
+    rather than raw JS milliseconds."""
     main = _CapturingFrame(
         console=[{"type": "log", "text": "MAIN_BEFORE", "timestamp": 1}],
         errors=[],
@@ -1202,3 +1422,9 @@ async def test_undetected_adapter_retrieve_returns_partial_results_if_a_frame_ra
     # The main frame's console buffer was drained before the subframe raised.
     assert "MAIN_BEFORE" in [m["text"] for m in messages]
     assert "NEVER_DRAINED" not in [m["text"] for m in messages]
+    # The drained message's timestamp was converted from JS ms (1) to
+    # Python seconds (0.001) before the later frame raised, so partial
+    # results match the happy-path unit — not raw ms (1).
+    assert messages[0]["timestamp"] == 0.001, (
+        f"expected 0.001 s (ms 1 / 1000), got {messages[0]['timestamp']!r}"
+    )
