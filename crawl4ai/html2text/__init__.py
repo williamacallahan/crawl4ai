@@ -1277,7 +1277,12 @@ class CustomHTML2Text(HTML2Text):
                     first = prefix + first
             else:
                 first = bq
-            rest = [(prefix + line if line else bq) for line in lines[1:]]
+            trailing_newlines = len(data) - len(data.rstrip("\n"))
+            trailing_line_start = trailing_newlines == 1 and lines[-1] == ""
+            rest_lines = lines[1:-1] if trailing_line_start else lines[1:]
+            rest = [(prefix + line if line else bq) for line in rest_lines]
+            if trailing_line_start:
+                rest.append("")
             self.out("\n".join([first] + rest))
             self._pre_at_line_start = data.endswith("\n")
             return
