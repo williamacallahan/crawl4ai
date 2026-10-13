@@ -211,6 +211,98 @@ def test_code_inside_pre_in_list_indented_correctly():
 
 
 # ---------------------------------------------------------------------------
+# Entity references & inline <code> boundaries inside <pre>
+# ---------------------------------------------------------------------------
+#
+# ``HTMLParser`` runs with ``convert_charrefs=False`` (set in
+# ``HTML2Text.__init__``), so a single logical code line containing an entity
+# reference (``&amp;``, ``&lt;``, ``&gt;``, numeric ``&#60;`` …) is delivered
+# as *separate* ``handle_data`` calls: the text before the entity, the decoded
+# entity, and the text after it. Inline ``<code>`` tag boundaries inside
+# ``<pre>`` split the stream the same way. The ``inside_pre`` branch of
+# ``CustomHTML2Text.handle_data`` must prepend the blockquote/list prefix only
+# at a *true* line start (tracked across chunks), not at the start of every
+# ``handle_data`` chunk — otherwise the prefix is spliced mid-line and the
+# code content is destroyed. These cases only trigger when ``_pre_prefix`` is
+# non-empty, i.e. the ``<pre>`` is nested inside an active list/blockquote.
+
+
+def test_entity_in_pre_inside_blockquote():
+    # The minimal reproducer: ``a & b`` must survive round-tripping through a
+    # blockquoted fenced code block.
+    md = _convert("<blockquote><pre>a &amp; b</pre></blockquote>")
+    assert "> a & b\n" in md, repr(md)
+    assert "> \n> ```\n> a & b\n> ```\n" == md, repr(md)
+    # The specific corruption pattern must never reappear.
+    assert "> &>" not in md and "&>  " not in md, repr(md)
+    rendered = _render(md)
+    assert "<pre><code>a &amp; b\n</code></pre>" in rendered, repr(rendered)
+    assert "<blockquote>\n</blockquote>" not in rendered, repr(rendered)
+
+
+def test_multiple_entities_in_pre_inside_blockquote():
+    md = _convert(
+        "<blockquote><pre>if a &lt; b &amp;&amp; c &gt; d: pass</pre></blockquote>"
+    )
+    assert "> if a < b && c > d: pass\n" in md, repr(md)
+    # Every decoded entity must appear in order with no prefix injected.
+    assert "> <" not in md and "> &" not in md and "> >" not in md, repr(md)
+    rendered = _render(md)
+    assert (
+        "<pre><code>if a &lt; b &amp;&amp; c &gt; d: pass\n</code></pre>"
+        in rendered
+    ), repr(rendered)
+    assert rendered.rstrip().endswith("</blockquote>"), repr(rendered)
+
+
+def test_numeric_charref_in_pre_inside_blockquote():
+    # Numeric character references (``&#60;`` -> ``<``) are delivered as their
+    # own ``handle_data`` call via ``handle_charref`` and must not be prefixed.
+    md = _convert("<blockquote><pre>a &#60; b &amp; c</pre></blockquote>")
+    assert "> a < b & c\n" in md, repr(md)
+    assert "> <" not in md, repr(md)
+    rendered = _render(md)
+    assert "<pre><code>a &lt; b &amp; c\n</code></pre>" in rendered, repr(rendered)
+
+
+def test_inline_code_in_pre_does_not_inject_prefix():
+    # The inline <code> start/end tags split one logical line into three
+    # handle_data chunks ('a', 'x', 'y'); the chunks must concatenate with no
+    # prefix inserted between them.
+    md = _convert("<ul><li><pre>a<code>x</code>y</pre></li></ul>")
+    assert "    axy\n" in md, repr(md)
+    assert "    a    x" not in md, repr(md)
+    rendered = _render(md)
+    assert "<pre><code>axy\n</code></pre>" in rendered, repr(rendered)
+
+
+def test_consecutive_pre_in_blockquote_with_entities():
+    # Two <pre> blocks in the same blockquote: the second must re-initialize
+    # the line-start flag so its first line (even if it begins with an
+    # entity-delivered chunk) is correctly prefixed.
+    html = "<blockquote><pre>x &amp; y</pre>text<pre>a &lt; b</pre></blockquote>"
+    md = _convert(html)
+    assert "> x & y\n> ```\n> text\n> ```\n> a < b" in md, repr(md)
+    assert md.count("```") == 4, repr(md)
+    rendered = _render(md)
+    assert rendered.count("<pre><code>") == 2, repr(rendered)
+    assert "<pre><code>x &amp; y\n</code></pre>" in rendered, repr(rendered)
+    assert "<pre><code>a &lt; b\n</code></pre>" in rendered, repr(rendered)
+    assert "</blockquote>\n<pre>" not in rendered, repr(rendered)
+
+
+def test_entity_at_line_start_keeps_prefix():
+    # Guarantees the fix does not over-correct: an entity that begins a *new*
+    # line (after a literal ``\n`` in the source) is at a true line start, so
+    # its line must still receive the blockquote prefix.
+    md = _convert("<blockquote><pre>a\n&amp;b</pre></blockquote>")
+    assert "> a\n> &b\n> ```\n" in md, repr(md)
+    assert "\n&b\n" not in md, repr(md)
+    rendered = _render(md)
+    assert "<pre><code>a\n&amp;b\n</code></pre>" in rendered, repr(rendered)
+
+
+# ---------------------------------------------------------------------------
 # Production path: DefaultMarkdownGenerator.generate_markdown
 # ---------------------------------------------------------------------------
 
