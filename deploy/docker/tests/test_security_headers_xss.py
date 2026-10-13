@@ -177,6 +177,8 @@ class TestErrorSanitization:
             "/CACHE/ms-playwright/chromium-1148/chrome",
             "/Tmp/browser-profile-abc123",
             "/Home/appuser/.cache/ms-playwright/chrome",
+            "/_data/browser-profile-abc123",
+            "/.cache/ms-playwright/chromium-1148/chrome",
         ):
             assert public_error_detail(
                 f"[Errno 2] No such file or directory: '{path}'"

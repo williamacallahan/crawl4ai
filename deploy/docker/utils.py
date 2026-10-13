@@ -232,7 +232,7 @@ _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", '
 # Directory names may begin with an uppercase letter or a digit too (e.g.
 # /DATA/..., /123/...), so all three are accepted; the URL is stripped first
 # to keep URL path segments from being mistaken for a container path.
-_CONTAINER_PATH = re.compile(r"/(?:[a-zA-Z0-9][a-zA-Z0-9_.-]*)/(?:\S)")
+_CONTAINER_PATH = re.compile(r"/(?:[^/\s][^/\s]*)/(?:\S)")
 _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 # Chromium's navigation error code. A withheld message keeps it because it is the
 # one fact a client needs to tell a target-side fault from a transient one. Only
