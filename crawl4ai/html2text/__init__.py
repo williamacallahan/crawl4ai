@@ -53,6 +53,10 @@ class HTML2Text(html.parser.HTMLParser):
         self.split_next_td = False
         self.td_count = 0
         self.table_start = False
+        # Depth of nesting inside <td>/<th> cells on the GFM (non-bypass,
+        # non-ignore) table path. <br> inside a cell must stay inline so the
+        # GFM row remains on a single physical line.
+        self.in_table_cell = 0
         self.unicode_snob = config.UNICODE_SNOB  # covered in cli
 
         self.escape_snob = config.ESCAPE_SNOB  # covered in cli
@@ -387,7 +391,13 @@ class HTML2Text(html.parser.HTMLParser):
                 self.p()
 
         if tag == "br" and start:
-            if self.blockquote > 0:
+            if self.in_table_cell:
+                # GFM table rows must occupy a single physical line; emit a
+                # cell-safe raw inline <br> instead of a hard line break so
+                # the cell is not split across lines (and the row/column
+                # structure is preserved for GFM-compliant consumers).
+                self.o("<br>")
+            elif self.blockquote > 0:
                 self.o("  \n> ")
             else:
                 self.o("  \n")
@@ -768,6 +778,10 @@ class HTML2Text(html.parser.HTMLParser):
                     self.table_start = False
                 if tag in ["td", "th"] and start:
                     self.td_count += 1
+                    self.in_table_cell += 1
+                if tag in ["td", "th"] and not start:
+                    if self.in_table_cell > 0:
+                        self.in_table_cell -= 1
 
         if tag == "pre":
             if start:
