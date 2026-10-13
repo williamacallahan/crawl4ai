@@ -261,7 +261,12 @@ def _structural_integrity_check(html: str) -> Tuple[bool, str]:
     # HTML fragment (e.g. a css_selector-wrapped result starting with <div)
     # legitimately has no <body> tag, so its absence is not a structural
     # failure there — the remaining content/text signals handle fragments.
-    _head = html.lstrip()[:10].lower()
+    # Strip the BOM (U+FEFF) before slicing: ``str.lstrip()`` does NOT remove
+    # it (``'\ufeff'.isspace()`` is ``False``), so a BOM-prefixed fragment
+    # would survive the strip, miss the ``<`` prefix, fall back to the
+    # full-document branch, and be flagged for "no <body>" — breaking the
+    # carve-out this signal exists to provide. Mirrors ``_looks_like_data``.
+    _head = _BOM_LSTRIP_RE.sub('', html).lstrip()[:10].lower()
     _is_fragment = _head.startswith("<") and not _head.startswith(("<html", "<!"))
     body_start = _body_start(html)
     if not _is_fragment and body_start is None:
