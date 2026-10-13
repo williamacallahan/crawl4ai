@@ -455,6 +455,10 @@ async def test_migration_rerun_missing_file_leaves_each_content_column_intact(
         f"{column}: expected a cache HIT before deleting the backing file"
     )
 
+    # Persist provenance while the backing file is still available so the
+    # rerun can distinguish this pointer from raw legacy text.
+    await run_migration(mgr.db_path)
+
     # The failure mode: DB persists, the backing file + the marker are lost.
     os.remove(backing)
     os.remove(mgr.version_manager.migration_marker)
