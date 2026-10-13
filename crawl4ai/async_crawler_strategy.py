@@ -242,13 +242,26 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         """
         Set custom headers for the browser.
 
+        Headers are merged into ``self.browser_config.headers`` — the store
+        read by the crawl path (``_crawl_web`` and ``_handle_http``) and by
+        ``BrowserManager.setup_context`` (which pushes them onto the
+        Playwright context via ``context.set_extra_http_headers``). They are
+        merged rather than replaced so the ``sec-ch-ua`` default seeded in
+        ``BrowserConfig.__init__`` is preserved unless explicitly overridden.
+
+        Note: headers are applied to the Playwright context at context-creation
+        time. Call this before ``start()`` / the first crawl for the headers
+        to take effect on the wire; calling it after a context is already live
+        mutates the config object but does not retroactively push headers onto
+        the existing context.
+
         Args:
             headers (Dict[str, str]): A dictionary of headers to set.
 
         Returns:
             None
         """
-        self.headers = headers
+        self.browser_config.headers.update(headers)
 
     async def smart_wait(self, page: Page, wait_for: str, timeout: float = 30000):
         """
@@ -621,17 +634,14 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 browser_hint=override_hint if ua_changed else None,
             )
 
-            # Push updated UA + sec-ch-ua to the page so the server sees them.
-            # Use the per-crawl locals captured above the ``await`` (NOT the
-            # shared ``self.browser_config`` fields, which a concurrent crawl
-            # may have overwritten while we were suspended at ``get_page``).
-            # The locals are applied LAST so they win over any stale
-            # ``sec-ch-ua`` / ``User-Agent`` left in the shared ``headers``
-            # dict by a concurrent crawl.
-            if ua_changed:
+            # Push configured headers to the live page so headers added after
+            # context creation reach the wire. Per-crawl UA locals are applied
+            # last so a concurrent crawl cannot overwrite this crawl's values.
+            if ua_changed or self.browser_config.headers:
                 combined_headers = dict(self.browser_config.headers)
-                combined_headers["User-Agent"] = override_ua
-                combined_headers["sec-ch-ua"] = override_hint
+                if ua_changed:
+                    combined_headers["User-Agent"] = override_ua
+                    combined_headers["sec-ch-ua"] = override_hint
                 await page.set_extra_http_headers(combined_headers)
 
             # await page.goto(URL)
@@ -1236,7 +1246,19 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     params={"delay": delay, "url": url},
                 )
                 await asyncio.sleep(delay)
-                return await page.content()
+                # When `config.session_id` keeps the page open, read the
+                # current page content so any changes made during the delay
+                # are reflected. Otherwise the `finally` block below may have
+                # closed `page` before this callable runs, so fall back to the
+                # HTML captured at crawl time.
+                if config.session_id and page is not None and not page.is_closed():
+                    try:
+                        return await page.content()
+                    except Error as error:
+                        if "closed" in str(error).lower():
+                            return html
+                        raise
+                return html
 
             ###
             # This ensures we capture the current page URL at the time we return the response,
@@ -1323,16 +1345,16 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     except Exception:
                         pass
 
-                    # Close the page unless it's the last one in a headless/managed browser.
+                    # Keep only a managed browser's last page: get_page reuses
+                    # it. Every other page is freshly created per crawl, so a
+                    # kept one is never reused and its renderer lives as long
+                    # as the browser.
                     try:
                         all_contexts = page.context.browser.contexts
                         total_pages = sum(len(context.pages) for context in all_contexts)
                         if not (
                             total_pages <= 1
-                            and (
-                                self.browser_config.use_managed_browser
-                                or self.browser_config.headless
-                            )
+                            and self.browser_config.use_managed_browser
                         ):
                             await page.close()
                     except asyncio.CancelledError:

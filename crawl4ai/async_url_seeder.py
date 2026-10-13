@@ -9,7 +9,7 @@ Features
 * Per-domain CDX result cache on disk (~/.crawl4ai/<index>_<domain>_<hash>.jsonl)
 * Optional HEAD-only liveness check
 * Optional partial <head> download + meta parsing
-* Global hits-per-second rate-limit via asyncio.Semaphore
+* Global hits-per-second rate-limit via _QpsLimiter (leaky-bucket pacing)
 * Concurrency in the thousands — fine on a single event-loop
 """
 
@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 import fnmatch
@@ -77,6 +77,51 @@ _link_rx = re.compile(
     r'<link\s+[^>]*rel=["\']?([^"\' >]+)[^>]*href=["\']?([^"\' >]+)', re.I)
 
 # ────────────────────────────────────────────────────────────────────────── helpers
+
+
+class _QpsLimiter:
+    """Per-second rate limiter (leaky-bucket). Async context manager.
+
+    A counting :class:`asyncio.Semaphore` only bounds *concurrent in-flight*
+    operations, not *operations per second* — its effective QPS is
+    ``permits / request_latency``, which overshoots the configured rate for
+    fast targets and undershoots it for slow ones. This limiter instead paces
+    the *start time* of each admission at ``1 / rate`` seconds apart, so the
+    sustained request rate stays at the configured value regardless of how
+    quickly the target responds.
+
+    Usage is API-compatible with ``async with <sem>:`` call sites previously
+    built on :class:`asyncio.Semaphore`::
+
+        async with self._rate_sem:
+            await self._validate(...)
+
+    The lock is held only for the bookkeeping (computing the next admission
+    time) and released before sleeping, so a burst of waiters schedule their
+    slots in microseconds and then each sleeps until its own deadline — the
+    lock is never held across the sleep. An idle period resets the baseline
+    (``_next_time`` clamps to ``now``) so no "burst debt" accumulates while
+    the limiter is unused. No third-party dependency is required.
+    """
+
+    def __init__(self, rate: float):
+        self.rate = rate
+        self._next_time = 0.0
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self):
+        async with self._lock:
+            now = time.monotonic()
+            if self._next_time < now:
+                self._next_time = now
+            wait = self._next_time - now
+            self._next_time += 1.0 / self.rate
+        if wait > 0:
+            await asyncio.sleep(wait)
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
 
 def _parse_sitemap_lastmod(xml_content: bytes) -> Optional[str]:
@@ -318,7 +363,7 @@ class AsyncUrlSeeder:
 
         # defer – grabbing the index inside an active loop blows up
         self.index_id: Optional[str] = None
-        self._rate_sem: Optional[asyncio.Semaphore] = None
+        self._rate_sem: Optional[_QpsLimiter] = None
 
         # ───────── cache dirs ─────────
         self.cache_root = Path(os.path.expanduser(
@@ -421,7 +466,7 @@ class AsyncUrlSeeder:
                     "warning", "hits_per_sec must be positive. Disabling rate limiting.", tag="URL_SEED")
                 self._rate_sem = None
             else:
-                self._rate_sem = asyncio.Semaphore(hits_per_sec)
+                self._rate_sem = _QpsLimiter(hits_per_sec)
         else:
             self._rate_sem = None  # Ensure it's None if no rate limiting
 
@@ -511,7 +556,7 @@ class AsyncUrlSeeder:
                             break
                     break
 
-                if self._rate_sem:  # global QPS control
+                if self._rate_sem:  # global QPS control (leaky-bucket pacing)
                     async with self._rate_sem:
                         await self._validate(url, res_list, live_check, extract_head,
                                              head_timeout, verbose, query, score_threshold, scoring_method,
@@ -645,7 +690,7 @@ class AsyncUrlSeeder:
                 self._log("warning", "hits_per_sec must be positive. Disabling rate limiting.", tag="URL_SEED")
                 self._rate_sem = None
             else:
-                self._rate_sem = asyncio.Semaphore(config.hits_per_sec)
+                self._rate_sem = _QpsLimiter(config.hits_per_sec)
         else:
             self._rate_sem = None
         
@@ -687,17 +732,31 @@ class AsyncUrlSeeder:
                 
                 try:
                     # Use existing _validate method which handles head extraction, caching, etc.
-                    await self._validate(
-                        url, res_list, 
-                        live=False,  # We're not doing live checks, just head extraction
-                        extract=True,  # Always extract head content
-                        timeout=timeout,
-                        verbose=config.verbose or False,
-                        query=config.query,
-                        score_threshold=config.score_threshold,
-                        scoring_method=config.scoring_method or "bm25",
-                        filter_nonsense=config.filter_nonsense_urls
-                    )
+                    if self._rate_sem:  # global QPS control (leaky-bucket pacing)
+                        async with self._rate_sem:
+                            await self._validate(
+                                url, res_list,
+                                live=False,  # We're not doing live checks, just head extraction
+                                extract=True,  # Always extract head content
+                                timeout=timeout,
+                                verbose=config.verbose or False,
+                                query=config.query,
+                                score_threshold=config.score_threshold,
+                                scoring_method=config.scoring_method or "bm25",
+                                filter_nonsense=config.filter_nonsense_urls
+                            )
+                    else:
+                        await self._validate(
+                            url, res_list,
+                            live=False,  # We're not doing live checks, just head extraction
+                            extract=True,  # Always extract head content
+                            timeout=timeout,
+                            verbose=config.verbose or False,
+                            query=config.query,
+                            score_threshold=config.score_threshold,
+                            scoring_method=config.scoring_method or "bm25",
+                            filter_nonsense=config.filter_nonsense_urls
+                        )
                 except Exception as e:
                     self._log("error", "Failed to process URL {url}: {error}",
                               params={"url": url, "error": str(e)}, tag="URL_SEED")
@@ -1147,7 +1206,7 @@ class AsyncUrlSeeder:
             for u in regular_urls:
                 yield u
 
-    async def _iter_sitemap(self, url: str):
+    async def _iter_sitemap(self, url: str, allowed_host: Optional[str] = None):
         try:
             r = await self.client.get(url, timeout=15, follow_redirects=True)
             r.raise_for_status()
@@ -1167,6 +1226,15 @@ class AsyncUrlSeeder:
         data = gzip.decompress(r.content) if url.endswith(".gz") else r.content
         base_url = str(r.url)
 
+        def _on_allowed_host(candidate: str) -> bool:
+            if allowed_host is None:
+                return True
+            actual = urlparse(candidate).hostname
+            return bool(actual) and actual.lower().removeprefix("www.") == allowed_host.lower().removeprefix("www.")
+
+        if not _on_allowed_host(base_url):
+            return
+
         def _normalize_loc(raw: Optional[str]) -> Optional[str]:
             if not raw:
                 return None
@@ -1174,7 +1242,7 @@ class AsyncUrlSeeder:
             normalized = urljoin(base_url, cleaned)
             if not normalized:
                 return None
-            return normalized
+            return normalized if _on_allowed_host(normalized) else None
 
         # Detect if this is a sitemap index by checking for <sitemapindex> or presence of <sitemap> elements
         is_sitemap_index = False
@@ -1294,7 +1362,7 @@ class AsyncUrlSeeder:
                     self._log(
                         "debug", "Processing sub-sitemap: {url}", params={"url": sitemap_url}, tag="URL_SEED")
                     # Recursively process sub-sitemap
-                    async with aclosing(self._iter_sitemap(sitemap_url)) as stream:
+                    async with aclosing(self._iter_sitemap(sitemap_url, allowed_host=allowed_host)) as stream:
                         async for u in stream:
                             await result_queue.put(u)  # Will block if queue is full
                 except Exception as e:

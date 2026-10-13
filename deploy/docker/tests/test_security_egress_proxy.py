@@ -11,6 +11,7 @@ test_security_ssrf_egress.py.)
 """
 
 import asyncio
+import socket
 
 import pytest
 
@@ -37,6 +38,22 @@ async def _fake_upstream():
     async def handle(reader, writer):
         await reader.read(65536)
         writer.write(b"UPSTREAM-OK")
+        await writer.drain()
+        writer.close()
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _fake_http_origin():
+    """A loopback HTTP origin that replies 200 OK with a small body.
+
+    Used by the plain-HTTP absolute-URI tests: the pinning proxy re-issues the
+    request in origin form to the pinned IP and splices the origin's response
+    back to the client, so the client observes a real HTTP status line.
+    """
+    async def handle(reader, writer):
+        await reader.read(65536)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
         await writer.drain()
         writer.close()
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
@@ -128,6 +145,261 @@ class TestPinningProxy:
             await w.drain()
             status = await asyncio.wait_for(r.readline(), timeout=5)
             assert b"400" in status
+            w.close()
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.parametrize(
+        ("host", "expected"),
+        [
+            ("refused.example", "net::ERR_CONNECTION_REFUSED"),
+            ("[2001:db8::1]", "net::ERR_CONNECTION_REFUSED"),
+            ("unresolvable.example", "net::ERR_NAME_NOT_RESOLVED"),
+            ("internal.example", "net::ERR_TUNNEL_CONNECTION_FAILED"),
+        ],
+    )
+    async def test_dead_target_surfaces_its_own_code_not_the_tunnel_code(
+        self, monkeypatch, host, expected
+    ):
+        """Chromium reports every refused CONNECT as ERR_TUNNEL_CONNECTION_FAILED;
+        the public crawl error restores a dead target's code, while a policy block
+        keeps the tunnel code."""
+        from egress_broker import TargetUnresolvable
+        from utils import public_error_detail
+
+        monkeypatch.setattr(egress_proxy, "_dial_failures", type(egress_proxy._dial_failures)())
+        proxy = PinningProxy()
+        await proxy.start()
+        # A port nothing listens on, taken after the proxy bound its own.
+        closed = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+        closed_port = closed.sockets[0].getsockname()[1]
+        closed.close()
+        await closed.wait_closed()
+
+        def fake_pin(url):
+            if host == "unresolvable.example":
+                raise TargetUnresolvable()
+            if host == "internal.example":
+                raise EgressBlocked()
+            return PinnedTarget("https", host, closed_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT {host}:{closed_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            status = await asyncio.wait_for(r.readline(), timeout=5)
+            assert b"403" in status
+            w.close()
+        finally:
+            await proxy.stop()
+
+        playwright_error = (
+            "Unexpected error in _crawl_web (/app/crawl4ai/async_crawler_strategy.py):\n"
+            "Error: Failed on navigating ACS-GOTO:\n"
+            f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{host}:{closed_port}/\n"
+            f"Call log:\n  - navigating to \"https://{host}:{closed_port}/\"\n"
+        )
+        assert public_error_detail(playwright_error) == f"Crawl failed: {expected}"
+
+    @pytest.mark.parametrize(
+        ("host", "expected"),
+        [
+            ("refused.example", "net::ERR_CONNECTION_REFUSED"),
+            ("[2001:db8::1]", "net::ERR_CONNECTION_REFUSED"),
+            ("unresolvable.example", "net::ERR_NAME_NOT_RESOLVED"),
+            ("internal.example", None),
+        ],
+    )
+    async def test_dead_target_surfaces_its_own_code_not_the_tunnel_code_all_proxies_failed_shape(
+        self, monkeypatch, host, expected
+    ):
+        """Regression: the "All proxies failed: ..." message shape produced when
+        CrawlerRunConfig.max_retries >= 1 (async_crawler_strategy.py:816 ->
+        async_webcrawler.py:677) carries no internal-error marker and no
+        container path, so it takes public_error_detail's early-return branch.
+        The tunnel-code swap must still fire there, otherwise a dead target
+        surfaces the misleading ERR_TUNNEL_CONNECTION_FAILED verbatim. A policy
+        block records no dial outcome, so it keeps the verbatim pass-through."""
+        from egress_broker import TargetUnresolvable
+        from utils import public_error_detail
+
+        monkeypatch.setattr(egress_proxy, "_dial_failures", type(egress_proxy._dial_failures)())
+        proxy = PinningProxy()
+        await proxy.start()
+        closed = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+        closed_port = closed.sockets[0].getsockname()[1]
+        closed.close()
+        await closed.wait_closed()
+
+        def fake_pin(url):
+            if host == "unresolvable.example":
+                raise TargetUnresolvable()
+            if host == "internal.example":
+                raise EgressBlocked()
+            return PinnedTarget("https", host, closed_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT {host}:{closed_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            status = await asyncio.wait_for(r.readline(), timeout=5)
+            assert b"403" in status
+            w.close()
+        finally:
+            await proxy.stop()
+
+        # The path-B shape: str(RuntimeError(...)) prefixed with "All proxies
+        # failed: ", clean of every marker and container path.
+        playwright_line = (
+            f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{host}:{closed_port}/\n"
+            f"Call log:\n  - navigating to \"https://{host}:{closed_port}/\"\n"
+        )
+        runtime_err = str(RuntimeError(f"Failed on navigating ACS-GOTO:\n{playwright_line}"))
+        message = f"All proxies failed: {runtime_err}"
+
+        if expected is not None:
+            assert public_error_detail(message) == f"Crawl failed: {expected}"
+        else:
+            # Policy block: nothing recorded -> swap no-ops -> verbatim pass-through
+            # (public_error_detail strips then caps at 500).
+            assert public_error_detail(message) == message.strip()[:500]
+
+
+@pytest.mark.asyncio
+class TestAbsoluteUriIpv6Literal:
+    """Regression for the bracket-dropping resolve-URL reconstruction in
+    ``_handle_absolute``.
+
+    A plain-HTTP absolute-URI request to a bracketed IPv6 literal
+    (``GET http://[2606:4700::1]/path``) must be tunneled for a global literal
+    and rejected with 403 for a non-global literal. The bug rebuilt the URL
+    handed to ``resolve_and_pin`` from ``urlsplit(target).hostname`` which
+    strips the ``[]`` brackets, producing e.g. ``http://2606:4700::1:80`` that
+    ``urlparse`` mis-parses (hostname becomes the first hex group, ``.port``
+    raises ``ValueError``); the ``ValueError`` escaped the ``except
+    EgressBlocked`` clause and the proxy closed the connection silently.
+    """
+
+    async def test_resolve_url_keeps_ipv6_brackets_and_tunnels(self, monkeypatch):
+        """The URL handed to ``resolve_and_pin`` retains the IPv6 brackets so
+        ``urlparse`` parses host+port correctly, the forwarded ``Host`` field is
+        bracketed, and the request is tunneled."""
+        sent = {}
+        up_port = {"port": None}
+
+        async def handle(reader, writer):
+            request = await reader.read(65536)
+            sent["request"] = request
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                b"Connection: close\r\n\r\nhi"
+            )
+            await writer.drain()
+            writer.close()
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        up_port["port"] = server.sockets[0].getsockname()[1]
+
+        seen = {}
+
+        def fake_pin(url):
+            seen["url"] = url
+            return PinnedTarget("http", "2606:4700::1", up_port["port"], "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                f"GET http://[2606:4700::1]:{up_port['port']}/path HTTP/1.1\r\n"
+                f"Host: [2606:4700::1]\r\n\r\n".encode()
+            )
+            await w.drain()
+            data = await asyncio.wait_for(r.read(200), timeout=5)
+            assert b"200" in data
+            w.close()
+        finally:
+            await proxy.stop()
+            server.close()
+            await server.wait_closed()
+        # Pre-fix the recorded URL was 'http://2606:4700::1:<port>' (no
+        # brackets), which urlparse mis-parses. The fix preserves the brackets.
+        assert seen["url"] == f"http://[2606:4700::1]:{up_port['port']}"
+        # The forwarded Host field must bracket the IPv6 literal so an origin
+        # that validates Host does not reject the request. The port is appended
+        # by the proxy, so check the bracketed host prefix only.
+        assert b"Host: [2606:4700::1]" in sent["request"]
+
+    async def test_global_ipv6_tunnels_through_real_resolve(self, monkeypatch):
+        """End-to-end through the REAL ``resolve_and_pin`` (only DNS mocked): a
+        global IPv6 literal pins to itself, the proxy dials the pinned IP (not
+        a re-resolved hostname), and the response is tunneled. Pre-fix the
+        unbracketed rebuilt URL raised ``ValueError`` inside ``resolve_and_pin``
+        and the proxy closed silently."""
+        import egress_broker
+        up, up_port = await _fake_http_origin()
+
+        def fake_getaddrinfo(host, port, *a, **k):
+            if host == "2606:4700::1":
+                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "",
+                         (host, port, 0, 0))]
+            raise OSError("no such host")
+        monkeypatch.setattr(egress_broker.socket, "getaddrinfo", fake_getaddrinfo)
+
+        real_open = asyncio.open_connection
+        dialed = {}
+
+        async def redirect_open(host, port, *a, **k):
+            dialed["host"], dialed["port"] = host, port
+            # The pinned IPv6 is not dialable offline; redirect to the origin.
+            return await real_open("127.0.0.1", up_port)
+        monkeypatch.setattr(egress_proxy.asyncio, "open_connection", redirect_open)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await real_open(proxy.bound_host, proxy.bound_port)
+            w.write(
+                f"GET http://[2606:4700::1]:{up_port}/path HTTP/1.1\r\n"
+                f"Host: [2606:4700::1]\r\n\r\n".encode()
+            )
+            await w.drain()
+            data = await asyncio.wait_for(r.read(200), timeout=5)
+            assert b"200" in data
+            w.close()
+        finally:
+            await proxy.stop()
+            up.close()
+        # The proxy dialed the pinned IPv6 literal, never re-resolving the host.
+        assert dialed["host"] == "2606:4700::1"
+        assert dialed["port"] == up_port
+
+    async def test_non_global_ipv6_returns_403_not_silent_close(self, monkeypatch):
+        """End-to-end through the REAL ``resolve_and_pin`` (only DNS mocked): a
+        non-global IPv6 literal (ULA ``fc00::/7``) must produce the recognizable
+        403 Forbidden, not a silent connection close. Pre-fix the unbracketed
+        rebuilt URL raised ``ValueError`` before the ``is_global`` check, so the
+        proxy closed silently."""
+        import egress_broker
+
+        def fake_getaddrinfo(host, port, *a, **k):
+            if host == "fc00::1":
+                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "",
+                         (host, port, 0, 0))]
+            raise OSError("no such host")
+        monkeypatch.setattr(egress_broker.socket, "getaddrinfo", fake_getaddrinfo)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(b"GET http://[fc00::1]:80/path HTTP/1.1\r\n"
+                    b"Host: [fc00::1]\r\n\r\n")
+            await w.drain()
+            status = await asyncio.wait_for(r.readline(), timeout=5)
+            assert b"403" in status
             w.close()
         finally:
             await proxy.stop()

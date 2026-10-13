@@ -127,6 +127,19 @@ def test_from_binary_returns_certificate(x509_cert, format_name, request, der_by
     assert isinstance(cert, dict)
     assert cert.subject == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
     assert cert.issuer == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
+    # subject_rdn / issuer_rdn preserve the duplicate OU that the collapsed
+    # subject/issuer dicts above drop (see ``test_ssl_certificate_rdn_duplicates``
+    # for the focused regression). The fixture's real subject/issuer have two
+    # OUs: "www.entrust.net/CPS is incorporated by reference" and
+    # "(c) 2006 Entrust, Inc." -- both must survive in order.
+    assert cert.subject_rdn == [
+        ("C", "US"),
+        ("O", "Entrust, Inc."),
+        ("OU", "www.entrust.net/CPS is incorporated by reference"),
+        ("OU", "(c) 2006 Entrust, Inc."),
+        ("CN", "Entrust Root Certification Authority"),
+    ]
+    assert cert.issuer_rdn == cert.subject_rdn
     assert cert.valid_from == "20061127202342Z"
     assert cert.valid_until == "20261127205342Z"
     # Fingerprint must match an independent SHA-256 of the DER bytes -- not the
@@ -198,6 +211,14 @@ def test_from_file_returns_certificate(fmt, request):
     assert isinstance(cert, SSLCertificate)
     assert cert.subject == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
     assert cert.issuer == {"C": "US", "O": "Entrust, Inc.", "OU": "(c) 2006 Entrust, Inc.", "CN": "Entrust Root Certification Authority"}
+    # Both OUs survive in the full RDN list (the collapsed dict above drops the
+    # CPS OU). See ``test_ssl_certificate_rdn_duplicates`` for the focused
+    # regression.
+    ou_values = [v for k, v in cert.subject_rdn if k == "OU"]
+    assert ou_values == [
+        "www.entrust.net/CPS is incorporated by reference",
+        "(c) 2006 Entrust, Inc.",
+    ]
 
 
 def test_from_file_returns_none_for_missing_file(capsys):

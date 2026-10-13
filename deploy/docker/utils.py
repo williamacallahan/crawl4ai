@@ -11,6 +11,8 @@ import dns.resolver
 import yaml
 from fastapi import Request
 
+from egress_proxy import tunnel_failure_code
+
 
 class TaskStatus(str, Enum):
     PROCESSING = "processing"
@@ -220,12 +222,23 @@ logger = logging.getLogger(__name__)
 
 _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", 'File "', ".py")
 # The markers above only recognize the library's get_error_context shape. Its
-# dispatcher reports a bare str(e) instead (crawl4ai/async_dispatcher.py:342,
-# :346), so a path-bearing OSError carries no marker at all. Match the
-# container filesystem directly, after removing the crawled URL — a URL
-# legitimately has path segments, whatever is left should not.
-_CONTAINER_PATH = re.compile(r"/(?:app|ms-playwright|home|root|usr|opt|srv|etc|var|tmp|proc)/")
+# dispatcher reports a bare str(e) instead (crawl4ai/async_dispatcher.py:357
+# and :769), so a path-bearing OSError carries no marker at all. Match any
+# absolute container path directly, after removing the crawled URL — a URL
+# legitimately has path segments, but whatever is left should not. A fixed
+# prefix allowlist would miss operator overrides of standard env vars (e.g.
+# PLAYWRIGHT_BROWSERS_PATH=/data/..., TMPDIR=/mnt/...) under unlisted
+# top-level dirs, leaking them to the client, so any /word/ segment is matched.
+# Directory names may begin with an uppercase letter or a digit too (e.g.
+# /DATA/..., /123/...), so all three are accepted; the URL is stripped first
+# to keep URL path segments from being mistaken for a container path.
+_CONTAINER_PATH = re.compile(r"/(?:[^/\s][^/\s]*)/(?:\S)")
 _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+# Chromium's navigation error code. A withheld message keeps it because it is the
+# one fact a client needs to tell a target-side fault from a transient one. Only
+# Playwright's own goto error line counts: the call log echoes the crawled URL.
+_NAVIGATION_ERROR_CODE = re.compile(r"Page\.goto: (net::ERR_[A-Z0-9_]{1,64})(?: at (\S+))?")
+_TUNNEL_CONNECTION_FAILED = "net::ERR_TUNNEL_CONNECTION_FAILED"
 
 
 def public_error_detail(error_message: Optional[str]) -> str:
@@ -233,15 +246,42 @@ def public_error_detail(error_message: Optional[str]) -> str:
 
     The library's catch-all error_message (get_error_context) embeds container
     file paths, source snippets and raw exception text; those must never reach
-    a client. Upstream-failure messages (anti-bot, navigation refusal, DNS,
-    timeouts) pass through, capped.
+    a client, so only its bare Chromium `net::ERR_*` code survives. Upstream-
+    failure messages (anti-bot, navigation refusal, DNS, timeouts) pass through,
+    capped.
     """
     message = (error_message or "").strip()
-    if not message or any(marker in message for marker in _INTERNAL_ERROR_MARKERS):
+    if (
+        message
+        and not any(marker in message for marker in _INTERNAL_ERROR_MARKERS)
+        and not _CONTAINER_PATH.search(_URL.sub("", message))
+    ):
+        # A clean message — but a tunnel failure is not really clean: it is the
+        # pinning proxy masking a dead target with a generic 403. The "All
+        # proxies failed: ..." shape produced when CrawlerRunConfig.max_retries
+        # >= 1 carries no internal marker or container path, so it takes this
+        # early return. Restore the recorded target-side code for it alone;
+        # other clean upstream-failure messages (anti-bot, cert, DNS, timeouts)
+        # still pass through verbatim per the documented pass-through contract.
+        navigation = _NAVIGATION_ERROR_CODE.search(message)
+        if (
+            navigation is not None
+            and navigation.group(1) == _TUNNEL_CONNECTION_FAILED
+            and navigation.group(2)
+        ):
+            swapped = tunnel_failure_code(navigation.group(2))
+            if swapped:
+                return f"Crawl failed: {swapped}"
+        return message[:500]
+    navigation = _NAVIGATION_ERROR_CODE.search(message)
+    if navigation is None:
         return "Crawl failed"
-    if _CONTAINER_PATH.search(_URL.sub("", message)):
-        return "Crawl failed"
-    return message[:500]
+    code, navigated_url = navigation.groups()
+    if code == _TUNNEL_CONNECTION_FAILED and navigated_url:
+        # The pinning proxy dials for the browser, so a dead target surfaces as a
+        # tunnel failure; restore the code a direct dial would have produced.
+        code = tunnel_failure_code(navigated_url) or code
+    return f"Crawl failed: {code}"
 
 
 class CorrelatedError(str):
@@ -533,6 +573,15 @@ def get_container_memory_percent() -> float:
             limit_path = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
 
         usage = int(usage_path.read_text())
+        # Working set, the share the container memory alert measures: the
+        # kernel reclaims inactive page cache before the limit, so counting it
+        # recycled and refused browsers on replicas holding 1.5 GiB of cache.
+        stat_path = usage_path.with_name("memory.stat")
+        if stat_path.exists():
+            stat = dict(line.split() for line in stat_path.read_text().splitlines())
+            cgroup_v2 = usage_path.name == "memory.current"
+            inactive = stat.get("inactive_file" if cgroup_v2 else "total_inactive_file", 0)
+            usage = max(0, usage - int(inactive))
         limit_raw = limit_path.read_text().strip()
         if limit_raw == "max":
             limit = psutil.virtual_memory().total

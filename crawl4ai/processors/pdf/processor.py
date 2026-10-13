@@ -101,21 +101,24 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             pages=[],
             version="1.1"
         )
+        _temp_dir = None
 
         try:
             with pdf_path.open('rb') as file:
                 reader = PdfReader(file)
                 result.metadata = self._extract_metadata(pdf_path, reader)
                 
-                # Handle image directory
+                # Handle image directory. Local variable, not shared instance
+                # state, so concurrent ``process`` calls on one processor
+                # instance cannot delete each other's temp directories.
                 image_dir = None
                 if self.extract_images and self.save_images_locally:
                     if self.image_save_dir:
                         image_dir = Path(self.image_save_dir)
                         image_dir.mkdir(exist_ok=True, parents=True)
                     else:
-                        self._temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
-                        image_dir = Path(self._temp_dir)
+                        _temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
+                        image_dir = Path(_temp_dir)
 
                 page_limit = self._page_limit(len(reader.pages))
                 for page_num, page in enumerate(reader.pages):
@@ -128,13 +131,10 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             logger.error(f"Failed to process PDF: {str(e)}")
             raise
         finally:
-            # Cleanup temp directory if it was created
-            if self._temp_dir and not self.image_save_dir:
+            # Cleanup only this call's own temp directory.
+            if _temp_dir is not None:
                 import shutil
-                try:
-                    shutil.rmtree(self._temp_dir)
-                except Exception as e:
-                    logger.error(f"Failed to cleanup temp directory: {str(e)}")
+                shutil.rmtree(_temp_dir, ignore_errors=True)
 
         result.processing_time = time() - start_time
         return result
@@ -161,6 +161,7 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             pages=[],
             version="1.1" 
         )
+        _temp_dir = None
 
         try:
             # Get metadata and page count from main thread
@@ -169,15 +170,21 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                 result.metadata = self._extract_metadata(pdf_path, reader)
                 total_pages = self._page_limit(len(reader.pages))
 
-            # Handle image directory setup
+            # Handle image directory setup.
+            # The temp directory is tracked in a *local* variable so that
+            # concurrent ``process_batch`` calls on the same processor instance
+            # each clean up only their own directory. Stashing it on
+            # ``self._temp_dir`` (the prior approach) let one call's ``finally``
+            # ``shutil.rmtree`` another call's still-in-use directory, deleting
+            # the victim's images mid-flight while leaking the owner's own dir.
             image_dir = None
             if self.extract_images and self.save_images_locally:
                 if self.image_save_dir:
                     image_dir = Path(self.image_save_dir)
                     image_dir.mkdir(exist_ok=True, parents=True)
                 else:
-                    self._temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
-                    image_dir = Path(self._temp_dir)
+                    _temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
+                    image_dir = Path(_temp_dir)
 
             def process_page_safely(page_num: int):
                 # Each thread opens its own file handle
@@ -207,13 +214,12 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             logger.error(f"Failed to process PDF: {str(e)}")
             raise
         finally:
-            # Cleanup temp directory if it was created
-            if self._temp_dir and not self.image_save_dir:
+            # Cleanup temp directory if it was created. Only this call's own
+            # temp directory is touched; ``ignore_errors=True`` keeps cleanup
+            # robust if the directory was already removed by an external caller.
+            if _temp_dir is not None:
                 import shutil
-                try:
-                    shutil.rmtree(self._temp_dir)
-                except Exception as e:
-                    logger.error(f"Failed to cleanup temp directory: {str(e)}")
+                shutil.rmtree(_temp_dir, ignore_errors=True)
 
         result.processing_time = time() - start_time
         return result
@@ -451,15 +457,49 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
         modified = self._parse_pdf_date(meta.get('/ModDate', ''))
         
         return PDFMetadata(
-            title=meta.get('/Title'),
-            author=meta.get('/Author'),
-            producer=meta.get('/Producer'),
+            title=self._info_value_as_text(meta.get('/Title')),
+            author=self._info_value_as_text(meta.get('/Author')),
+            producer=self._info_value_as_text(meta.get('/Producer')),
             created=created,
             modified=modified,
             pages=len(reader.pages),
             encrypted=reader.is_encrypted,
             file_size=pdf_path.stat().st_size
         )
+
+    @staticmethod
+    def _info_value_as_text(value) -> Optional[str]:
+        """Resolve a raw ``reader.metadata`` /Info value to a JSON-safe ``str``.
+
+        ``reader.metadata.get('/...')`` can hand back non-JSON-native ``pypdf``
+        objects: a ``TextStringObject`` (``str`` subclass), a
+        ``ByteStringObject`` (``bytes`` subclass that ``str()`` decodes via a
+        charset fallback), or an ``IndirectObject`` (an unresolved indirect
+        reference). An ``IndirectObject`` can only be dereferenced while the
+        ``PdfReader``'s underlying stream is open -- ``get_object()`` seeks that
+        stream -- so this must be called from ``_extract_metadata`` inside the
+        caller's ``with open(...)`` block, before the reader is released and the
+        stream is closed. Resolving here (rather than later in the cache writer)
+        keeps ``PDFMetadata``'s ``Optional[str]`` text fields honest to their
+        declared type and guarantees the dict the cache writer receives is
+        JSON-native. ``None`` (key absent) is passed through unchanged.
+        Malformed indirect objects raise their original error so callers do not
+        silently lose metadata or mistake a failed conversion for an absent
+        field.
+        """
+        if value is None:
+            return None
+        from pypdf.generic import IndirectObject
+
+        if isinstance(value, bytes):
+            return value.decode("latin-1")
+        if isinstance(value, IndirectObject):
+            value = value.get_object()
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                return value.decode("latin-1")
+        return str(value)
 
     def _parse_pdf_date(self, date_str: str) -> Optional[datetime]:
         try:

@@ -5,7 +5,7 @@ import socket
 import base64
 import json
 import hashlib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from urllib.parse import unquote, urlparse
 import OpenSSL.crypto
 from pathlib import Path
@@ -66,6 +66,39 @@ class SSLCertificate(dict):
         elif isinstance(data, list):
             return [SSLCertificate._decode_cert_data(item) for item in data]
         return data
+
+    @staticmethod
+    def _decode_rdn_components(
+        components: List[Tuple[bytes, bytes]]
+    ) -> List[Tuple[str, str]]:
+        """Decode pyOpenSSL RDN ``get_components()`` output into a list of
+        ``(str, str)`` tuples, preserving the original order *and* any
+        duplicate attribute types.
+
+        ``x509.get_subject().get_components()`` (and the issuer equivalent)
+        returns an ordered list of ``(key, value)`` byte tuples and may
+        legitimately contain repeated keys (e.g. multiple ``OU`` entries,
+        which are common in real certificates -- CPS incorporation notices,
+        organizational units, qualification statements). Wrapping that
+        list in ``dict(...)`` silently keeps only the last value for each
+        repeated key. This helper keeps every entry so the full certificate
+        Name is represented without data loss.
+
+        Decoding mirrors :meth:`_decode_cert_data`: UTF-8 first, with a
+        latin-1 fallback for attribute values that are not valid UTF-8.
+        """
+        decoded: List[Tuple[str, str]] = []
+        for k, v in components:
+            key = k.decode("utf-8") if isinstance(k, bytes) else k
+            if isinstance(v, bytes):
+                try:
+                    value = v.decode("utf-8")
+                except UnicodeDecodeError:
+                    value = v.decode("latin-1")
+            else:
+                value = v
+            decoded.append((key, value))
+        return decoded
 
     @staticmethod
     def from_url(url: str, timeout: int = 10) -> Optional["SSLCertificate"]:
@@ -174,9 +207,26 @@ class SSLCertificate(dict):
                 OpenSSL.crypto.FILETYPE_ASN1, x509
             )
 
+            subject_components = SSLCertificate._decode_rdn_components(
+                x509.get_subject().get_components()
+            )
+            issuer_components = SSLCertificate._decode_rdn_components(
+                x509.get_issuer().get_components()
+            )
+
             cert_info_raw = {
-                "subject": dict(x509.get_subject().get_components()),
-                "issuer": dict(x509.get_issuer().get_components()),
+                # ``subject`` / ``issuer`` stay Dict[str, str] to preserve the
+                # documented schema (and the existing consumers that read them
+                # as single-valued). For repeated attribute types the last
+                # value wins. The full ordered RDN component list -- which
+                # preserves every duplicate attribute (e.g. multiple OU/O/CN
+                # entries) -- is stored alongside in ``subject_rdn`` /
+                # ``issuer_rdn`` and exposed via the like-named properties, so
+                # no certificate data is silently dropped.
+                "subject": dict(subject_components),
+                "issuer": dict(issuer_components),
+                "subject_rdn": subject_components,
+                "issuer_rdn": issuer_components,
                 "version": x509.get_version(),
                 "serial_number": hex(x509.get_serial_number()),
                 "not_before": x509.get_notBefore(),
@@ -235,6 +285,24 @@ class SSLCertificate(dict):
     @property
     def subject(self) -> Dict[str, str]:
         return self.get("subject", {})
+
+    @property
+    def issuer_rdn(self) -> List[Tuple[str, str]]:
+        """The issuer Name as an ordered list of ``(key, value)`` RDN
+        tuples, preserving duplicate attribute types in their certificate
+        order (e.g. multiple ``OU`` entries). Use this when the
+        :attr:`issuer` dict would collapse repeated attributes and drop
+        data. Each value is a decoded ``str``."""
+        return self.get("issuer_rdn", [])
+
+    @property
+    def subject_rdn(self) -> List[Tuple[str, str]]:
+        """The subject Name as an ordered list of ``(key, value)`` RDN
+        tuples, preserving duplicate attribute types in their certificate
+        order (e.g. multiple ``OU`` entries). Use this when the
+        :attr:`subject` dict would collapse repeated attributes and drop
+        data. Each value is a decoded ``str``."""
+        return self.get("subject_rdn", [])
 
     @property
     def valid_from(self) -> str:

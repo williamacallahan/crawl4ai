@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Callable
 import time
 import json
+import weakref
 
 # Import both, but use conditionally
 try:
@@ -255,8 +256,8 @@ class UndetectedAdapter(BrowserAdapter):
     """Adapter for undetected browser automation with stealth features"""
     
     def __init__(self):
-        self._console_script_injected = {}
-        self._error_script_injected = {}
+        self._console_script_injected = weakref.WeakKeyDictionary()
+        self._error_script_injected = weakref.WeakKeyDictionary()
     
     async def evaluate(self, page: UndetectedPage, expression: str, arg: Any = None) -> Any:
         """Undetected browser evaluate with isolated context"""
@@ -373,19 +374,22 @@ class UndetectedAdapter(BrowserAdapter):
                     "() => { const msgs = window.__capturedConsole || []; window.__capturedConsole = []; return msgs; }",
                     isolated_context=False
                 )
-                messages.extend(console_messages or [])
+                # Convert per-batch so a later frame's raise cannot skip the
+                # ms->s conversion already owed to collected messages.
+                for msg in (console_messages or []):
+                    if 'timestamp' in msg and isinstance(msg['timestamp'], (int, float)):
+                        msg['timestamp'] = msg['timestamp'] / 1000.0  # Convert from ms to seconds
+                    messages.append(msg)
 
                 # Get errors
                 errors = await frame.evaluate(
                     "() => { const errs = window.__capturedErrors || []; window.__capturedErrors = []; return errs; }",
                     isolated_context=False
                 )
-                messages.extend(errors or [])
-
-            # Convert timestamps from JS to Python format
-            for msg in messages:
-                if 'timestamp' in msg and isinstance(msg['timestamp'], (int, float)):
-                    msg['timestamp'] = msg['timestamp'] / 1000.0  # Convert from ms to seconds
+                for msg in (errors or []):
+                    if 'timestamp' in msg and isinstance(msg['timestamp'], (int, float)):
+                        msg['timestamp'] = msg['timestamp'] / 1000.0  # Convert from ms to seconds
+                    messages.append(msg)
 
         except Exception:
             # If retrieval fails, return whatever was collected so far

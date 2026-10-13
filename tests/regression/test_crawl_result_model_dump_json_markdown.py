@@ -24,6 +24,7 @@ Run with:
 import json
 
 import pytest
+from pydantic import BaseModel
 
 from crawl4ai.models import (
     CrawlResult,
@@ -33,6 +34,15 @@ from crawl4ai.models import (
 
 URL = "https://example.com"
 HTML = "<html><head><title>x</title></head><body><p>hello</p></body></html>"
+
+
+class _Outer(BaseModel):
+    """Reference model that carries a ``MarkdownGenerationResult`` as a
+    *standard* nested field. Used to assert that ``CrawlResult``'s injected
+    ``markdown`` sub-object matches pydantic's own field-serialization path
+    under each forwarded serialization option."""
+
+    inner: MarkdownGenerationResult
 
 
 def _md(raw="hello", citations="c", refs="r", fit="fm", fithtml="<p>fh</p>"):
@@ -128,6 +138,110 @@ class TestSerializationParity:
         assert set(cr.model_dump(include={"markdown"}).keys()) == {"markdown"}
 
 
+class TestNestedDictIncludeExclude:
+    """Pydantic v2's ``include``/``exclude`` accept a dict-valued nested
+    spec (``{'markdown': {'fit_markdown'}}``) to select sub-fields of a
+    nested model. A normal pydantic field of type ``MarkdownGenerationResult``
+    honors this; ``CrawlResult.markdown`` (a ``PrivateAttr`` re-injected by
+    the wrap serializer) must honor it too.
+
+    Regression for the gap introduced in commit 8cfcb25c: the wrap
+    serializer's ``"markdown" in info.include``/``info.exclude`` membership
+    checks treated the dict-valued nested form as whole-field control and
+    never forwarded the sub-field spec to the inner ``model_dump``, so
+    nested-``exclude`` dropped the entire ``markdown`` key and
+    nested-``include`` emitted all sub-fields.
+    """
+
+    def _normal(self):
+        """A plain ``BaseModel`` with a normal ``MarkdownGenerationResult``
+        field, used to pin the behavior ``CrawlResult.markdown`` must match."""
+        from pydantic import BaseModel
+
+        class Normal(BaseModel):
+            n: MarkdownGenerationResult
+
+        return Normal(n=_md())
+
+    def test_nested_exclude_drops_only_named_subfield_model_dump(self):
+        """``exclude={'markdown': {'fit_markdown'}}`` must keep the
+        ``markdown`` key with only ``fit_markdown`` removed — not drop
+        ``markdown`` entirely (the pre-fix behavior)."""
+        cr = _result(md=_md())
+        out = cr.model_dump(mode="json", exclude={"markdown": {"fit_markdown"}})
+        assert "markdown" in out
+        md = out["markdown"]
+        assert set(md.keys()) == {
+            "raw_markdown", "markdown_with_citations",
+            "references_markdown", "fit_html",
+        }
+        assert md["raw_markdown"] == "hello"
+        assert md["fit_html"] == "<p>fh</p>"
+
+    def test_nested_exclude_drops_only_named_subfield_matches_normal_field(self):
+        """The nested-``exclude`` output of ``CrawlResult.markdown`` must
+        match that of a normal pydantic field of the same type."""
+        cr = _result(md=_md())
+        actual = cr.model_dump(mode="json", exclude={"markdown": {"fit_markdown"}})["markdown"]
+        expected = self._normal().model_dump(
+            mode="json", exclude={"n": {"fit_markdown"}}
+        )["n"]
+        assert actual == expected
+
+    def test_nested_include_keeps_only_named_subfield_model_dump(self):
+        """``include={'markdown': {'raw_markdown'}}`` must emit only
+        ``raw_markdown`` under ``markdown`` — not all sub-fields (the
+        pre-fix behavior)."""
+        cr = _result(md=_md())
+        out = cr.model_dump(mode="json", include={"markdown": {"raw_markdown"}})
+        assert set(out.keys()) == {"markdown"}
+        assert set(out["markdown"].keys()) == {"raw_markdown"}
+        assert out["markdown"]["raw_markdown"] == "hello"
+
+    def test_nested_include_keeps_only_named_subfield_matches_normal_field(self):
+        """The nested-``include`` output of ``CrawlResult.markdown`` must
+        match that of a normal pydantic field of the same type."""
+        cr = _result(md=_md())
+        actual = cr.model_dump(mode="json", include={"markdown": {"raw_markdown"}})["markdown"]
+        expected = self._normal().model_dump(
+            mode="json", include={"n": {"raw_markdown"}}
+        )["n"]
+        assert actual == expected
+
+    def test_nested_exclude_on_model_dump_json(self):
+        """Nested-``exclude`` must work on the JSON surface too — the
+        wrap serializer applies to both ``model_dump`` and
+        ``model_dump_json``."""
+        cr = _result(md=_md())
+        out = json.loads(cr.model_dump_json(exclude={"markdown": {"fit_markdown"}}))
+        assert "markdown" in out
+        assert "fit_markdown" not in out["markdown"]
+        assert out["markdown"]["raw_markdown"] == "hello"
+
+    def test_nested_include_on_model_dump_json(self):
+        """Nested-``include`` must work on the JSON surface too."""
+        cr = _result(md=_md())
+        out = json.loads(cr.model_dump_json(include={"markdown": {"raw_markdown"}}))
+        assert set(out.keys()) == {"markdown"}
+        assert set(out["markdown"].keys()) == {"raw_markdown"}
+
+    def test_no_markdown_set_nested_spec_does_not_inject_key(self):
+        """When ``_markdown`` is None, a nested spec on ``markdown`` must
+        not synthesize a spurious ``"markdown": null`` entry."""
+        cr = _result()
+        out = cr.model_dump(mode="json", include={"markdown": {"raw_markdown"}})
+        assert "markdown" not in out
+
+    def test_whole_field_markers_match_normal_pydantic_field(self):
+        cr = _result(md=_md())
+        assert cr.model_dump(mode="json", include={"markdown": ...}) == {
+            "markdown": self._normal().model_dump(mode="json")["n"]
+        }
+        assert "markdown" not in cr.model_dump(
+            mode="json", exclude={"markdown": ...}
+        )
+
+
 class TestRoundTrip:
     """``model_dump_json()`` output must let Pydantic reconstruct
     ``_markdown`` via the existing custom ``__init__`` pop-and-wrap.
@@ -217,3 +331,92 @@ class TestNoRegressionOnOtherFields:
         out = json.loads(cr.model_dump_json())
         assert "fit_markdown" not in out
         assert "markdown_v2" not in out
+
+
+class TestSerializationOptionForwarding:
+    """The ``@model_serializer(mode="wrap")`` must forward the full
+    ``SerializationInfo`` option set to the nested
+    ``MarkdownGenerationResult.model_dump(...)`` call — not just ``mode``.
+
+    Before the fix the wrap serializer only forwarded ``mode`` (and the
+    flat ``include``/``exclude`` membership check), silently dropping
+    ``exclude_none`` / ``exclude_defaults`` / ``exclude_unset`` /
+    ``by_alias`` / ``round_trip``. The injected ``markdown`` sub-object
+    therefore violated those serialization options while the rest of the
+    model honored them.
+
+    The strongest guarantee here is *parity with a standard nested pydantic
+    model*: serializing a ``CrawlResult`` carrying a ``MarkdownGenerationResult``
+    under a given option must produce the same ``markdown`` sub-object that
+    serializing a reference ``_Outer`` model carrying that same object as a
+    regular nested field would produce. This contract is asserted directly
+    against pydantic's own field-serialization path on both the dict and JSON
+    surfaces for the three boolean exclusion flags; ``by_alias`` and
+    ``round_trip`` (no-ops for this alias-less model) are exercised to pin
+    the forwarding behavior and the ``by_alias=None`` default.
+    """
+
+    def test_exclude_none_matches_standard_nested_model(self):
+        """Under ``exclude_none`` the injected ``markdown`` sub-object must
+        equal what a standard nested pydantic field carrying the same
+        ``MarkdownGenerationResult`` would emit, on both the dict and JSON
+        surfaces. This is the headline regression: previously
+        ``"fit_markdown": null`` / ``"fit_html": null`` survived inside the
+        injected ``markdown`` sub-object."""
+        md = MarkdownGenerationResult(
+            raw_markdown="# Hi", markdown_with_citations="c",
+            references_markdown="r", fit_markdown=None, fit_html=None,
+        )
+        cr = _result(md=md)
+        outer = _Outer(inner=md)
+        assert cr.model_dump(exclude_none=True)["markdown"] == outer.model_dump(exclude_none=True)["inner"]
+        assert (
+            json.loads(cr.model_dump_json(exclude_none=True))["markdown"]
+            == json.loads(outer.model_dump_json(exclude_none=True))["inner"]
+        )
+
+    def test_exclude_defaults_matches_standard_nested_model(self):
+        """``exclude_defaults`` drops markdown sub-fields whose values equal
+        their defaults (``fit_markdown``/``fit_html`` default to ``None``).
+        The injected sub-object must match a standard nested field's
+        behavior on both surfaces."""
+        md = _md(raw="# Hi", citations="c", refs="r", fit=None, fithtml=None)
+        cr = _result(md=md)
+        outer = _Outer(inner=md)
+        assert cr.model_dump(exclude_defaults=True)["markdown"] == outer.model_dump(exclude_defaults=True)["inner"]
+
+    def test_exclude_unset_matches_standard_nested_model(self):
+        """``exclude_unset`` drops markdown sub-fields that were not explicitly
+        provided when building the ``MarkdownGenerationResult``. The injected
+        sub-object must match a standard nested field's behavior on both
+        surfaces."""
+        md = MarkdownGenerationResult(
+            raw_markdown="# Hi", markdown_with_citations="c", references_markdown="r"
+        )
+        cr = _result(md=md)
+        outer = _Outer(inner=md)
+        assert cr.model_dump(exclude_unset=True)["markdown"] == outer.model_dump(exclude_unset=True)["inner"]
+
+    def test_by_alias_forwarding_is_noop_without_aliases(self):
+        """``MarkdownGenerationResult`` declares no aliases, so
+        ``by_alias=True`` must be a no-op for the injected ``markdown``
+        sub-object and must not raise. This pins that the forwarded
+        ``by_alias`` flag (which is ``None`` by default, not ``False``) is
+        passed through without corrupting the un-aliased path."""
+        cr = _result(md=_md())
+        assert cr.model_dump(by_alias=True)["markdown"] == cr.model_dump()["markdown"]
+        assert (
+            json.loads(cr.model_dump_json(by_alias=True))["markdown"]
+            == json.loads(cr.model_dump_json())["markdown"]
+        )
+
+    def test_round_trip_forwarding_preserves_markdown(self):
+        """``round_trip=True`` must serialize the ``markdown`` sub-object in
+        a way that round-trips back through ``model_validate``."""
+        cr = _result(md=_md(raw="# Hi", citations="c", refs="r", fit="fm", fithtml="<a>"))
+        dumped = cr.model_dump(round_trip=True)
+        rebuilt = CrawlResult.model_validate(dumped)
+        assert rebuilt._markdown is not None
+        assert rebuilt._markdown.raw_markdown == "# Hi"
+        assert rebuilt._markdown.fit_markdown == "fm"
+        assert rebuilt._markdown.fit_html == "<a>"

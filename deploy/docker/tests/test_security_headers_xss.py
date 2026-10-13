@@ -7,6 +7,8 @@ playground keep the baseline headers but not the strict CSP until they are
 externalized (CSP-compat refactor - tracked separately). CORS is deny-by-default.
 """
 
+import re
+
 import pytest
 
 pytestmark = pytest.mark.posture
@@ -127,6 +129,227 @@ class TestErrorSanitization:
         upstream = "Blocked by anti-bot protection at https://example.com/app/login"
         assert public_error_detail(upstream) == upstream
 
+    def test_tunnel_swap_fires_for_clean_all_proxies_failed_message(self, monkeypatch):
+        """Regression for the max_retries >= 1 path: the "All proxies failed: ..."
+        shape is clean of every internal marker and container path, so it reaches
+        public_error_detail's early-return branch. A recorded dead-target dial
+        outcome must still drive the ERR_TUNNEL_CONNECTION_FAILED -> real code
+        swap there; without a recording the message passes through verbatim."""
+        import time
+        import egress_proxy
+        from utils import public_error_detail
+
+        # Fresh dial-failure map so this test never sees or leaks state.
+        failures = type(egress_proxy._dial_failures)()
+        monkeypatch.setattr(egress_proxy, "_dial_failures", failures)
+
+        def _all_proxies_failed(url):
+            line = f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at {url}\n"
+            return f"All proxies failed: Failed on navigating ACS-GOTO:\n{line}"
+
+        # No recording: a transient proxy fault surfaces verbatim (pass-through).
+        transient = _all_proxies_failed("https://transient.example:443/")
+        assert public_error_detail(transient) == transient.strip()[:500]
+
+        # Record a refused dial outcome for the same host:port -> swap fires.
+        failures[("dead.example", 443)] = ("net::ERR_CONNECTION_REFUSED", time.monotonic())
+        refused = _all_proxies_failed("https://dead.example:443/")
+        assert public_error_detail(refused) == "Crawl failed: net::ERR_CONNECTION_REFUSED"
+
+        # Default https port (443) is inferred when the URL omits the port.
+        failures.clear()
+        failures[("dead.example", 443)] = ("net::ERR_NAME_NOT_RESOLVED", time.monotonic())
+        unresolvable = _all_proxies_failed("https://dead.example/")
+        assert public_error_detail(unresolvable) == "Crawl failed: net::ERR_NAME_NOT_RESOLVED"
+
+        # An expired recording (past the TTL) no-ops -> verbatim pass-through.
+        failures.clear()
+        failures[("stale.example", 443)] = (
+            "net::ERR_ADDRESS_UNREACHABLE",
+            time.monotonic() - egress_proxy._DIAL_FAILURE_TTL_S - 1,
+        )
+        stale = _all_proxies_failed("https://stale.example:443/")
+        assert public_error_detail(stale) == stale.strip()[:500]
+
+    def test_clean_non_tunnel_navigation_error_still_passes_through(self, monkeypatch):
+        """A clean navigation error that is NOT ERR_TUNNEL_CONNECTION_FAILED
+        (e.g. a cert error) must continue to pass through verbatim even though it
+        takes the same early-return branch — the swap is tunnel-failure-only."""
+        import egress_proxy
+        from utils import public_error_detail
+
+        failures = type(egress_proxy._dial_failures)()
+        monkeypatch.setattr(egress_proxy, "_dial_failures", failures)
+
+        cert = (
+            "All proxies failed: Failed on navigating ACS-GOTO:\n"
+            "Page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://self-signed.example/\n"
+        )
+        assert public_error_detail(cert) == cert.strip()[:500]
+
+    def test_public_crawl_error_mints_correlation_id_when_tunnel_swap_rewrites_clean_message(
+        self, monkeypatch
+    ):
+        """When the tunnel swap rewrites a clean "All proxies failed" message,
+        something is withheld (the verbatim message was replaced), so
+        public_crawl_error must mint a correlation id — mirroring the contract
+        that a correlation id is minted only when something was withheld."""
+        import time
+        import egress_proxy
+        from utils import public_crawl_error
+
+        failures = type(egress_proxy._dial_failures)()
+        monkeypatch.setattr(egress_proxy, "_dial_failures", failures)
+        failures[("dead.example", 443)] = ("net::ERR_CONNECTION_REFUSED", time.monotonic())
+
+        message = (
+            "All proxies failed: Failed on navigating ACS-GOTO:\n"
+            "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://dead.example:443/\n"
+        )
+        public = public_crawl_error(message, "https://dead.example:443/")
+        assert re.fullmatch(
+            r"Crawl failed: net::ERR_CONNECTION_REFUSED \(correlation_id=[0-9a-f]{12}\)",
+            public,
+        )
+        assert public.correlation_id
+
+        # No recording -> verbatim pass-through -> NO correlation id minted.
+        failures.clear()
+        transient = (
+            "All proxies failed: Failed on navigating ACS-GOTO:\n"
+            "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://transient.example:443/\n"
+        )
+        assert public_crawl_error(transient) == transient.strip()
+
+    def test_public_error_detail_redacts_unlisted_container_path_prefixes(self):
+        """Operators routinely override PLAYWRIGHT_BROWSERS_PATH / TMPDIR to
+        top-level dirs absent from the default Dockerfile layout (e.g. /data,
+        /mnt). The bare str(e) the dispatcher stores (async_dispatcher.py:357
+        and :769) carries no get_error_context marker, so _CONTAINER_PATH is
+        the only defense; it must match any absolute path, not a fixed
+        allowlist of prefixes. Covers both exploit shapes: a missing browser
+        binary (PLAYWRIGHT_BROWSERS_PATH) and a failed profile dir (TMPDIR)."""
+        from utils import public_error_detail
+
+        # FileNotFoundError shape under unlisted prefixes (the original hardcoded
+        # denylist missed every one of these) and its "Failed to start browser"
+        # re-raise shape from browser_manager.py.
+        for path in (
+            "/data/browsers/chrome-linux/chrome",
+            "/mnt/cache/chrome-linux/chrome",
+            "/scratch/tmp/browser-profile-abc123",
+            "/cache/ms-playwright/chromium-1148/chrome",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"unlisted-prefix FileNotFoundError leaked: {path}"
+            assert public_error_detail(
+                f"Failed to start browser: [Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"unlisted-prefix re-raise leaked: {path}"
+        # TMPDIR override: the profile dir lives under an unlisted prefix and
+        # Chromium fails on it — a different message shape than FileNotFoundError.
+        assert public_error_detail(
+            "Failed to start browser: could not create profile dir "
+            "/data/tmp/browser-profile-abc123: Permission denied"
+        ) == "Crawl failed"
+        assert public_error_detail(
+            "user_data_dir /scratch/tmp/crawl4ai-persistent-xyz is not empty: abort"
+        ) == "Crawl failed"
+
+    def test_public_error_detail_redacts_uppercase_container_path_prefixes(self):
+        """Directory names may begin with an uppercase letter (e.g. /DATA/...,
+        /CACHE/...). _CONTAINER_PATH must match those too, otherwise the bare
+        str(e) the dispatcher stores (async_dispatcher.py:357 and :769) would
+        leak the path to the client. URL path segments under an uppercase dir
+        are still stripped first and must pass through intact."""
+        from utils import public_error_detail
+
+        for path in (
+            "/DATA/profile-abc123",
+            "/CACHE/ms-playwright/chromium-1148/chrome",
+            "/Tmp/browser-profile-abc123",
+            "/Home/appuser/.cache/ms-playwright/chrome",
+            "/_data/browser-profile-abc123",
+            "/.cache/ms-playwright/chromium-1148/chrome",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"uppercase-prefix FileNotFoundError leaked: {path}"
+        # URL path under an uppercase top-level dir is stripped first and must
+        # not be mistaken for a container path.
+        assert public_error_detail(
+            "Blocked by anti-bot protection at https://example.com/Data/thing"
+        ) == "Blocked by anti-bot protection at https://example.com/Data/thing"
+
+    def test_public_error_detail_redacts_digit_starting_container_path_prefixes(self):
+        """Top-level directory names may begin with a digit (e.g. /123/...,
+        /0tmp/...). _CONTAINER_PATH must match those too, otherwise the bare
+        str(e) the dispatcher stores (async_dispatcher.py:357 and :769) would
+        leak the path to the client. URL path segments under a digit-starting
+        dir are still stripped first and must pass through intact."""
+        from utils import public_error_detail
+
+        for path in (
+            "/123/profile-abc123",
+            "/0tmp/browser-profile-abc123",
+            "/9cache/ms-playwright/chromium-1148/chrome",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"digit-prefix FileNotFoundError leaked: {path}"
+        # URL path under a digit-starting top-level dir is stripped first and
+        # must not be mistaken for a container path.
+        assert public_error_detail(
+            "Blocked by anti-bot protection at https://example.com/123/thing"
+        ) == "Blocked by anti-bot protection at https://example.com/123/thing"
+
+    def test_public_error_detail_still_redacts_default_dockerfile_prefixes(self):
+        """No regression for the default deployment, which keeps all assets
+        under the prefixes the original allowlist covered. Marker-bearing
+        payloads are avoided so this exercises the path regex, not the marker
+        denylist."""
+        from utils import public_error_detail
+
+        for path in (
+            "/ms-playwright/chromium-1148/chrome",
+            "/home/appuser/.cache/ms-playwright/chrome",
+            "/app/server.log",
+            "/tmp/browser-profile-abc123",
+            "/usr/local/bin/chrome",
+            "/opt/crawl4ai/runtime/chrome",
+            "/var/log/crawl4ai/server.log",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/root/.cache/ms-playwright/chrome",
+            "/srv/www/index.html",
+            "/proc/1/status",
+        ):
+            assert public_error_detail(
+                f"[Errno 2] No such file or directory: '{path}'"
+            ) == "Crawl failed", f"regression: previously-listed prefix now leaks: {path}"
+
+    def test_public_error_detail_url_path_segments_do_not_trip_filter(self):
+        """A crawled URL legitimately carries path segments — including under
+        unlisted top-level dirs — and is stripped before the path check, so an
+        upstream anti-bot / navigation message must pass through intact. This
+        is the false-positive guard against over-broadening the regex."""
+        from utils import public_error_detail
+
+        for case in (
+            # URL path uses a listed prefix; must still pass (existing case).
+            "Blocked by anti-bot protection at https://example.com/app/login",
+            # URL path uses an unlisted top-level dir; the URL is stripped first.
+            "Blocked by anti-bot protection at https://example.com/data/thing",
+            "Blocked at https://example.com/mnt/cache/login then retry",
+            # Plain upstream reasons with no absolute path at all.
+            "Blocked by anti-bot protection: Cloudflare JS challenge",
+            "net::ERR_CONNECTION_RESET",
+            "Page.goto: Timeout 30000ms exceeded.",
+            "DNS_PROBE_FINISHED_NXDOMAIN",
+        ):
+            assert public_error_detail(case) == case[:500], (
+                f"upstream reason incorrectly redacted: {case!r}"
+            )
+
     def test_correlation_id_is_minted_only_when_something_was_withheld(self):
         from utils import public_crawl_error
 
@@ -140,6 +363,34 @@ class TestErrorSanitization:
         assert public_crawl_error("Traceback (most recent call last)").startswith(
             "Crawl failed (correlation_id="
         )
+
+    def test_withheld_navigation_failure_keeps_only_its_net_error_code(self):
+        """A navigation failure outside the target-refusal set arrives wrapped in
+        get_error_context; the client keeps the bare Chromium code (target vs
+        transient) and the correlation id, never the path, call log, or source."""
+        from utils import public_crawl_error
+
+        internal = (
+            "Unexpected error in _crawl_web at line 816 in _crawl_web "
+            "(../usr/local/lib/python3.12/site-packages/crawl4ai/async_crawler_strategy.py):\n"
+            "Error: Failed on navigating ACS-GOTO:\nPage.goto: net::ERR_CONNECTION_CLOSED "
+            "at https://example.com/\nCall log:\n  - navigating to \"https://example.com/\"\n\n"
+            "Code context:\n 816 →   raise RuntimeError(...)\n"
+        )
+        public = public_crawl_error(internal, "https://example.com/")
+
+        assert re.fullmatch(
+            r"Crawl failed: net::ERR_CONNECTION_CLOSED \(correlation_id=[0-9a-f]{12}\)", public
+        )
+        assert public.correlation_id
+
+        # A code that only appears in the crawled URL echoed by the call log is not the error.
+        timeout = (
+            "Unexpected error in _crawl_web (/app/crawl4ai/async_crawler_strategy.py):\n"
+            "Error: Failed on navigating ACS-GOTO:\nPage.goto: Timeout 30000ms exceeded.\n"
+            "Call log:\n  - navigating to \"https://x.example/net::ERR_FAILED\"\n"
+        )
+        assert public_crawl_error(timeout).startswith("Crawl failed (correlation_id=")
 
     def test_execute_js_result_error_message_is_sanitized(
         self, stock_client, server_module, monkeypatch

@@ -15,7 +15,7 @@ import psutil
 from playwright.async_api import BrowserContext
 
 from .async_configs import BrowserConfig, CrawlerRunConfig
-from .config import DOWNLOAD_PAGE_TIMEOUT
+from .config import DOWNLOAD_PAGE_TIMEOUT, PAGE_TIMEOUT
 from .js_snippet import load_js_script
 from .utils import get_chromium_path
 
@@ -27,6 +27,12 @@ CANCELLATION_GRACE_SECONDS = 20.0
 # wedges the whole browser rather than degrading it.
 RECYCLE_CLOSE_SECONDS = 60.0
 RECYCLE_START_SECONDS = 120.0
+# A due recycle waits for in-flight pages to release for as long as the longest
+# page_timeout this browser has admitted, within these bounds, then restarts
+# anyway. A page that never released held admission closed for 50 minutes on a
+# production replica, failing every request on that browser after 235s.
+RECYCLE_DRAIN_MIN_SECONDS = PAGE_TIMEOUT / 1000
+RECYCLE_DRAIN_MAX_SECONDS = 5 * RECYCLE_DRAIN_MIN_SECONDS
 # The whole worst-case legitimate recycle: a close that runs its cap, one
 # absorbed cancellation inside it, the driver-stop fallback, a launch, and
 # margin. Derived rather than picked, so a waiter cannot start failing while a
@@ -44,6 +50,14 @@ PAGE_CLOSE_SECONDS = 30.0
 # Stopping the driver transport is the last resort for a wedged close; its exit
 # handler ends the whole Chromium group. Capped because it can wedge too.
 DRIVER_STOP_SECONDS = 5.0
+# Window during which _get_page_by_target_id keeps polling Playwright for the
+# page identified by target_id. Targets created via raw CDP commands (as a
+# cloud browser service does before handing off context_id + target_id) can
+# take a moment to surface in context.pages, so a short poll is required
+# before giving up and letting get_page create a fresh page. Bounded so a
+# stale/typo target_id surfaces as a missing page (None) rather than silently
+# attaching to an arbitrary tab.
+TARGET_ID_DISCOVERY_SECONDS = 2.0
 
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
@@ -759,6 +773,8 @@ class BrowserManager:
         self._active_acquisitions = set()
         self._page_to_admission = {}
         self._recycle_task = None
+        self._drain_deadline = None
+        self._drain_seconds = RECYCLE_DRAIN_MIN_SECONDS
         self._background_tasks = set()
 
         # Stealth adapter for stealth mode
@@ -892,6 +908,9 @@ class BrowserManager:
                 "user_agent": self.config.user_agent or None,
                 "ignore_https_errors": self.config.ignore_https_errors,
                 "accept_downloads": self.config.accept_downloads,
+                # See create_browser_context: a registered service worker keeps a
+                # renderer alive after every page closes.
+                "service_workers": "block",
             }
 
             if self.config.proxy_config:
@@ -1485,6 +1504,12 @@ class BrowserManager:
             "ignore_https_errors": self.config.ignore_https_errors,
             "device_scale_factor": self.config.device_scale_factor,
             "java_script_enabled": self.config.java_script_enabled,
+            # A crawled site's service worker keeps its own renderer process
+            # running after every page of the context closes, and cached
+            # contexts outlive their crawls, so each SW-registering site leaks a
+            # renderer until the browser dies. Service-worker fetches also bypass
+            # the context routes that text_mode/avoid_css blocking relies on.
+            "service_workers": "block",
         }
         
         if self.config.text_mode:
@@ -1651,49 +1676,51 @@ class BrowserManager:
         """
         Get an existing page by its CDP target ID.
 
-        This is used when connecting to a pre-created browser context with an existing page.
-        Playwright may not immediately see targets created via raw CDP commands, so we
-        use CDP to get all targets and find the matching one.
+        This is used when connecting to a pre-created browser context with an
+        existing page. Playwright does not expose a target ID on its Page
+        object, so a CDP session is opened per candidate page and the
+        ``targetId`` returned by ``Target.getTargetInfo`` is compared with the
+        requested id. Targets created via raw CDP commands can take a moment
+        to surface in ``context.pages``, so the lookup is retried briefly
+        before giving up.
 
         Args:
             context: The browser context to search in
             target_id: The CDP target ID to find
 
         Returns:
-            Page object if found, None otherwise
+            Page object if found, None otherwise. This method never falls
+            back to an arbitrary page (e.g. ``context.pages[0]``): returning
+            None lets ``get_page`` create a fresh page rather than silently
+            attaching the crawler to the wrong tab when ``target_id`` is
+            stale, mistyped, or belongs to a different context.
         """
         try:
-            # First check if Playwright already sees the page
-            for page in context.pages:
-                # Playwright's internal target ID might match
-                if hasattr(page, '_impl_obj') and hasattr(page._impl_obj, '_target_id'):
-                    if page._impl_obj._target_id == target_id:
+            wait_seconds = getattr(
+                self, "_target_id_wait_seconds", TARGET_ID_DISCOVERY_SECONDS
+            )
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + wait_seconds
+            # Cache each page's targetId for the lifetime of this call so the
+            # poll loop does not re-query pages it has already inspected.
+            checked: Dict[int, tuple[object, str]] = {}
+            while True:
+                for page in context.pages:
+                    key = id(page)
+                    cached = checked.get(key)
+                    if cached is not None and cached[0] is page:
+                        page_target_id = cached[1]
+                    else:
+                        page_target_id = await self._query_page_target_id(context, page)
+                        # Failed probes are intentionally not cached: a target
+                        # can surface in CDP after the page list does.
+                        if page_target_id is not None:
+                            checked[key] = (page, page_target_id)
+                    if page_target_id == target_id:
                         return page
-
-            # If not found, try using CDP to get targets
-            if hasattr(self.browser, '_impl_obj') and hasattr(self.browser._impl_obj, '_connection'):
-                cdp_session = await context.new_cdp_session(context.pages[0] if context.pages else None)
-                if cdp_session:
-                    try:
-                        result = await cdp_session.send("Target.getTargets")
-                        targets = result.get("targetInfos", [])
-                        for target in targets:
-                            if target.get("targetId") == target_id:
-                                # Found the target - if it's a page type, we can use it
-                                if target.get("type") == "page":
-                                    # The page exists, let Playwright discover it
-                                    await asyncio.sleep(0.1)
-                                    # Refresh pages list
-                                    if context.pages:
-                                        return context.pages[0]
-                    finally:
-                        await cdp_session.detach()
-
-            # Fallback: if there are any pages now, return the first one
-            if context.pages:
-                return context.pages[0]
-
-            return None
+                if wait_seconds <= 0 or loop.time() >= deadline:
+                    return None
+                await asyncio.sleep(0.1)
         except Exception as e:
             if self.logger:
                 self.logger.warning(
@@ -1702,6 +1729,32 @@ class BrowserManager:
                     params={"error": str(e)}
                 )
             return None
+
+    async def _query_page_target_id(self, context: BrowserContext, page) -> Optional[str]:
+        """
+        Return the CDP ``targetId`` of ``page`` (when it is a page-type
+        target), or None if the id cannot be queried. A fresh CDP session is
+        opened and detached per call so no per-page state leaks out.
+        """
+        try:
+            session = await context.new_cdp_session(page)
+        except Exception:
+            return None
+        try:
+            result = await session.send("Target.getTargetInfo")
+        except Exception:
+            return None
+        finally:
+            try:
+                await session.detach()
+            except Exception:
+                pass
+        if not isinstance(result, dict):
+            return None
+        info = result.get("targetInfo")
+        if not isinstance(info, dict) or info.get("type") != "page":
+            return None
+        return info.get("targetId")
 
     def _track_background_task(self, task):
         """Retain cleanup started after a caller was cancelled."""
@@ -1765,11 +1818,13 @@ class BrowserManager:
                 if task.done():
                     try:
                         return task.result(), cancelled
-                    except BaseException:
-                        raise asyncio.CancelledError from None
-            except BaseException:
+                    except BaseException as error:
+                        # The cancel still wins (uncancel() cleared it above),
+                        # but the task's own failure stays attached as the cause.
+                        raise asyncio.CancelledError from error
+            except BaseException as error:
                 if cancelled:
-                    raise asyncio.CancelledError from None
+                    raise asyncio.CancelledError from error
                 raise
 
     def _abandon_hung_task(self, task, on_abandon) -> None:
@@ -1921,10 +1976,15 @@ class BrowserManager:
                 )
             raise
 
-    async def _admit_page_acquisition(self):
+    async def _admit_page_acquisition(self, page_timeout_ms=PAGE_TIMEOUT):
         """Issue a drain token only while the browser admits new pages."""
+        self._drain_seconds = max(
+            self._drain_seconds,
+            min(page_timeout_ms / 1000, RECYCLE_DRAIN_MAX_SECONDS),
+        )
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + RECYCLE_WAIT_SECONDS
+        wait_seconds = self._drain_seconds + RECYCLE_WAIT_SECONDS
+        deadline = loop.time() + wait_seconds
         while True:
             try:
                 remaining = deadline - loop.time()
@@ -1938,7 +1998,7 @@ class BrowserManager:
                 # it - PERMANENT has no janitor backstop.
                 raise RuntimeError(
                     "Browser recycle did not finish within "
-                    f"{RECYCLE_WAIT_SECONDS:.0f}s"
+                    f"{wait_seconds:.0f}s"
                 ) from None
             async with self._recycle_lock:
                 if self._closing:
@@ -1958,11 +2018,37 @@ class BrowserManager:
         ):
             return
         self._recycle_done.clear()
-        if self._active_acquisitions or self._recycling:
+        if self._recycling:
             return
+        if self._active_acquisitions:
+            if self._drain_deadline is None:
+                self._drain_deadline = asyncio.create_task(self._end_drain_at_deadline())
+            return
+        if self._drain_deadline is not None:
+            self._drain_deadline.cancel()
+            self._drain_deadline = None
         self._recycling = True
         self._recycle_task = asyncio.create_task(self._recycle_browser())
         self._recycle_task.add_done_callback(self._consume_recycle_result)
+
+    async def _end_drain_at_deadline(self) -> None:
+        """Restart without the pages that did not release within the drain bound.
+
+        Their crawls fail when the browser closes under them; their late
+        releases find no token and only re-check admission.
+        """
+        await asyncio.sleep(self._drain_seconds)
+        async with self._recycle_lock:
+            self._drain_deadline = None
+            if (
+                not self._recycle_due
+                or self._recycling
+                or self._closing
+                or self.sessions
+            ):
+                return
+            self._active_acquisitions.clear()
+            self._close_admission_if_recycle_due_locked()
 
     def _consume_recycle_result(self, task) -> None:
         try:
@@ -2110,7 +2196,9 @@ class BrowserManager:
                 pass
             return page, context
 
-        token = await self._admit_page_acquisition()
+        token = await self._admit_page_acquisition(
+            crawlerRunConfig.page_timeout or PAGE_TIMEOUT
+        )
         context = None
         page = None
         signature = None
@@ -2278,6 +2366,28 @@ class BrowserManager:
         if cancelled:
             raise asyncio.CancelledError
 
+    async def request_recycle(self) -> bool:
+        """Recycle the browser process once in-flight pages drain.
+
+        Runs the same drain-then-restart cycle as an exhausted
+        ``max_pages_before_recycle`` budget, for callers that see memory
+        pressure before the page budget runs out. Returns whether a recycle
+        was scheduled: a browser that served no page since its last start has
+        nothing to give back, and sessions keep their browser until they end.
+        """
+        async with self._recycle_lock:
+            if (
+                self._closing
+                or self._recycling
+                or self._recycle_due
+                or self._pages_served == 0
+                or not self._owns_browser_process()
+            ):
+                return False
+            self._recycle_due = True
+            self._close_admission_if_recycle_due_locked()
+            return not self.sessions
+
     def _should_recycle(self) -> bool:
         """Only an owned browser process can honor process recycling."""
         limit = self.config.max_pages_before_recycle
@@ -2299,11 +2409,15 @@ class BrowserManager:
             self._track_background_task(asyncio.create_task(self._kill_session(sid)))
 
     async def _close_contexts(self) -> None:
-        contexts = list(self.contexts_by_config.values())
-        self.contexts_by_config.clear()
-        self._context_refcounts.clear()
-        self._context_last_used.clear()
-        self._page_to_sig.clear()
+        # Under the lock, so a context _acquire_context is creating is either
+        # in this snapshot or created after it, never dropped from the registry
+        # while it lives on in the restarted browser.
+        async with self._contexts_lock:
+            contexts = list(self.contexts_by_config.values())
+            self.contexts_by_config.clear()
+            self._context_refcounts.clear()
+            self._context_last_used.clear()
+            self._page_to_sig.clear()
         for context in contexts:
             await self._close_context_quietly(context)
 
@@ -2431,6 +2545,9 @@ class BrowserManager:
             if not _for_recycle:
                 self.sessions.clear()
                 async with self._recycle_lock:
+                    if self._drain_deadline is not None:
+                        self._drain_deadline.cancel()
+                        self._drain_deadline = None
                     self._active_acquisitions.clear()
                     self._recycle_due = False
                     self._recycling = False

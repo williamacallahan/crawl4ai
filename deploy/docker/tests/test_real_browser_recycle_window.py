@@ -134,3 +134,145 @@ async def test_real_browser_recycle_keeps_is_live_true_throughout():
         await manager.release_page_with_context(second_page)
     finally:
         await manager.close()
+
+
+def _real_manager(**config_overrides):
+    config = BrowserConfig(headless=True, extra_args=["--no-sandbox"], **config_overrides)
+    manager = BrowserManager(config, logger=None)
+    manager._browser_endpoint_key = f"instance:{id(manager)}"
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_concurrent_get_page_under_real_recycling_never_deadlocks():
+    """Concurrent acquisitions across several real close/start cycles all finish.
+
+    The mock suite stubs ``close``/``start``; only a real recycle shows that
+    the drain barrier, the restart, and the waiters it wakes cannot wedge.
+    """
+    manager = _real_manager(max_pages_before_recycle=3)
+    acquisitions, concurrency = 24, 6
+    browsers = []  # holding each Browser keeps CPython from reusing its id
+    gate = asyncio.Semaphore(concurrency)
+
+    async def acquire_and_release():
+        async with gate:
+            page, _ = await manager.get_page(CrawlerRunConfig())
+            browsers.append(manager.browser)
+            await asyncio.sleep(0.01)
+            await manager.release_page_with_context(page)
+
+    try:
+        await manager.start()
+        await asyncio.wait_for(
+            asyncio.gather(*(acquire_and_release() for _ in range(acquisitions))),
+            timeout=120,
+        )
+        if manager._recycle_task is not None:
+            await asyncio.wait_for(manager._recycle_task, timeout=60)
+
+        assert len({id(browser) for browser in browsers}) > 1, "no real recycle ran under concurrent load"
+        assert not manager._active_acquisitions
+        assert manager._closing is False
+        assert crawler_pool._is_live(_crawler(manager)) is True
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_context_refcount_reaches_zero_after_a_real_browser_crash():
+    manager = _real_manager()
+    try:
+        await manager.start()
+        page, _ = await manager.get_page(CrawlerRunConfig())
+        assert sum(manager._context_refcounts.values()) == 1
+
+        # The browser dies under an in-flight crawl; its release must still
+        # return the context reference and the drain token.
+        await manager.browser.close()
+        await asyncio.wait_for(manager.release_page_with_context(page), timeout=30)
+
+        assert all(count == 0 for count in manager._context_refcounts.values())
+        assert not manager._active_acquisitions
+        assert crawler_pool._is_live(_crawler(manager)) is False
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_pressure_janitor_pass_restarts_a_worn_browser(monkeypatch):
+    """Above the recovery threshold the janitor restarts the busiest browser once.
+
+    The page budget is far away (100 pages), so only memory pressure can
+    restart this browser; the replacement must still serve pages. A second pass
+    still above the threshold must not restart it again, however many pages it
+    served since: three processes share one container-wide signal.
+    """
+    manager = _real_manager(max_pages_before_recycle=100)
+    monkeypatch.setattr(crawler_pool, "PERMANENT", _crawler(manager))
+    monkeypatch.setattr(crawler_pool, "HOT_POOL", {})
+    monkeypatch.setattr(crawler_pool, "COLD_POOL", {})
+    monkeypatch.setattr(crawler_pool, "_LAST_MEMORY_RECYCLE", float("-inf"))
+    monkeypatch.setattr(
+        crawler_pool, "get_container_memory_percent", lambda: crawler_pool.RECYCLE_LIMIT
+    )
+
+    async def serve_pages(count):
+        for _ in range(count):
+            page, _ = await manager.get_page(CrawlerRunConfig())
+            await manager.release_page_with_context(page)
+
+    real_sleep = asyncio.sleep
+
+    async def janitor_pass_without_its_interval():
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "sleep", lambda _delay: real_sleep(0))
+            await crawler_pool._janitor_pass()
+
+    try:
+        await manager.start()
+        first_browser = manager.browser
+        await serve_pages(50)
+        assert manager._recycle_task is None
+
+        await janitor_pass_without_its_interval()
+        assert manager._recycle_task is not None
+        await asyncio.wait_for(manager._recycle_task, timeout=60)
+
+        assert manager.browser is not first_browser
+        assert manager.browser.is_connected() is True
+        await asyncio.wait_for(serve_pages(50), timeout=60)
+
+        restarted_browser = manager.browser
+        await janitor_pass_without_its_interval()
+        assert manager._recycle_due is False
+        assert manager.browser is restarted_browser
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_a_page_that_never_releases_cannot_hold_a_due_recycle(monkeypatch):
+    """A due recycle restarts after the drain bound even if a page never releases.
+
+    The unreleased page stands for a crawl whose release never runs; before the
+    bound, every later request on the browser failed after the recycle wait.
+    """
+    import crawl4ai.browser_manager as browser_manager_module
+
+    # The drain bound follows the admitted page_timeout down to this floor.
+    monkeypatch.setattr(browser_manager_module, "RECYCLE_DRAIN_MIN_SECONDS", 0.5)
+    manager = _real_manager(max_pages_before_recycle=1)
+    short_pages = CrawlerRunConfig(page_timeout=500)
+    try:
+        await manager.start()
+        first_browser = manager.browser
+        await manager.get_page(short_pages)  # never released
+
+        page, _ = await asyncio.wait_for(manager.get_page(short_pages), timeout=60)
+
+        assert manager.browser is not first_browser
+        assert manager.browser.is_connected() is True
+        await manager.release_page_with_context(page)
+    finally:
+        await manager.close()
