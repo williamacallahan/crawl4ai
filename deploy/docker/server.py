@@ -40,6 +40,7 @@ from auth import (
 from auth_gate import AuthGateMiddleware
 from crawler_pool import close_all, get_crawler, janitor, release_crawler
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import (
@@ -648,6 +649,16 @@ async def _http_exception_handler(request: Request, exc: _StarletteHTTPException
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return JSON-safe validation details without echoing untrusted inputs."""
+    detail = [
+        {key: value for key, value in error.items() if key != "input"}
+        for error in exc.errors()
+    ]
+    return JSONResponse({"detail": detail}, status_code=422)
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
     cid = uuid.uuid4().hex[:12]
@@ -1016,7 +1027,7 @@ async def llm_endpoint(
     url: str = Path(...),
     q: str = Query(...),
     provider: Optional[str] = Query(None, description="LLM provider override, e.g. 'openai/gpt-4o-mini'"),
-    temperature: Optional[float] = Query(None, description="LLM temperature override"),
+    temperature: Optional[float] = Query(None, ge=0.0, le=2.0, description="LLM temperature override"),
     _td: Dict = Depends(token_dep),
 ):
     # base_url is intentionally not accepted (key-exfil vector); the endpoint is
