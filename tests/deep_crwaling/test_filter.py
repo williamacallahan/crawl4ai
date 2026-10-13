@@ -253,6 +253,20 @@ class _RaisingSyncFilter(URLFilter):
         raise self._exc_type(self._exc_msg)
 
 
+class _TaskFilter(URLFilter):
+    def __init__(self):
+        super().__init__(name="task")
+        self.task = None
+
+    async def _run(self):
+        await asyncio.sleep(60)
+        return True
+
+    def apply(self, url):
+        self.task = asyncio.create_task(self._run())
+        return self.task
+
+
 def _assert_no_never_awaited_warnings(recorded):
     leaked = [
         str(w.message)
@@ -331,6 +345,15 @@ class TestFilterChain:
         assert chain.stats.total_urls == 1
         assert chain.stats.passed_urls == 0
         assert chain.stats.rejected_urls == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_rejection_cancels_pending_task(self):
+        pending = _TaskFilter()
+        chain = FilterChain([pending, _SyncFilter("sync-reject", False)])
+
+        assert await chain.apply("https://example.com/report.pdf") is False
+        assert pending.task is not None
+        assert pending.task.cancelled()
 
     @pytest.mark.asyncio
     async def test_sync_rejection_closes_multiple_pending_async_coroutines(self):
@@ -476,4 +499,3 @@ class TestFilterChain:
             _assert_no_never_awaited_warnings(caught)
         finally:
             _c4ai_utils.HeadPeekr.peek_html = original
-
