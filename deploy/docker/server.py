@@ -1010,6 +1010,7 @@ async def execute_js(
 
 
 @app.get("/llm/{url:path}")
+@limiter.limit(config["rate_limiting"]["default_limit"])
 async def llm_endpoint(
     request: Request,
     url: str = Path(...),
