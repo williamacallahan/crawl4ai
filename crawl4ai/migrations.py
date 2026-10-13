@@ -17,6 +17,8 @@ logger = AsyncLogger(log_level=LogLevel.DEBUG, verbose=True)
 
 
 class DatabaseMigration:
+    _POINTER_TABLE = "crawl4ai_content_pointers"
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.content_paths = self._ensure_content_dirs(os.path.dirname(db_path))
@@ -77,7 +79,9 @@ class DatabaseMigration:
         # miss, never via a destructive re-hash into a hash-of-hash pointer.
         return True
 
-    async def _store_content(self, content: str, content_type: str) -> str:
+    async def _store_content(
+        self, content: str, content_type: str, *, force: bool = False
+    ) -> str:
         if not content:
             return ""
 
@@ -88,7 +92,7 @@ class DatabaseMigration:
         # when the backing ``*_content/`` file is missing (the row self-heals
         # as a cache miss on read rather than being corrupted into a
         # hash-of-hash pointer whose new file body is the old hash string).
-        if self._is_content_hash(content, content_type):
+        if not force and self._is_content_hash(content, content_type):
             return content
 
         content_hash = self._generate_content_hash(content)
@@ -114,6 +118,18 @@ class DatabaseMigration:
                 ) as cursor:
                     rows = await cursor.fetchall()
 
+                await db.execute(
+                    f"""CREATE TABLE IF NOT EXISTS {self._POINTER_TABLE} (
+                        url TEXT NOT NULL,
+                        content_type TEXT NOT NULL,
+                        PRIMARY KEY (url, content_type)
+                    )"""
+                )
+                async with db.execute(
+                    f"SELECT url, content_type FROM {self._POINTER_TABLE}"
+                ) as cursor:
+                    known_pointers = set(await cursor.fetchall())
+
                 migrated_count = 0
                 for row in rows:
                     (
@@ -126,15 +142,44 @@ class DatabaseMigration:
                     ) = row
 
                     # Store content in files and get hashes
-                    html_hash = await self._store_content(html, "html")
-                    cleaned_hash = await self._store_content(cleaned_html, "cleaned")
-                    markdown_hash = await self._store_content(markdown, "markdown")
-                    extracted_hash = await self._store_content(
-                        extracted_content, "extracted"
-                    )
-                    screenshot_hash = await self._store_content(
-                        screenshot, "screenshots"
-                    )
+                    content_values = {
+                        "html": html,
+                        "cleaned": cleaned_html,
+                        "markdown": markdown,
+                        "extracted": extracted_content,
+                        "screenshots": screenshot,
+                    }
+                    stored_hashes = {}
+                    for content_type, value in content_values.items():
+                        pointer_key = (url, content_type)
+                        backing_file = (
+                            os.path.join(self.content_paths[content_type], value)
+                            if value
+                            else ""
+                        )
+                        known = pointer_key in known_pointers
+                        legacy_pointer = (
+                            self._is_content_hash(value, content_type)
+                            and os.path.exists(backing_file)
+                        )
+                        stored_hashes[content_type] = await self._store_content(
+                            value,
+                            content_type,
+                            force=not (known or legacy_pointer),
+                        )
+                        if value and pointer_key not in known_pointers:
+                            await db.execute(
+                                f"INSERT OR IGNORE INTO {self._POINTER_TABLE} "
+                                "(url, content_type) VALUES (?, ?)",
+                                pointer_key,
+                            )
+                            known_pointers.add(pointer_key)
+
+                    html_hash = stored_hashes["html"]
+                    cleaned_hash = stored_hashes["cleaned"]
+                    markdown_hash = stored_hashes["markdown"]
+                    extracted_hash = stored_hashes["extracted"]
+                    screenshot_hash = stored_hashes["screenshots"]
 
                     # Update database with hashes
                     await db.execute(

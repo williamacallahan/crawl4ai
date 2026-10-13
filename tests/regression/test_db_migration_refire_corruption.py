@@ -350,6 +350,11 @@ async def test_migration_rerun_with_missing_content_files_does_not_corrupt(
     cached = await mgr.aget_cached_url(url)
     assert cached is not None and cached.html == original_html
 
+    # Persist the migration provenance while the backing file is available.
+    # A later rerun can then distinguish this pointer from raw legacy text even
+    # after the file and marker disappear.
+    await run_migration(mgr.db_path)
+
     # Simulate the failure mode: the DB persists but the content file is lost.
     os.remove(html_file_before)
     assert not os.path.exists(html_file_before)
@@ -508,6 +513,34 @@ async def test_is_content_hash_guard():
         with open(os.path.join(d, h), "w") as f:
             f.write("hello")
         assert dm._is_content_hash(h, "html") is True  # file present
+
+
+@pytest.mark.asyncio
+async def test_migration_hashes_raw_16_hex_legacy_content(tmp_path, monkeypatch):
+    """Raw legacy text with hash-shaped content must not become a pointer."""
+    _set_version(monkeypatch, "0.9.3")
+    mgr = _new_manager(tmp_path)
+    await mgr.initialize()
+    mgr._initialized = True
+    url = "https://e.com/raw-hex"
+    raw = "0123456789abcdef"
+    await _insert_raw_blob_row(
+        mgr,
+        url,
+        html=raw,
+        cleaned_html="",
+        markdown="",
+        extracted_content="",
+        screenshot="",
+    )
+
+    await run_migration(mgr.db_path)
+
+    stored = await _db_column(mgr, url, "html")
+    assert stored == generate_content_hash(raw)
+    assert stored != raw
+    cached = await mgr.aget_cached_url(url)
+    assert cached is not None and cached.html == raw
 
 
 # ---------------------------------------------------------------------------
