@@ -160,10 +160,10 @@ async def test_cancelled_new_page_restores_its_refcount_and_closes_the_page():
     context = _Context(new_page_started=started, new_page_release=release)
     manager = _manager(BrowserConfig(headless=True))
 
-    async def create_context(_):
+    async def create_context(*_, **__):
         return context
 
-    async def setup_context(*_):
+    async def setup_context(*_, **__):
         return None
 
     manager.create_browser_context = create_context
@@ -189,10 +189,10 @@ async def test_cancelled_new_page_keeps_cancellation_when_allocation_fails():
     context = _FailingContext(new_page_started=started, new_page_release=release)
     manager = _manager(BrowserConfig(headless=True))
 
-    async def create_context(_):
+    async def create_context(*_, **__):
         return context
 
-    async def setup_context(*_):
+    async def setup_context(*_, **__):
         return None
 
     manager.create_browser_context = create_context
@@ -216,10 +216,10 @@ async def test_cancelled_stealth_restores_its_refcount_and_closes_the_page():
     manager = _manager(BrowserConfig(headless=True))
     manager._stealth_adapter = _BlockingStealth(started, release)
 
-    async def create_context(_):
+    async def create_context(*_, **__):
         return context
 
-    async def setup_context(*_):
+    async def setup_context(*_, **__):
         return None
 
     manager.create_browser_context = create_context
@@ -245,10 +245,10 @@ async def test_close_rejects_an_acquisition_that_was_already_in_flight():
     context = _Context(new_page_started=started, new_page_release=release)
     manager = _manager(BrowserConfig(headless=True))
 
-    async def create_context(_):
+    async def create_context(*_, **__):
         return context
 
-    async def setup_context(*_):
+    async def setup_context(*_, **__):
         return None
 
     manager.create_browser_context = create_context

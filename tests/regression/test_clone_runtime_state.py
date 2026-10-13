@@ -489,7 +489,7 @@ class TestCloneRuntimeStateGetPageConcurrent:
 
         bm._new_page = _gated_new_page
 
-        async def _gated_new_context(crawlerRunConfig):
+        async def _gated_new_context(crawlerRunConfig, user_agent=None, browser_hint=None, **_):
             # Block the ``_new_context`` (and thus ``clone_runtime_state``)
             # call until BOTH crawls' pages exist on the shared context. This
             # deterministically reproduces the interleaving where the
