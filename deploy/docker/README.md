@@ -484,7 +484,7 @@ async def main():
     # here — authenticate() reuses it to mint a JWT when JWT is enabled.
     async with Crawl4aiDockerClient(
         base_url="http://localhost:11235",
-        api_token=os.environ.get("CRAWL4AI_API_TOKEN", "operator-token"),
+        api_token=os.environ["CRAWL4AI_API_TOKEN"],
         verbose=True,
     ) as client:
         # If JWT is enabled on the server, authenticate first:
