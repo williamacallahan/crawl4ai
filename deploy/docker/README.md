@@ -474,12 +474,19 @@ Install the SDK: `pip install crawl4ai`
 
 ```python
 import asyncio
+import os
 from crawl4ai.docker_client import Crawl4aiDockerClient
 from crawl4ai import BrowserConfig, CrawlerRunConfig, CacheMode # Assuming you have crawl4ai installed
 
 async def main():
-    # Point to the correct server port
-    async with Crawl4aiDockerClient(base_url="http://localhost:11235", verbose=True) as client:
+    # Point to the correct server port. The hardened (0.9.0+) /token handler
+    # requires the operator CRAWL4AI_API_TOKEN in the request body, so pass it
+    # here — authenticate() reuses it to mint a JWT when JWT is enabled.
+    async with Crawl4aiDockerClient(
+        base_url="http://localhost:11235",
+        api_token=os.environ.get("CRAWL4AI_API_TOKEN", "operator-token"),
+        verbose=True,
+    ) as client:
         # If JWT is enabled on the server, authenticate first:
         # await client.authenticate("user@example.com") # See Server Configuration section
 
