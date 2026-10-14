@@ -1175,6 +1175,14 @@ This is the easiest way to translate Python configuration to JSON requests when 
 
 Install the SDK: `pip install crawl4ai`
 
+Before running this example, export the same operator token the Docker server
+expects (set via `CRAWL4AI_API_TOKEN`, or `security.api_token` in the server
+config when that variable is unset):
+
+```bash
+export CRAWL4AI_API_TOKEN="your-token"
+```
+
 The Python SDK provides a convenient way to interact with the Docker API.
 
 > **⚠️ Changed in 0.9.0:** the SDK's function-based hooks (`hooks={...}` with
