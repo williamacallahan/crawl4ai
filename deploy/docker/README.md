@@ -183,7 +183,7 @@ The Docker setup now supports flexible LLM provider configuration through three 
    }
    ```
 
-3. **Config File Default**: Falls back to `config.yml` (default: `openai/gpt-4o-mini`)
+3. **Config File Default**: Falls back to `config.yml`
 
 The system automatically selects the appropriate API key based on the provider.
 

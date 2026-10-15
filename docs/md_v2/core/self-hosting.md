@@ -274,7 +274,7 @@ The Docker setup now supports flexible LLM provider configuration through a hier
    LLM_BASE_URL=https://api.proxy.com/v1
    ```
 
-4. **Config File Default**: Falls back to `config.yml` (default: `openai/gpt-4o-mini`)
+4. **Config File Default**: Falls back to `config.yml`
 
 The system automatically selects the appropriate API key based on the provider. LiteLLM handles finding the correct environment variable for each provider (e.g., OPENAI_API_KEY for OpenAI, GEMINI_API_TOKEN for Google Gemini, etc.).
 
