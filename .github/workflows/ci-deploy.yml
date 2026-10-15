@@ -164,38 +164,18 @@ jobs:
           C4AI_VER=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' crawl4ai/__version__.py)
           test -n "$C4AI_VER"
           echo "building C4AI_VER=${C4AI_VER}"
-          docker build --provenance=false --sbom=false \
-            --build-arg "C4AI_VER=${C4AI_VER}" \
-            --build-arg "C4AI_GIT_SHA=${GIT_SHA}" \
-            --build-arg "SOURCE_COMMIT=${GIT_SHA}" \
-            --build-arg INSTALL_TYPE=default \
-            --build-arg ENABLE_GPU=false \
-            -t "${IMAGE}:${GIT_SHA}-${ARCH}" .
-          # Exercise browser regressions against the image on each architecture.
-          docker run --rm --entrypoint /bin/sh \
-            --workdir /tmp/project \
-            -e UV_PROJECT_ENVIRONMENT=/tmp/browser-test-env \
-            -e PYTHONPATH=/app \
-            "${IMAGE}:${GIT_SHA}-${ARCH}" -ec '
-              uv venv --system-site-packages /tmp/browser-test-env
-              uv export --locked --only-group test --no-hashes > /tmp/browser-test-requirements.txt
-              uv pip install --python /tmp/browser-test-env/bin/python -r /tmp/browser-test-requirements.txt
-              # Keep directory groups contiguous so pytest retains fixture scope.
-              /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m "browser and not network" \
-                deploy/docker/tests/test_real_browser_recycle_window.py \
-                deploy/docker/tests/test_real_admin_recycle_eviction.py \
-                tests/regression/test_adjust_viewport_screenshot_formula.py \
-                tests/regression/test_e2e_stale_extraction_fallthrough.py \
-                tests/regression/test_create_session_user_agent.py \
-                tests/regression/test_robots_blocked_return_type.py \
-                tests/regression/test_c4a_wait_text_injection.py \
-                tests/regression/test_c4a_wait_text_integration.py \
-                tests/regression/test_reg_browser.py \
-                tests/regression/test_reg_deep_crawl.py \
-                tests/test_issue_2161_overlay_html_body.py
-            '
+          build_args=(
+            --provenance=false --sbom=false --platform "linux/${ARCH}"
+            --build-arg "C4AI_VER=${C4AI_VER}"
+            --build-arg "C4AI_GIT_SHA=${GIT_SHA}"
+            --build-arg "SOURCE_COMMIT=${GIT_SHA}"
+            --build-arg INSTALL_TYPE=default --build-arg ENABLE_GPU=false
+          )
+          docker buildx build "${build_args[@]}" --target browser-tests --output type=cacheonly .
+          # The registry exporter does not unpack the image into the local store.
           # Docker owns layer-transfer retries; surface its terminal failure.
-          docker push "${IMAGE}:${GIT_SHA}-${ARCH}"
+          docker buildx build "${build_args[@]}" --target runtime --push \
+            -t "${IMAGE}:${GIT_SHA}-${ARCH}" .
 
       # The runners are long-lived and shared; without this the Nexus credential
       # stays in ~/.docker/config.json for whatever job lands here next.

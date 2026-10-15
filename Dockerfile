@@ -201,3 +201,26 @@ ENV REDIS_HOST=localhost
 # supervisord. supervisord.conf reads GUNICORN_BIND and REDIS_PASSWORD from it,
 # so invoking supervisord directly would leave both unset.
 CMD ["bash", "entrypoint.sh"]
+
+# Exercise the runtime as appuser without exporting and unpacking a second copy
+# of its browser layers on a small native CI runner.
+FROM build AS browser-tests
+WORKDIR /tmp/project
+RUN uv venv --system-site-packages /tmp/browser-test-env \
+    && uv export --locked --only-group test --no-hashes > /tmp/browser-test-requirements.txt \
+    && uv pip install --python /tmp/browser-test-env/bin/python -r /tmp/browser-test-requirements.txt \
+    && PYTHONPATH=/app /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m "browser and not network" \
+        deploy/docker/tests/test_real_browser_recycle_window.py \
+        deploy/docker/tests/test_real_admin_recycle_eviction.py \
+        tests/regression/test_adjust_viewport_screenshot_formula.py \
+        tests/regression/test_e2e_stale_extraction_fallthrough.py \
+        tests/regression/test_create_session_user_agent.py \
+        tests/regression/test_robots_blocked_return_type.py \
+        tests/regression/test_c4a_wait_text_injection.py \
+        tests/regression/test_c4a_wait_text_integration.py \
+        tests/regression/test_reg_browser.py \
+        tests/regression/test_reg_deep_crawl.py \
+        tests/test_issue_2161_overlay_html_body.py
+
+# Keep the default published image free of the test-only stage.
+FROM build AS runtime
