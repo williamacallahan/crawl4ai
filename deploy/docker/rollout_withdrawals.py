@@ -294,7 +294,15 @@ class Withdrawals:
                 or status.get("ContainerStatus", {}).get("ContainerID") != container
                 or status.get("Err") or time.monotonic() >= self.deadline
                 or status["State"] not in ({"running", "complete"} if complete else {"running"})):
-            raise RuntimeError("withdrawal collector failed, expired, or was replaced")
+            # Cleanup removes the service, so its final state and output survive only here.
+            output = subprocess.run(["docker", "service", "logs", "--raw", "--tail", "40", service],
+                                    capture_output=True, text=True, timeout=30)
+            raise RuntimeError("withdrawal collector failed, expired, or was replaced: " + json.dumps({
+                "node": node, "taskNode": task["NodeID"], "replaced": task["ID"] != identifier,
+                "state": status["State"], "err": status.get("Err"),
+                "exit": status.get("ContainerStatus", {}).get("ExitCode"),
+                "expired": time.monotonic() >= self.deadline,
+                "output": (output.stdout + output.stderr)[-6000:]}))
         if status["State"] == "complete" and status["ContainerStatus"].get("ExitCode") != 0:
             raise RuntimeError("withdrawal collector exited unsuccessfully")
 

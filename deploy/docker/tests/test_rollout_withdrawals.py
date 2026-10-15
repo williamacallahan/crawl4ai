@@ -185,3 +185,23 @@ def test_cleanup_removes_only_recorded_services(monkeypatch, tmp_path):
     withdrawals.cleanup(path)
     assert removed == [("service", "rm", "exact-first"), ("service", "rm", "exact-second")]
     assert not path.exists()
+
+
+def test_failed_collector_reports_its_final_state_and_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(withdrawals, "ready_nodes", lambda: {"node1": "worker"})
+    collector = withdrawals.Withdrawals("crawl4ai", "image", tmp_path / "lifecycle.json", 30)
+    collector.collectors["node1"] = ("collector", "task1", "container1")
+    failed = {"ID": "task1", "NodeID": "node1", "Status": {
+        "State": "failed", "Err": "task: non-zero exit (1)", "ContainerStatus": {
+            "ContainerID": "container1", "ExitCode": 1}}}
+    monkeypatch.setattr(collector, "_task", lambda _service: failed)
+
+    class Logs:
+        stdout = '{"ready": true}\n'
+        stderr = "TimeoutError: timed out\n"
+    monkeypatch.setattr(withdrawals.subprocess, "run", lambda *_args, **_kwargs: Logs())
+    with pytest.raises(RuntimeError) as failure:
+        collector._guard("node1")
+    detail = json.loads(str(failure.value).split(": ", 1)[1])
+    assert detail["state"] == "failed" and detail["exit"] == 1 and not detail["replaced"]
+    assert detail["output"].endswith("TimeoutError: timed out\n")
