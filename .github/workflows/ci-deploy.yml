@@ -281,30 +281,37 @@ jobs:
           export ROLLOUT_MONITOR_ARMED_PATH="$evidence_dir/monitor.armed"
           export ROLLOUT_MONITOR_STOP_PATH="$evidence_dir/monitor.stop"
           rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
+          # One EXIT trap owns every failure exit: it stops a still-running
+          # monitor, withdraws its collectors, and prints each command's single
+          # estate-free "rollout failure:" line. The full logs stay private.
+          monitor_pid=
+          finish() {
+            status=$?
+            if [ -n "$monitor_pid" ]; then
+              touch "$ROLLOUT_MONITOR_STOP_PATH"
+              wait "$monitor_pid" || true
+              .venv/bin/python deploy/docker/verify_rollout.py cleanup-withdrawals >"$evidence_dir/cleanup.log" 2>&1 || status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              grep -h '^rollout failure: ' "$evidence_dir"/{monitor,deploy,evidence,cleanup}.log 2>/dev/null || true
+              echo 'Rollout verification failed; full diagnostics retained privately on the runner.'
+            fi
+            exit "$status"
+          }
+          trap finish EXIT
           .venv/bin/python deploy/docker/verify_rollout.py monitor >"$evidence_dir/monitor.log" 2>&1 &
           monitor_pid=$!
-          trap 'touch "$ROLLOUT_MONITOR_STOP_PATH"; wait "$monitor_pid" || true; .venv/bin/python deploy/docker/verify_rollout.py cleanup-withdrawals' EXIT
           for _ in {1..30}; do
             test -f "$ROLLOUT_MONITOR_ARMED_PATH" && break
             kill -0 "$monitor_pid"
             sleep 1
           done
           test -f "$ROLLOUT_MONITOR_ARMED_PATH"
-
-          if ! .venv/bin/python deploy/docker/verify_rollout.py deploy >"$evidence_dir/deploy.log" 2>&1; then
-            # verify_rollout prints one estate-free failure-class line; the rest stays private.
-            grep '^rollout failure: ' "$evidence_dir/deploy.log" || true
-            echo 'Deployment verification failed; full diagnostics retained privately on the runner.'
-            exit 1
-          fi
+          .venv/bin/python deploy/docker/verify_rollout.py deploy >"$evidence_dir/deploy.log" 2>&1
           touch "$ROLLOUT_MONITOR_STOP_PATH"
           wait "$monitor_pid"
-          trap - EXIT
-          if ! .venv/bin/python deploy/docker/verify_rollout.py evidence >"$evidence_dir/evidence.log" 2>&1; then
-            grep '^rollout failure: ' "$evidence_dir/evidence.log" || true
-            echo 'Final rollout evidence failed; full diagnostics retained privately on the runner.'
-            exit 1
-          fi
+          monitor_pid=
+          .venv/bin/python deploy/docker/verify_rollout.py evidence >"$evidence_dir/evidence.log" 2>&1
           echo 'Deployment and final replica verification passed; full diagnostics retained privately on the runner.'
 
       # Same reason as build and merge: an authenticated session otherwise

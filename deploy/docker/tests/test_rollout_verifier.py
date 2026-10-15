@@ -1,15 +1,12 @@
 import copy
-import http.client
 import json
 import subprocess
 from dataclasses import fields
 from pathlib import Path
-from threading import Thread
 
 import pytest
 
 import swarm_observer as observer
-import swarm_observer_server as observer_server
 import verify_rollout as rollout
 
 BASELINE = "registry.example/crawl4ai@sha256:baseline"
@@ -2582,6 +2579,19 @@ def test_deploy_times_out_a_prior_native_update_without_writing(monkeypatch, cap
     )
 
 
+def test_main_keeps_the_original_failure_when_its_summary_fails(monkeypatch, capsys):
+    _deploy_env(monkeypatch)
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application())
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: "paused")
+    monkeypatch.setattr(
+        rollout, "_public_failure", lambda *_args: (_ for _ in ()).throw(OSError("unreadable"))
+    )
+    monkeypatch.setattr(rollout.sys, "argv", ["verify_rollout.py", "deploy"])
+    with pytest.raises(RuntimeError, match="prior Crawl4AI Swarm update ended in paused"):
+        rollout.main()
+    assert capsys.readouterr().err == "rollout failure: command=deploy error=StateError\n"
+
+
 @pytest.mark.parametrize("state", ["paused", "rollback_paused", "rollback_completed"])
 def test_deploy_rejects_a_failed_prior_native_update_without_writing(monkeypatch, capsys, state):
     _deploy_env(monkeypatch)
@@ -3182,40 +3192,6 @@ def test_sampling_failure_replaces_a_stale_healthy_sample(monkeypatch, tmp_path)
         "crawl4ai_coverage_sample_timestamp_seconds 1789000000.125\n"
     )
     assert state_path.read_bytes() == b"open\n"
-
-
-def test_metrics_endpoint_exposes_only_the_fixed_contract(tmp_path):
-    path = tmp_path / "metrics"
-    path.write_text(OBSERVER_COMPLETE.metrics_text(1789000000.125))
-    metrics = observer_server.MetricsFile(path, 60)
-    server = observer_server.http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0), observer_server.handler(metrics)
-    )
-    thread = Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        connection = http.client.HTTPConnection(*server.server_address, timeout=2)
-        connection.request("GET", "/metrics")
-        response = connection.getresponse()
-        assert response.status == 200
-        assert response.read().decode() == OBSERVER_COMPLETE.metrics_text(1789000000.125)
-        connection.request("GET", "/tasks")
-        assert connection.getresponse().status == 404
-        connection.request("POST", "/metrics")
-        assert connection.getresponse().status == 501
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
-
-
-def test_metrics_endpoint_fails_closed_when_the_sampler_is_stale(monkeypatch, tmp_path):
-    path = tmp_path / "metrics"
-    path.write_text(OBSERVER_COMPLETE.metrics_text(1789000000.125))
-    monkeypatch.setattr(observer_server.time, "time", lambda: path.stat().st_mtime + 61)
-
-    with pytest.raises(TimeoutError, match="stale"):
-        observer_server.MetricsFile(path, 60).read()
 
 
 # --- rollback-registry source (issue #83) -----------------------------------

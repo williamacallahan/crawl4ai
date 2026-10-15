@@ -1041,23 +1041,15 @@ def _deploy() -> None:
     eligibility = _eligible_nodes()
     eligible, ready = eligibility
     already_deployed = _record_converged(application, candidate, revision, placement)
+    census = (
+        f"{REPLICAS} replicas, {len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
+        f"not Ready: {', '.join(sorted(eligible - ready)) or 'none'}"
+    )
     if not already_deployed and len(ready) < REPLICAS:
-        raise RuntimeError(
-            f"not enough Ready eligible nodes to place every replica: {REPLICAS} replicas, "
-            f"{len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
-            f"not Ready: {', '.join(sorted(eligible - ready)) or 'none'}"
-        )
+        raise RuntimeError(f"not enough Ready eligible nodes to place every replica: {census}")
     # Only a one-per-node cap makes a spare mandatory for start-first.
-    if (
-        not already_deployed
-        and placement.get("MaxReplicas") == 1
-        and len(ready) <= REPLICAS
-    ):
-        raise RuntimeError(
-            f"start-first needs a spare eligible node: {REPLICAS} replicas, "
-            f"{len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
-            f"not Ready: {', '.join(sorted(eligible - ready)) or 'none'}"
-        )
+    if not already_deployed and placement.get("MaxReplicas") == 1 and len(ready) <= REPLICAS:
+        raise RuntimeError(f"start-first needs a spare eligible node: {census}")
     baseline_proof = _verify_tasks(
         app_name, baseline, baseline_revision, eligibility, False, placement
     )
@@ -1413,7 +1405,11 @@ def main() -> None:
         {"deploy": deploy, "monitor": monitor, "evidence": evidence,
          "cleanup-withdrawals": cleanup_withdrawals}[command]()
     except Exception as error:
-        print(_public_failure(command, error), file=sys.stderr, flush=True)
+        try:
+            line = _public_failure(command, error)
+        except Exception:
+            line = f"rollout failure: command={command} error={type(error).__name__}"
+        print(line, file=sys.stderr, flush=True)
         raise
 
 
