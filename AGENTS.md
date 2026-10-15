@@ -12,7 +12,7 @@
 - Source development requires an explicit user request naming this repository
   and source behavior. Keep that work separate from live operational recovery.
 - The `upstream` repository is read-only. Never open or update an upstream pull
-  request. A push to this user-owned fork requires separate explicit approval.
+  request.
 - Verify live Dokploy, Swarm, ingress, image, and telemetry state through their
   authoritative owners; never reconstruct those inventories in this repository.
 
