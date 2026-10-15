@@ -826,7 +826,8 @@ def test_task_runtime_guards_the_container_id_swarm_omits(monkeypatch):
     assert runtime["addresses"] == set()
 
 
-def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
+@pytest.mark.parametrize("retain_predecessors", [True, False])
+def test_verify_tasks_proves_each_overlay_backend(monkeypatch, retain_predecessors):
     rows = [
         {
             "ID": f"task{index}",
@@ -837,7 +838,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         }
         for index, node in enumerate(("haiku-6", "haiku-5", "haiku-9"), 1)
     ]
-    rows += [
+    predecessors = [
         {
             "ID": f"old{index}",
             "Name": f"crawl4ai.{index}",
@@ -847,6 +848,8 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch):
         }
         for index, node in enumerate(("haiku-5", "haiku-9", "haiku-18"), 1)
     ]
+    if retain_predecessors:
+        rows += predecessors
     runtimes = {
         f"task{index}": {
             "container": f"container{index}",

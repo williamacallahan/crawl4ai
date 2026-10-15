@@ -863,6 +863,11 @@ def _verify_tasks(
         if desired != "running" or state != "running":
             raise RuntimeError("Swarm task history contradicts the start-first rollout")
         history = by_slot[str(candidate.get("Name"))]
+        # Swarm reaps terminal predecessors with task-history-limit=1, but
+        # retains a predecessor that is still running. Verify retained history
+        # when present; exact VIP membership below also excludes old backends.
+        if len(history) == 1:
+            continue
         withdrawn = [
             row for row in history[1:]
             if str(row.get("DesiredState", "")).lower() == "shutdown"
