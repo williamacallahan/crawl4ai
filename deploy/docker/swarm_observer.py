@@ -14,7 +14,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import verify_rollout as rollout
+import rollout_policy
+import rollout_http
+import rollout_tasks
 
 
 DEFAULT_STATE_PATH = "/var/lib/crawl4ai-swarm-observer/episode.state"
@@ -81,7 +83,7 @@ class CoverageSnapshot:
     @property
     def complete(self) -> int:
         return int(
-            self.authoritative_task_count == rollout.REPLICAS
+            self.authoritative_task_count == rollout_policy.REPLICAS
             and self.authoritative_task_count
             == self.direct_healthy_count
             == self.public_covered_count
@@ -274,19 +276,19 @@ def _public_coverage(direct_instance: dict[str, str], deadline: float) -> int:
     if not direct_instance:
         return 0
     observed = []
-    for url in rollout.HEALTH_URLS:
+    for url in rollout_policy.HEALTH_URLS:
         seen = set()
-        for _ in range(rollout.PUBLIC_PROOF_ATTEMPTS):
+        for _ in range(rollout_policy.PUBLIC_PROOF_ATTEMPTS):
             if time.monotonic() >= deadline:
                 raise TimeoutError("coverage sampling deadline expired")
             try:
-                health = rollout._request_json(f"{url}?observer={uuid.uuid4()}")
+                health = rollout_http._request_json(f"{url}?observer={uuid.uuid4()}")
             except Exception:
                 break
             instance = (
                 str(health.get("instance", "")) if isinstance(health, dict) else ""
             )
-            if instance in direct_instance and rollout._exact_health(
+            if instance in direct_instance and rollout_tasks._exact_health(
                 health, direct_instance[instance]
             ):
                 seen.add(instance)
@@ -314,9 +316,9 @@ def _verify_ingress_namespace(ingress_pid: int) -> None:
 def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]:
     """Reuse the rollout verifier's task and health owners for one stable sample."""
     deadline = time.monotonic() + SAMPLE_DEADLINE_SECONDS
-    ingress_pid = rollout._verify_ingress_host()
+    ingress_pid = rollout_tasks._verify_ingress_host()
     _verify_ingress_namespace(ingress_pid)
-    before = rollout._service_tasks(service_name)
+    before = rollout_tasks._service_tasks(service_name)
     current = [
         row for row in before if str(row.get("DesiredState", "")).lower() == "running"
     ]
@@ -340,18 +342,18 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
             continue
         task_id = str(row["ID"])
         try:
-            runtime = rollout._task_runtime(task_id[:12], str(network["Id"]))
+            runtime = rollout_tasks._task_runtime(task_id[:12], str(network["Id"]))
             runtime_by_task[task_id] = runtime
             address = runtime["addresses"]
             revision = str(runtime["labels"].get("otel.service.version", ""))
             if len(address) != 1:
                 continue
-            health = rollout._request_json(
+            health = rollout_http._request_json(
                 f"http://{next(iter(address))}:11235/health",
                 network_namespace_pid=ingress_pid,
             )
             if (
-                rollout._exact_health(health, revision)
+                rollout_tasks._exact_health(health, revision)
                 and health["instance"] == runtime["container"]
             ):
                 direct_instance[runtime["container"]] = revision
@@ -373,7 +375,7 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
             comparison = NetworkDbFdbComparison.INCONCLUSIVE
     after_ids = {
         str(row["ID"])
-        for row in rollout._service_tasks(service_name)
+        for row in rollout_tasks._service_tasks(service_name)
         if str(row.get("DesiredState", "")).lower() == "running"
     }
     if after_ids != {str(row["ID"]) for row in current}:

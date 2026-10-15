@@ -85,7 +85,10 @@ case "$action" in
         install -d -m 0755 "$release" /etc/crawl4ai
         install -m 0555 "$source_dir/swarm_observer.py" "$release/swarm_observer.py"
         install -m 0555 "$source_dir/swarm_observer_server.py" "$release/swarm_observer_server.py"
-        install -m 0444 "$source_dir/verify_rollout.py" "$release/verify_rollout.py"
+        install -m 0444 "$source_dir/rollout_policy.py" "$release/rollout_policy.py"
+        install -m 0444 "$source_dir/rollout_http.py" "$release/rollout_http.py"
+        install -m 0444 "$source_dir/rollout_tasks.py" "$release/rollout_tasks.py"
+        install -m 0444 "$source_dir/config.yml" "$release/config.yml"
         install -m 0444 "$source_dir/$server_unit" "$release/$server_unit"
         install -m 0444 "$source_dir/$sample_unit" "$release/$sample_unit"
         install -m 0444 "$source_dir/$timer_unit" "$release/$timer_unit"
