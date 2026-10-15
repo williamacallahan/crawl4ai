@@ -11,6 +11,20 @@ from pathlib import Path
 from typing import TypedDict
 
 
+class StateError(RuntimeError):
+    """A native task, update, or deployment reached a state the rollout rejects.
+
+    ``state`` is the platform's own enum name and ``exit_code`` its container exit
+    code; both are safe for the public CI log. The message stays private because
+    it can name nodes and tasks.
+    """
+
+    def __init__(self, message: str, state: str, exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.state = state
+        self.exit_code = exit_code
+
+
 class Task(TypedDict):
     task: str
     container: str
@@ -320,14 +334,15 @@ class Withdrawals:
                 output = logs.stdout + logs.stderr
             except subprocess.TimeoutExpired as timeout:
                 output = str(timeout)
-            raise RuntimeError("withdrawal collector failed, expired, or was replaced: " + json.dumps({
+            exit_code = status.get("ContainerStatus", {}).get("ExitCode")
+            raise StateError("withdrawal collector failed, expired, or was replaced: " + json.dumps({
                 "node": node, "taskNode": task["NodeID"], "replaced": task["ID"] != identifier,
-                "state": status["State"], "err": status.get("Err"),
-                "exit": status.get("ContainerStatus", {}).get("ExitCode"),
+                "state": status["State"], "err": status.get("Err"), "exit": exit_code,
                 "expired": time.monotonic() >= self.deadline,
-                "output": output[-6000:]}))
+                "output": output[-6000:]}), status["State"], exit_code)
         if status["State"] == "complete" and status["ContainerStatus"].get("ExitCode") != 0:
-            raise RuntimeError("withdrawal collector exited unsuccessfully")
+            raise StateError("withdrawal collector exited unsuccessfully", status["State"],
+                             status["ContainerStatus"].get("ExitCode"))
 
     def finish(self, candidate: list[Task]) -> Journal:
         if ready_nodes() != self.nodes or census(self.app) != candidate:

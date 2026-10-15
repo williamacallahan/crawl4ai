@@ -2476,7 +2476,7 @@ def _deploy_env(monkeypatch):
 
 @pytest.mark.parametrize("placement", rollout.PLACEMENTS)
 @pytest.mark.parametrize("ready_count", [2, 3, 4])
-def test_deploy_capacity_follows_placement(monkeypatch, placement, ready_count):
+def test_deploy_capacity_follows_placement(monkeypatch, capsys, placement, ready_count):
     _deploy_env(monkeypatch)
     ready = frozenset(sorted(ELIGIBLE_NODES)[:ready_count])
     monkeypatch.setattr(rollout, "_application", lambda *_args: application(placement=placement))
@@ -2491,8 +2491,13 @@ def test_deploy_capacity_follows_placement(monkeypatch, placement, ready_count):
         lambda *_args: (_ for _ in ()).throw(SystemExit("capacity gate passed")),
     )
     if ready_count < 3:
+        monkeypatch.setattr(rollout.sys, "argv", ["verify_rollout.py", "deploy"])
         with pytest.raises(RuntimeError, match="not enough Ready eligible nodes"):
-            rollout.deploy()
+            rollout.main()
+        # The message names nodes, so the public line carries only its class.
+        assert capsys.readouterr().err == (
+            "rollout failure: command=deploy check=_deploy error=RuntimeError\n"
+        )
     elif ready_count == 3 and placement.get("MaxReplicas") == 1:
         with pytest.raises(RuntimeError, match="start-first needs a spare eligible node"):
             rollout.deploy()
@@ -2559,7 +2564,7 @@ def test_deploy_waits_for_a_prior_native_update_before_reading_baseline(monkeypa
         rollout.deploy()
 
 
-def test_deploy_times_out_a_prior_native_update_without_writing(monkeypatch):
+def test_deploy_times_out_a_prior_native_update_without_writing(monkeypatch, capsys):
     _deploy_env(monkeypatch)
     clock = iter([0, 0, 11])
     monkeypatch.setattr(rollout, "TIMEOUT_SECONDS", 10)
@@ -2568,18 +2573,27 @@ def test_deploy_times_out_a_prior_native_update_without_writing(monkeypatch):
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "updating")
     monkeypatch.setattr(rollout.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(rollout.sys, "argv", ["verify_rollout.py", "deploy"])
     with pytest.raises(TimeoutError, match="prior Crawl4AI Swarm update did not finish"):
-        rollout.deploy()
+        rollout.main()
+    assert capsys.readouterr().err == (
+        "rollout failure: command=deploy check=_deploy error=TimeoutError "
+        'reason="prior Crawl4AI Swarm update did not finish"\n'
+    )
 
 
 @pytest.mark.parametrize("state", ["paused", "rollback_paused", "rollback_completed"])
-def test_deploy_rejects_a_failed_prior_native_update_without_writing(monkeypatch, state):
+def test_deploy_rejects_a_failed_prior_native_update_without_writing(monkeypatch, capsys, state):
     _deploy_env(monkeypatch)
     monkeypatch.setattr(rollout, "_application", lambda *_args: application())
     monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
     monkeypatch.setattr(rollout, "_update_state", lambda _name: state)
+    monkeypatch.setattr(rollout.sys, "argv", ["verify_rollout.py", "deploy"])
     with pytest.raises(RuntimeError, match=f"prior Crawl4AI Swarm update ended in {state}"):
-        rollout.deploy()
+        rollout.main()
+    assert capsys.readouterr().err == (
+        f"rollout failure: command=deploy check=_deploy error=StateError state={state}\n"
+    )
 
 
 def test_deploy_rejects_a_reintroduced_cap_once_the_record_converged(monkeypatch):

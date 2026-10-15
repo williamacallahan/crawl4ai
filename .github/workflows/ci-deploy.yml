@@ -289,7 +289,8 @@ jobs:
           test -f "$ROLLOUT_MONITOR_ARMED_PATH"
 
           if ! .venv/bin/python deploy/docker/verify_rollout.py deploy >"$evidence_dir/deploy.log" 2>&1; then
-            grep -E '^TimeoutError: stock Dokploy deployment (was not admitted from the queue|did not finish after queue admission)$' "$evidence_dir/deploy.log" || true
+            # verify_rollout prints one estate-free failure-class line; the rest stays private.
+            grep '^rollout failure: ' "$evidence_dir/deploy.log" || true
             echo 'Deployment verification failed; full diagnostics retained privately on the runner.'
             exit 1
           fi
@@ -297,6 +298,7 @@ jobs:
           wait "$monitor_pid"
           trap - EXIT
           if ! .venv/bin/python deploy/docker/verify_rollout.py evidence >"$evidence_dir/evidence.log" 2>&1; then
+            grep '^rollout failure: ' "$evidence_dir/evidence.log" || true
             echo 'Final rollout evidence failed; full diagnostics retained privately on the runner.'
             exit 1
           fi

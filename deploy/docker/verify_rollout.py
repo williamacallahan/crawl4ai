@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -763,7 +764,7 @@ def _wait_deployment(
             if status == "done":
                 return owned
             if status in {"error", "cancelled"}:
-                raise RuntimeError(f"stock Dokploy deployment ended in {status}")
+                raise withdrawals.StateError(f"stock Dokploy deployment ended in {status}", status)
         time.sleep(5)
     if admitted:
         raise TimeoutError("stock Dokploy deployment did not finish after queue admission")
@@ -1001,7 +1002,7 @@ def _deploy() -> None:
     waited = False
     while state not in {"", "completed"}:
         if state not in {"updating", "rollback_started"}:
-            raise RuntimeError(f"prior Crawl4AI Swarm update ended in {state}")
+            raise withdrawals.StateError(f"prior Crawl4AI Swarm update ended in {state}", state)
         if time.monotonic() >= deadline:
             raise TimeoutError("prior Crawl4AI Swarm update did not finish")
         if not waited:
@@ -1140,7 +1141,9 @@ def _deploy() -> None:
             if state == "completed":
                 break
             if state in {"paused", "rollback_paused", "rollback_completed"}:
-                raise RuntimeError(f"Swarm update ended in {state}; manual reconciliation required")
+                raise withdrawals.StateError(
+                    f"Swarm update ended in {state}; manual reconciliation required", state
+                )
             if time.monotonic() >= deadline:
                 raise TimeoutError("Swarm update did not reach completed")
             time.sleep(5)
@@ -1373,10 +1376,45 @@ def evidence() -> None:
     )
 
 
+def _public_failure(command: str, error: Exception) -> str:
+    """Name the failure class for the public CI log without estate data.
+
+    The verifier check is the innermost frame of this package. The message is
+    shown only when it appears verbatim as a source literal: an interpolated
+    message can carry node names, image digests, or curl's host diagnosis.
+    """
+    frames = traceback.extract_tb(error.__traceback__)
+    own = [frame for frame in frames if Path(frame.filename).parent == Path(__file__).parent]
+    fields = [
+        f"command={command}",
+        f"check={own[-1].name if own else 'unknown'}",
+        f"error={type(error).__name__}",
+    ]
+    if isinstance(error, withdrawals.StateError):
+        fields.append(f"state={error.state}")
+    exit_code = (
+        error.curl_exit if isinstance(error, CurlError)
+        else error.returncode if isinstance(error, subprocess.CalledProcessError)
+        else error.exit_code if isinstance(error, withdrawals.StateError)
+        else None
+    )
+    if exit_code is not None:
+        fields.append(f"exit={exit_code}")
+    message = json.dumps(str(error))
+    raised_here = bool(own) and own[-1] is frames[-1]
+    if raised_here and message in Path(frames[-1].filename).read_text():
+        fields.append(f"reason={message}")
+    return "rollout failure: " + " ".join(fields)
+
+
 def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else "deploy"
-    {"deploy": deploy, "monitor": monitor, "evidence": evidence,
-     "cleanup-withdrawals": cleanup_withdrawals}[command]()
+    try:
+        {"deploy": deploy, "monitor": monitor, "evidence": evidence,
+         "cleanup-withdrawals": cleanup_withdrawals}[command]()
+    except Exception as error:
+        print(_public_failure(command, error), file=sys.stderr, flush=True)
+        raise
 
 
 if __name__ == "__main__":
