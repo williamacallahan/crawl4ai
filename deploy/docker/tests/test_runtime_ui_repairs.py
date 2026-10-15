@@ -1211,11 +1211,14 @@ def test_ci_build_reclaims_repo_images_only_on_arm64():
     assert arm64_cleanup.count('docker images --filter=reference="${IMAGE}:*"') == 1
     assert "docker builder prune" not in arm64_cleanup
     assert build_script.index("reclaim_build_disk\n") < build_script.index(
-        "docker build --provenance"
+        "docker buildx build"
     )
     assert "docker builder prune -af --filter until=10m" in build_script
     assert "docker system prune" not in build_script
-    assert build_script.count('docker push "${IMAGE}:${GIT_SHA}-${ARCH}"') == 1
+    assert build_script.count("--target browser-tests --output type=cacheonly") == 1
+    assert build_script.count("--target runtime --push") == 1
+    assert "docker push " not in build_script
+    assert "--load" not in build_script
     assert "for attempt in" not in build_script
 
 
