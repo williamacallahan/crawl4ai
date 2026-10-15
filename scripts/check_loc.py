@@ -19,8 +19,9 @@ SCOPE = ("deploy/*.py", "tests/*.py")
 
 
 def _git(*args: str) -> list[str]:
+    # stderr stays on the console, so a failed upstream fetch names its own cause.
     return subprocess.run(
-        ["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=True
+        ["git", "-C", str(ROOT), *args], stdout=subprocess.PIPE, text=True, check=True
     ).stdout.split("\0")
 
 
