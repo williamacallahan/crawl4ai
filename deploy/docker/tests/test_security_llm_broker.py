@@ -35,6 +35,12 @@ class TestProviderAllowlist:
         with pytest.raises(LLMProviderNotAllowed):
             resolve_llm(CONF, "anthropic/claude-3-opus")
 
+    def test_model_override_keeps_its_own_reasoning_contract(self):
+        conf = {"llm": {"provider": "openai/default-model", "reasoning_effort": "minimal"}}
+        assert resolve_llm(conf)["extra_args"]["reasoning_effort"] == "minimal"
+        assert resolve_llm(conf, "openai/default-model")["extra_args"]["reasoning_effort"] == "minimal"
+        assert "reasoning_effort" not in resolve_llm(conf, "openai/another-model")["extra_args"]
+
     def test_explicit_allowlist_widens(self):
         conf = {"llm": {"provider": "openai/gpt-4o-mini",
                         "allowed_providers": ["anthropic/claude-3-opus"]}}

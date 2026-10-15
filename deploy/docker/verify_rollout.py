@@ -16,7 +16,7 @@ from typing import Any
 import yaml
 
 REPLICAS = 3
-LLM_PROVIDER = "openai/qwen3.8-fast"
+LLM_PROVIDER = yaml.safe_load(Path(__file__).with_name("config.yml").read_text())["llm"]["provider"]
 LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 HEALTH_URLS = (
     "https://crawl4ai.haiku.host/health",

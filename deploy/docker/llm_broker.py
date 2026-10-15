@@ -64,7 +64,10 @@ def resolve_llm(config: Dict, requested_provider: Optional[str] = None) -> Dict:
         "extra_args": {
             "timeout": config["llm"].get("request_timeout_seconds", 300),
             "num_retries": config["llm"].get("request_retries", 0),
-            "reasoning_effort": config["llm"].get("reasoning_effort", "low"),
+            # The configured effort belongs to the default model. A named model
+            # override inherits its own gateway reasoning contract.
+            **({"reasoning_effort": config["llm"].get("reasoning_effort", "low")}
+               if provider == default else {}),
             "max_tokens": config["llm"].get("max_output_tokens", 4096),
             "extra_headers": {"X-User-ID": "crawl4ai"},
         },
