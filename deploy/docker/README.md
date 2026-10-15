@@ -896,7 +896,7 @@ app:
 
 # Default LLM Configuration
 llm:
-  provider: "openai/gpt-4o-mini"  # Can be overridden by LLM_PROVIDER env var
+  provider: "openai/muse-spark-1.3-contributor"  # Can be overridden by LLM_PROVIDER env var
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
 # Redis Configuration (Used by internal Redis server managed by supervisord)
