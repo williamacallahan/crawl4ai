@@ -14,7 +14,18 @@ key can never be redirected to an attacker host.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Dict, Optional
+
+
+class LLMWorkload(str, Enum):
+    PAGE_QUESTION = "page-question"
+    JOB_EXTRACTION = "job-extraction"
+    MARKDOWN_FILTER = "markdown-filter"
+
+    @property
+    def tier(self) -> str:
+        return "batch" if self is LLMWorkload.JOB_EXTRACTION else "production-a"
 
 
 class LLMProviderNotAllowed(ValueError):
@@ -40,7 +51,9 @@ def allowed_provider_families(config: Dict) -> set:
     return {f for f in fams if f}
 
 
-def resolve_llm(config: Dict, requested_provider: Optional[str] = None) -> Dict:
+def resolve_llm(
+    config: Dict, requested_provider: Optional[str] = None, *, workload: LLMWorkload
+) -> Dict:
     """Resolve the LLM call parameters fully server-side.
 
     A request-supplied base_url/api_token is intentionally NOT a parameter here:
@@ -69,6 +82,9 @@ def resolve_llm(config: Dict, requested_provider: Optional[str] = None) -> Dict:
             **({"reasoning_effort": config["llm"].get("reasoning_effort", "low")}
                if provider == default else {}),
             "max_tokens": config["llm"].get("max_output_tokens", 4096),
-            "extra_headers": {"X-User-ID": "crawl4ai"},
+            "extra_headers": {
+                "X-User-ID": f"crawl4ai:{workload.value}:{'batch' if workload.tier == 'batch' else 'live'}",
+                "X-Tier": workload.tier,
+            },
         },
     }

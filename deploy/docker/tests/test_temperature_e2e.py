@@ -32,6 +32,7 @@ import crawler_pool
 import egress_broker
 import llm_broker
 import pytest
+import utils
 from crawl4ai import LLMConfig, LLMExtractionStrategy
 from utils import load_config
 
@@ -99,6 +100,20 @@ def _patch_acompletion(monkeypatch, captured):
 
     import litellm
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+
+def test_page_question_workload_reaches_the_transport(monkeypatch):
+    captured = {}
+    _patch_crawl_path(monkeypatch)
+    _patch_acompletion(monkeypatch, captured)
+    monkeypatch.setattr(utils, "get_llm_api_key", lambda *_args: "test-only")
+    answer = asyncio.run(api.handle_llm_qa(
+        "https://example.com", "question", _config(), redis=PermitRedis()
+    ))
+    assert answer == "answer"
+    assert captured["kwargs"]["extra_headers"] == {
+        "X-User-ID": "crawl4ai:page-question:live", "X-Tier": "production-a"
+    }
 
 
 # ---------------------------------------------------------------------------

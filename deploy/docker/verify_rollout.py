@@ -987,6 +987,24 @@ def deploy() -> None:
     revision = os.environ["GITHUB_SHA"]
     candidate = f"{os.environ['IMAGE']}@{os.environ['IMAGE_DIGEST']}"
     application = _application(base, api_key, application_id)
+    app_name = str(application["appName"])
+    # A native environment reload can outlive the CI build. Join its bounded
+    # wait before capturing the baseline; never submit a competing update.
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    state = _update_state(app_name)
+    waited = False
+    while state not in {"", "completed"}:
+        if state not in {"updating", "rollback_started"}:
+            raise RuntimeError(f"prior Crawl4AI Swarm update ended in {state}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("prior Crawl4AI Swarm update did not finish")
+        if not waited:
+            print("waiting for the prior native Crawl4AI Swarm update", flush=True)
+            waited = True
+        time.sleep(5)
+        state = _update_state(app_name)
+    if waited:
+        application = _application(base, api_key, application_id)
     _policy(application)
     baseline = str(application.get("dockerImage", ""))
     baseline_labels = application.get("labelsSwarm")
@@ -995,11 +1013,6 @@ def deploy() -> None:
     baseline_revision = baseline_labels.get("otel.service.version")
     if not isinstance(baseline_revision, str) or not baseline_revision:
         raise ValueError("stock Dokploy baseline has no revision")
-    app_name = str(application["appName"])
-    # A never-updated or recreated service reports no UpdateStatus at all, which
-    # is nothing in flight rather than an update still running.
-    if _update_state(app_name) not in {"", "completed"}:
-        raise RuntimeError("Crawl4AI already has a nonterminal Swarm update")
     # Nothing is in flight now, so a record that disagrees with the service is a
     # previous run's stranded candidate, not a live deploy. Repair it here.
     application = _heal_stranded_record(base, api_key, application_id, app_name, application)

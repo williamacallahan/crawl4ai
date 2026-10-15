@@ -5,7 +5,7 @@ be redirected to an attacker endpoint (the reported credential-exfil gadget).
 """
 
 import pytest
-from llm_broker import LLMProviderNotAllowed, resolve_llm
+from llm_broker import LLMProviderNotAllowed, LLMWorkload, resolve_llm
 
 pytestmark = pytest.mark.posture
 
@@ -14,55 +14,63 @@ CONF = {"llm": {"provider": "openai/gpt-4o-mini"}}
 
 class TestProviderAllowlist:
     def test_default_provider_allowed(self):
-        out = resolve_llm(CONF, None)
+        out = resolve_llm(CONF, None, workload=LLMWorkload.PAGE_QUESTION)
         assert out["provider"] == "openai/gpt-4o-mini"
 
     def test_same_family_allowed(self):
-        out = resolve_llm(CONF, "openai/gpt-4o")
+        out = resolve_llm(CONF, "openai/gpt-4o", workload=LLMWorkload.PAGE_QUESTION)
         assert out["provider"] == "openai/gpt-4o"
 
     def test_server_bounds_slow_provider_attempts(self):
-        out = resolve_llm(CONF)
+        out = resolve_llm(CONF, workload=LLMWorkload.PAGE_QUESTION)
         assert out["extra_args"] == {
             "timeout": 300,
             "num_retries": 0,
             "reasoning_effort": "low",
             "max_tokens": 4096,
-            "extra_headers": {"X-User-ID": "crawl4ai"},
+            "extra_headers": {
+                "X-User-ID": "crawl4ai:page-question:live",
+                "X-Tier": "production-a",
+            },
         }
 
     def test_other_family_rejected(self):
         with pytest.raises(LLMProviderNotAllowed):
-            resolve_llm(CONF, "anthropic/claude-3-opus")
+            resolve_llm(CONF, "anthropic/claude-3-opus", workload=LLMWorkload.PAGE_QUESTION)
 
     def test_model_override_keeps_its_own_reasoning_contract(self):
         conf = {"llm": {"provider": "openai/default-model", "reasoning_effort": "minimal"}}
-        assert resolve_llm(conf)["extra_args"]["reasoning_effort"] == "minimal"
-        assert resolve_llm(conf, "openai/default-model")["extra_args"]["reasoning_effort"] == "minimal"
-        assert "reasoning_effort" not in resolve_llm(conf, "openai/another-model")["extra_args"]
+        assert resolve_llm(conf, workload=LLMWorkload.PAGE_QUESTION)["extra_args"]["reasoning_effort"] == "minimal"
+        assert resolve_llm(conf, "openai/default-model", workload=LLMWorkload.PAGE_QUESTION)["extra_args"]["reasoning_effort"] == "minimal"
+        assert "reasoning_effort" not in resolve_llm(conf, "openai/another-model", workload=LLMWorkload.PAGE_QUESTION)["extra_args"]
+
+    @pytest.mark.parametrize("workload", LLMWorkload)
+    def test_every_workload_has_a_gateway_identity_and_tier(self, workload):
+        headers = resolve_llm(CONF, workload=workload)["extra_args"]["extra_headers"]
+        assert headers["X-User-ID"] == f"crawl4ai:{workload.value}:{'batch' if workload is LLMWorkload.JOB_EXTRACTION else 'live'}"
+        assert headers["X-Tier"] == ("batch" if workload is LLMWorkload.JOB_EXTRACTION else "production-a")
 
     def test_explicit_allowlist_widens(self):
         conf = {"llm": {"provider": "openai/gpt-4o-mini",
                         "allowed_providers": ["anthropic/claude-3-opus"]}}
-        assert resolve_llm(conf, "anthropic/claude-3-opus")["provider"].startswith("anthropic/")
+        assert resolve_llm(conf, "anthropic/claude-3-opus", workload=LLMWorkload.PAGE_QUESTION)["provider"].startswith("anthropic/")
 
 
 class TestBaseUrlIsServerOnly:
     def test_resolve_has_no_request_base_url_param(self):
         import inspect
         params = list(inspect.signature(resolve_llm).parameters)
-        # only (config, requested_provider) - no way to inject base_url/api_token
-        assert params == ["config", "requested_provider"]
+        assert params == ["config", "requested_provider", "workload"]
 
     def test_base_url_is_canonical_from_env(self, monkeypatch):
         monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.example")
-        out = resolve_llm(CONF, "openai/gpt-4o-mini")
+        out = resolve_llm(CONF, "openai/gpt-4o-mini", workload=LLMWorkload.PAGE_QUESTION)
         assert out["base_url"] == "https://api.openai.example"
 
     def test_no_base_url_when_unset(self, monkeypatch):
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("LLM_BASE_URL", raising=False)
-        out = resolve_llm(CONF, "openai/gpt-4o-mini")
+        out = resolve_llm(CONF, "openai/gpt-4o-mini", workload=LLMWorkload.PAGE_QUESTION)
         assert out["base_url"] is None
 
 

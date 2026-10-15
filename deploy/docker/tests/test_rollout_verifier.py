@@ -2491,8 +2491,44 @@ def test_deploy_treats_an_absent_update_status_as_terminal(monkeypatch):
     with pytest.raises(SystemExit, match="gate passed"):
         rollout.deploy()
 
+
+
+def test_deploy_waits_for_a_prior_native_update_before_reading_baseline(monkeypatch):
+    _deploy_env(monkeypatch)
+    states = iter(["updating", "updating", "completed"])
+    snapshots = iter([{"appName": application()["appName"]}, application()])
+    monkeypatch.setattr(rollout, "_application", lambda *_args: next(snapshots))
+    monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec())
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: next(states))
+    monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        rollout, "_verify_redis", lambda: (_ for _ in ()).throw(SystemExit("baseline accepted"))
+    )
+    with pytest.raises(SystemExit, match="baseline accepted"):
+        rollout.deploy()
+
+
+def test_deploy_times_out_a_prior_native_update_without_writing(monkeypatch):
+    _deploy_env(monkeypatch)
+    clock = iter([0, 0, 11])
+    monkeypatch.setattr(rollout, "TIMEOUT_SECONDS", 10)
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application())
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
     monkeypatch.setattr(rollout, "_update_state", lambda _name: "updating")
-    with pytest.raises(RuntimeError, match="nonterminal Swarm update"):
+    monkeypatch.setattr(rollout.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rollout.time, "sleep", lambda _seconds: None)
+    with pytest.raises(TimeoutError, match="prior Crawl4AI Swarm update did not finish"):
+        rollout.deploy()
+
+
+@pytest.mark.parametrize("state", ["paused", "rollback_paused", "rollback_completed"])
+def test_deploy_rejects_a_failed_prior_native_update_without_writing(monkeypatch, state):
+    _deploy_env(monkeypatch)
+    monkeypatch.setattr(rollout, "_application", lambda *_args: application())
+    monkeypatch.setattr(rollout, "_post_json", lambda *_args: pytest.fail("no write may happen"))
+    monkeypatch.setattr(rollout, "_update_state", lambda _name: state)
+    with pytest.raises(RuntimeError, match=f"prior Crawl4AI Swarm update ended in {state}"):
         rollout.deploy()
 
 

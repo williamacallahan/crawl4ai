@@ -360,8 +360,8 @@ async def handle_llm_qa(
 
         # Provider by name only; base_url/api_token are server-derived. A
         # request-supplied base_url is ignored (it was the key-exfil vector).
-        from llm_broker import resolve_llm
-        llm = resolve_llm(config, provider)
+        from llm_broker import LLMWorkload, resolve_llm
+        llm = resolve_llm(config, provider, workload=LLMWorkload.PAGE_QUESTION)
         if redis is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -446,8 +446,8 @@ async def process_llm_extraction(
             )
             return
         # Provider by name only; base_url/api_token server-derived (no exfil).
-        from llm_broker import resolve_llm
-        _llm = resolve_llm(config, provider)
+        from llm_broker import LLMWorkload, resolve_llm
+        _llm = resolve_llm(config, provider, workload=LLMWorkload.JOB_EXTRACTION)
         job_extra_args = {
             **_llm["extra_args"],
             "timeout": config["llm"].get("job_request_timeout_seconds", 120),
@@ -597,9 +597,9 @@ async def handle_markdown_request(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=error_msg
                 )
-            from llm_broker import resolve_llm
+            from llm_broker import LLMWorkload, resolve_llm
 
-            llm = resolve_llm(config, provider)
+            llm = resolve_llm(config, provider, workload=LLMWorkload.MARKDOWN_FILTER)
         decoded_url = unquote(url)
         if not decoded_url.startswith(('http://', 'https://')) and not decoded_url.startswith(("raw:", "raw://")):
             decoded_url = 'https://' + decoded_url
