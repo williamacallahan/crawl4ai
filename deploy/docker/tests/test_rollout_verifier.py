@@ -18,6 +18,50 @@ REVISION = "a" * 40
 ELIGIBLE_NODES = frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"})
 
 
+@pytest.fixture(autouse=True)
+def deploy_event_boundary(monkeypatch, tmp_path, request):
+    if not request.node.name.startswith("test_deploy"):
+        return
+
+    class Collector:
+        nodes = {}
+
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            return []
+
+        def finish(self, _candidate):
+            return None
+
+    monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
+    monkeypatch.setattr(rollout.withdrawals, "Withdrawals", Collector)
+    monkeypatch.setattr(rollout.withdrawals, "census", lambda _app: [])
+    monkeypatch.setattr(rollout.withdrawals, "ready_nodes", lambda: {})
+
+
+def _wire_withdrawal_journal(monkeypatch):
+    path = rollout._task_proof_path()
+    proof = json.loads(path.read_text())
+    candidate = [
+        {"task": identifier, "container": container, "node": proof["nodes"][index % len(proof["nodes"]) ]}
+        for index, (identifier, container) in enumerate(zip(proof["tasks"], proof["instances"]))
+    ]
+    baseline = [{"task": "old-task", "container": "old-container", "node": proof["nodes"][0]}]
+    nodes = {node: node for node in proof["nodes"]}
+    events = {node: [] for node in nodes}
+    events[baseline[0]["node"]].append({"action": "die", "task": "old-task", "container": "old-container", "exit": "0"})
+    for identity in candidate:
+        events[identity["node"]].append({"action": "create", "task": identity["task"], "container": identity["container"], "exit": ""})
+    proof["baselineTasks"] = baseline
+    proof["withdrawals"] = {"app": "crawl4ai", "nodes": nodes, "baseline": baseline,
+                            "candidate": candidate, "events": events}
+    path.write_text(json.dumps(proof))
+    monkeypatch.setattr(rollout.withdrawals, "census", lambda _app: candidate)
+    monkeypatch.setattr(rollout.withdrawals, "ready_nodes", lambda: nodes)
+
+
 def application(image=BASELINE, revision="baseline", placement=rollout.PLACEMENT):
     return {
         "applicationId": "app",
@@ -1147,6 +1191,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys,
     deployments[:] = [{"deploymentId": "old", "status": "done"}]
     proofs = iter([
         {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
+        {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
         {"tasks": ["1", "2", "3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["a", "b", "c"]},
         {"tasks": ["1", "2", "4"], "nodes": ["haiku-5", "haiku-6", "haiku-18"], "instances": ["a", "b", "d"]},
     ])
@@ -1549,7 +1594,7 @@ def test_deploy_real_rollout_passes_strict_converged_to_the_candidate_proof(
     # The baseline proof (image == BASELINE) stays lenient; every candidate
     # proof (image == CANDIDATE) the rollout takes for itself stays strict.
     assert calls[0] == (BASELINE, False), calls
-    assert all(call == (CANDIDATE, True) for call in calls[1:]), calls
+    assert all(converged is (image == CANDIDATE) for image, converged in calls), calls
 
 
 @pytest.mark.parametrize("fail_on", [1, 2])
@@ -1595,6 +1640,7 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
 
 
 def _wire_final_evidence(monkeypatch, tasks):
+    _wire_withdrawal_journal(monkeypatch)
     monkeypatch.setattr(rollout, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
     monkeypatch.setattr(rollout, "_service_spec", lambda _name: service_spec(CANDIDATE, REVISION))
     monkeypatch.setattr(rollout, "verify_route", lambda *_args: None)
@@ -1807,6 +1853,7 @@ def _wire_real_verify_tasks_for_evidence(monkeypatch, tmp_path, rows, runtimes, 
         lambda _revision, instances: {url: sorted(instances) for url in rollout.HEALTH_URLS},
     )
     _wire_verify_tasks(monkeypatch, rows, runtimes, revision=revision)
+    _wire_withdrawal_journal(monkeypatch)
     return path
 
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+import rollout_withdrawals as withdrawals
 
 REPLICAS = 3
 LLM_PROVIDER = yaml.safe_load(Path(__file__).with_name("config.yml").read_text())["llm"]["provider"]
@@ -985,7 +986,7 @@ def _record_converged(
     )
 
 
-def deploy() -> None:
+def _deploy() -> None:
     base = os.environ["DOKPLOY_URL"]
     api_key = os.environ["DOKPLOY_API_KEY"]
     application_id = os.environ["APPLICATION_ID"]
@@ -1056,7 +1057,7 @@ def deploy() -> None:
             f"{len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
             f"not Ready: {', '.join(sorted(eligible - ready)) or 'none'}"
         )
-    _verify_tasks(
+    baseline_proof = _verify_tasks(
         app_name, baseline, baseline_revision, eligibility, False, placement
     )
     for url in HEALTH_URLS:
@@ -1074,6 +1075,9 @@ def deploy() -> None:
     # appears. The baseline proof above already ran against this same candidate,
     # so the proof below is the whole remaining job.
     deployment_id = None
+    withdrawal_proof = None
+    collector = None
+    original_census = None
     if already_deployed:
         print("candidate is already deployed; proving it in place", flush=True)
     else:
@@ -1088,6 +1092,24 @@ def deploy() -> None:
             or current.get("placementSwarm") != placement
         ):
             raise RuntimeError("baseline metadata changed before submission")
+        verify_route(base, api_key, application_id, app_name)
+        original_census = withdrawals.census(app_name)
+        collector = withdrawals.Withdrawals(
+            app_name, baseline, Path(f"{_task_proof_path()}.withdrawals.json"), TIMEOUT_SECONDS
+        )
+        if collector.start() != original_census:
+            raise RuntimeError("baseline task identity changed while arming withdrawal proof")
+        _running_spec(_service_spec(app_name), baseline, baseline_labels, placements=(placement,))
+        if _verify_tasks(app_name, baseline, baseline_revision, eligibility, False, placement) != baseline_proof:
+            raise RuntimeError("baseline readiness changed while arming withdrawal proof")
+        if withdrawals.ready_nodes() != collector.nodes:
+            raise RuntimeError("eligible node coverage changed before candidate submission")
+        current = _application(base, api_key, application_id)
+        _policy(current)
+        if (current.get("dockerImage") != baseline
+                or current.get("labelsSwarm") != baseline_labels
+                or current.get("placementSwarm") != placement):
+            raise RuntimeError("baseline metadata changed while arming withdrawal proof")
         verify_route(base, api_key, application_id, app_name)
         _post_json(
             f"{base.rstrip('/')}/api/application.update",
@@ -1153,6 +1175,8 @@ def deploy() -> None:
         app_name, candidate, revision, eligibility, converged, placement
     ) != task_proof:
         raise RuntimeError("Crawl4AI task census changed during public proof")
+    if collector is not None:
+        withdrawal_proof = collector.finish(withdrawals.census(app_name))
     proof = {
         "revision": revision,
         "image": candidate,
@@ -1160,6 +1184,9 @@ def deploy() -> None:
         "placement": placement,
         **task_proof,
         "publicInstances": public_instances,
+        "withdrawals": withdrawal_proof,
+        "baselineTasks": original_census,
+        "rolloutSubmitted": not already_deployed,
     }
     _task_proof_path().write_text(json.dumps(proof, separators=(",", ":")))
     print(
@@ -1171,6 +1198,18 @@ def deploy() -> None:
             separators=(",", ":"),
         )
     )
+
+
+def deploy() -> None:
+    try:
+        _deploy()
+    finally:
+        if "ROLLOUT_MONITOR_PATH" in os.environ:
+            cleanup_withdrawals()
+
+
+def cleanup_withdrawals() -> None:
+    withdrawals.cleanup(Path(f"{_task_proof_path()}.withdrawals.json"))
 
 
 def monitor() -> None:
@@ -1287,7 +1326,19 @@ def evidence() -> None:
     # rerun (candidate already the baseline, so baselineRevision == revision)
     # or a real start-first rollout (a different baseline). Only a real rollout
     # owes the strict converged proof; a no-op re-proves the live SHA in place.
-    converged = baseline_revision != revision
+    converged = task_proof.get("rolloutSubmitted", baseline_revision != revision)
+    if converged:
+        journal = task_proof.get("withdrawals")
+        if not isinstance(journal, dict):
+            raise RuntimeError("real rollout has no exact withdrawal journal")
+        current_census = withdrawals.census(app_name)
+        withdrawals.validate(journal, app_name, task_proof.get("baselineTasks"), current_census)
+        if (
+            sorted(task["task"][:12] for task in current_census) != sorted(task_proof["tasks"])
+            or sorted(task["container"][:12] for task in current_census) != sorted(task_proof["instances"])
+            or set(withdrawals.ready_nodes()) != set(journal["nodes"])
+        ):
+            raise RuntimeError("saved withdrawal journal differs from the candidate census")
     if _verify_tasks(
         app_name, image, revision, eligibility, converged, placement
     ) != recorded_task_proof:
@@ -1324,7 +1375,8 @@ def evidence() -> None:
 
 def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else "deploy"
-    {"deploy": deploy, "monitor": monitor, "evidence": evidence}[command]()
+    {"deploy": deploy, "monitor": monitor, "evidence": evidence,
+     "cleanup-withdrawals": cleanup_withdrawals}[command]()
 
 
 if __name__ == "__main__":

@@ -276,7 +276,7 @@ jobs:
           rm -f "$ROLLOUT_MONITOR_PATH" "$ROLLOUT_MONITOR_ARMED_PATH" "$ROLLOUT_MONITOR_STOP_PATH"
           .venv/bin/python deploy/docker/verify_rollout.py monitor >"$evidence_dir/monitor.log" 2>&1 &
           monitor_pid=$!
-          trap 'touch "$ROLLOUT_MONITOR_STOP_PATH"; wait "$monitor_pid" || true' EXIT
+          trap 'touch "$ROLLOUT_MONITOR_STOP_PATH"; wait "$monitor_pid" || true; .venv/bin/python deploy/docker/verify_rollout.py cleanup-withdrawals' EXIT
           for _ in {1..30}; do
             test -f "$ROLLOUT_MONITOR_ARMED_PATH" && break
             kill -0 "$monitor_pid"
