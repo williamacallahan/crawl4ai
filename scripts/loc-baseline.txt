@@ -4,7 +4,6 @@
 1337 deploy/docker/tests/test_crawl_job_queue.py
 739 deploy/docker/tests/test_janitor_recycle_eviction.py
 656 deploy/docker/tests/test_resource_policy.py
-3285 deploy/docker/tests/test_rollout_verifier.py
 1247 deploy/docker/tests/test_runtime_ui_repairs.py
 695 deploy/docker/tests/test_server_crawler_defaults.py
 541 deploy/docker/tests/test_temperature_unbounded_repro.py
