@@ -1209,6 +1209,16 @@ def test_ci_build_reclaims_repo_images_only_on_arm64():
     assert build_script.count("reclaim_build_disk\n") == 1
     assert build_script.count('docker images --filter=reference="${IMAGE}:*"') == 1
     assert arm64_cleanup.count('docker images --filter=reference="${IMAGE}:*"') == 1
+    assert build_script.count("docker image prune") == 1
+    assert arm64_cleanup.count("docker image prune -f --filter label=c4ai.version") == 1
+    assert (
+        "--filter label=org.opencontainers.image.revision --filter until=10m"
+        in arm64_cleanup
+    )
+    assert "docker image prune -af" not in build_script
+    assert "docker image prune --all" not in build_script
+    assert "docker container prune" not in build_script
+    assert "docker volume prune" not in build_script
     assert "docker builder prune" not in arm64_cleanup
     assert build_script.index("reclaim_build_disk\n") < build_script.index(
         "docker buildx build"

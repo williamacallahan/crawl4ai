@@ -151,6 +151,11 @@ jobs:
               # X64 may be the Dokploy host and must retain its rollback source.
               docker images --filter=reference="${IMAGE}:*" --format '{{.ID}}' \
                 | xargs -r docker rmi || true
+              # Prior exports can leave untagged images outside the reference
+              # filter. Only prune stale, dangling Crawl4AI source images;
+              # Docker preserves every image still used by a container.
+              docker image prune -f --filter label=c4ai.version \
+                --filter label=org.opencontainers.image.revision --filter until=10m
             fi
             docker builder prune -af --filter until=10m || true
             df -h /
