@@ -4,6 +4,9 @@ api_token are always server-derived, so the configured provider key can never
 be redirected to an attacker endpoint (the reported credential-exfil gadget).
 """
 
+import json
+
+import httpx
 import pytest
 from llm_broker import LLMProviderNotAllowed, LLMWorkload, resolve_llm
 
@@ -27,6 +30,7 @@ class TestProviderAllowlist:
             "timeout": 300,
             "num_retries": 0,
             "reasoning_effort": "low",
+            "allowed_openai_params": ["reasoning_effort"],
             "max_tokens": 4096,
             "extra_headers": {
                 "X-User-ID": "crawl4ai:page-question:live",
@@ -54,6 +58,65 @@ class TestProviderAllowlist:
         conf = {"llm": {"provider": "openai/gpt-4o-mini",
                         "allowed_providers": ["anthropic/claude-3-opus"]}}
         assert resolve_llm(conf, "anthropic/claude-3-opus", workload=LLMWorkload.PAGE_QUESTION)["provider"].startswith("anthropic/")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workload", LLMWorkload)
+@pytest.mark.parametrize("requested_provider", [None, "openai/default-model", "openai/another-model"])
+async def test_reasoning_effort_reaches_serialized_http(monkeypatch, workload, requested_provider):
+    # Use the installed cost map so dependency initialization stays offline too.
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    import litellm
+    from openai import AsyncOpenAI
+    from crawl4ai.utils import aperform_completion_with_backoff
+
+    monkeypatch.setattr(litellm, "drop_params", litellm.drop_params)
+    conf = {"llm": {
+        "provider": "openai/default-model",
+        "reasoning_effort": "minimal",
+        "api_key": "test-only-key",
+    }}
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+    resolved = resolve_llm(conf, requested_provider, workload=workload)
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={
+            "id": "offline-completion",
+            "object": "chat.completion",
+            "created": 1,
+            "model": resolved["provider"].removeprefix("openai/"),
+            "choices": [{"index": 0, "message": {
+                "role": "assistant", "content": "filtered content",
+            }, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+        async with AsyncOpenAI(
+            api_key=resolved["api_token"], base_url=resolved["base_url"],
+            http_client=transport, max_retries=0,
+        ) as client:
+            response = await aperform_completion_with_backoff(
+                provider=resolved["provider"], prompt_with_variables="Filter this page",
+                api_token=resolved["api_token"], base_url=resolved["base_url"],
+                max_attempts=1, extra_args={**resolved["extra_args"], "client": client},
+            )
+
+    assert response.choices[0].message.content == "filtered content"
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url) == "https://gateway.example/v1/chat/completions"
+    payload = json.loads(request.content)
+    assert payload["model"] == resolved["provider"].removeprefix("openai/")
+    if requested_provider == "openai/another-model":
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == "minimal"
+    assert "allowed_openai_params" not in payload
+    assert request.headers["X-User-ID"] == f"crawl4ai:{workload.value}:{'batch' if workload is LLMWorkload.JOB_EXTRACTION else 'live'}"
+    assert request.headers["X-Tier"] == ("batch" if workload is LLMWorkload.JOB_EXTRACTION else "production-a")
 
 
 class TestBaseUrlIsServerOnly:

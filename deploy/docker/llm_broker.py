@@ -79,7 +79,8 @@ def resolve_llm(
             "num_retries": config["llm"].get("request_retries", 0),
             # The configured effort belongs to the default model. A named model
             # override inherits its own gateway reasoning contract.
-            **({"reasoning_effort": config["llm"].get("reasoning_effort", "low")}
+            **({"reasoning_effort": config["llm"].get("reasoning_effort", "low"),
+                "allowed_openai_params": ["reasoning_effort"]}
                if provider == default else {}),
             "max_tokens": config["llm"].get("max_output_tokens", 4096),
             "extra_headers": {
