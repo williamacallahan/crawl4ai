@@ -53,8 +53,10 @@ jobs:
           # The EXIT trap below never fires when the runner itself dies
           # ("lost communication"), which left a Redis running for weeks.
           # The crawl4ai-deploy concurrency group admits one run at a time,
-          # so every other run's container on this host is abandoned.
-          docker ps --all --filter 'name=^crawl4ai-ci-redis-' --format '{{.Names}}' \
+          # so every other run's container on this host is abandoned. Running
+          # only: an exited --rm container is already being removed, and
+          # removing it again would fail this step.
+          docker ps --filter 'name=^crawl4ai-ci-redis-' --format '{{.Names}}' \
             | grep -vxF "$redis_container" \
             | xargs -r docker rm --force
           docker run --rm --detach --name "$redis_container" \
