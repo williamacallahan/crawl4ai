@@ -29,8 +29,6 @@ class TestProviderAllowlist:
         assert out["extra_args"] == {
             "timeout": 300,
             "num_retries": 0,
-            "reasoning_effort": "low",
-            "allowed_openai_params": ["reasoning_effort"],
             "max_tokens": 4096,
             "extra_headers": {
                 "X-User-ID": "crawl4ai:page-question:live",
@@ -63,7 +61,8 @@ class TestProviderAllowlist:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workload", LLMWorkload)
 @pytest.mark.parametrize("requested_provider", [None, "openai/default-model", "openai/another-model"])
-async def test_reasoning_effort_reaches_serialized_http(monkeypatch, workload, requested_provider):
+@pytest.mark.parametrize("configured_effort", [None, "minimal"], ids=["omitted-effort", "minimal-effort"])
+async def test_reasoning_effort_reaches_serialized_http(monkeypatch, workload, requested_provider, configured_effort):
     # Use the installed cost map so dependency initialization stays offline too.
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     import litellm
@@ -73,11 +72,15 @@ async def test_reasoning_effort_reaches_serialized_http(monkeypatch, workload, r
     monkeypatch.setattr(litellm, "drop_params", litellm.drop_params)
     conf = {"llm": {
         "provider": "openai/default-model",
-        "reasoning_effort": "minimal",
         "api_key": "test-only-key",
     }}
+    if configured_effort is not None:
+        conf["llm"]["reasoning_effort"] = configured_effort
     monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
     resolved = resolve_llm(conf, requested_provider, workload=workload)
+    if configured_effort is None or requested_provider == "openai/another-model":
+        assert "reasoning_effort" not in resolved["extra_args"]
+        assert "allowed_openai_params" not in resolved["extra_args"]
     requests: list[httpx.Request] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -110,10 +113,10 @@ async def test_reasoning_effort_reaches_serialized_http(monkeypatch, workload, r
     assert str(request.url) == "https://gateway.example/v1/chat/completions"
     payload = json.loads(request.content)
     assert payload["model"] == resolved["provider"].removeprefix("openai/")
-    if requested_provider == "openai/another-model":
+    if configured_effort is None or requested_provider == "openai/another-model":
         assert "reasoning_effort" not in payload
     else:
-        assert payload["reasoning_effort"] == "minimal"
+        assert payload["reasoning_effort"] == configured_effort
     assert "allowed_openai_params" not in payload
     assert request.headers["X-User-ID"] == f"crawl4ai:{workload.value}:{'batch' if workload is LLMWorkload.JOB_EXTRACTION else 'live'}"
     assert request.headers["X-Tier"] == ("batch" if workload is LLMWorkload.JOB_EXTRACTION else "production-a")
