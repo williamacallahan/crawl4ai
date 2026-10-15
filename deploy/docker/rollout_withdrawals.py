@@ -38,9 +38,8 @@ def _collect(app: str, arm: str, finish: str, seconds: int) -> None:
     import json
     import socket
     import time
-    import datetime
 
-    def request(method, path, payload=None):
+    def request(method, path, payload=None, end_marker=None):
         connection = http.client.HTTPConnection("localhost", timeout=15)
         connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.sock.settimeout(15)
@@ -48,8 +47,26 @@ def _collect(app: str, arm: str, finish: str, seconds: int) -> None:
         connection.request(method, path, None if payload is None else json.dumps(payload),
                            {"Content-Type": "application/json"})
         response = connection.getresponse()
-        body = response.read(4_194_305)
-        connection.close()
+        try:
+            if end_marker is None:
+                body = response.read(4_194_305)
+            else:
+                lines = []
+                for _ in range(256):
+                    line = response.readline(65537)
+                    if not line or len(line) > 65536:
+                        raise RuntimeError("Engine journal lost its checkpoint anchor: stream ended")
+                    lines.append(line)
+                    record = json.loads(line)
+                    if (record["Type"] == "container"
+                            and record["Actor"]["ID"] == own_id
+                            and record["Actor"]["Attributes"].get("execID") == end_marker):
+                        break
+                else:
+                    raise RuntimeError("Engine journal checkpoint left the native cache")
+                body = b"".join(lines)
+        finally:
+            connection.close()
         if response.status not in {200, 201, 204} or len(body) > 4_194_304:
             raise RuntimeError(f"Engine journal request failed: {method} {response.status}")
         return body
@@ -67,10 +84,11 @@ def _collect(app: str, arm: str, finish: str, seconds: int) -> None:
         marker = json.loads(request("POST", "/containers/" + own_id + "/exec",
             {"Cmd": ["python", "-c", "pass"], "AttachStdout": False,
              "AttachStderr": False, "AttachStdin": False}))["Id"]
-        clock = json.loads(request("GET", "/info"))["SystemTime"]
-        cutoff = int(datetime.datetime.fromisoformat(clock.replace("Z", "+00:00")).timestamp()) + 1
-        time.sleep(2)
-        cached = [json.loads(line) for line in request("GET", f"/events?since=1&until={cutoff}").splitlines()]
+        # Read the already-cached anchor immediately. Waiting for a wall-clock
+        # cutoff let unrelated engine traffic evict it before the snapshot.
+        cached = [json.loads(line) for line in request(
+            "GET", "/events?since=1", end_marker=marker
+        ).splitlines()]
         # Engine appends/evicts under one mutex. Both anchors in the same
         # retrospective snapshot prove the entire intervening insertion window.
         anchors = [index for index, record in enumerate(cached)
@@ -119,6 +137,7 @@ def _collect(app: str, arm: str, finish: str, seconds: int) -> None:
         if finished:
             print(json.dumps({"complete": True, "events": events}), flush=True)
             return
+        time.sleep(0.1)
     raise RuntimeError("Engine withdrawal journal expired")
 
 
