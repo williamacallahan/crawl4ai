@@ -27,13 +27,13 @@ can ship another crawl's ``sec-ch-ua``:
     "Anti-bot systems like Akamai detect this mismatch as a bot signal").
 
 The fix has two layers. (1) ``_crawl_web`` snapshots ``configured_headers``
-into a local BEFORE the ``await get_page(...)`` and the post-await flush
-reads that snapshot (not the shared dict) — mirroring the per-crawl UA locals
-TOCTOU mitigation. (2) A magic / random-UA crawl RESTORES the shared
-``browser_config`` fields it mutated (``user_agent``, ``browser_hint``,
-``headers["sec-ch-ua"]``) after ``get_page`` returns, so the shared config
-stays clean for subsequent crawls at both the page level and the context
-level (``setup_context`` → ``self.config.headers``).
+into a local BEFORE the ``await get_page(...)``; the post-await flush reads
+that snapshot (not the shared dict) — mirroring the per-crawl UA locals
+TOCTOU mitigation — and threads it through ``get_page`` → ``setup_context``
+so context-level headers use it too. (2) A magic / random-UA crawl does NOT
+mutate the shared ``browser_config`` — the per-crawl UA / hint and header
+snapshot are threaded through ``get_page`` as locals, so ``setup_context`` /
+``create_browser_context`` see the per-crawl values without touching shared state.
 
 Most tests are offline using a mocked browser surface modeled on
 ``tests/regression/test_concurrent_user_agent_isolation.py``. The single
@@ -170,8 +170,9 @@ async def test_sequential_magic_crawl_does_not_leave_stale_sec_ch_ua():
     """Scenario B (sequential staleness): a magic crawl runs and finishes;
     under the bug its ``sec-ch-ua`` write into the shared dict is never
     reverted, so a subsequent custom-header crawl ships the stale hint. The
-    fix restores the shared config after the magic crawl's ``get_page``
-    returns, so the later crawl ships its own default ``sec-ch-ua``."""
+    fix does not mutate the shared ``browser_config`` — per-crawl UA / hint
+    are threaded through ``get_page`` as locals, so the later crawl ships
+    its own default ``sec-ch-ua``."""
     strategy, captured, queue = _build_strategy()
     original_sec_ch_ua = strategy.browser_config.headers["sec-ch-ua"]
 
@@ -181,12 +182,12 @@ async def test_sequential_magic_crawl_does_not_leave_stale_sec_ch_ua():
     assert magic_h["sec-ch-ua"] != original_sec_ch_ua, (
         "magic crawl must generate a distinct sec-ch-ua for the test to be meaningful"
     )
-    # The shared config is restored after the magic crawl.
+    # The shared config is never mutated by the magic crawl.
     assert strategy.browser_config.headers["sec-ch-ua"] == original_sec_ch_ua, (
-        "shared headers['sec-ch-ua'] must be restored after the magic crawl"
+        "shared headers['sec-ch-ua'] must not be mutated by the magic crawl"
     )
     assert strategy.browser_config.user_agent == UA_DEFAULT, (
-        "shared user_agent must be restored after the magic crawl"
+        "shared user_agent must not be mutated by the magic crawl"
     )
 
     # Second: a custom-header crawl on the same crawler.
@@ -206,7 +207,7 @@ async def test_custom_user_agent_via_set_custom_headers_not_polluted_by_prior_ma
     ``set_custom_headers`` API (advanced-features.md lists "specialized
     user-agent strings" as a use case) after a magic crawl must not get a
     stale ``sec-ch-ua`` from that magic crawl. The custom UA ships alongside
-    the default (restored) ``sec-ch-ua``, never the magic crawl's hint."""
+    the default ``sec-ch-ua``, never the magic crawl's hint."""
     strategy, captured, queue = _build_strategy()
     original_sec_ch_ua = strategy.browser_config.headers["sec-ch-ua"]
 
@@ -318,14 +319,13 @@ def _applied_headers(mock_context):
 
 
 @pytest.mark.asyncio
-async def test_setup_context_clean_after_magic_crawl_restoration():
+async def test_setup_context_clean_after_magic_crawl_no_mutation():
     """The context-level vector: ``BrowserManager.setup_context`` pushes the
-    shared ``self.config.headers`` (and ``self.config.user_agent`` when no
-    per-crawl UA is threaded) at context creation. After a magic crawl
-    restores the shared config, a subsequent ``setup_context`` (no per-crawl
-    override) must push the ORIGINAL ``sec-ch-ua`` / ``user_agent``, not the
-    magic crawl's. Under the bug the never-reverted mutation leaks into
-    every subsequent context.
+    shared ``self.config.headers`` at context creation. A magic crawl does NOT
+    mutate the shared ``browser_config``, so a subsequent ``setup_context``
+    (no per-crawl override) must push the ORIGINAL ``sec-ch-ua``, not the
+    magic crawl's. Under the bug the never-reverted mutation leaks into every
+    subsequent context.
 
     Uses a REAL ``BrowserManager`` (only ``get_page`` /
     ``release_page_with_context`` are faked) so ``setup_context`` runs

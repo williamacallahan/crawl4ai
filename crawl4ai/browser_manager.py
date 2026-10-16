@@ -1261,6 +1261,7 @@ class BrowserManager:
         is_default=False,
         user_agent: Optional[str] = None,
         browser_hint: Optional[str] = None,
+        configured_headers: Optional[Dict[str, str]] = None,
     ):
         """
         Set up a browser context with the configured options.
@@ -1295,11 +1296,29 @@ class BrowserManager:
             browser_hint (str): Per-crawl ``sec-ch-ua`` (client hints) override.
                 When provided, used in place of ``self.config.browser_hint``.
                 When ``None``, falls back to ``self.config.browser_hint``.
+            configured_headers (dict): Per-crawl snapshot of
+                ``self.config.headers`` captured before the ``await get_page``
+                in ``_crawl_web``. When provided, used in place of
+                ``self.config.headers`` for the context-level HTTP headers so
+                a concurrent crawl's mutation of the shared dict cannot leak
+                onto this crawl's context. When ``None``, falls back to
+                ``self.config.headers`` (existing behavior for callers that do
+                not thread a snapshot).
         Returns:
             None
         """
-        if self.config.headers:
-            await context.set_extra_http_headers(self.config.headers)
+        # Use the per-crawl header snapshot when provided (threaded from
+        # ``_crawl_web``) so the shared ``self.config.headers`` dict — which a
+        # concurrent crawl may mutate — is never read for the context-level
+        # headers. Fall back to ``self.config.headers`` for callers that do not
+        # thread a snapshot (e.g. default-context setup at browser start).
+        headers = (
+            configured_headers
+            if configured_headers is not None
+            else (self.config.headers or {})
+        )
+        if headers:
+            await context.set_extra_http_headers(headers)
 
         if self.config.cookies:
             await context.add_cookies(self.config.cookies)
@@ -1323,6 +1342,15 @@ class BrowserManager:
         # headers, and on ``navigator.userAgent``-dependent state at first
         # context creation). Fall back to ``self.config`` when no override is
         # provided (existing behavior for callers that do not thread a UA).
+        #
+        # The per-crawl header snapshot (``headers``) is used as the base so a
+        # concurrent crawl's mutation of the shared dict cannot leak onto this
+        # crawl's context. When a per-crawl UA override is provided
+        # (``user_agent is not None``), the explicit UA and ``sec-ch-ua`` are
+        # applied AFTER the snapshot so they always win. When no override is
+        # provided, the snapshot's own ``User-Agent`` / ``sec-ch-ua`` (which may
+        # include values set via ``set_custom_headers``) take precedence and the
+        # effective UA / hint fill in any gaps via ``setdefault``.
         effective_ua = (
             user_agent if user_agent is not None else self.config.user_agent
         )
@@ -1330,11 +1358,18 @@ class BrowserManager:
             browser_hint if browser_hint is not None else self.config.browser_hint
         )
         if effective_ua:
-            combined_headers = {
-                "User-Agent": effective_ua,
-                "sec-ch-ua": effective_hint,
-            }
-            combined_headers.update(self.config.headers)
+            combined_headers = dict(headers)
+            if user_agent is not None:
+                # Per-crawl UA override (magic/random): the explicit UA and
+                # sec-ch-ua must win over anything in the shared headers.
+                combined_headers["User-Agent"] = effective_ua
+                combined_headers["sec-ch-ua"] = effective_hint
+            else:
+                # No per-crawl override: the snapshot's headers (which may
+                # include a custom User-Agent from set_custom_headers) take
+                # precedence; the effective UA / hint fill in gaps.
+                combined_headers.setdefault("User-Agent", effective_ua)
+                combined_headers.setdefault("sec-ch-ua", effective_hint)
             await context.set_extra_http_headers(combined_headers)
 
         # Add default cookie (skip for raw:/file:// URLs which are not valid cookie URLs)
@@ -1921,6 +1956,7 @@ class BrowserManager:
         crawlerRunConfig,
         user_agent: Optional[str] = None,
         browser_hint: Optional[str] = None,
+        configured_headers: Optional[Dict[str, str]] = None,
     ):
         """Acquire one context reference, closing partial contexts on failure.
 
@@ -1929,6 +1965,10 @@ class BrowserManager:
         UAs get distinct cached contexts) and into context creation / setup
         (so each context is baked with the crawl's own UA). When ``None``,
         callers get the existing behavior (fall back to ``self.config``).
+        ``configured_headers`` is the per-crawl snapshot of
+        ``self.config.headers`` threaded from ``_crawl_web`` so
+        ``setup_context`` uses it instead of the shared (and potentially racy)
+        ``self.config.headers`` for the context-level HTTP headers.
         """
         signature = self._make_config_signature(crawlerRunConfig, user_agent=user_agent)
         context = None
@@ -1949,6 +1989,7 @@ class BrowserManager:
                         crawlerRunConfig,
                         user_agent=user_agent,
                         browser_hint=browser_hint,
+                        configured_headers=configured_headers,
                     )
                     self.contexts_by_config[signature] = context
                     self._context_refcounts[signature] = 0
@@ -2170,6 +2211,7 @@ class BrowserManager:
         crawlerRunConfig: CrawlerRunConfig,
         user_agent: Optional[str] = None,
         browser_hint: Optional[str] = None,
+        configured_headers: Optional[Dict[str, str]] = None,
     ):
         """Get a page, retaining every partial allocation until it is cleaned up.
 
@@ -2180,6 +2222,13 @@ class BrowserManager:
         context creation / setup (so each context is baked with the crawl's
         own UA - the value that actually goes on the wire). When ``None``,
         callers get the existing behavior (the shared ``BrowserConfig`` UA).
+        ``configured_headers`` is the per-crawl snapshot of
+        ``self.config.headers`` captured before the ``await`` in
+        ``_crawl_web``; it is threaded into ``setup_context`` so the
+        context-level HTTP headers use the per-crawl snapshot instead of the
+        shared (and potentially racy) ``self.config.headers`` dict. When
+        ``None``, ``setup_context`` falls back to ``self.config.headers``
+        (existing behavior for callers that do not thread a snapshot).
         """
         self._cleanup_expired_sessions()
 
@@ -2215,6 +2264,7 @@ class BrowserManager:
                     crawlerRunConfig,
                     user_agent=user_agent,
                     browser_hint=browser_hint,
+                    configured_headers=configured_headers,
                 )
                 page, cancelled = await self._new_page(context)
                 close_page = True
