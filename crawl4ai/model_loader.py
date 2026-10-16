@@ -2,10 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 import os
 import shutil
-from .model_loader import *
 import argparse
-
-__location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
 
 
 @lru_cache()
@@ -73,17 +70,6 @@ def get_home_folder():
 
 
 @lru_cache()
-def load_bert_base_uncased():
-    from transformers import BertTokenizer, BertModel
-
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", resume_download=None)
-    model = BertModel.from_pretrained("bert-base-uncased", resume_download=None)
-    model.eval()
-    model, device = set_model_device(model)
-    return tokenizer, model
-
-
-@lru_cache()
 def load_HF_embedding_model(model_name="BAAI/bge-small-en-v1.5") -> tuple:
     """Load the Hugging Face model for embedding.
 
@@ -107,15 +93,6 @@ def load_text_multilabel_classifier():
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     from scipy.special import expit
     import torch
-
-    # # Check for available device: CUDA, MPS (for Apple Silicon), or CPU
-    # if torch.cuda.is_available():
-    #     device = torch.device("cuda")
-    # elif torch.backends.mps.is_available():
-    #     device = torch.device("mps")
-    # else:
-    #     device = torch.device("cpu")
-    #     # return load_spacy_model(), torch.device("cpu")
 
     MODEL = "cardiffnlp/tweet-topic-21-multi"
     tokenizer = AutoTokenizer.from_pretrained(MODEL, resume_download=None)
@@ -183,12 +160,6 @@ def download_all_models(remove_existing=False):
         print("[LOG] Existing models removed.")
 
     # Load each model to trigger download
-    # print("[LOG] Downloading BERT Base Uncased...")
-    # load_bert_base_uncased()
-    # print("[LOG] Downloading BGE Small EN v1.5...")
-    # load_bge_small_en_v1_5()
-    # print("[LOG] Downloading ONNX model...")
-    # load_onnx_all_MiniLM_l6_v2()
     print("[LOG] Downloading text classifier...")
     _, device = load_text_multilabel_classifier()
     print(f"[LOG] Text classifier loaded on {device}")
