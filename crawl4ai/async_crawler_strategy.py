@@ -591,6 +591,31 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         ua_changed = False
         override_ua = None
         override_hint = None
+        # Snapshot the configured headers into a local BEFORE the
+        # ``await self.browser_manager.get_page(...)`` below. The shared
+        # ``browser_config.headers`` dict is written by magic / random-UA
+        # crawls (see the ``ua_changed`` block below) and read by every
+        # concurrent ``_crawl_web`` invocation; reading it post-``await``
+        # would ship another crawl's ``sec-ch-ua`` on this crawl's wire
+        # (TOCTOU on the page-level HTTP sec-ch-ua header). The snapshot
+        # mirrors the per-crawl UA / hint locals and is what the
+        # post-``await`` ``page.set_extra_http_headers`` flush uses, so a
+        # concurrent (or earlier, never-reverted) mutation of the shared
+        # dict cannot leak onto this crawl's page-level headers.
+        configured_headers_snapshot = dict(
+            getattr(self.browser_config, "headers", {}) or {}
+        )
+        # Remember the shared config's pre-mutation UA / hint / sec-ch-ua so a
+        # magic / random-UA crawl can restore them after ``get_page`` returns,
+        # leaving the shared config clean for subsequent crawls. Without this a
+        # later custom-header crawl ships a stale ``sec-ch-ua`` (and
+        # ``user_agent``) baked into the shared dict by this crawl - the
+        # sequential-staleness vector of the bug report - at both the context
+        # level (``setup_context`` pushes ``self.config.headers``) and the page
+        # level (the snapshot above, taken before this crawl mutated).
+        _saved_user_agent = self.browser_config.user_agent
+        _saved_browser_hint = self.browser_config.browser_hint
+        _saved_sec_ch_ua = configured_headers_snapshot.get("sec-ch-ua")
         if not self.browser_config.use_persistent_context:
             user_agent_to_override = config.user_agent
             if user_agent_to_override:
@@ -605,10 +630,12 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         # Keep sec-ch-ua in sync whenever the UA changed. Still mutate the
         # shared ``browser_config`` so ``create_browser_context`` /
         # ``setup_context`` (which run inside the awaited ``get_page``) see
-        # the per-crawl UA. The locals captured above are what we use for the
-        # page-level HTTP headers AFTER the ``await`` (see ``set_extra_http_
-        # headers`` below), so this mutation does not feed back into the racy
-        # page-level read.
+        # the per-crawl UA. The mutation is restored after ``get_page``
+        # returns (see below) so the shared config stays clean for subsequent
+        # crawls. The locals captured above (and the
+        # ``configured_headers_snapshot``) are what we use for the page-level
+        # HTTP headers AFTER the ``await`` (see ``set_extra_http_headers``
+        # below), so this mutation does not feed back into the page-level read.
         if ua_changed:
             override_hint = UAGen.generate_client_hints(override_ua)
             self.browser_config.user_agent = override_ua
@@ -639,12 +666,35 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 browser_hint=override_hint if ua_changed else None,
             )
 
+            # Restore the shared ``browser_config`` fields the magic /
+            # random-UA block mutated above so ``create_browser_context`` /
+            # ``setup_context`` saw the per-crawl UA during ``get_page``. The
+            # context is already created with this crawl's UA (threaded into
+            # ``get_page``), so restoring now leaves the shared config clean
+            # for subsequent crawls and prevents a stale ``sec-ch-ua`` /
+            # ``user_agent`` from leaking onto a later crawl's wire at both the
+            # context level (``setup_context`` pushes ``self.config.headers``)
+            # and the page level (the snapshot taken above). This crawl's own
+            # page-level headers below still come from the per-crawl locals /
+            # snapshot, unaffected by the restore.
+            if ua_changed:
+                self.browser_config.user_agent = _saved_user_agent
+                self.browser_config.browser_hint = _saved_browser_hint
+                _restored_headers = getattr(self.browser_config, "headers", None)
+                if _restored_headers is not None:
+                    if _saved_sec_ch_ua is None:
+                        _restored_headers.pop("sec-ch-ua", None)
+                    else:
+                        _restored_headers["sec-ch-ua"] = _saved_sec_ch_ua
+
             # Push configured headers to the live page so headers added after
-            # context creation reach the wire. Per-crawl UA locals are applied
-            # last so a concurrent crawl cannot overwrite this crawl's values.
-            configured_headers = getattr(self.browser_config, "headers", {})
+            # context creation reach the wire. Uses the pre-``await`` snapshot
+            # (not the shared dict) so a concurrent crawl's mutation during the
+            # ``await`` suspension cannot leak onto this crawl's wire. Per-crawl
+            # UA locals are applied last so a concurrent crawl cannot overwrite
+            # this crawl's values.
             if ua_changed or getattr(self, "_custom_headers_set", False):
-                combined_headers = dict(configured_headers)
+                combined_headers = dict(configured_headers_snapshot)
                 if ua_changed:
                     combined_headers["User-Agent"] = override_ua
                     combined_headers["sec-ch-ua"] = override_hint

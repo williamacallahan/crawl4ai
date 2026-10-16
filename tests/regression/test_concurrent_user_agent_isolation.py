@@ -179,24 +179,34 @@ async def test_locals_used_not_post_await_shared_state():
 
 
 @pytest.mark.asyncio
-async def test_shared_browser_config_still_mutated_for_context_creation():
-    """The fix still mutates the shared ``browser_config`` (load-bearing for
-    ``navigator.userAgent`` / context-level headers at context creation, see
-    ``BrowserManager.create_browser_context`` / ``setup_context``). The
-    leftover (last writer's UA) is the documented behavior; the page-level
+async def test_magic_crawl_restores_shared_browser_config_after_get_page():
+    """A magic / random-UA crawl mutates the shared ``browser_config`` so
+    ``create_browser_context`` / ``setup_context`` (which run inside the
+    awaited ``get_page``) see the per-crawl UA, but RESTORES the original
+    values after ``get_page`` returns so the shared config stays clean for
+    subsequent crawls. This closes the sequential-staleness vector of the
+    bug report (a later custom-header crawl shipping a stale ``sec-ch-ua``
+    baked into the shared dict by an earlier magic crawl). The page-level
     HTTP headers remain correct per-crawl regardless."""
-    strategy, _, queue = _build_strategy_with_capturing_pages()
-    await asyncio.gather(
-        _run_crawl(strategy, queue, "A", "https://example.test/a", user_agent=UA_CHROME_121),
-        _run_crawl(strategy, queue, "B", "https://example.test/b", user_agent=UA_CHROME_122),
+    strategy, captured, queue = _build_strategy_with_capturing_pages()
+    original_ua = strategy.browser_config.user_agent
+    original_hint = strategy.browser_config.browser_hint
+    original_sec_ch_ua = strategy.browser_config.headers.get("sec-ch-ua")
+    await _run_crawl(strategy, queue, "A", "https://example.test/a", magic=True)
+    h = captured["A"].captured_headers
+    assert h is not None
+    assert h.get("User-Agent"), "magic mode must generate a non-empty User-Agent"
+    assert h["sec-ch-ua"] == UAGen.generate_client_hints(h["User-Agent"])
+    # Shared config restored to the pre-crawl values after get_page returned.
+    assert strategy.browser_config.user_agent == original_ua, (
+        "shared user_agent must be restored after a magic crawl"
     )
-    # Shared config holds the last writer's UA - documented leftover; this
-    # is NOT the page-level HTTP race fixed here, see the bug report's
-    # "Scope: the leftover corruption" note.
-    assert strategy.browser_config.user_agent in (UA_CHROME_121, UA_CHROME_122)
-    last = strategy.browser_config.user_agent
-    assert strategy.browser_config.browser_hint == UAGen.generate_client_hints(last)
-    assert strategy.browser_config.headers["sec-ch-ua"] == UAGen.generate_client_hints(last)
+    assert strategy.browser_config.browser_hint == original_hint, (
+        "shared browser_hint must be restored after a magic crawl"
+    )
+    assert strategy.browser_config.headers.get("sec-ch-ua") == original_sec_ch_ua, (
+        "shared headers['sec-ch-ua'] must be restored after a magic crawl"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,14 +219,19 @@ async def test_magic_mode_generates_and_applies_ua_to_page():
     sec-ch-ua is regenerated from the generated UA so they stay in sync
     (the original fdd989785 anti-bot fix's intent). Covers the shared
     ``elif config.magic or config.user_agent_mode == "random"`` generate
-    branch."""
+    branch. The shared config is restored after ``get_page`` returns, so
+    only the page-level headers carry the generated UA (not the shared
+    config, which is the sequential-staleness surface closed by the fix)."""
     strategy, captured, queue = _build_strategy_with_capturing_pages()
+    original_ua = strategy.browser_config.user_agent
     await _run_crawl(strategy, queue, "A", "https://example.test/a", magic=True)
     h = captured["A"].captured_headers
     assert h is not None
     assert h.get("User-Agent"), "magic mode must generate a non-empty User-Agent"
     assert h["sec-ch-ua"] == UAGen.generate_client_hints(h["User-Agent"])
-    assert strategy.browser_config.user_agent == h["User-Agent"]
+    assert strategy.browser_config.user_agent == original_ua, (
+        "shared config restored after the magic crawl's get_page returns"
+    )
 
 
 @pytest.mark.asyncio
