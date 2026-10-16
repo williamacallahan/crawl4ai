@@ -568,13 +568,17 @@ async def clone_runtime_state(
     # shared dict cannot add a header that this crawl's page-level snapshot
     # does not contain (Playwright merges context headers into page requests
     # unless a page overrides the same header).
-    effective_headers = (
-        configured_headers
-        if configured_headers is not None
-        else (browserConfig.headers if browserConfig else None)
-    )
-    if effective_headers:
-        await dst.set_extra_http_headers(effective_headers)
+    # When a per-crawl snapshot is threaded (``configured_headers is not
+    # None``), apply it even when it is empty so a shared default context
+    # does not retain a prior crawl's header (e.g. ``Authorization``) that
+    # this crawl's snapshot omits — a page-level ``set_extra_http_headers``
+    # cannot remove an inherited header it does not name. Fall back to the
+    # shared ``browserConfig.headers`` for callers that do not thread a
+    # snapshot (preserving the prior behavior).
+    if configured_headers is not None:
+        await dst.set_extra_http_headers(configured_headers)
+    elif browserConfig and browserConfig.headers:
+        await dst.set_extra_http_headers(browserConfig.headers)
 
     # geolocation
     if crawlerRunConfig and crawlerRunConfig.geolocation:
@@ -1716,6 +1720,21 @@ class BrowserManager:
         else:
             effective_ua = self.config.user_agent
         sig_dict["user_agent"] = effective_ua
+
+        # Per-crawl configured headers flow into setup_context() (context-level
+        # HTTP headers via ``set_extra_http_headers``). Concurrent crawls with
+        # DIFFERENT header snapshots MUST get distinct signatures so they do
+        # not share a context baked with another crawl's headers — a
+        # page-level override cannot remove an inherited header it does not
+        # name (e.g. an ``Authorization`` header present in the first crawl's
+        # snapshot but absent from the second). When ``configured_headers`` is
+        # provided the snapshot is used; otherwise ``self.config.headers`` is
+        # used to preserve the existing behavior for callers that do not
+        # thread a snapshot.
+        if configured_headers is not None:
+            sig_dict["configured_headers"] = dict(configured_headers)
+        else:
+            sig_dict["configured_headers"] = dict(self.config.headers or {})
 
         signature_json = json.dumps(sig_dict, sort_keys=True, default=str)
         return hashlib.sha256(signature_json.encode("utf-8")).hexdigest()
