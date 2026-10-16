@@ -257,6 +257,10 @@ class CrawlResult(BaseModel):
                     return False
                 if isinstance(spec, set):
                     return key in spec
+                if not isinstance(spec, dict):
+                    # list/tuple: membership means whole-field control
+                    # (pydantic honors sequence excludes/includes at runtime).
+                    return key in spec
                 if key not in spec:
                     return False
                 value = spec[key]
