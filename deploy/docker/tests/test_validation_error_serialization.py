@@ -163,3 +163,44 @@ def test_handler_strips_input_from_every_error(server_module):
     assert response.status_code == 422
     for err in json.loads(response.body)["detail"]:
         assert "input" not in err, err
+
+
+def test_handler_rejects_non_finite_float_in_ctx(server_module):
+    """A non-finite float (``nan``/``inf``) in ``ctx`` must not crash the handler.
+
+    ``JSONResponse`` serializes with ``allow_nan=False``, so a bare ``nan`` or
+    ``inf`` would raise ``ValueError`` and the catch-all handler would turn the
+    422 into a 500.  The sanitizer treats non-finite floats as non-JSON-safe and
+    stringifies ``ctx`` so the response stays a clean 422.
+    """
+    import asyncio
+    import math
+
+    exc = RequestValidationError([
+        {
+            "type": "value_error",
+            "loc": ("body", "field"),
+            "msg": "Value error, bad",
+            "input": "untrusted",
+            "ctx": {"limit": math.inf},
+            "url": "https://errors.pydantic.dev/2.11/v/value_error",
+        },
+        {
+            "type": "value_error",
+            "loc": ("body", "other"),
+            "msg": "Value error, bad",
+            "input": "untrusted",
+            "ctx": {"limit": float("nan")},
+            "url": "https://errors.pydantic.dev/2.11/v/value_error",
+        },
+    ])
+
+    async def _run():
+        return await server_module._validation_exception_handler(None, exc)
+
+    response = asyncio.run(_run())
+    assert response.status_code == 422, response.body
+    for err in json.loads(response.body)["detail"]:
+        assert "input" not in err, err
+        assert isinstance(err["ctx"]["limit"], str), err
+        assert math.isfinite(float(err["ctx"]["limit"])) is False, err
