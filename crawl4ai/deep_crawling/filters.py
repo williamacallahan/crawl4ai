@@ -3,11 +3,9 @@ from typing import List, Pattern, Set, Union
 from urllib.parse import urlparse
 from array import array
 import re
-import logging
 from functools import lru_cache
 import fnmatch
 from dataclasses import dataclass
-import weakref
 import math
 from collections import defaultdict
 from typing import Dict
@@ -40,20 +38,11 @@ class FilterStats:
 class URLFilter(ABC):
     """Optimized base filter class"""
 
-    __slots__ = ("name", "stats", "_logger_ref")
+    __slots__ = ("name", "stats")
 
     def __init__(self, name: str = None):
         self.name = name or self.__class__.__name__
         self.stats = FilterStats()
-        # Lazy logger initialization using weakref
-        self._logger_ref = None
-
-    @property
-    def logger(self):
-        if self._logger_ref is None or self._logger_ref() is None:
-            logger = logging.getLogger(f"urlfilter.{self.name}")
-            self._logger_ref = weakref.ref(logger)
-        return self._logger_ref()
 
     @abstractmethod
     def apply(self, url: str) -> bool:
@@ -69,19 +58,11 @@ class URLFilter(ABC):
 class FilterChain:
     """Optimized filter chain"""
 
-    __slots__ = ("filters", "stats", "_logger_ref")
+    __slots__ = ("filters", "stats")
 
     def __init__(self, filters: List[URLFilter] = None):
         self.filters = tuple(filters or [])  # Immutable tuple for speed
         self.stats = FilterStats()
-        self._logger_ref = None
-
-    @property
-    def logger(self):
-        if self._logger_ref is None or self._logger_ref() is None:
-            logger = logging.getLogger("urlfilter.chain")
-            self._logger_ref = weakref.ref(logger)
-        return self._logger_ref()
 
     def add_filter(self, filter_: URLFilter) -> "FilterChain":
         """Add a filter to the chain"""
