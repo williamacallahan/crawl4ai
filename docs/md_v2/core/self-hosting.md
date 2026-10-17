@@ -274,7 +274,7 @@ The Docker setup now supports flexible LLM provider configuration through a hier
    LLM_BASE_URL=https://api.proxy.com/v1
    ```
 
-4. **Config File Default**: Falls back to `config.yml` (default: `openai/gpt-4o-mini`)
+4. **Config File Default**: Falls back to `config.yml`
 
 The system automatically selects the appropriate API key based on the provider. LiteLLM handles finding the correct environment variable for each provider (e.g., OPENAI_API_KEY for OpenAI, GEMINI_API_TOKEN for Google Gemini, etc.).
 
@@ -1979,7 +1979,7 @@ app:
 
 # Default LLM Configuration
 llm:
-  provider: "openai/gpt-4o-mini"  # Can be overridden by LLM_PROVIDER env var
+  provider: "openai/muse-spark-1.3-contributor"  # Can be overridden by LLM_PROVIDER env var
   # api_key: sk-...  # If you pass the API key directly (not recommended)
   # temperature and base_url are controlled via environment variables or request parameters
 
