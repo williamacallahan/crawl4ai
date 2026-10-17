@@ -224,3 +224,92 @@ def test_unreadable_collector_logs_keep_the_guard_failure(monkeypatch, tmp_path)
     monkeypatch.setattr(withdrawals.subprocess, "run", slow_logs)
     detail = guard_detail(collector)
     assert detail["state"] == "failed" and "timed out after 30 seconds" in detail["output"]
+
+
+def start_collector(monkeypatch, tmp_path):
+    monkeypatch.setattr(withdrawals, "ready_nodes", lambda: {"node1": "worker"})
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    collector = withdrawals.Withdrawals("crawl4ai", "image", tmp_path / "lifecycle.json", 30)
+    running = {"ID": "task1", "NodeID": "node1", "Status": {
+        "State": "running", "ContainerStatus": {"ContainerID": "container1", "ExitCode": 0}}}
+    dead = {"ID": "task1", "NodeID": "node1", "Status": {
+        "State": "complete", "Err": "task: non-zero exit (1)",
+        "ContainerStatus": {"ContainerID": "container1", "ExitCode": 1}}}
+    state = {"task": running}
+    log_lines: list[str] = []
+    guard_calls = {"count": 0}
+    real_guard = collector._guard
+
+    def spy_guard(node, complete=False):
+        guard_calls["count"] += 1
+        return real_guard(node, complete)
+
+    def fake_task(_service, pending=False):
+        return running if pending else state["task"]
+
+    monkeypatch.setattr(collector, "_create", lambda name, node, program, collector=False: name)
+    monkeypatch.setattr(collector, "_marker", lambda _service, _node: None)
+    monkeypatch.setattr(collector, "_task", fake_task)
+    monkeypatch.setattr(collector, "_guard", spy_guard)
+    monkeypatch.setattr(withdrawals, "_docker", lambda *_arguments: "\n".join(log_lines))
+    monkeypatch.setattr(withdrawals.subprocess, "run", lambda *_args, **_kwargs: type(
+        "Logs", (), {"stdout": "\n".join(log_lines), "stderr": ""})())
+    return collector, state, log_lines, guard_calls, dead
+
+
+def test_logs_raises_when_the_collector_stream_interleaves_a_traceback(monkeypatch):
+    monkeypatch.setattr(withdrawals, "_docker", lambda *_arguments: (
+        '{"ready": false}\nTraceback (most recent call last):\nRuntimeError: expired'))
+    with pytest.raises(json.JSONDecodeError):
+        withdrawals.Withdrawals._logs(None, "collector")
+
+
+def test_start_guards_before_logs_when_the_collector_dies_during_ready(monkeypatch, tmp_path):
+    collector, state, log_lines, guard_calls, dead = start_collector(monkeypatch, tmp_path)
+    log_lines.extend(['{"ready": false}', 'Traceback (most recent call last):',
+                      'RuntimeError: Engine withdrawal journal expired'])
+    state["task"] = dead
+    with pytest.raises(withdrawals.StateError) as failure:
+        collector.start()
+    detail = json.loads(str(failure.value).split(": ", 1)[1])
+    assert guard_calls["count"] >= 1
+    assert detail["state"] == "complete" and detail["exit"] == 1
+    assert detail["err"] == "task: non-zero exit (1)" and not detail["replaced"]
+    assert "Traceback" in detail["output"]
+
+
+def test_start_guards_before_logs_when_the_collector_dies_during_arming(monkeypatch, tmp_path):
+    collector, state, log_lines, guard_calls, dead = start_collector(monkeypatch, tmp_path)
+    log_lines.append('{"ready": true}')
+
+    def arm(name, node, program, collector=False):
+        if name.endswith("-arm"):
+            state["task"] = dead
+            log_lines.extend(['Traceback (most recent call last):',
+                              'RuntimeError: Engine withdrawal journal expired'])
+        return name
+
+    monkeypatch.setattr(collector, "_create", arm)
+    with pytest.raises(withdrawals.StateError) as failure:
+        collector.start()
+    detail = json.loads(str(failure.value).split(": ", 1)[1])
+    assert guard_calls["count"] >= 1
+    assert detail["state"] == "complete" and detail["exit"] == 1
+    assert "Traceback" in detail["output"]
+
+
+def test_start_returns_baseline_when_collectors_arm_normally(monkeypatch, tmp_path):
+    collector, _state, log_lines, guard_calls, _dead = start_collector(monkeypatch, tmp_path)
+    log_lines.append('{"ready": true}')
+    baseline = [task("old")]
+    monkeypatch.setattr(withdrawals, "census", lambda _app: baseline)
+
+    def arm(name, node, program, collector=False):
+        if name.endswith("-arm"):
+            log_lines.append('{"armed": true}')
+        return name
+
+    monkeypatch.setattr(collector, "_create", arm)
+    result = collector.start()
+    assert result == baseline
+    assert guard_calls["count"] >= 2
