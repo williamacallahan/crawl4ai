@@ -11,6 +11,7 @@ import ast
 import asyncio
 import base64
 import logging
+import math
 import os
 import pathlib
 import re
@@ -651,11 +652,30 @@ async def _http_exception_handler(request: Request, exc: _StarletteHTTPException
 
 @app.exception_handler(RequestValidationError)
 async def _validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Return JSON-safe validation details without echoing untrusted inputs."""
-    detail = [
-        {key: value for key, value in error.items() if key != "input"}
-        for error in exc.errors()
-    ]
+    """Return JSON-safe validation details without echoing untrusted inputs.
+
+    The ``input`` key is stripped so untrusted or non-finite values are not
+    echoed back to the client. pydantic error dicts can also carry non-JSON-
+    safe objects in ``ctx`` -- notably ``ctx['error']`` holding the live
+    ``ValueError`` instance when a ``field_validator`` raises -- so ``ctx`` is
+    sanitized to JSON-safe strings before serialization. Without this,
+    ``json.dumps`` raises ``TypeError`` on the live exception object and the
+    catch-all handler turns a legitimate 422 into a generic 500.  Non-finite
+    floats (``nan``/``inf``) are likewise rejected by ``JSONResponse`` (it
+    serializes with ``allow_nan=False``), so they are treated as non-JSON-safe
+    and stringified along with the rest of ``ctx``.
+    """
+    detail = []
+    for error in exc.errors():
+        safe = {k: v for k, v in error.items() if k != "input"}
+        ctx = safe.get("ctx")
+        if isinstance(ctx, dict) and not all(
+            isinstance(v, (str, int, float, bool, type(None)))
+            and not (isinstance(v, float) and not math.isfinite(v))
+            for v in ctx.values()
+        ):
+            safe["ctx"] = {k: str(v) for k, v in ctx.items()}
+        detail.append(safe)
     return JSONResponse({"detail": detail}, status_code=422)
 
 
