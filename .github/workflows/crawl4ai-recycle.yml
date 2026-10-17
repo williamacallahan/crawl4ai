@@ -29,9 +29,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Must be ci-deploy.yml's group verbatim: a recycle and a deploy both roll the
-  # same Swarm service, and a second roller trips verify_rollout's overlap gate.
-  group: crawl4ai-deploy
+  # A recycle and a deploy both roll the same Swarm service, and a second roller
+  # trips verify_rollout's overlap gate. Each workflow keeps its own lane so a
+  # recycle never replaces a queued deploy; the overlap is prevented by
+  # placement instead: this job and ci-deploy.yml's deploy job both require the
+  # canonical-haiku-0 label, which exactly one runner carries.
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

@@ -32,9 +32,14 @@ on:
       - "crawl4ai/extraction_strategy.py"
       - ".github/workflows/security.yml"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   security-offline:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -60,6 +65,7 @@ jobs:
     # required status check. xfail-marked items (e.g. the build-gated
     # --no-sandbox removal) do not fail this job.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
