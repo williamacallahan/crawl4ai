@@ -239,6 +239,10 @@ _URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 # Playwright's own goto error line counts: the call log echoes the crawled URL.
 _NAVIGATION_ERROR_CODE = re.compile(r"Page\.goto: (net::ERR_[A-Z0-9_]{1,64})(?: at (\S+))?")
 _TUNNEL_CONNECTION_FAILED = "net::ERR_TUNNEL_CONNECTION_FAILED"
+# Playwright's own goto deadline line. A withheld timeout keeps it for the same
+# reason as a Chromium code: without it a client cannot tell a page that never
+# answered from an unexplained server fault.
+_NAVIGATION_TIMEOUT = re.compile(r"Page\.goto: (Timeout \d{1,9}ms exceeded)")
 
 
 def public_error_detail(error_message: Optional[str]) -> str:
@@ -246,9 +250,9 @@ def public_error_detail(error_message: Optional[str]) -> str:
 
     The library's catch-all error_message (get_error_context) embeds container
     file paths, source snippets and raw exception text; those must never reach
-    a client, so only its bare Chromium `net::ERR_*` code survives. Upstream-
-    failure messages (anti-bot, navigation refusal, DNS, timeouts) pass through,
-    capped.
+    a client, so only its bare Chromium `net::ERR_*` code or Playwright goto
+    timeout survives. Upstream-failure messages (anti-bot, navigation refusal,
+    DNS, timeouts) pass through, capped.
     """
     message = (error_message or "").strip()
     if (
@@ -275,7 +279,8 @@ def public_error_detail(error_message: Optional[str]) -> str:
         return message[:500]
     navigation = _NAVIGATION_ERROR_CODE.search(message)
     if navigation is None:
-        return "Crawl failed"
+        timeout = _NAVIGATION_TIMEOUT.search(message)
+        return f"Crawl failed: {timeout.group(1)}" if timeout else "Crawl failed"
     code, navigated_url = navigation.groups()
     if code == _TUNNEL_CONNECTION_FAILED and navigated_url:
         # The pinning proxy dials for the browser, so a dead target surfaces as a

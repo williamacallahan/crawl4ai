@@ -390,7 +390,11 @@ class TestErrorSanitization:
             "Error: Failed on navigating ACS-GOTO:\nPage.goto: Timeout 30000ms exceeded.\n"
             "Call log:\n  - navigating to \"https://x.example/net::ERR_FAILED\"\n"
         )
-        assert public_crawl_error(timeout).startswith("Crawl failed (correlation_id=")
+        # The navigation timeout itself is the reason, so it survives redaction.
+        assert re.fullmatch(
+            r"Crawl failed: Timeout 30000ms exceeded \(correlation_id=[0-9a-f]{12}\)",
+            public_crawl_error(timeout),
+        )
 
     def test_execute_js_result_error_message_is_sanitized(
         self, stock_client, server_module, monkeypatch
