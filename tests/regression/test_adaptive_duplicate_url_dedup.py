@@ -23,7 +23,9 @@ exercises the real ``digest`` / ``_crawl_batch`` / ``rank_links`` /
 """
 
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -417,6 +419,68 @@ async def test_digest_dedup_does_not_reappend_crawled_urls_after_batch():
     assert state.crawled_urls == {
         start_url, "http://site/a", "http://site/b", "http://site/c",
     }
+
+
+@pytest.mark.asyncio
+async def test_extend_pending_links_keeps_highest_scoring_duplicate():
+    """``_extend_pending_links`` keeps the highest-scoring representative per
+    href (within a call and across batches), so a low-scoring first link cannot
+    crowd out a higher-scoring later preview before ``rank_links`` applies
+    ``min_gain_threshold``."""
+    crawler = _make_crawler(min_gain_threshold=0.7)
+    crawler.state = CrawlState(query="alpha")
+    crawler.state.crawled_urls = set()
+    crawler.state.pending_links = []
+    pending_urls: set = set()
+    crawler._extend_pending_links([
+        _link("http://x/dup", contextual_score=0.01),
+        _link("http://x/dup", contextual_score=0.9),
+        _link("http://x/other", contextual_score=0.5),
+    ], pending_urls)
+
+    by_href = {link.href: link for link in crawler.state.pending_links}
+    assert set(by_href) == {"http://x/dup", "http://x/other"}
+    assert by_href["http://x/dup"].contextual_score == 0.9  # not the first 0.01
+
+    # A later batch re-surfaces a pending href with a higher preview score.
+    crawler._extend_pending_links([_link("http://x/dup", contextual_score=0.95)], pending_urls)
+    assert len(crawler.state.pending_links) == 2
+    dup = next(l for l in crawler.state.pending_links if l.href == "http://x/dup")
+    assert dup.contextual_score == 0.95
+
+
+@pytest.mark.asyncio
+async def test_digest_normalizes_resumed_pending_links_keeping_best_preview():
+    """Resuming from a state file with duplicate hrefs carrying different preview
+    scores, ``digest`` normalizes ``pending_links`` keeping the highest-scoring
+    representative per href (not the first), so ``rank_links`` sees the stronger
+    preview and the href can clear ``min_gain_threshold``."""
+    crawler = _make_crawler(max_depth=1, top_k_links=3, min_gain_threshold=1.0)
+    start_url = "http://site/already"
+    state = CrawlState(
+        crawled_urls={start_url}, knowledge_base=[],
+        pending_links=[
+            _link("http://site/x", contextual_score=0.01),
+            _link("http://site/x", contextual_score=0.9),
+            _link("http://site/y", contextual_score=0.5),
+        ],
+        query="alpha", metrics={},
+    )
+    tmp_dir = tempfile.mkdtemp()
+    state_path = os.path.join(tmp_dir, "adaptive_state.json")
+    state.save(state_path)
+
+    async def fake_preview(url, query):
+        return _result(url, True, content=f"{url} alpha")
+
+    crawler._crawl_with_preview = fake_preview
+    await crawler.digest(start_url=start_url, query="alpha", resume_from=state_path)
+
+    by_href = {link.href: link for link in crawler.state.pending_links}
+    assert set(by_href) == {"http://site/x", "http://site/y"}
+    assert by_href["http://site/x"].contextual_score == 0.9
+    hrefs = [link.href for link in crawler.state.pending_links]
+    assert len(hrefs) == len(set(hrefs))
 
 
 # Script runner (matches other tests/regression/*.py files)

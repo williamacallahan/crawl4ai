@@ -1211,6 +1211,27 @@ class EmbeddingStrategy(CrawlStrategy):
             state.coverage_shape = self.compute_coverage_shape(state.query_embeddings, self.config.alpha_shape_alpha if hasattr(self, 'config') else 0.5)
 
 
+def _link_preview_score(link: Optional[Link]) -> float:
+    """Best-effort comparable preview score for ``link``.
+
+    Used to pick the strongest representative when several ``Link`` objects
+    share a href. Prefers ``total_score`` (the combined intrinsic + contextual
+    preview score), then ``contextual_score`` (the BM25 relevance that
+    ``StatisticalStrategy.rank_links`` uses for its relevance component), then
+    ``intrinsic_score``. A link without any preview score compares as 0.0 so a
+    scored link always wins over an unscored one and ties keep the first
+    occurrence. This is only a tiebreaker for which duplicate to retain; the
+    ranked strategies re-score the survivors independently.
+    """
+    if link is None:
+        return 0.0
+    for attr in ("total_score", "contextual_score", "intrinsic_score"):
+        value = getattr(link, attr, None)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
 class AdaptiveCrawler:
     """Main adaptive crawler that orchestrates the crawling process"""
     
@@ -1301,17 +1322,31 @@ class AdaptiveCrawler:
             #
             # A ``pending_links`` list loaded from a state file written by an
             # older version can already contain duplicate hrefs. Normalize it
-            # once here -- dropping later duplicates while preserving the
-            # first occurrence and original order -- so the returned and
-            # re-saved state does not carry an inflated pending-link count and
-            # ``rank_links`` does not scan duplicates every cycle. ``pending_urls``
-            # is then built from the normalized list.
+            # once here -- keeping the highest-scoring representative per href
+            # (different anchor text / context can give the same href different
+            # preview scores; ``StatisticalStrategy.rank_links`` picks the best
+            # among whatever survives here, so dropping a higher-scoring
+            # duplicate at this step could let a low-scoring representative
+            # fall below ``min_gain_threshold`` and skip the href entirely)
+            # while preserving the first occurrence's position and the original
+            # order of remaining hrefs -- so the returned and re-saved state
+            # does not carry an inflated pending-link count and ``rank_links``
+            # does not scan duplicates every cycle. ``pending_urls`` is then
+            # built from the normalized list.
             seen_hrefs: Set[str] = set()
             normalized_pending: List[Link] = []
+            best_idx: Dict[str, int] = {}
             for link in self.state.pending_links:
-                if link.href and link.href not in seen_hrefs:
-                    seen_hrefs.add(link.href)
-                    normalized_pending.append(link)
+                if not link.href:
+                    continue
+                if link.href in seen_hrefs:
+                    idx = best_idx[link.href]
+                    if _link_preview_score(link) > _link_preview_score(normalized_pending[idx]):
+                        normalized_pending[idx] = link
+                    continue
+                seen_hrefs.add(link.href)
+                best_idx[link.href] = len(normalized_pending)
+                normalized_pending.append(link)
             self.state.pending_links = normalized_pending
             pending_urls = seen_hrefs
 
@@ -1505,14 +1540,32 @@ class AdaptiveCrawler:
         deduping here additionally prevents ``pending_links`` from growing
         unboundedly with duplicates across iterations (which would otherwise
         waste ranking work every cycle).
+
+        When the same href appears more than once (within ``new_links`` or
+        already present in ``pending_links``), the highest-scoring
+        representative is kept. Different anchor text or context can give the
+        same href different preview scores, and keeping the first encountered
+        could let a low-scoring duplicate fall below ``min_gain_threshold``
+        and skip the href even when a higher-scoring duplicate would have
+        cleared it; ``rank_links`` re-scores the survivors independently.
         """
+        pending = self.state.pending_links
         for new_link in new_links:
             href = new_link.href
             if not href:
                 continue
-            if href in self.state.crawled_urls or href in pending_urls:
+            if href in self.state.crawled_urls:
                 continue
-            self.state.pending_links.append(new_link)
+            if href in pending_urls:
+                # Already pending (from a prior batch or earlier in this
+                # call): keep the highest-scoring representative for this href.
+                for i, existing in enumerate(pending):
+                    if existing.href == href:
+                        if _link_preview_score(new_link) > _link_preview_score(existing):
+                            pending[i] = new_link
+                        break
+                continue
+            pending.append(new_link)
             pending_urls.add(href)
     
     # Status properties
