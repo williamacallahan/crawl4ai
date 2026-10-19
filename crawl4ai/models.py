@@ -385,6 +385,7 @@ class Link(BaseModel):
     intrinsic_score: Optional[float] = None  # Quality score based on URL structure, text, and context
     contextual_score: Optional[float] = None  # BM25 relevance score based on query and head content
     total_score: Optional[float] = None  # Combined score from intrinsic and contextual scores
+    page: Optional[int] = None
 
 
 class Media(BaseModel):
