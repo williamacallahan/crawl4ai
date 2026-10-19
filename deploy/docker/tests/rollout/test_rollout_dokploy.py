@@ -63,9 +63,11 @@ def test_wait_deployment_refreshes_and_checks_the_collector(monkeypatch):
     # The runner deadline tracks the caller's per-phase resets so a slow queue
     # wait within its own fresh TIMEOUT_SECONDS bound never fails a healthy
     # collector whose runner deadline the earlier arming consumed (regression
-    # for the 2e49c6e7 stale-deadline bug). The collector refresh hits at entry
-    # (queue admission) and on admission itself (the processing reset), and
-    # the check polls every polling iteration that does not return.
+    # for the 2e49c6e7 stale-deadline bug). The collector check fires before
+    # the entry refresh so an expired arming phase is reported at this boundary
+    # instead of being masked, then refresh hits at entry (queue admission) and
+    # on admission itself (the processing reset), and the check polls every
+    # polling iteration that does not return.
     matching = {
         "deploymentId": "new",
         "title": "title",
@@ -104,12 +106,13 @@ def test_wait_deployment_refreshes_and_checks_the_collector(monkeypatch):
     # Refresh at entry (clock=0, queue admission) and on admission (clock=0,
     # processing reset): both happen before the first time.sleep.
     assert refresh_calls == [0, 0], refresh_calls
-    # Check before refreshing on admission (clock=0), then every iteration that
-    # does not return early (iter 1 at clock=0, iter 2 at clock=5), and a final
+    # Check before the entry refresh (clock=0, arming boundary), then again
+    # before the admission refresh (clock=0), then every iteration that does
+    # not return early (iter 1 at clock=0, iter 2 at clock=5), and a final
     # check before the done return at clock=10 so a collector death between
     # polls is attributed to this phase rather than masked by the caller's
     # refresh.
-    assert check_calls == [0, 0, 5, 10], check_calls
+    assert check_calls == [0, 0, 0, 5, 10], check_calls
 
 
 def test_wait_deployment_checks_the_collector_without_one(monkeypatch):

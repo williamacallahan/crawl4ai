@@ -135,6 +135,11 @@ def _wait_deployment(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
     if collector is not None:
+        # Check before refreshing: the arming work before this call can
+        # outlast the runner deadline that started when the collector was
+        # constructed, and refreshing would mask that expiry instead of
+        # reporting it at this phase boundary.
+        collector.check()
         # Refresh at the same boundary the caller's own deadline does, so a
         # queue wait within its own TIMEOUT_SECONDS bound never fails a
         # collector whose runner deadline the earlier arming consumed.
