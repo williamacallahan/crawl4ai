@@ -494,8 +494,10 @@ class AsyncUrlSeeder:
         stop_event = asyncio.Event()
         seen: set[str] = set()
         filter_nonsense = config.filter_nonsense_urls  # Extract this for passing to workers
+        producer_error: Optional[BaseException] = None
 
         async def producer():
+            nonlocal producer_error
             try:
                 async with aclosing(gen()) as stream:
                     async for u in stream:
@@ -514,6 +516,7 @@ class AsyncUrlSeeder:
                             # Skip URLs that cause encoding errors (e.g. on Windows)
                             continue
             except Exception as e:
+                producer_error = e
                 self._log("error", "Producer encountered an error: {error}", params={
                           "error": str(e)}, tag="URL_SEED")
             finally:
@@ -576,6 +579,9 @@ class AsyncUrlSeeder:
         # Wait for all workers to finish
         await asyncio.gather(prod_task, *workers)
         await queue.join()  # Ensure all queued items are processed
+
+        if producer_error is not None:
+            raise producer_error
 
         self._log("info", "Finished URL seeding for {domain}. Total URLs: {count}",
                   params={"domain": domain, "count": len(results)}, tag="URL_SEED")
