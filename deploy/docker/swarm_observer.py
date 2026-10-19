@@ -22,6 +22,7 @@ import rollout_tasks
 DEFAULT_STATE_PATH = "/var/lib/crawl4ai-swarm-observer/episode.state"
 DEFAULT_METRICS_PATH = "/var/lib/crawl4ai-swarm-observer/metrics.prom"
 SAMPLE_DEADLINE_SECONDS = 45.0
+NETNS_DIR = Path("/var/run/docker/netns")
 
 
 def _atomic_replace(
@@ -107,6 +108,12 @@ class NetworkDbFdbComparison(str, Enum):
     DESTINATION_MISMATCH = "destination_mismatch"
     MISSING = "missing"
     INCONCLUSIVE = "inconclusive"
+    # Distinct from INCONCLUSIVE: the overlay sandbox netns file could not be
+    # resolved, or nsenter could not enter / invoke `bridge fdb show` there,
+    # so no comparison was attempted. Surfaced as a named outcome so a
+    # persistent nsenter/netns failure cannot masquerade as a genuine
+    # "could not measure" INCONCLUSIVE.
+    NS_ENTER_UNAVAILABLE = "ns_enter_unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +232,32 @@ def _overlay_mac(address: str) -> str:
     return "02:42:" + ":".join(f"{part:02x}" for part in octet)
 
 
+def _overlay_namespace(network_id: str) -> Path | None:
+    """Resolve the overlay sandbox netns file the way libnetwork does.
+
+    libnetwork truncates the whole sandbox key ``"<epoch>-<network_id>"`` to
+    12 characters, so the overlay netns file is ``"<epoch>-<network_id[:10]>"``
+    (epoch normally ``1``). The epoch increments whenever the overlay network's
+    sandbox is reinitialized (for example, after the last container leaves and
+    one rejoins within the same daemon lifetime), so the file may be
+    ``"2-<network_id[:10]>"``, ``"3-..."``, etc. Hardcoding the ``1`` prefix,
+    or building ``"1-" + network_id[:12]`` (14 characters, which can never
+    exist), makes nsenter fail on every sample. We suffix-scan the netns
+    directory for ``"-" + network_id[:10]`` and pick the highest-epoch
+    candidate instead.
+    """
+    suffix = f"-{network_id[:10]}"
+    if not NETNS_DIR.is_dir():
+        return None
+    candidates = sorted(
+        NETNS_DIR.glob(f"*{suffix}"),
+        key=lambda candidate: int(candidate.name.split("-", 1)[0])
+        if candidate.name.split("-", 1)[0].isdigit()
+        else -1,
+    )
+    return candidates[-1] if candidates else None
+
+
 def _fdb_comparison(
     network_id: str,
     task: list[dict[str, Any]],
@@ -238,22 +271,27 @@ def _fdb_comparison(
         if len(address) != 1 or task_id not in data_path_by_task:
             return NetworkDbFdbComparison.INCONCLUSIVE
         expected[_overlay_mac(next(iter(address)))] = data_path_by_task[task_id]
-    namespace = Path("/var/run/docker/netns") / f"1-{network_id[:12]}"
-    result = subprocess.run(
-        [
-            "nsenter",
-            f"--net={namespace}",
-            "bridge",
-            "fdb",
-            "show",
-            "dev",
-            "vxlan0",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    namespace = _overlay_namespace(network_id)
+    if namespace is None:
+        return NetworkDbFdbComparison.NS_ENTER_UNAVAILABLE
+    try:
+        result = subprocess.run(
+            [
+                "nsenter",
+                f"--net={namespace}",
+                "bridge",
+                "fdb",
+                "show",
+                "dev",
+                "vxlan0",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return NetworkDbFdbComparison.NS_ENTER_UNAVAILABLE
     observed = {}
     seen_mac = set()
     for line in result.stdout.splitlines():
@@ -367,12 +405,9 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
     if snapshot.complete or len(runtime_by_task) != authoritative_task_count:
         comparison = NetworkDbFdbComparison.INCONCLUSIVE
     else:
-        try:
-            comparison = _fdb_comparison(
-                str(network["Id"]), current, runtime_by_task, data_path_by_task
-            )
-        except Exception:
-            comparison = NetworkDbFdbComparison.INCONCLUSIVE
+        comparison = _fdb_comparison(
+            str(network["Id"]), current, runtime_by_task, data_path_by_task
+        )
     after_ids = {
         str(row["ID"])
         for row in rollout_tasks._service_tasks(service_name)
