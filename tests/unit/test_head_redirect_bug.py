@@ -107,6 +107,26 @@ class TestDoFetchHeadHostGuard:
         assert _norm(urlparse(r["url"]).netloc) == _norm(r["host"])
 
     @pytest.mark.asyncio
+    async def test_userinfo_host_spoof_dropped(self):
+        """``netloc`` includes userinfo, so a ``Location`` like
+        ``https://example.com:x@evil.com/`` would fool a ``netloc.split(":")``
+        guard into seeing ``example.com`` while the request actually reaches
+        ``evil.com``. Using ``urlparse(...).hostname`` drops the userinfo and
+        port, so the real host (``evil.com``) is compared and the record is
+        rejected as off-host."""
+        mapper = _bare_mapper()
+        seeder = AsyncMock()
+        seeder._fetch_head = AsyncMock(return_value=(
+            True, "<html><head><title>Evil</title></head></html>",
+            "https://example.com:x@evil.com/",
+        ))
+        r = _record("https://example.com/login", "example.com")
+        await mapper._do_fetch_head(r, seeder, DomainMapperConfig())
+        assert r["url"] == "https://example.com/login", f"url leaked: {r}"
+        assert r["status"] == "not_valid", f"should be not_valid: {r}"
+        assert r["head_data"] == {}, f"foreign head_data leaked: {r}"
+
+    @pytest.mark.asyncio
     async def test_onhost_redirect_url_adopted(self):
         """Same-host redirect (trailing slash, http->https) admitted;
         ``head_data`` parsed from the response; status stays ``valid``."""

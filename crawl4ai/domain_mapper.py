@@ -1231,7 +1231,7 @@ class DomainMapper:
                 return
             if final_url and final_url != r["url"]:
                 try:
-                    final_host = urlparse(final_url).netloc.lower().split(":")[0].removeprefix("www.")
+                    final_host = (urlparse(final_url).hostname or "").removeprefix("www.")
                 except Exception:
                     r["status"] = "not_valid"
                     return
