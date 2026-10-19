@@ -3,7 +3,6 @@ from base64 import b64decode
 import httpx
 import json
 import warnings
-from urllib.parse import urljoin
 
 from .async_configs import BrowserConfig, CrawlerRunConfig
 from .models import CrawlResult
@@ -97,7 +96,7 @@ class Crawl4aiDockerClient:
         ``authenticate(email)`` call cannot succeed against the server
         without one.
         """
-        url = urljoin(self.base_url, "/token")
+        url = f"{self.base_url}/token"
         credential = api_token or self._api_token
         if not credential:
             raise ConnectionError(
@@ -130,8 +129,16 @@ class Crawl4aiDockerClient:
     async def _check_server(self) -> None:
         """Check if server is reachable, raising an error if not."""
         try:
-            await self._http_client.get(urljoin(self.base_url, "/health"))
+            response = await self._http_client.get(f"{self.base_url}/health")
+            response.raise_for_status()
             self.logger.success(f"Connected to {self.base_url}", tag="READY")
+        except httpx.HTTPStatusError as e:
+            error_msg = (
+                f"Server unreachable: Server error {e.response.status_code}: "
+                f"{_http_error_detail(e.response, e)}"
+            )
+            self.logger.error(error_msg, tag="ERROR")
+            raise ConnectionError(error_msg)
         except httpx.RequestError as e:
             self.logger.error(f"Server unreachable: {str(e)}", tag="ERROR")
             raise ConnectionError(f"Cannot connect to server: {str(e)}")
@@ -217,7 +224,7 @@ class Crawl4aiDockerClient:
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> httpx.Response:
         """Make an HTTP request with error handling."""
-        url = urljoin(self.base_url, endpoint)
+        url = f"{self.base_url}{endpoint}"
         try:
             response = await self._http_client.request(method, url, **kwargs)
             response.raise_for_status()
