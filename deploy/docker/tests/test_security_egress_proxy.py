@@ -758,6 +758,295 @@ class TestUpstreamChaining:
         assert seen == [f"CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\n".encode()]
 
 
+@pytest.mark.asyncio
+class TestDirectDialNoSmuggling:
+    """Regression for the egress proxy's direct-dial (no-upstream) keep-alive
+    request-smuggling hole.
+
+    ``_handle_absolute`` validates and rewrites only the FIRST request on a
+    client connection, then hands both socket ends to a raw bidirectional
+    ``_splice``.  The upstream-proxy branch already rejects a smuggled second
+    request by stripping the client's ``Connection`` header and appending
+    ``Connection: close`` to the rewritten request (covered by
+    ``TestUpstreamChaining::test_chained_plain_http_pinned_absolute_form_no_smuggling``);
+    the direct-dial branch lacked the same guard, so a keep-alive client's
+    ``Connection`` header (or HTTP/1.1's persistence-by-default) survived into
+    the direct-dial request, both sides stayed alive after the first response,
+    and any later absolute-form request on the same socket was piped verbatim
+    -- unvalidated, never re-pinned, never policy-checked -- to the FIRST
+    request's pinned destination, letting an attacker-controlled plain-HTTP
+    origin spoof a different plain-HTTP origin's content/cookies.  These
+    tests mirror the upstream regression test for the direct branch.
+    """
+
+    async def test_direct_plain_http_pinned_absolute_form_no_smuggling(
+        self, monkeypatch
+    ):
+        """Direct-dial plain HTTP: the request is re-issued in ORIGIN form
+        (path only) to the PINNED IP, carries ``Connection: close``, the
+        client's ``keep-alive`` is stripped, and a reused client connection
+        cannot smuggle a second, unvalidated absolute-form request to the
+        first origin.  Mirrors the upstream-proxy branch regression test."""
+        lines = []
+
+        async def handle(reader, writer):
+            # Record exactly one complete request; the smuggled second request
+            # must never arrive at this origin.
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            lines.append(req)
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                b"Connection: close\r\n\r\nhi"
+            )
+            await writer.drain()
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        pin_calls = []
+
+        def fake_pin(url):
+            pin_calls.append(url)
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"GET http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n"
+                 "Connection: keep-alive\r\n\r\n").encode()
+            )
+            await w.drain()
+            first = await asyncio.wait_for(r.read(200), timeout=5)
+            assert b"200" in first
+            # Attempt to smuggle an unvalidated request on the same connection.
+            w.write(b"GET http://rebind.evil/ HTTP/1.1\r\nHost: rebind.evil\r\n\r\n")
+            await w.drain()
+            leftover = await asyncio.wait_for(r.read(200), timeout=5)
+            assert leftover == b""  # origin closed; nothing came back
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        sent = b"".join(lines)
+        # Direct dial uses ORIGIN form (path only), not absolute form.
+        assert sent.startswith(b"GET / HTTP/1.1\r\n")
+        # The proxy must strip any client Connection header and force close.
+        assert b"Connection: close" in sent
+        assert b"keep-alive" not in sent.lower()
+        # The smuggled request never reached the origin.
+        assert b"rebind.evil" not in sent
+        # The smuggled target was never re-resolved / re-pinned: only the
+        # first request triggers resolve_and_pin (pre-fix this was also true
+        # because the raw splice bypassed _handle_absolute, but we assert it
+        # here to lock the invariant).
+        assert len(pin_calls) == 1
+        assert "rebind.evil" not in pin_calls[0]
+
+    async def test_direct_path_force_close_without_explicit_client_connection_header(
+        self, monkeypatch
+    ):
+        """HTTP/1.1 defaults to keep-alive, so a client that omits
+        ``Connection`` entirely still reuses the socket for a second request.
+        The direct branch must append ``Connection: close`` even when no
+        client ``Connection`` header was sent, otherwise a relying-on-defaults
+        keep-alive client can still smuggle a second request.  Mirrors the
+        upstream branch's behavior."""
+        lines = []
+
+        async def handle(reader, writer):
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            lines.append(req)
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                b"Connection: close\r\n\r\nhi"
+            )
+            await writer.drain()
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            # No Connection header at all - HTTP/1.1 keep-alive is the default.
+            w.write(
+                (f"GET http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n\r\n").encode()
+            )
+            await w.drain()
+            first = await asyncio.wait_for(r.read(200), timeout=5)
+            assert b"200" in first
+            # Attempt to smuggle an unvalidated request on the same connection.
+            w.write(b"GET http://rebind.evil/ HTTP/1.1\r\nHost: rebind.evil\r\n\r\n")
+            await w.drain()
+            leftover = await asyncio.wait_for(r.read(200), timeout=5)
+            assert leftover == b""  # origin closed; nothing came back
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        sent = b"".join(lines)
+        # The proxy added Connection: close even though the client sent none.
+        assert b"Connection: close" in sent
+        # The smuggled request never reached the origin.
+        assert b"rebind.evil" not in sent
+
+    async def test_direct_path_request_line_stays_origin_form(self, monkeypatch):
+        """Sanity guard that the direct-path fix does NOT change the
+        request-line form: a plain-HTTP absolute-URI request forwarded direct
+        (no upstream) must still be rewritten to ORIGIN form (``GET /path``)
+        against the pinned IP -- never forwarded verbatim in absolute form,
+        which would expose the request-line host to the origin server and
+        allow origin confusion.  The direct branch always had this; pin it
+        down so a future change cannot regress it while adding the close."""
+        sent = {}
+
+        async def handle(reader, writer):
+            request = await reader.read(65536)
+            sent["request"] = request
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                b"Connection: close\r\n\r\nhi"
+            )
+            await writer.drain()
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"GET http://plain.example:{origin_port}/path?q=1 HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n\r\n").encode()
+            )
+            await w.drain()
+            data = await asyncio.wait_for(r.read(200), timeout=5)
+            assert b"200" in data
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        request = sent["request"]
+        # Origin form: path + query preserved, no absolute-URI in request line.
+        assert request.startswith(b"GET /path?q=1 HTTP/1.1\r\n")
+        assert b"plain.example" not in request.split(b"\r\n")[0]
+        # Host header carries the original hostname so the origin can route.
+        assert b"Host: plain.example:" + str(origin_port).encode() in request
+        # The proxy's own Connection: close is appended.
+        assert b"Connection: close" in request
+
+    async def test_direct_path_origin_ignoring_connection_close_no_smuggling(
+        self, monkeypatch
+    ):
+        """The raw ``_splice`` relay relied on the origin honoring the forced
+        ``Connection: close``: an origin that ignored it and kept the socket
+        alive would let a keep-alive client pipe a second, unvalidated
+        absolute-form request to the first request's pinned IP.  The
+        one-request ``_relay_one`` must close both ends as soon as the
+        *framed* first response is complete -- without waiting for the origin
+        to close -- so smuggling is impossible even against a non-cooperating
+        origin.  This origin deliberately keeps the connection open after the
+        Content-Length response and never closes on its own."""
+        received = []
+
+        async def handle(reader, writer):
+            # Read the first request only.
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            received.append(req)
+            # Send a full Content-Length response and KEEP THE SOCKET OPEN,
+            # ignoring the proxy's Connection: close.
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi"
+            )
+            await writer.drain()
+            # Wait for any smuggled second request; record it if it arrives.
+            try:
+                second = b""
+                while b"\r\n\r\n" not in second:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=2)
+                    if not chunk:
+                        break
+                    second += chunk
+                received.append(second)
+            except asyncio.TimeoutError:
+                pass
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"GET http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n"
+                 "Connection: keep-alive\r\n\r\n").encode()
+            )
+            await w.drain()
+            first = await asyncio.wait_for(r.read(200), timeout=5)
+            assert b"200" in first
+            assert first.endswith(b"hi")
+            # Attempt to smuggle an unvalidated request on the same connection.
+            w.write(b"GET http://rebind.evil/ HTTP/1.1\r\nHost: rebind.evil\r\n\r\n")
+            await w.drain()
+            # The proxy must have closed the client socket after the framed
+            # response; the smuggled request yields EOF, not a second response.
+            leftover = await asyncio.wait_for(r.read(200), timeout=5)
+            assert leftover == b""
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        # Exactly one (non-empty) request reached the origin; the smuggled
+        # second one never did -- at most an EOF from the proxy closing the
+        # upstream socket after the framed response.
+        assert [chunk for chunk in received if chunk] == [received[0]]
+        assert b"rebind.evil" not in b"".join(received)
+
+
 def test_upstream_proxy_env_parsing(monkeypatch):
     assert egress_proxy.upstream_proxy() is None
     monkeypatch.setenv("HTTP_PROXY", "http://192.168.180.254:56560")

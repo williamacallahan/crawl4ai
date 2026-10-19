@@ -49,6 +49,28 @@ _STOP_DEADLINE_S = 5.0
 # How long one stop() pass waits for Server.wait_closed() before sweeping again.
 _STOP_SWEEP_S = 0.1
 
+
+def _body_framing(headers: bytes) -> tuple[int | None, bool]:
+    """Return (Content-Length, chunked) parsed from ``headers`` (raw header
+    lines joined by ``\\r\\n``).  Content-Length is ``None`` when absent or
+    unparseable; chunked is True only when ``Transfer-Encoding: chunked`` is
+    present."""
+    content_length: int | None = None
+    chunked = False
+    for line in headers.split(b"\r\n"):
+        if not line:
+            continue
+        name, _, value = line.partition(b":")
+        lname = name.strip().lower()
+        if lname == b"content-length":
+            try:
+                content_length = int(value.strip())
+            except ValueError:
+                content_length = None
+        elif lname == b"transfer-encoding" and b"chunked" in value.lower():
+            chunked = True
+    return content_length, chunked
+
 # Chromium turns every CONNECT answer other than 200/407 into
 # net::ERR_TUNNEL_CONNECTION_FAILED (net/http/http_proxy_client_socket.cc,
 # DoProcessResponseCode), so no reply can tell the browser that the target
@@ -420,7 +442,7 @@ class PinningProxy:
 
         headers = await self._read_headers(client_reader)
         try:
-            body_length = _request_body_length(headers)
+            _request_body_length(headers)
         except ValueError:
             await self._reply(client_writer, _BAD)
             return
@@ -438,12 +460,38 @@ class PinningProxy:
             ).encode("latin-1")
             if upstream[2]:
                 out += upstream[2]
-        # Only this request was validated and pinned, so the connection carries
-        # exactly one exchange in each direction (see _forward_request_body).
+        # Only the first request on this connection was validated and rewritten.
+        # Strip every hop-by-hop header -- the client's ``Connection`` plus any
+        # header it nominates by name (e.g. ``Connection: X-Foo, keep-alive``)
+        # and the standard hop-by-hop set -- and force close, so a keep-alive
+        # client cannot reuse this socket to smuggle a second, unvalidated
+        # absolute-form request through to the first request's pinned IP.  The
+        # generated ``Host`` is added below, after this filter, so it is never
+        # stripped even if a malicious client writes ``Connection: Host``; and
+        # ``Content-Length`` / ``Transfer-Encoding`` are preserved so the body
+        # framing _relay_one forwards to the upstream stays correct.  This guard
+        # previously lived only in the upstream-proxy branch; the direct branch
+        # leaked the client's Connection header (HTTP/1.1 default keep-alive
+        # preserves the socket) and the raw _splice then piped every later
+        # request verbatim, unvalidated, to the first pinned destination.
+        header_lines = [line for line in headers.split(b"\r\n") if line]
+        nominated = set()
+        for line in header_lines:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"connection":
+                nominated.update(
+                    token.strip().lower()
+                    for token in value.split(b",")
+                    if token.strip()
+                )
+        framing = {b"content-length", b"transfer-encoding"}
+        drop = (nominated - framing) | {
+            b"connection", b"keep-alive", b"te", b"trailer", b"upgrade",
+        }
         headers = b"".join(
             line + b"\r\n"
-            for line in headers.split(b"\r\n")
-            if line and not line.lower().startswith(b"connection:")
+            for line in header_lines
+            if line.split(b":", 1)[0].strip().lower() not in drop
         ) + b"Connection: close\r\n"
         out += b"Host: " + _bracket(sp.hostname).encode("latin-1")
         if sp.port:
@@ -460,15 +508,19 @@ class PinningProxy:
             await self._reply(client_writer, _BLOCKED)
             return
         _record_dial_outcome(sp.hostname, port, None)
-        # A cancel or error before the splice owns the upstream still closes it.
+        # A cancel or error before the relay owns the upstream still closes it.
         try:
             up_writer.write(out)
             await up_writer.drain()
-            await self._splice(
-                client_writer,
-                up_writer,
-                self._forward_request_body(client_reader, up_writer, body_length),
-                self._relay_response(up_reader, client_writer),
+            # _relay_one forwards exactly this one request and its single
+            # response, then closes both sockets -- it never pipes a subsequent
+            # client request to the already-pinned upstream, so an origin that
+            # ignores our forced ``Connection: close`` still cannot be used to
+            # smuggle a second, unvalidated absolute-form request to the pinned
+            # IP.  CONNECT keeps the raw bidirectional _splice because its
+            # payload is opaque TLS.
+            await self._relay_one(
+                method, headers, client_reader, client_writer, up_reader, up_writer
             )
         finally:
             await self._safe_close(up_writer)
@@ -636,6 +688,145 @@ class PinningProxy:
         for direction in pipes:
             if not direction.cancelled():
                 direction.result()
+
+    async def _relay_one(self, method, req_headers, c_reader, c_writer,
+                        u_reader, u_writer):
+        """Relay exactly one HTTP/1.1 request and its response, then close both
+        sockets.
+
+        Used on the plain-HTTP path (direct dial and upstream-chained) instead
+        of the raw bidirectional ``_splice``: only the first request on this
+        connection was validated and re-pinned, so after forwarding it (and any
+        request body) and its single framed response we close both ends.  A
+        keep-alive client -- or an origin/upstream that ignores the forced
+        ``Connection: close`` we appended -- cannot reuse this socket to
+        smuggle a second, unvalidated absolute-form request to the pinned IP,
+        because no client bytes are ever piped to the upstream after the first
+        request body.  CONNECT keeps ``_splice`` because its payload is opaque
+        TLS (or another tunnelled protocol) this proxy must not frame.
+        """
+        await self._forward_http_body(c_reader, u_writer, req_headers)
+        try:
+            await self._forward_http_response(method, u_reader, c_writer)
+        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
+            logger.debug("proxy one-request response relay failed: %s", error)
+        finally:
+            await self._safe_close(c_writer)
+            await self._safe_close(u_writer)
+
+    async def _forward_http_body(self, c_reader, u_writer, req_headers):
+        """Forward a request body framed by ``req_headers`` (Content-Length or
+        chunked); without framing there is no body, since ``_read_headers``
+        already consumed up to the terminating blank line."""
+        content_length, chunked = _body_framing(req_headers)
+        try:
+            if chunked:
+                await self._forward_chunked(c_reader, u_writer)
+            elif content_length is not None and content_length > 0:
+                remaining = content_length
+                while remaining > 0:
+                    chunk = await c_reader.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    u_writer.write(chunk)
+                    await u_writer.drain()
+                    remaining -= len(chunk)
+        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
+            logger.debug("proxy request body relay failed: %s", error)
+
+    async def _forward_http_response(self, method, u_reader, c_writer):
+        """Read one HTTP/1.1 response from ``u_reader``, forward it to
+        ``c_writer``, and return as soon as the response body is complete so
+        the caller can close both ends without waiting for the upstream to
+        close (an origin that ignores ``Connection: close`` cannot hold the
+        socket open for a smuggled second request)."""
+        status_line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+        if not status_line:
+            return
+        c_writer.write(status_line)
+        await c_writer.drain()
+        status_code = 0
+        parts = status_line.split(b" ", 2)
+        if len(parts) >= 2:
+            try:
+                status_code = int(parts[1])
+            except ValueError:
+                status_code = 0
+        content_length, chunked = None, False
+        while True:
+            line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+            c_writer.write(line)
+            await c_writer.drain()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            name, _, value = line.partition(b":")
+            lname = name.strip().lower()
+            if lname == b"content-length":
+                try:
+                    content_length = int(value.strip())
+                except ValueError:
+                    content_length = None
+            elif lname == b"transfer-encoding" and b"chunked" in value.lower():
+                chunked = True
+        no_body = (
+            method.upper() == b"HEAD"
+            or 100 <= status_code < 200
+            or status_code in (204, 304)
+        )
+        if no_body:
+            return
+        if chunked:
+            await self._forward_chunked(u_reader, c_writer)
+        elif content_length is not None:
+            remaining = content_length
+            while remaining > 0:
+                chunk = await u_reader.read(min(65536, remaining))
+                if not chunk:
+                    break
+                c_writer.write(chunk)
+                await c_writer.drain()
+                remaining -= len(chunk)
+        else:
+            while True:
+                chunk = await u_reader.read(65536)
+                if not chunk:
+                    break
+                c_writer.write(chunk)
+                await c_writer.drain()
+
+    async def _forward_chunked(self, src, dst):
+        """Copy a chunked HTTP/1.1 body (including the terminating zero-size
+        chunk and any trailers) from ``src`` to ``dst`` verbatim."""
+        while True:
+            line = await asyncio.wait_for(src.readline(), timeout=30)
+            dst.write(line)
+            await dst.drain()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            size_field = line.strip().split(b";", 1)[0] or b"0"
+            try:
+                size = int(size_field, 16)
+            except ValueError:
+                break
+            if size == 0:
+                while True:
+                    trailer = await asyncio.wait_for(src.readline(), timeout=30)
+                    dst.write(trailer)
+                    await dst.drain()
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            remaining = size
+            while remaining > 0:
+                chunk = await src.read(min(65536, remaining))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                await dst.drain()
+                remaining -= len(chunk)
+            crlf = await asyncio.wait_for(src.readline(), timeout=30)
+            dst.write(crlf)
+            await dst.drain()
 
     async def _reply(self, writer, payload: bytes):
         try:
