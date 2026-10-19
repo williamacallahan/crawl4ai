@@ -1233,6 +1233,94 @@ class TestDirectDialNoSmuggling:
         # The relay rewrites the final response's Connection to close.
         assert b"Connection: close" in data
 
+    async def test_direct_path_expect_100_continue_does_not_deadlock(self, monkeypatch):
+        """A client that sends ``Expect: 100-continue`` waits for an interim
+        ``100 Continue`` before sending the body.  ``_relay_one`` reads the
+        full request body before reading the upstream response, so without
+        handling the interim handshake the client would block forever waiting
+        for ``100 Continue`` while the proxy blocks in ``_forward_http_body``
+        waiting for body bytes the client never sends.  The proxy strips
+        ``Expect`` from the upstream request (the origin does not need to
+        send its own ``100 Continue``) and sends the interim response to the
+        client itself, after which the body flows and the final response is
+        relayed normally."""
+        received = {}
+
+        async def handle(reader, writer):
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            head, _, rest = req.partition(b"\r\n\r\n")
+            received["head"] = head
+            # The proxy must strip Expect: the origin should not see it.
+            assert b"expect:" not in head.lower()
+            # Read the body the client sends after the proxy's 100 Continue.
+            # Content-Length is 5, so read until we have all of it.
+            body = rest
+            while len(body) < 5:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                body += chunk
+            received["body"] = body
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 7\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\ngot it!"
+            )
+            await writer.drain()
+            await asyncio.sleep(1)
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"POST http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n"
+                 "Expect: 100-continue\r\n"
+                 "Content-Length: 5\r\n\r\n").encode()
+            )
+            await w.drain()
+            # The proxy sends 100 Continue so the client can send the body.
+            # Read the interim response first; it must arrive before the body
+            # is forwarded, so a bounded read can return just it.
+            interim = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), timeout=5)
+            assert interim == b"HTTP/1.1 100 Continue\r\n\r\n"
+            # Now the client sends the body.
+            w.write(b"hello")
+            await w.drain()
+            # Drain to EOF to collect the final response.
+            data = b""
+            while True:
+                chunk = await asyncio.wait_for(r.read(8192), timeout=5)
+                if not chunk:
+                    break
+                data += chunk
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        # The origin received the full body the client sent after 100 Continue.
+        assert received.get("body") == b"hello"
+        # The final 200 OK reached the client after the interim 100 Continue.
+        assert b"HTTP/1.1 200 OK" in data
+        assert data.endswith(b"got it!")
+        assert b"Connection: close" in data
+
 
 def test_upstream_proxy_env_parsing(monkeypatch):
     assert egress_proxy.upstream_proxy() is None

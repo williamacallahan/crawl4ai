@@ -476,18 +476,24 @@ class PinningProxy:
         # request verbatim, unvalidated, to the first pinned destination.
         header_lines = [line for line in headers.split(b"\r\n") if line]
         nominated = set()
+        expect_continue = False
         for line in header_lines:
             name, _, value = line.partition(b":")
-            if name.strip().lower() == b"connection":
+            lname = name.strip().lower()
+            if lname == b"connection":
                 nominated.update(
                     token.strip().lower()
                     for token in value.split(b",")
                     if token.strip()
                 )
+            elif lname == b"expect" and b"100-continue" in value.strip().lower():
+                expect_continue = True
         framing = {b"content-length", b"transfer-encoding"}
         drop = (nominated - framing) | {
             b"connection", b"keep-alive", b"te", b"trailer", b"upgrade",
         }
+        if expect_continue:
+            drop.add(b"expect")
         headers = b"".join(
             line + b"\r\n"
             for line in header_lines
@@ -512,6 +518,16 @@ class PinningProxy:
         try:
             up_writer.write(out)
             await up_writer.drain()
+            # ``_relay_one`` reads the full request body before reading the
+            # upstream response, so a client using ``Expect: 100-continue``
+            # would deadlock waiting for an interim response we never forward.
+            # We stripped ``Expect`` from the upstream request so the origin
+            # does not wait for one either; send the interim response to the
+            # client ourselves so it sends the body, which ``_relay_one`` then
+            # forwards.
+            if expect_continue:
+                client_writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                await client_writer.drain()
             # _relay_one forwards exactly this one request and its single
             # response, then closes both sockets -- it never pipes a subsequent
             # client request to the already-pinned upstream, so an origin that
