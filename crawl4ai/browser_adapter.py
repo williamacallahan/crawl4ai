@@ -554,6 +554,13 @@ _HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
 # Fallback: matches the first ``<html ...>`` opening tag, case-insensitive,
 # when the document has no ``<head>`` (e.g. ``<html><body>...</body></html>``).
 _HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
+# Opening ``<script ...>`` tag, used to skip script raw text when locating
+# the insertion point for the bootstrap — a ``<head>`` substring inside a
+# script string (e.g. ``<script>const s = "<head>";</script>``) must not be
+# treated as the real ``<head>`` opening tag, or the bootstrap would be
+# injected inside the script and the user script truncated.
+_SCRIPT_OPEN_RE = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
+_SCRIPT_CLOSE_RE = re.compile(r"</script\s*>", re.IGNORECASE)
 # Leading prologue (doctype, XML declaration, HTML comments) that must stay
 # before the bootstrap script when no ``<html>`` / ``<head>`` tag is present,
 # so the document does not flip into quirks mode (a doctype after ``<html>``
@@ -565,25 +572,54 @@ _PROLOG_RE = re.compile(
 )
 
 
-def _search_outside_html_comments(pattern, html: str):
+def _search_outside_html_comments_and_scripts(pattern, html: str):
     """Return the leftmost ``pattern`` match in ``html`` that is not inside
-    an HTML comment. Without this, a tag-like substring inside ``<!-- ... -->``
-    (e.g. ``<!-- <head> -->``) would match ``_HEAD_OPEN_RE`` and the bootstrap
-    would be inserted before ``-->`` — the HTML5 parser then treats it as
-    comment text, so the real ``<head>`` never gets the bootstrap and the
-    following page script runs without capture."""
+    an HTML comment or a ``<script>...</script>`` raw-text region. Without
+    this:
+
+    * a tag-like substring inside ``<!-- ... -->`` (e.g. ``<!-- <head> -->``)
+      would match ``_HEAD_OPEN_RE`` and the bootstrap would be inserted
+      before ``-->`` — the HTML5 parser then treats it as comment text, so
+      the real ``<head>`` never gets the bootstrap and the following page
+      script runs without capture;
+    * a tag-like substring inside a script string (e.g.
+      ``<script>const s = "<head>";</script>``) would match
+      ``_HEAD_OPEN_RE`` and the bootstrap would be inserted inside the
+      script; the generated ``</script>`` then closes the user script
+      early, truncating it and leaving the real ``<head>`` unbootstrapped.
+
+    For each cursor position the function picks the leftmost of: a
+    ``pattern`` match, an HTML comment start, or a ``<script>`` open tag.
+    A pattern match wins (it is returned). A comment is skipped to its
+    ``-->`` terminator. A script open tag is skipped to its matching
+    ``</script>`` close. This mirrors the HTML5 tokenizer's raw-text
+    handling for ``<script>`` (content ends at the first ``</script>``)."""
     cursor = 0
-    while cursor < len(html):
+    n = len(html)
+    while cursor < n:
         match = pattern.search(html, cursor)
         comment_start = html.find("<!--", cursor)
-        if comment_start == -1:
-            return match
-        if match is not None and match.start() < comment_start:
-            return match
-        comment_end = html.find("-->", comment_start + 4)
-        if comment_end == -1:
+        script_open = _SCRIPT_OPEN_RE.search(html, cursor)
+        # Leftmost special region vs. the pattern match.
+        match_pos = match.start() if match is not None else n
+        comment_pos = comment_start if comment_start != -1 else n
+        script_pos = script_open.start() if script_open is not None else n
+        earliest = min(match_pos, comment_pos, script_pos)
+        if earliest == n:
             return None
-        cursor = comment_end + 3
+        if earliest == match_pos:
+            return match
+        if earliest == comment_pos:
+            comment_end = html.find("-->", comment_start + 4)
+            if comment_end == -1:
+                return None
+            cursor = comment_end + 3
+            continue
+        # earliest == script_pos: skip the script raw-text region.
+        script_close = _SCRIPT_CLOSE_RE.search(html, script_open.end())
+        if script_close is None:
+            return None
+        cursor = script_close.end()
     return None
 
 
@@ -614,12 +650,12 @@ def _inject_script_at_head_top(html: str, script_body: str) -> str:
     use of fixed, reviewed constants (``_CONSOLE_CAPTURE_JS`` /
     ``_ERROR_CAPTURE_JS``).
     """
-    head_match = _search_outside_html_comments(_HEAD_OPEN_RE, html)
+    head_match = _search_outside_html_comments_and_scripts(_HEAD_OPEN_RE, html)
     if head_match is not None:
         at = head_match.end()
         return html[:at] + f"<script>{script_body}</script>" + html[at:]
 
-    html_match = _search_outside_html_comments(_HTML_OPEN_RE, html)
+    html_match = _search_outside_html_comments_and_scripts(_HTML_OPEN_RE, html)
     if html_match is not None:
         at = html_match.end()
         return (

@@ -307,6 +307,41 @@ def test_inject_skips_head_tag_inside_html_comment():
     )
 
 
+def test_inject_skips_head_tag_inside_script_raw_text():
+    """A ``<head>``-like substring inside an earlier ``<script>``'s raw
+    text (e.g. ``<script>const s = "<head>";</script>``) must NOT be
+    treated as the head opening tag — otherwise the bootstrap is injected
+    inside the user script, the generated ``</script>`` closes the user
+    script early (truncating it), and the real ``<head>`` after the
+    script stays unbootstrapped so the following page script runs without
+    capture. The script-aware search must skip the entire
+    ``<script>...</script>`` region and find the real ``<head>`` after
+    it."""
+    html = (
+        '<!DOCTYPE html><script>const s = "<head>";</script>'
+        "<html><head><title>real</title></head>"
+        "<body><script>console.log('x')</script></body></html>"
+    )
+    out = _inject_script_at_head_top(html, "/*BS*/")
+    # The user script must survive intact (not truncated by an injected
+    # </script>).
+    assert 'const s = "<head>";' in out, (
+        "user script must not be truncated by the bootstrap insertion: " + out
+    )
+    # The bootstrap must land inside the real <head>, after the user
+    # script, not inside it.
+    real_head_idx = out.find("<html><head>")
+    assert real_head_idx != -1, "real <head> after the user script must be found: " + out
+    script_bs_idx = out.find("<script>/*BS*/</script>")
+    assert script_bs_idx > real_head_idx, (
+        "bootstrap must be the first child of the real <head>, not inserted "
+        "into the earlier script: " + out
+    )
+    assert "<script>/*BS*/</script><title>real</title>" in out, (
+        "bootstrap must precede <title> inside the real <head>: " + out
+    )
+
+
 def test_inject_into_fragment_with_leading_doctype_preserves_standards_mode():
     """A document that omits both ``<html>`` and ``<head>`` but keeps a
     leading ``<!DOCTYPE html>`` (a legal HTML5 document, e.g.
