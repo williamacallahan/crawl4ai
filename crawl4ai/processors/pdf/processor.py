@@ -310,6 +310,20 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                                             # unpack 1-, 2-, and 4-bit predictor
                                             # output and scale to 8-bit.
                                             bits = xobj.get('/BitsPerComponent', 8)
+                                            # ``Image.frombytes`` with mode ``L``
+                                            # or ``RGB`` consumes one byte per
+                                            # sample; for 16-bit samples it
+                                            # silently ignores the extra byte
+                                            # and emits a wrong-pixel PNG.
+                                            # Retain the raw ``bin`` fallback
+                                            # until 16-bit conversion is
+                                            # supported.
+                                            if bits == 16:
+                                                raise ValueError(
+                                                    "16-bit samples unsupported by "
+                                                    "PIL L/RGB conversion; using "
+                                                    "raw bin fallback"
+                                                )
                                             # ``/Indexed`` color spaces map each
                                             # sample to a palette entry; the
                                             # ``L``/``RGB`` paths below would
