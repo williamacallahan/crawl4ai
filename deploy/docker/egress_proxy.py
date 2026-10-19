@@ -739,12 +739,19 @@ class PinningProxy:
         ``c_writer``, and return as soon as the response body is complete so
         the caller can close both ends without waiting for the upstream to
         close (an origin that ignores ``Connection: close`` cannot hold the
-        socket open for a smuggled second request)."""
+        socket open for a smuggled second request).
+
+        The response is accumulated into a buffer and written to the client
+        in 64 KiB chunks (a small response is written as a single chunk), the
+        same way the raw ``_splice`` delivered it -- so a client that issues
+        one bounded ``read()`` for a small response observes the whole
+        response in that read, then EOF when we close, instead of a fragment
+        of it (status line or a single header line) per ``read()``.
+        """
         status_line = await asyncio.wait_for(u_reader.readline(), timeout=30)
         if not status_line:
             return
-        c_writer.write(status_line)
-        await c_writer.drain()
+        buf = bytearray(status_line)
         status_code = 0
         parts = status_line.split(b" ", 2)
         if len(parts) >= 2:
@@ -755,8 +762,7 @@ class PinningProxy:
         content_length, chunked = None, False
         while True:
             line = await asyncio.wait_for(u_reader.readline(), timeout=30)
-            c_writer.write(line)
-            await c_writer.drain()
+            buf.extend(line)
             if line in (b"\r\n", b"\n", b""):
                 break
             name, _, value = line.partition(b":")
@@ -768,31 +774,70 @@ class PinningProxy:
                     content_length = None
             elif lname == b"transfer-encoding" and b"chunked" in value.lower():
                 chunked = True
+
+        async def flush(threshold: int = 65536):
+            if len(buf) >= threshold:
+                c_writer.write(buf)
+                await c_writer.drain()
+                buf.clear()
+
         no_body = (
             method.upper() == b"HEAD"
             or 100 <= status_code < 200
             or status_code in (204, 304)
         )
         if no_body:
+            c_writer.write(buf)
+            await c_writer.drain()
             return
         if chunked:
-            await self._forward_chunked(u_reader, c_writer)
+            while True:
+                line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                buf.extend(line)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                size_field = line.strip().split(b";", 1)[0] or b"0"
+                try:
+                    size = int(size_field, 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    while True:
+                        trailer = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                        buf.extend(trailer)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                remaining = size
+                while remaining > 0:
+                    chunk = await u_reader.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    remaining -= len(chunk)
+                    await flush()
+                crlf = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                buf.extend(crlf)
+                await flush()
         elif content_length is not None:
             remaining = content_length
             while remaining > 0:
                 chunk = await u_reader.read(min(65536, remaining))
                 if not chunk:
                     break
-                c_writer.write(chunk)
-                await c_writer.drain()
+                buf.extend(chunk)
                 remaining -= len(chunk)
+                await flush()
         else:
             while True:
                 chunk = await u_reader.read(65536)
                 if not chunk:
                     break
-                c_writer.write(chunk)
-                await c_writer.drain()
+                buf.extend(chunk)
+                await flush()
+        if buf:
+            c_writer.write(buf)
+            await c_writer.drain()
 
     async def _forward_chunked(self, src, dst):
         """Copy a chunked HTTP/1.1 body (including the terminating zero-size
