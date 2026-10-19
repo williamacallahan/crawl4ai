@@ -176,6 +176,11 @@ def _deploy() -> None:
             # Dokploy's newly submitted update is waiting to start.
             current_update = started_at != "" and started_at != prior_started_at
             if current_update and state == "completed":
+                # Surface a collector death that landed between the last check
+                # and this poll before the post-update refresh, so it is
+                # attributed to the Swarm-update phase and not masked into the
+                # proof phase.
+                collector.check()
                 break
             if current_update and state in {"paused", "rollback_paused", "rollback_completed"}:
                 raise withdrawals.StateError(
@@ -227,7 +232,10 @@ def _deploy() -> None:
         # The finish barrier gets its own fresh caller span: each collector's
         # end marker and "complete" log appear within seconds, so a refresh
         # here keeps the runner's deadline from misreporting a slow earlier
-        # phase as the final collector `"expired"` error.
+        # phase as the final collector `"expired"` error. Check first so a
+        # collector that expired during the public proofs is attributed to
+        # that phase rather than masked by the refresh.
+        collector.check()
         collector.refresh()
         withdrawal_proof = collector.finish(withdrawals.census(app_name))
     proof = {

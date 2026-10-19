@@ -104,10 +104,12 @@ def test_wait_deployment_refreshes_and_checks_the_collector(monkeypatch):
     # Refresh at entry (clock=0, queue admission) and on admission (clock=0,
     # processing reset): both happen before the first time.sleep.
     assert refresh_calls == [0, 0], refresh_calls
-    # Check polls every iteration that does not return early: iter 1 (running,
-    # not done) at clock=0, iter 2 (running, not done) at clock=5; iter 3
-    # returns done before reaching the check.
-    assert check_calls == [0, 5], check_calls
+    # Check before refreshing on admission (clock=0), then every iteration that
+    # does not return early (iter 1 at clock=0, iter 2 at clock=5), and a final
+    # check before the done return at clock=10 so a collector death between
+    # polls is attributed to this phase rather than masked by the caller's
+    # refresh.
+    assert check_calls == [0, 0, 5, 10], check_calls
 
 
 def test_wait_deployment_checks_the_collector_without_one(monkeypatch):

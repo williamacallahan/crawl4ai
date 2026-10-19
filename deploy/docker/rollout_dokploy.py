@@ -165,6 +165,12 @@ def _wait_deployment(
         if matching:
             owned = matching[0]
             if not admitted:
+                if collector is not None:
+                    # Check before refreshing: a queue wait that outlasted the
+                    # runner deadline would be masked by the refresh below, so
+                    # surface the expired collector here instead of extending it
+                    # into the processing phase.
+                    collector.check()
                 admitted = True
                 deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
                 if collector is not None:
@@ -175,6 +181,12 @@ def _wait_deployment(
                 print("stock Dokploy deployment was admitted; waiting for processing", flush=True)
             status = owned.get("status")
             if status == "done":
+                if collector is not None:
+                    # Surface a collector death that landed between the last
+                    # check and this poll before the caller refreshes the
+                    # deadline, so it is attributed to this phase and not the
+                    # finish barrier.
+                    collector.check()
                 return owned
             if status in {"error", "cancelled"}:
                 raise withdrawals.StateError(f"stock Dokploy deployment ended in {status}", status)
