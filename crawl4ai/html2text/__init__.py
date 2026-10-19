@@ -57,6 +57,14 @@ class HTML2Text(html.parser.HTMLParser):
         # non-ignore) table path. <br> inside a cell must stay inline so the
         # GFM row remains on a single physical line.
         self.in_table_cell = 0
+        # Snapshot of in_table_cell at each <table> open, restored on the
+        # matching </table>. Python's html.parser does not synthesize implied
+        # end tags, so a legally omitted </td>/<th> would otherwise leave
+        # in_table_cell elevated forever and leak raw <br> into the rest of
+        # the document. Restoring (rather than zeroing) also keeps the
+        # nested-table case correct: after an inner </table> the counter
+        # returns to the enclosing cell's depth.
+        self._in_table_cell_stack: List[int] = []
         self.unicode_snob = config.UNICODE_SNOB  # covered in cli
 
         self.escape_snob = config.ESCAPE_SNOB  # covered in cli
@@ -733,6 +741,17 @@ class HTML2Text(html.parser.HTMLParser):
                 if tag == "table":
                     if start:
                         self.table_start = True
+                        # Snapshot the cell depth at <table> open so the
+                        # counter is restored at </table>. Python's
+                        # html.parser never synthesizes implied end tags,
+                        # so a legally omitted </td>/<th> would otherwise
+                        # keep in_table_cell elevated past the table
+                        # boundary and leak raw <br> into the rest of the
+                        # document. Restoring (rather than zeroing) also
+                        # keeps nested-table cases correct: after an inner
+                        # </table> the counter returns to the enclosing
+                        # cell's depth.
+                        self._in_table_cell_stack.append(self.in_table_cell)
                         if self.pad_tables:
                             self.o("<" + config.TABLE_MARKER_FOR_PAD + ">")
                             self.o("  \n")
@@ -740,6 +759,13 @@ class HTML2Text(html.parser.HTMLParser):
                             # Ensure table starts on its own line (GFM requirement)
                             self.soft_br()
                     else:
+                        if self._in_table_cell_stack:
+                            self.in_table_cell = self._in_table_cell_stack.pop()
+                        else:
+                            # Stray </table> after an unclosed <td>: drop
+                            # any still-open cell so a later <br> in prose
+                            # is not hijacked by the leaked counter.
+                            self.in_table_cell = 0
                         if self.pad_tables:
                             # add break in case the table is empty or its 1 row table
                             self.soft_br()
