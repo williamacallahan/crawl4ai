@@ -10,7 +10,6 @@ import base64
 import tempfile
 from .utils import *
 from .utils import (
-    apply_png_predictor,
     clean_pdf_text,
     clean_pdf_text_to_html,
 )
@@ -299,18 +298,12 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                                     
                                     if '/FlateDecode' in filters:
                                         try:
-                                            decode_parms = xobj.get('/DecodeParms', {})
-                                            if isinstance(decode_parms, IndirectObject):
-                                                decode_parms = decode_parms.get_object()
-                                            
-                                            predictor = decode_parms.get('/Predictor', 1)
-                                            bits = xobj.get('/BitsPerComponent', 8)
-                                            colors = 3 if color_space == '/DeviceRGB' else 1
-
-                                            if predictor >= 10:
-                                                data = apply_png_predictor(data, width, bits, colors)
-
-                                            # Create PIL Image
+                                            # ``xobj.get_data()`` already
+                                            # applied any PNG predictor
+                                            # (pypdf: ``FlateDecode.decode``
+                                            # -> ``_decode_png_prediction``);
+                                            # calling ``apply_png_predictor``
+                                            # again would double-decode.
                                             from PIL import Image
                                             mode = 'RGB' if color_space == '/DeviceRGB' else 'L'
                                             img = Image.frombytes(mode, (width, height), data)
