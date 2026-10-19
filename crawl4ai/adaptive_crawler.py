@@ -422,27 +422,36 @@ class StatisticalStrategy(CrawlStrategy):
     async def rank_links(self, state: CrawlState, config: AdaptiveConfig) -> List[Tuple[Link, float]]:
         """Rank links by expected information gain"""
         scored_links = []
-        
+        # Filter out already crawled URLs and remove duplicates. ``pending_links``
+        # can contain multiple ``Link`` objects with the same ``href`` (a common
+        # case on real sites where every page links to the same nav/footer
+        # URL). Without this guard, identical-href entries would receive
+        # identical scores, occupy adjacent slots in the descending sort, and
+        # fill the entire ``top_k_links`` slice -- causing the same URL to be
+        # fetched multiple times concurrently within a single batch. Mirrors
+        # the dedup already performed by ``EmbeddingStrategy.rank_links``.
+        seen_urls = set()
+
         for link in state.pending_links:
-            # Skip already crawled URLs
-            if link.href in state.crawled_urls:
+            if link.href in state.crawled_urls or link.href in seen_urls:
                 continue
-                
+            seen_urls.add(link.href)
+
             # Calculate component scores
             relevance = self._calculate_relevance(link, state)
             novelty = self._calculate_novelty(link, state)
             authority = 1.0
-            
+
             # Combined score
             score = (config.relevance_weight * relevance +
                     config.novelty_weight * novelty +
                     config.authority_weight * authority)
-            
+
             scored_links.append((link, score))
-        
+
         # Sort by score descending
         scored_links.sort(key=lambda x: x[1], reverse=True)
-        
+
         return scored_links
     
     def _calculate_relevance(self, link: Link, state: CrawlState) -> float:
@@ -1269,6 +1278,20 @@ class AdaptiveCrawler:
             self.state.embedding_model = self.strategy.embedding_model
         
         try:
+            # Track hrefs already present in ``pending_links`` so the same
+            # uncrawled URL cannot accumulate multiple entries (a common case
+            # via nav/footer links appearing on every crawled page). Built
+            # from any resumed ``pending_links`` (which naturally dedupes
+            # pre-existing duplicate entries from a state saved by an older
+            # version) and maintained as links are appended below. The ranked
+            # ``EmbeddingStrategy.rank_links`` already dedupes its output;
+            # ``StatisticalStrategy.rank_links`` now does the same, but
+            # deduping at the append site additionally prevents
+            # ``pending_links`` from growing unboundedly with duplicates
+            # across iterations (which would otherwise waste ranking work
+            # every cycle).
+            pending_urls = {link.href for link in self.state.pending_links}
+
             # Initial crawl if not resuming
             if start_url not in self.state.crawled_urls:
                 result = await self._crawl_with_preview(start_url, query)
@@ -1280,10 +1303,10 @@ class AdaptiveCrawler:
                         if isinstance(result.links, dict):
                             # Extract internal and external links from dict
                             internal_links = [Link(**link) for link in result.links.get('internal', [])]
-                            self.state.pending_links.extend(internal_links)
                         else:
                             # Handle Links object
-                            self.state.pending_links.extend(result.links.internal)
+                            internal_links = result.links.internal
+                        self._extend_pending_links(internal_links, pending_urls)
                     
                     # Update state
                     await self.strategy.update_state(self.state, [result])
@@ -1341,10 +1364,9 @@ class AdaptiveCrawler:
                                 # Handle Links object
                                 new_links = result.links.internal
                             
-                            # Add new links to pending
-                            for new_link in new_links:
-                                if new_link.href not in self.state.crawled_urls:
-                                    self.state.pending_links.append(new_link)
+                            # Add new links to pending, deduping by href
+                            # against ``crawled_urls`` and ``pending_urls``.
+                            self._extend_pending_links(new_links, pending_urls)
                     
                     # Update state with new results
                     await self.strategy.update_state(self.state, new_results)
@@ -1444,6 +1466,31 @@ class AdaptiveCrawler:
             # result is None when _crawl_with_preview swallowed an exception;
             # nothing to record in that case -- the link stays re-eligible.
         return valid_pairs
+
+    def _extend_pending_links(self, new_links: List[Link], pending_urls: Set[str]) -> None:
+        """Append newly discovered links to ``state.pending_links`` while
+        deduplicating by ``href`` against both ``state.crawled_urls`` and the
+        in-progress ``pending_urls`` set.
+
+        ``pending_urls`` is mutated in place and stays in sync with the hrefs
+        of ``state.pending_links``. Without this guard, the same uncrawled URL
+        (e.g. a nav/footer link present on every crawled page) would be
+        appended once per crawled page that links to it, allowing duplicate
+        entries to fill the entire ``top_k_links`` slice and be fetched
+        multiple times concurrently in a single batch. The ranked-strategy
+        ``rank_links`` methods also dedupe their output independently, but
+        deduping here additionally prevents ``pending_links`` from growing
+        unboundedly with duplicates across iterations (which would otherwise
+        waste ranking work every cycle).
+        """
+        for new_link in new_links:
+            href = new_link.href
+            if not href:
+                continue
+            if href in self.state.crawled_urls or href in pending_urls:
+                continue
+            self.state.pending_links.append(new_link)
+            pending_urls.add(href)
     
     # Status properties
     @property
