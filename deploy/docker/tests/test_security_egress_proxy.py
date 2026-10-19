@@ -1209,7 +1209,17 @@ class TestDirectDialNoSmuggling:
                  f"Host: plain.example:{origin_port}\r\n\r\n").encode()
             )
             await w.drain()
-            data = await asyncio.wait_for(r.read(8192), timeout=5)
+            # Read until EOF: the proxy forwards the interim 100 Continue and
+            # the final 200 OK as separate writes, then closes the client
+            # socket in _relay_one's finally.  A single bounded read() may
+            # return after just the interim block (timing-dependent), so drain
+            # to EOF to observe both responses.
+            data = b""
+            while True:
+                chunk = await asyncio.wait_for(r.read(8192), timeout=5)
+                if not chunk:
+                    break
+                data += chunk
             w.close()
         finally:
             await proxy.stop()
