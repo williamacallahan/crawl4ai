@@ -621,7 +621,17 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             if (
                 len(text_content.split())
                 < (1 if el.tag in inline_tags else word_count_threshold)
-                and not el.getchildren()
+                and (
+                    not el.getchildren()
+                    or (
+                        el.tag not in inline_tags
+                        and not any(
+                            descendant.tag in bypass_tags
+                            or descendant.tag in ("pre", "code")
+                            for descendant in el.iterdescendants()
+                        )
+                    )
+                )
             ):
                 parent = el.getparent()
                 if parent is not None:

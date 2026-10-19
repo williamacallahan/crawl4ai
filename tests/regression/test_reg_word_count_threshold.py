@@ -220,6 +220,76 @@ class TestInlineAndChildlessCodeBlocks:
         assert ">x<" in ch, "<code> text must be preserved"
 
 
+# T4c: short non-inline parent blocks must be pruned even when they have
+# children, *unless* a descendant is in ``bypass_tags`` or is a ``<pre>``/
+# ``<code>`` element (in which case the parent is preserved to protect the
+# bypass/code content). This prevents a short ``<p><strong>Menu</strong></p>``
+# from lingering at a high threshold solely because the ``<strong>`` child
+# blocked the old ``not el.getchildren()`` guard, while still keeping
+# ``<p><a href="/">Home</a></p>`` and ``<div><pre>short</pre></div>``.
+
+SHORT_INLINE_PARENT_HTML = (
+    "<html><body>"
+    '<p id="short_menu"><strong>Menu</strong></p>'
+    '<p id="pad">' + _paragraph(60, prefix="pad") + "</p>"
+    "</body></html>"
+)
+
+SHORT_BYPASS_PARENT_HTML = (
+    "<html><body>"
+    '<p id="short_link"><a href="/">Home</a></p>'
+    '<p id="pad">' + _paragraph(60, prefix="pad") + "</p>"
+    "</body></html>"
+)
+
+SHORT_PRE_PARENT_HTML = (
+    "<html><body>"
+    '<div id="short_pre"><pre>short</pre></div>'
+    '<p id="pad">' + _paragraph(60, prefix="pad") + "</p>"
+    "</body></html>"
+)
+
+
+class TestShortParentPruning:
+    """Short non-inline parents are pruned even with children, but a parent
+    holding a bypass tag or ``<pre>``/``<code>`` descendant is preserved."""
+
+    def test_short_parent_with_only_inline_child_is_pruned(self, scraper):
+        ch = _cleaned(
+            scraper._scrap(
+                "raw://test", SHORT_INLINE_PARENT_HTML, word_count_threshold=50
+            )
+        )
+        assert "Menu" not in ch, (
+            "short <p><strong>Menu</strong></p> must be pruned at threshold=50"
+        )
+        assert "<strong" not in ch, (
+            "the inline child of a pruned short parent is removed with it"
+        )
+
+    def test_short_parent_with_bypass_descendant_survives(self, scraper):
+        ch = _cleaned(
+            scraper._scrap(
+                "raw://test", SHORT_BYPASS_PARENT_HTML, word_count_threshold=50
+            )
+        )
+        assert "<a" in ch, (
+            "<a> bypass descendant must keep its short parent alive at threshold=50"
+        )
+        assert "Home" in ch, "<a> text must be preserved"
+
+    def test_short_parent_with_pre_descendant_survives(self, scraper):
+        ch = _cleaned(
+            scraper._scrap(
+                "raw://test", SHORT_PRE_PARENT_HTML, word_count_threshold=50
+            )
+        )
+        assert "<pre" in ch, (
+            "<pre> descendant must keep its short parent alive at threshold=50"
+        )
+        assert "short" in ch, "<pre> text must be preserved"
+
+
 # T5: end-to-end through ``AsyncWebCrawler.arun``. Pins the full plumbing
 # chain ``CrawlerRunConfig.word_count_threshold`` -> ``arun`` -> ``ascrap``
 # -> ``scrap`` -> ``_scrap(word_count_threshold=...)``. The browser fetch
