@@ -194,30 +194,32 @@ def test_thead_colspan_starts_before_pending_rowspan_header_preserved():
 
 
 def test_real_world_summary_row_overlaps_pending_continuation():
-    # The "Impact" scenario from the bug report: a Category rowspan is still
-    # pending (its continuation belongs in row 3), but row 3 is a full-width
-    # "<td colspan=3>" that starts at col 0 and spans across col 0 where the
-    # continuation belongs. Under the bug, the pending Category A leaked past
-    # the summary row into row 4. After the fix, Category A's continuation
-    # occupies col 0 of the summary row, Total A fills cols 1 and 2 only,
-    # and row 4 is unshifted.
+    # The "Impact" scenario from the bug report: a Category rowspan sits in
+    # the MIDDLE column (col 1) and is still pending (its continuation belongs
+    # in row 3), while row 3 is a full-width "<td colspan=3>" that starts at
+    # col 0 and spans across col 1 where the continuation belongs. The leading
+    # ``while col in pending`` consumes col 0 but leaves col 1 pending, so the
+    # overlap is exercised inside the colspan loop itself. Under the bug,
+    # Category A leaked past the summary row into row 4. After the fix,
+    # Category A's continuation occupies col 1 of the summary row, Total A
+    # fills cols 0 and 2 only, and row 4 is unshifted.
     table = (
         "<table><thead>"
         "<tr><th>Cat</th><th>Metric</th><th>Value</th></tr>"
         "</thead><tbody>"
-        '<tr><td rowspan="3">Category A</td><td>Count</td><td>10</td></tr>'
+        '<tr><td>Count</td><td rowspan="3">Category A</td><td>10</td></tr>'
         "<tr><td>Volume</td><td>20</td></tr>"
         '<tr><td colspan="3">Total A</td></tr>'
-        "<tr><td>Category B</td><td>Count</td><td>5</td></tr>"
+        "<tr><td>Count</td><td>Category B</td><td>5</td></tr>"
         "</tbody></table>"
     )
     _, data = _extract(table, table_score_threshold=0)
 
     assert data["rows"] == [
-        ["Category A", "Count", "10"],
-        ["Category A", "Volume", "20"],
-        ["Category A", "Total A", "Total A"],
-        ["Category B", "Count", "5"],
+        ["Count", "Category A", "10"],
+        ["Volume", "Category A", "20"],
+        ["Total A", "Category A", "Total A"],
+        ["Count", "Category B", "5"],
     ]
-    assert data["rows"][2][0] == "Category A"
-    assert data["rows"][3] == ["Category B", "Count", "5"]
+    assert data["rows"][2][1] == "Category A"
+    assert data["rows"][3] == ["Count", "Category B", "5"]
