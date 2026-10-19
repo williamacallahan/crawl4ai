@@ -455,7 +455,12 @@ async def test_digest_normalizes_resumed_pending_links_keeping_best_preview():
     scores, ``digest`` normalizes ``pending_links`` keeping the highest-scoring
     representative per href (not the first), so ``rank_links`` sees the stronger
     preview and the href can clear ``min_gain_threshold``."""
-    crawler = _make_crawler(max_depth=1, top_k_links=3, min_gain_threshold=1.0)
+    # With the default weights and an empty knowledge base, ``http://site/x``
+    # (contextual_score=0.9) scores 0.95 and ``http://site/y`` (0.5) scores
+    # 0.75. A threshold between the two lets the stronger href through so the
+    # resumed crawl actually fetches it; a threshold of 1.0 would gate it out
+    # and the assertions below would pass without exercising the fetch path.
+    crawler = _make_crawler(max_depth=1, top_k_links=3, min_gain_threshold=0.8)
     start_url = "http://site/already"
     state = CrawlState(
         crawled_urls={start_url}, knowledge_base=[],
@@ -473,7 +478,13 @@ async def test_digest_normalizes_resumed_pending_links_keeping_best_preview():
     async def fake_preview(url, query):
         return _result(url, True, content=f"{url} alpha")
 
-    crawler._crawl_with_preview = fake_preview
+    fetched = []
+
+    async def recording_preview(url, query):
+        fetched.append(url)
+        return await fake_preview(url, query)
+
+    crawler._crawl_with_preview = recording_preview
     await crawler.digest(start_url=start_url, query="alpha", resume_from=state_path)
 
     by_href = {link.href: link for link in crawler.state.pending_links}
@@ -481,6 +492,8 @@ async def test_digest_normalizes_resumed_pending_links_keeping_best_preview():
     assert by_href["http://site/x"].contextual_score == 0.9
     hrefs = [link.href for link in crawler.state.pending_links]
     assert len(hrefs) == len(set(hrefs))
+    # The stronger href is fetched exactly once (rank_links dedupes by href).
+    assert fetched.count("http://site/x") == 1
 
 
 # Script runner (matches other tests/regression/*.py files)
