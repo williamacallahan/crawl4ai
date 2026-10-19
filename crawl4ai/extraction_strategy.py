@@ -1449,11 +1449,9 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
 
         # Success criteria
         if expected_fields:
-            # Strict: all expected fields must exist in schema AND be populated
-            # (baseFields count just like fields — extract() merges both.)
-            schema_field_names = {f["name"] for f in schema.get("fields", [])} | {
-                f["name"] for f in schema.get("baseFields", [])
-            }
+            # Strict: all expected fields must be populated.
+            # (populated_names is derived from fields + baseFields, so
+            # membership implies the field exists in the schema.)
             populated_names = {
                 fd["name"] for fd in result["field_details"] if fd["populated_count"] > 0
             }
