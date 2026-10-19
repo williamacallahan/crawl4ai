@@ -342,6 +342,38 @@ def test_inject_skips_head_tag_inside_script_raw_text():
     )
 
 
+def test_inject_skips_head_tag_inside_style_raw_text():
+    """A ``<head>``-like substring inside a ``<style>`` block's raw text
+    (e.g. ``<style>.x > head { ... }</style>``) must NOT be treated as the
+    head opening tag — the HTML5 tokenizer treats ``<style>`` content as
+    raw text, so ``<head>`` inside it is not a tag. If the bootstrap were
+    injected inside the style block, the real ``<head>`` after it would
+    stay unbootstrapped so the following page script runs without capture.
+    The style-aware search must skip the entire ``<style>...</style>``
+    region and find the real ``<head>`` after it."""
+    html = (
+        "<!DOCTYPE html><style>.x > head { color: red }</style>"
+        "<html><head><title>real</title></head>"
+        "<body><script>console.log('x')</script></body></html>"
+    )
+    out = _inject_script_at_head_top(html, "/*BS*/")
+    # The style block must survive intact and unchanged.
+    assert ".x > head { color: red }" in out, (
+        "style block must not be modified by the bootstrap insertion: " + out
+    )
+    # The bootstrap must land inside the real <head>, after the style block.
+    real_head_idx = out.find("<html><head>")
+    assert real_head_idx != -1, "real <head> after the style block must be found: " + out
+    script_bs_idx = out.find("<script>/*BS*/</script>")
+    assert script_bs_idx > real_head_idx, (
+        "bootstrap must be the first child of the real <head>, not inserted "
+        "into the style block: " + out
+    )
+    assert "<script>/*BS*/</script><title>real</title>" in out, (
+        "bootstrap must precede <title> inside the real <head>: " + out
+    )
+
+
 def test_inject_into_fragment_with_leading_doctype_preserves_standards_mode():
     """A document that omits both ``<html>`` and ``<head>`` but keeps a
     leading ``<!DOCTYPE html>`` (a legal HTML5 document, e.g.

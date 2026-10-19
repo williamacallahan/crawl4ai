@@ -561,6 +561,15 @@ _HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
 # injected inside the script and the user script truncated.
 _SCRIPT_OPEN_RE = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
 _SCRIPT_CLOSE_RE = re.compile(r"</script\s*>", re.IGNORECASE)
+# Opening ``<style ...>`` tag, used to skip style raw text when locating the
+# injection point — a ``<head>`` substring inside a ``<style>`` block
+# (e.g. ``<style>.x > head { ... }</style>``, or a literal ``<head>``
+# in a style string) must not be treated as the real ``<head>`` opening
+# tag, or the bootstrap would be injected inside the style block and the
+# real ``<head>`` would stay unbootstrapped so the following page script
+# runs without capture.
+_STYLE_OPEN_RE = re.compile(r"<style\b[^>]*>", re.IGNORECASE)
+_STYLE_CLOSE_RE = re.compile(r"</style\s*>", re.IGNORECASE)
 # Leading prologue (doctype, XML declaration, HTML comments) that must stay
 # before the bootstrap script when no ``<html>`` / ``<head>`` tag is present,
 # so the document does not flip into quirks mode (a doctype after ``<html>``
@@ -587,24 +596,33 @@ def _search_outside_html_comments_and_scripts(pattern, html: str):
       ``_HEAD_OPEN_RE`` and the bootstrap would be inserted inside the
       script; the generated ``</script>`` then closes the user script
       early, truncating it and leaving the real ``<head>`` unbootstrapped.
+    * a tag-like substring inside a ``<style>`` block (e.g.
+      ``<style>.x > head { ... }</style>``) would match ``_HEAD_OPEN_RE``
+      and the bootstrap would be injected inside the style block; the
+      real ``<head>`` then stays unbootstrapped so the following page
+      script runs without capture.
 
     For each cursor position the function picks the leftmost of: a
-    ``pattern`` match, an HTML comment start, or a ``<script>`` open tag.
-    A pattern match wins (it is returned). A comment is skipped to its
-    ``-->`` terminator. A script open tag is skipped to its matching
-    ``</script>`` close. This mirrors the HTML5 tokenizer's raw-text
-    handling for ``<script>`` (content ends at the first ``</script>``)."""
+    ``pattern`` match, an HTML comment start, a ``<script>`` open tag, or
+    a ``<style>`` open tag. A pattern match wins (it is returned). A
+    comment is skipped to its ``-->`` terminator. A script open tag is
+    skipped to its matching ``</script>`` close. A style open tag is
+    skipped to its matching ``</style>`` close. This mirrors the HTML5
+    tokenizer's raw-text handling for ``<script>`` and ``<style>``
+    (content ends at the first matching close tag)."""
     cursor = 0
     n = len(html)
     while cursor < n:
         match = pattern.search(html, cursor)
         comment_start = html.find("<!--", cursor)
         script_open = _SCRIPT_OPEN_RE.search(html, cursor)
+        style_open = _STYLE_OPEN_RE.search(html, cursor)
         # Leftmost special region vs. the pattern match.
         match_pos = match.start() if match is not None else n
         comment_pos = comment_start if comment_start != -1 else n
         script_pos = script_open.start() if script_open is not None else n
-        earliest = min(match_pos, comment_pos, script_pos)
+        style_pos = style_open.start() if style_open is not None else n
+        earliest = min(match_pos, comment_pos, script_pos, style_pos)
         if earliest == n:
             return None
         if earliest == match_pos:
@@ -614,6 +632,12 @@ def _search_outside_html_comments_and_scripts(pattern, html: str):
             if comment_end == -1:
                 return None
             cursor = comment_end + 3
+            continue
+        if earliest == style_pos:
+            style_close = _STYLE_CLOSE_RE.search(html, style_open.end())
+            if style_close is None:
+                return None
+            cursor = style_close.end()
             continue
         # earliest == script_pos: skip the script raw-text region.
         script_close = _SCRIPT_CLOSE_RE.search(html, script_open.end())
