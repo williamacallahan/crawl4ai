@@ -591,6 +591,11 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             "td",
             "th",
         }
+        inline_tags = {
+            "b", "strong", "i", "em", "u", "s", "small", "mark",
+            "sub", "sup", "abbr", "cite", "q", "kbd", "samp",
+            "var", "time", "span", "label",
+        }
 
         for el in reversed(list(root.iterdescendants())):
             if not isinstance(el, lhtml.HtmlElement):
@@ -609,12 +614,13 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                     break
                 ancestor = ancestor.getparent()
 
-            if is_in_code_block:
+            if el.tag in ("pre", "code") or is_in_code_block:
                 continue
 
             text_content = (el.text_content() or "").strip()
             if (
-                len(text_content.split()) < word_count_threshold
+                len(text_content.split())
+                < (1 if el.tag in inline_tags else word_count_threshold)
                 and not el.getchildren()
             ):
                 parent = el.getparent()

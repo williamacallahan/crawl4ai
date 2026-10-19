@@ -169,6 +169,57 @@ class TestBypassTagsAndCodeBlocks:
         )
 
 
+# T4b: inline elements inside a long paragraph and childless ``<pre>``/``<code>``
+# must survive a high threshold. The threshold applies to block-level elements
+# only; short inline leaves (``<strong>``, ``<code>``, ``<span>``, ...) are kept
+# with a threshold of 1, and childless ``<pre>``/``<code>`` are protected
+# directly (the ancestor-based code-block check only covers descendants).
+
+INLINE_IN_LONG_PARA_HTML = (
+    "<html><body>"
+    '<p id="long">' + _paragraph(60, prefix="pad") + "</p>"
+    "<p>This sentence has a <strong>bold</strong> word and a "
+    "<code>code</code> word and an <em>em</em> word.</p>"
+    "</body></html>"
+)
+
+CHILDLESS_PRE_HTML = (
+    "<html><body>"
+    '<p>' + _paragraph(60, prefix="pad") + '</p>'
+    "<pre>short</pre>"
+    "<code>x</code>"
+    "</body></html>"
+)
+
+
+class TestInlineAndChildlessCodeBlocks:
+    """``word_count_threshold`` must not strip short inline text inside a
+    longer paragraph nor childless ``<pre>``/``<code>`` blocks."""
+
+    def test_inline_elements_survive_high_threshold(self, scraper):
+        ch = _cleaned(
+            scraper._scrap(
+                "raw://test", INLINE_IN_LONG_PARA_HTML, word_count_threshold=50
+            )
+        )
+        assert "<strong" in ch, "<strong> inline text must survive"
+        assert "<code" in ch, "<code> inline text must survive"
+        assert "<em" in ch, "<em> inline text must survive"
+        assert "bold" in ch, "<strong> word text must be preserved"
+        assert "code" in ch, "<code> word text must be preserved"
+
+    def test_childless_pre_code_survive_high_threshold(self, scraper):
+        ch = _cleaned(
+            scraper._scrap(
+                "raw://test", CHILDLESS_PRE_HTML, word_count_threshold=50
+            )
+        )
+        assert "<pre" in ch, "childless <pre> must survive a high threshold"
+        assert "short" in ch, "<pre> text must be preserved"
+        assert "<code" in ch, "childless <code> must survive a high threshold"
+        assert ">x<" in ch, "<code> text must be preserved"
+
+
 # T5: end-to-end through ``AsyncWebCrawler.arun``. Pins the full plumbing
 # chain ``CrawlerRunConfig.word_count_threshold`` -> ``arun`` -> ``ascrap``
 # -> ``scrap`` -> ``_scrap(word_count_threshold=...)``. The browser fetch
