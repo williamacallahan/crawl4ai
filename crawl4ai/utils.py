@@ -2587,9 +2587,12 @@ def is_external_url(url: str, base_domain: str) -> bool:
         if not parsed.netloc:  # Relative URL
             return False
 
-        # Strip port and 'www.' from both domains for comparison
-        url_domain = parsed.netloc.lower().split(":")[0].replace("www.", "")
-        base = base_domain.lower().split(":")[0].replace("www.", "")
+        # Strip port and a leading 'www.' label from both domains for
+        # comparison. Use anchored prefix stripping (removeprefix) rather than
+        # unanchored replace so hosts that merely contain "www." as a
+        # substring (e.g. "mywww.example.com") are not mis-normalized.
+        url_domain = parsed.netloc.lower().split(":")[0].removeprefix("www.")
+        base = base_domain.lower().split(":")[0].removeprefix("www.")
 
         # Check if URL domain is the same as, or a subdomain of, the base
         # domain. Enforce a label boundary so lookalike hosts whose hostname

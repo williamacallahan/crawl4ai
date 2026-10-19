@@ -1054,13 +1054,15 @@ class DomainMapper:
         # Normalize the scanned host the same way ``is_external_url`` normalizes
         # a URL's netloc (lowercase, strip port, strip leading ``www.``) so the
         # exact-host predicate below agrees with the rest of the codebase on
-        # canonical ``www.``-aliasing.
-        host_norm = host.lower().split(":")[0].replace("www.", "")
+        # canonical ``www.``-aliasing. Use anchored ``removeprefix`` rather than
+        # unanchored ``replace`` so hosts that merely contain ``www.`` as a
+        # substring (e.g. ``mywww.example.com``) are not mis-normalized.
+        host_norm = host.lower().split(":")[0].removeprefix("www.")
 
         def _on_host(u: str) -> bool:
             try:
                 return (
-                    urlparse(u).netloc.lower().split(":")[0].replace("www.", "")
+                    urlparse(u).netloc.lower().split(":")[0].removeprefix("www.")
                     == host_norm
                 )
             except Exception:
