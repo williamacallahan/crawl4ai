@@ -801,6 +801,86 @@ check("Large 200 JSON feed not blocked despite large size",
     False)
 
 
+# =========================================================================
+# SITE-WIDE SENSOR RAW-SNIPPET FP GUARD (HTTP 200) — regression for the
+# PerimeterX false-positive bug.
+# =========================================================================
+# Commit b4d03c2a excluded the three site-wide sensor markers
+# (window._pxAppId, captcha-delivery.com, KPSDK.scriptStart) from the
+# large-page DEEP scan so legitimate large 200 articles on
+# PerimeterX/DataDome/Kasada-protected sites are not flagged as blocked.
+# But the deep scan only runs once html_len > 15000, and the FP guard only
+# applied to markers PAST the 15000-byte raw-snippet window. The
+# raw-snippet Tier 1 pass scanned the first 15000 bytes of EVERY response
+# unconditionally, so a sensor sitting in <head> — exactly where
+# PerimeterX, DataDome and Kasada deploy it on EVERY page of a protected
+# site — flipped is_blocked(200, page) from (False, '') to
+# (True, '<vendor> ...') for every successful crawl of the site.
+#
+# The fix: split _TIER1_PATTERNS into block-page-only markers (searched
+# raw unconditionally) and site-wide sensors (searched raw only when an
+# HTTP error status, >= 400, corroborates the sensor).
+#
+# The four `check()` cases below pin the bug-report headline scenario and
+# the three load-bearing paths (200 FP guard, 403 corroboration, 400
+# boundary, silent-200 fallback). The three-sensor x small/large x status
+# matrix is covered exhaustively by the pytest functions at the bottom
+# of this file (test_sensor_in_head_window_*,
+# test_sensor_with_error_status_corroborates_block,
+# test_corroboration_boundary_is_exactly_status_ge_400,
+# test_silent_200_sensor_block_still_caught_by_fallback_paths).
+
+def _px_legit_in_window_small():
+    """Small legit PX-protected product page with the site-wide window._pxAppId
+    sensor in <head>, inside the first 15000 bytes (real-world deployment)."""
+    page = (
+        '<html><head><title>Widget Pro - Premium Ergonomic Mouse</title>'
+        "<script>window._pxAppId = 'PX9aBcDe';</script>"
+        '</head><body>'
+        '<h1>Widget Pro</h1>'
+        '<p>Our flagship widget delivers precision tracking and ergonomic design.</p>'
+        '<p>Features include long battery life, programmable buttons, USB-C charging.</p>'
+        '<p>Customer reviews consistently rate this product 4.8 out of 5 stars.</p>'
+        '<a href="/cart">Add to cart</a> <a href="/reviews">Read reviews</a>'
+        '</body></html>'
+    )
+    assert page.index('_pxAppId') < 15000, "sensor must be inside the raw-snippet window"
+    assert len(page) < 15000, "page must be small enough to NOT trigger the deep scan"
+    return page
+
+
+print("\n=== SITE-WIDE SENSOR RAW-SNIPPET FP GUARD (HTTP 200) ===\n")
+
+# The exact scenario every prior test deliberately avoided
+# (`assert page.index(...) > 15000`): a legitimate 200 page with the
+# site-wide sensor in <head>, inside the first 15000 bytes. Pre-fix this
+# returned (True, "PerimeterX block"); post-fix it returns (False, "").
+check("Legit PX page (_pxAppId in <head>, 200) not blocked (FP guard)",
+    is_blocked(200, _px_legit_in_window_small()),
+    False)
+
+# Same page on a 403 — sensor + corroboration = blocked, surface the
+# vendor reason (the load-bearing new detection path that replaces the
+# old unconditional raw-snippet sensor pass).
+check("PX block (403, _pxAppId in <head>) blocked via corroboration",
+    is_blocked(403, _px_legit_in_window_small()),
+    True, "PerimeterX block")
+
+# Corroboration boundary: status_code >= 400 is the exact threshold.
+check("PX (400, _pxAppId in <head>) blocked (at corroboration boundary)",
+    is_blocked(400, _px_legit_in_window_small()),
+    True, "PerimeterX block")
+
+# A genuine silent-200 block page (sensor only, near-empty body) must
+# STILL be caught — the fix routes 200 sensors through the existing
+# `200 + near-empty` path and the Tier 3 structural-integrity check.
+_silent_px_block = '<html><body><script>window._pxAppId = "PX1";</script></body></html>'
+assert len(_silent_px_block) < 100, "must fall in the 200 + near-empty window"
+check("Silent PX block (200, near-empty + sensor) caught by near-empty path",
+    is_blocked(200, _silent_px_block),
+    True, "Near-empty")
+
+
 
 # =========================================================================
 print(f"\n{'=' * 60}")
@@ -996,4 +1076,163 @@ def test_script_block_pass_ignores_sensor_only_script():
     assert 'captcha.px-cdn.net' not in page
     assert 'orchestrate' not in page
     assert is_blocked(200, page) == (False, "")
+
+
+# =========================================================================
+# pytest-style regression tests for the raw-snippet site-wide-sensor FP
+# guard (the PerimeterX false-positive bug). Per this file's convention
+# (see the comment above the foster-parenting tests), the `is_blocked`-
+# level shapes are covered by the `check()` cases in the SITE-WIDE SENSOR
+# RAW-SNIPPET FP GUARD section above. The functions below cover the
+# fix-specific contracts that are NOT otherwise exercised there: the
+# in-window FP-guard contract for all three sensors, the exact
+# corroboration boundary, and the no-corroboration-on-None contract.
+# =========================================================================
+
+
+def test_sensor_in_head_window_does_not_block_legitimate_200_page():
+    """Each of the three site-wide sensors (window._pxAppId,
+    captcha-delivery.com, KPSDK.scriptStart) sitting in <head> inside the
+    first 15000 bytes of a legitimate 200 page must NOT be flagged. This is
+    the case every prior test deliberately avoided by asserting
+    `page.index(...) > 15000`."""
+    # PX — small page, sensor in <head>
+    small_px = (
+        '<html><head><title>Widget Pro</title>'
+        "<script>window._pxAppId = 'PX9aBcDe';</script>"
+        '</head><body>'
+        '<h1>Widget Pro</h1>'
+        '<p>Our flagship widget delivers precision tracking and ergonomic design.</p>'
+        '<p>Features include long battery life, programmable buttons, USB-C charging.</p>'
+        '<a href="/cart">Add to cart</a>'
+        '</body></html>'
+    )
+    assert small_px.index('_pxAppId') < 15000
+    assert is_blocked(200, small_px) == (False, "")
+
+    # PX — large page, sensor in <head> inside the raw-snippet window
+    large_px = (
+        '<html><head><title>Article</title>'
+        "<script>window._pxAppId = 'PX9aBcDe';</script>"
+        '</head><body>'
+        + ('<article><p>Real article content about web security and bot detection systems.</p></article>' * 800)
+        + '</body></html>'
+    )
+    assert large_px.index('_pxAppId') < 15000
+    assert len(large_px) > 15000
+    assert is_blocked(200, large_px) == (False, "")
+
+    # DataDome — small page, sensor in <head>
+    small_dd = (
+        '<html><head><title>Widget Pro</title>'
+        '<script src="https://geo.captcha-delivery.com/abc.js"></script>'
+        '</head><body>'
+        '<h1>Widget Pro</h1>'
+        '<p>Our flagship widget delivers precision tracking and ergonomic design.</p>'
+        '<p>Features include long battery life, programmable buttons, USB-C charging.</p>'
+        '<a href="/cart">Add to cart</a>'
+        '</body></html>'
+    )
+    assert small_dd.index('captcha-delivery.com') < 15000
+    assert is_blocked(200, small_dd) == (False, "")
+
+    # Kasada — small page, sensor in <head>
+    small_ks = (
+        '<html><head><title>Article</title>'
+        '<script>KPSDK.scriptStart = KPSDK.now();</script>'
+        '</head><body>'
+        '<h1>Web Security Article</h1>'
+        '<p>Real article content about web security and bot detection systems.</p>'
+        '<a href="/more">Read more</a>'
+        '</body></html>'
+    )
+    assert small_ks.index('KPSDK.scriptStart') < 15000
+    assert is_blocked(200, small_ks) == (False, "")
+
+
+def test_sensor_with_error_status_corroborates_block():
+    """The same in-<head> sensor pages with status 403 MUST be flagged — the
+    new corroboration branch (status >= 400 + sensor) is the load-bearing
+    detection path that replaces the old unconditional raw-snippet sensor.
+    Catches the regression where a 403 PX block page with only the sensor
+    would otherwise be classed as a generic 403 instead of 'PerimeterX block'."""
+    px_page = (
+        '<html><head><title>Blocked</title>'
+        "<script>window._pxAppId = 'PX9aBcDe';</script>"
+        '</head><body><h1>Blocked</h1><p>Real product content for users.</p></body></html>'
+    )
+    assert px_page.index('_pxAppId') < 15000
+    assert is_blocked(403, px_page) == (True, "PerimeterX block")
+
+    dd_page = (
+        '<html><head><title>Blocked</title>'
+        '<script src="https://geo.captcha-delivery.com/abc.js"></script>'
+        '</head><body><h1>Blocked</h1><p>Real product content for users.</p></body></html>'
+    )
+    blocked, reason = is_blocked(403, dd_page)
+    assert blocked is True
+    assert "DataDome" in reason
+
+    ks_page = (
+        '<html><head><title>Blocked</title>'
+        '<script>KPSDK.scriptStart = KPSDK.now();</script>'
+        '</head><body><h1>Blocked</h1><p>Real article content for users.</p></body></html>'
+    )
+    blocked, reason = is_blocked(403, ks_page)
+    assert blocked is True
+    assert "Kasada" in reason
+
+
+def test_corroboration_boundary_is_exactly_status_ge_400():
+    """`status_code >= 400` is the exact corroboration threshold. 399 must
+    NOT corroborate; 400 must. None must NOT corroborate. Pins the boundary
+    so a future refactor cannot shift it (e.g. to `> 400` or `>= 500`)
+    without breaking these assertions."""
+    page = (
+        '<html><head><title>Widget Pro</title>'
+        "<script>window._pxAppId = 'PX9aBcDe';</script>"
+        '</head><body>'
+        '<h1>Widget Pro</h1>'
+        '<p>Real product content for users and researchers.</p>'
+        '<p>More genuine paragraph content for a legitimate page description.</p>'
+        '<a href="/cart">Add to cart</a>'
+        '</body></html>'
+    )
+    assert page.index('_pxAppId') < 15000
+
+    # 200 and 399: no corroboration -> not blocked (raw-snippet sensor skipped)
+    assert is_blocked(200, page) == (False, "")
+    assert is_blocked(399, page) == (False, "")
+
+    # 400, 403, 500, 503: corroboration -> blocked via the sensor
+    for status in (400, 403, 500, 503):
+        assert is_blocked(status, page) == (True, "PerimeterX block"), \
+            f"status {status} should corroborate the sensor"
+
+    # None status: no corroboration -> not blocked
+    assert is_blocked(None, page) == (False, "")
+
+
+def test_silent_200_sensor_block_still_caught_by_fallback_paths():
+    """A genuine silent-200 block page (sensor only, no real content) must
+    STILL be caught — the fix only removes the raw-snippet sensor pass on
+    200; the 200 + near-empty path and the Tier 3 structural-integrity
+    check remain as fallbacks. Guards against the obvious "you broke
+    detection of real silent-200 blocks" objection to the fix."""
+    # Tiny page — below the 100-byte near-empty threshold.
+    tiny = '<html><body><script>window._pxAppId = "PX1";</script></body></html>'
+    assert len(tiny) < 100
+    assert is_blocked(200, tiny)[0] is True
+    assert "Near-empty" in is_blocked(200, tiny)[1]
+
+    # Bigger than 100 bytes so it bypasses near-empty, but Tier 3 catches it
+    # via minimal_text + no content elements (script-only shell).
+    shell = (
+        '<html><!-- ' + ('padding ' * 14) + '-->'
+        '<body><script>window._pxAppId = "PX1";</script></body></html>'
+    )
+    assert 100 < len(shell) < 50000
+    blocked, reason = is_blocked(200, shell)
+    assert blocked is True
+    assert "Structural" in reason
 
