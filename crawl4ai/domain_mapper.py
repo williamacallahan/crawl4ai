@@ -1202,15 +1202,45 @@ class DomainMapper:
     async def _do_fetch_head(
         self, r: Dict[str, Any], seeder: AsyncUrlSeeder, config: "DomainMapperConfig"
     ):
-        """Fetch and parse <head> for a single result."""
+        """Fetch and parse <head> for a single result.
+
+        ``_scan_host`` stamps every record with ``host=<scanned host>`` and
+        reports the result set as that host's own URLs. ``seeder._fetch_head``
+        follows up to ``max_redirects`` hops with no host filtering and returns
+        the post-redirect final URL as its third tuple element, so an off-site
+        redirect (e.g. ``<scanned>/login`` -> an SSO provider, an expired/parked
+        domain, an auth wall) would — pre-fix — overwrite ``r["url"]`` with the
+        foreign destination while ``r["host"]`` still said the scanned host,
+        misattributing both the foreign URL and the foreign ``<head>`` metadata
+        to the scanned host. Mirror the ``_do_probe`` same-host guard (with
+        canonical ``www.``-aliasing): adopt ``final_url`` only when its host
+        matches ``r["host"]``, and reject the record (``status="not_valid"``,
+        no ``head_data``) when it does not — consistent with ``_do_probe``
+        returning ``None`` for off-host destinations.
+
+        The host guard runs before ``_parse_head`` so that, in addition to not
+        adopting the foreign URL, the foreign ``<head>`` is not parsed/stored
+        as the scanned host's metadata. Use anchored ``www.``-prefix stripping
+        (``removeprefix``) rather than unanchored ``replace`` so hosts that
+        merely contain ``www.`` as a substring are not mis-normalized.
+        """
         try:
             ok, html, final_url = await seeder._fetch_head(r["url"], int(config.http_timeout))
-            if ok:
-                r["head_data"] = await asyncio.to_thread(_parse_head, html)
-                if final_url and final_url != r["url"]:
-                    r["url"] = final_url
-            else:
+            if not ok:
                 r["status"] = "not_valid"
+                return
+            if final_url and final_url != r["url"]:
+                try:
+                    final_host = urlparse(final_url).netloc.lower().split(":")[0].removeprefix("www.")
+                except Exception:
+                    r["status"] = "not_valid"
+                    return
+                host_norm = r["host"].lower().split(":")[0].removeprefix("www.")
+                if final_host != host_norm:
+                    r["status"] = "not_valid"
+                    return
+                r["url"] = final_url
+            r["head_data"] = await asyncio.to_thread(_parse_head, html)
         except Exception:
             r["status"] = "not_valid"
 
