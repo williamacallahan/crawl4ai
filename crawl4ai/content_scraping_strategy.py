@@ -929,7 +929,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                     img.set("src", self.BASE64_PATTERN.sub("", src))
 
             # Remove empty elements
-            self.remove_empty_elements_fast(content_element, 1)
+            self.remove_empty_elements_fast(content_element, word_count_threshold)
 
             # Remove unneeded attributes
             self.remove_unwanted_attributes_fast(
