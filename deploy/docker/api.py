@@ -1168,10 +1168,18 @@ async def handle_crawl_request(
         
         # Build the config(s) to pass to arun/arun_many
         if crawler_configs and len(urls) > 1:
-            # Per-URL config list: deserialize each and apply base_config
+            # Per-URL config list: deserialize each and apply base_config.
+            # The non-streaming /crawl endpoint owns the batch/stream contract:
+            # force stream=False on every per-URL config so arun_many cannot
+            # honor a per-URL stream=true and return an async generator (which
+            # the handler would wrap as a single result and classify as an
+            # unexpected type, failing the whole request). Mirrors the streaming
+            # handler's cfg.stream=True normalization; position no longer
+            # decides whether streaming kicks in (issue #1837 follow-up).
             config_list = [CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED) for cc in crawler_configs]
             for cfg, request_config in zip(config_list, crawler_configs):
                 apply_server_crawler_defaults(cfg, request_config, config)
+                cfg.stream = False
             effective_config = config_list
         else:
             # Single config (original behavior)
