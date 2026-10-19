@@ -388,13 +388,26 @@ class UndetectedAdapter(BrowserAdapter):
     """
 
     # The combined console-AND-error bootstrap that ``bootstrap_capture_html``
-    # prepends to ``set_content`` / ``file://`` HTML. Concatenated from the
-    # same script bodies that ``setup_console_capture`` /
-    # ``setup_error_capture`` inject as init scripts, so the in-page state
-    # left behind (buffers + console override + listeners) is byte-identical
-    # between the http(s) init-script path and the set_content prepend path —
-    # downstream retrieval / parsing cannot tell them apart.
-    _CAPTURE_BOOTSTRAP_JS = _CONSOLE_CAPTURE_JS + "\n" + _ERROR_CAPTURE_JS
+    # prepends to ``set_content`` / ``file://`` HTML. Built from the same
+    # script bodies that ``setup_console_capture`` / ``setup_error_capture``
+    # inject as init scripts, so the in-page state left behind (buffers +
+    # console override + listeners) is byte-identical between the http(s)
+    # init-script path and the set_content prepend path — downstream
+    # retrieval / parsing cannot tell them apart.
+    #
+    # Each body is wrapped in its own IIFE so the top-level ``const
+    # originalConsole`` (and any other lexical declarations) do not leak
+    # into the page's global lexical environment when the bootstrap runs as
+    # a normal ``<script>``. ``add_init_script`` already scopes its body
+    # inside a function, so the init-script path is unaffected; the prepend
+    # path runs the script as a classic document script where a top-level
+    # ``const`` would collide with a page script that declares the same
+    # name. State still flows through ``window.__capturedConsole`` /
+    # ``window.__capturedErrors`` (set on ``window`` inside the IIFEs).
+    _CAPTURE_BOOTSTRAP_JS = (
+        "(() => {" + _CONSOLE_CAPTURE_JS + "})();\n"
+        "(() => {" + _ERROR_CAPTURE_JS + "})();"
+    )
 
     def __init__(self):
         self._console_script_injected = weakref.WeakKeyDictionary()
@@ -463,8 +476,21 @@ class UndetectedAdapter(BrowserAdapter):
         ``config.capture_console_messages`` is enabled, so crawls that
         do not request console capture pay no extra cost and see no
         console-override side effects.
+
+        The injected ``<script>`` removes itself from the DOM at the end
+        of its synchronous run (``document.currentScript.remove()``) so
+        the ``result.html`` produced by ``page.content()`` for
+        ``raw:`` / ``file://`` crawls matches the http(s) init-script
+        path (which adds nothing to the DOM). The console override and
+        ``error`` / ``unhandledrejection`` listeners stay active after
+        the element is gone — they live on ``window`` / ``console``,
+        not on the script element.
         """
-        return _inject_script_at_head_top(html, self._CAPTURE_BOOTSTRAP_JS)
+        return _inject_script_at_head_top(
+            html,
+            self._CAPTURE_BOOTSTRAP_JS
+            + "\ntry { document.currentScript && document.currentScript.remove(); } catch (e) {}\n",
+        )
     
     async def retrieve_console_messages(self, page: UndetectedPage) -> List[Dict]:
         """Retrieve captured console messages and errors from the page.
@@ -528,6 +554,37 @@ _HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
 # Fallback: matches the first ``<html ...>`` opening tag, case-insensitive,
 # when the document has no ``<head>`` (e.g. ``<html><body>...</body></html>``).
 _HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
+# Leading prologue (doctype, XML declaration, HTML comments) that must stay
+# before the bootstrap script when no ``<html>`` / ``<head>`` tag is present,
+# so the document does not flip into quirks mode (a doctype after ``<html>``
+# is a parse error and ignored) and XML processing instructions are not
+# swallowed by the implied ``<head>``.
+_PROLOG_RE = re.compile(
+    r"\s*(?:(?:<\?xml[^>]*>|<!doctype[^>]*>|<!--.*?-->)\s*)*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _search_outside_html_comments(pattern, html: str):
+    """Return the leftmost ``pattern`` match in ``html`` that is not inside
+    an HTML comment. Without this, a tag-like substring inside ``<!-- ... -->``
+    (e.g. ``<!-- <head> -->``) would match ``_HEAD_OPEN_RE`` and the bootstrap
+    would be inserted before ``-->`` — the HTML5 parser then treats it as
+    comment text, so the real ``<head>`` never gets the bootstrap and the
+    following page script runs without capture."""
+    cursor = 0
+    while cursor < len(html):
+        match = pattern.search(html, cursor)
+        comment_start = html.find("<!--", cursor)
+        if comment_start == -1:
+            return match
+        if match is not None and match.start() < comment_start:
+            return match
+        comment_end = html.find("-->", comment_start + 4)
+        if comment_end == -1:
+            return None
+        cursor = comment_end + 3
+    return None
 
 
 def _inject_script_at_head_top(html: str, script_body: str) -> str:
@@ -542,12 +599,13 @@ def _inject_script_at_head_top(html: str, script_body: str) -> str:
     the property needed to bootstrap console/error capture in time for
     inline-script ``console.log`` calls.
 
-    Handles malformed / partial HTML by falling back to wrapping the
-    content in ``<html><head><script>...</script></head><body>...</body></html>``
-    when no ``<head>`` or ``<html>`` opening tag is present. The wrapping is
-    safe under the HTML5 parser: any subsequent ``<html>`` / ``<head>``
-    / ``<body>`` start tags emitted by the original HTML are merged into the
-    wrapping tags rather than creating duplicates.
+    Handles malformed / partial HTML by inserting the script after any
+    leading doctype / XML declaration / comments when no ``<head>`` or
+    ``<html>`` opening tag is present, leaving the rest of the input
+    unchanged. The HTML5 parser places a leading ``<script>`` into the
+    implied ``<head>`` so it still runs before any subsequent inline
+    script, and a leading ``<!DOCTYPE html>`` stays first so the document
+    does not flip into quirks mode.
 
     ``script_body`` MUST NOT contain the literal substring ``</script>``
     (none of the capture bootstraps do). The function does not escape it
@@ -556,12 +614,12 @@ def _inject_script_at_head_top(html: str, script_body: str) -> str:
     use of fixed, reviewed constants (``_CONSOLE_CAPTURE_JS`` /
     ``_ERROR_CAPTURE_JS``).
     """
-    head_match = _HEAD_OPEN_RE.search(html)
+    head_match = _search_outside_html_comments(_HEAD_OPEN_RE, html)
     if head_match is not None:
         at = head_match.end()
         return html[:at] + f"<script>{script_body}</script>" + html[at:]
 
-    html_match = _HTML_OPEN_RE.search(html)
+    html_match = _search_outside_html_comments(_HTML_OPEN_RE, html)
     if html_match is not None:
         at = html_match.end()
         return (
@@ -571,9 +629,12 @@ def _inject_script_at_head_top(html: str, script_body: str) -> str:
         )
 
     # No <html> or <head> at all (e.g. fragment like "<p>hi</p>" or a raw
-    # HTML page that omits both tags). Wrap so the script still runs first.
-    return (
-        f"<html><head><script>{script_body}</script></head><body>"
-        + html
-        + "</body></html>"
-    )
+    # HTML page that omits both tags). Keep any leading doctype / XML decl /
+    # comments first so the document does not switch to quirks mode (a
+    # doctype after <html> is a parse error and ignored); the HTML5 parser
+    # places a leading <script> into the implied <head>, so it still runs
+    # before any subsequent inline script without wrapping the rest of the
+    # input in synthetic <html>/<head>/<body> tags.
+    prolog = _PROLOG_RE.match(html)
+    at = prolog.end() if prolog else 0
+    return html[:at] + f"<script>{script_body}</script>" + html[at:]

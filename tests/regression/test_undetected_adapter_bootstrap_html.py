@@ -125,12 +125,24 @@ async def test_undetected_adapter_bootstrap_uses_same_bodies_as_init_scripts():
     init-script path and the set_content prepend path. Downstream
     `retrieve_console_messages` cannot tell the two paths apart — that
     property is the only reason the fix is safe without touching
-    retrieval."""
+    retrieval.
+
+    The bootstrap wraps each body in its own IIFE so the top-level
+    ``const originalConsole`` does not leak into the page's global
+    lexical environment when the bootstrap runs as a classic
+    ``<script>`` (``add_init_script`` already scopes its body inside a
+    function, so the init-script path is unaffected). State still flows
+    through ``window.__capturedConsole`` / ``window.__capturedErrors``,
+    so the in-page state the two paths leave is identical even though
+    the literal source differs by the IIFE wrappers."""
     adapter = UndetectedAdapter()
-    combined = adapter._CONSOLE_CAPTURE_JS + "\n" + adapter._ERROR_CAPTURE_JS
-    assert adapter._CAPTURE_BOOTSTRAP_JS == combined, (
-        "_CAPTURE_BOOTSTRAP_JS must be the concatenation of the two init "
-        "scripts so the prepend and init-script paths leave identical state"
+    assert adapter._CONSOLE_CAPTURE_JS in adapter._CAPTURE_BOOTSTRAP_JS, (
+        "_CAPTURE_BOOTSTRAP_JS must contain the console-capture init-script "
+        "body so the prepend and init-script paths leave identical state"
+    )
+    assert adapter._ERROR_CAPTURE_JS in adapter._CAPTURE_BOOTSTRAP_JS, (
+        "_CAPTURE_BOOTSTRAP_JS must contain the error-capture init-script "
+        "body so the prepend and init-script paths leave identical state"
     )
 
 
@@ -191,15 +203,18 @@ def test_inject_into_html_with_only_html_no_head():
 
 
 def test_inject_into_html_with_no_html_or_head_wraps_fragment():
-    """A bare fragment with no `<html>` or `<head>` is wrapped in
-    `<html><head><script>...</script></head><body>...</body></html>`."""
+    """A bare fragment with no `<html>` or `<head>` is not wrapped in
+    synthetic ``<html>``/``<head>``/``<body>`` tags — the HTML5 parser
+    places a leading ``<script>`` into the implied ``<head>``, so it
+    still runs before any subsequent inline script. Wrapping would
+    insert a synthetic ``<head>`` *after* a leading ``<!DOCTYPE html>``
+    (when present), which the parser treats as a parse error and
+    drops the doctype, flipping the document into quirks mode; leaving
+    the fragment unwrapped preserves any leading doctype / XML decl /
+    comments so standards mode survives."""
     html = "<p>just a paragraph</p>"
     out = _inject_script_at_head_top(html, "/*BS*/")
-    assert out == (
-        "<html><head><script>/*BS*/</script></head><body>"
-        "<p>just a paragraph</p>"
-        "</body></html>"
-    ), out
+    assert out == "<script>/*BS*/</script><p>just a paragraph</p>", out
 
 
 def test_inject_is_case_insensitive_on_head_and_html_tags():
@@ -260,10 +275,58 @@ def test_inject_handles_html_with_xml_declaration_and_comment():
 
 
 def test_inject_into_empty_string_does_not_crash():
-    """An empty HTML string still produces a valid (empty) wrapped
-    document; the function must not raise on degenerate input the
-    strategy might pass if a caller handed `raw:` an empty string."""
+    """An empty HTML string still produces a runnable script; the
+    function must not raise on degenerate input the strategy might
+    pass if a caller handed `raw:` an empty string. No synthetic
+    ``<html>``/``<head>``/``<body>`` wrapper is emitted — the bootstrap
+    script alone is enough for ``set_content`` to load it."""
     out = _inject_script_at_head_top("", "/*BS*/")
-    assert out == (
-        "<html><head><script>/*BS*/</script></head><body></body></html>"
-    ), out
+    assert out == "<script>/*BS*/</script>", out
+
+
+def test_inject_skips_head_tag_inside_html_comment():
+    """A ``<head>``-like substring inside an HTML comment (e.g.
+    ``<!-- <head> -->``) must NOT be treated as the head opening tag —
+    otherwise the bootstrap would be inserted before ``-->`` and the
+    HTML5 parser would treat it as comment text, leaving the real
+    ``<head>`` unbootstrapped so the following page script runs without
+    capture. The comment-aware search must skip the comment and find the
+    real ``<head>`` after it."""
+    html = (
+        "<!-- <head> --><html><head><title>real</title></head>"
+        "<body><script>console.log('x')</script></body></html>"
+    )
+    out = _inject_script_at_head_top(html, "/*BS*/")
+    assert out.startswith("<!-- <head> --><html><head>"), (
+        "the comment must survive intact and the real <head> must be found: "
+        + out
+    )
+    assert "<script>/*BS*/</script><title>real</title>" in out, (
+        "bootstrap must be the first child of the real <head>, not inserted "
+        "into the comment: " + out
+    )
+
+
+def test_inject_into_fragment_with_leading_doctype_preserves_standards_mode():
+    """A document that omits both ``<html>`` and ``<head>`` but keeps a
+    leading ``<!DOCTYPE html>`` (a legal HTML5 document, e.g.
+    ``<!DOCTYPE html><title>T</title><p>hi</p>``) must keep that doctype
+    first in the output. The previous fallback wrapped the document as
+    ``<html><head>...</head><body><!DOCTYPE html>...``, which the HTML5
+    parser treats as a parse error — the doctype after ``<html>`` is
+    ignored and the document renders in quirks mode, changing layout,
+    screenshots, and dimension checks. The bootstrap is inserted right
+    after the leading doctype so the parser still places it in the
+    implied ``<head>`` and runs it before any subsequent inline script."""
+    html = "<!DOCTYPE html><title>T</title><p>hi</p>"
+    out = _inject_script_at_head_top(html, "/*BS*/")
+    assert out.startswith("<!DOCTYPE html><script>/*BS*/</script>"), (
+        "doctype must stay first and the bootstrap must follow it directly, "
+        "without a synthetic <html>/<head> wrapper: " + out
+    )
+    assert "<title>T</title>" in out and "<p>hi</p>" in out, (
+        "the original fragment content must survive unchanged: " + out
+    )
+    assert "<html>" not in out and "<head>" not in out, (
+        "no synthetic wrapper must be added when the input has no <html>: " + out
+    )
