@@ -748,32 +748,71 @@ class PinningProxy:
         response in that read, then EOF when we close, instead of a fragment
         of it (status line or a single header line) per ``read()``.
         """
-        status_line = await asyncio.wait_for(u_reader.readline(), timeout=30)
-        if not status_line:
-            return
-        buf = bytearray(status_line)
-        status_code = 0
-        parts = status_line.split(b" ", 2)
-        if len(parts) >= 2:
-            try:
-                status_code = int(parts[1])
-            except ValueError:
-                status_code = 0
-        content_length, chunked = None, False
+        # Forward any interim 1xx responses (100 Continue, 103 Early Hints) to
+        # the client and keep reading until the final response.  The request
+        # path strips ``Upgrade``, so 101 Switching Protocols does not occur
+        # here; a 101 is treated as the final response (no body) below.
         while True:
-            line = await asyncio.wait_for(u_reader.readline(), timeout=30)
-            buf.extend(line)
-            if line in (b"\r\n", b"\n", b""):
-                break
-            name, _, value = line.partition(b":")
-            lname = name.strip().lower()
-            if lname == b"content-length":
+            status_line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+            if not status_line:
+                return
+            status_code = 0
+            parts = status_line.split(b" ", 2)
+            if len(parts) >= 2:
                 try:
-                    content_length = int(value.strip())
+                    status_code = int(parts[1])
                 except ValueError:
-                    content_length = None
-            elif lname == b"transfer-encoding" and b"chunked" in value.lower():
-                chunked = True
+                    status_code = 0
+            content_length, chunked = None, False
+            header_lines = []
+            connection_value = b""
+            while True:
+                line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                name, _, value = line.partition(b":")
+                lname = name.strip().lower()
+                if lname == b"connection":
+                    connection_value = value.strip().lower()
+                    continue
+                header_lines.append(line)
+                if lname == b"content-length":
+                    try:
+                        content_length = int(value.strip())
+                    except ValueError:
+                        content_length = None
+                elif lname == b"transfer-encoding" and b"chunked" in value.lower():
+                    chunked = True
+            # Rewrite hop-by-hop response headers: drop the origin's
+            # ``Connection`` and every header it nominates by name, drop
+            # ``Keep-Alive``/``TE``/``Trailer``/``Upgrade``, and append our own
+            # ``Connection: close`` so the client treats this socket as
+            # single-use and does not try to reuse it for a second (smuggled)
+            # request.  ``Content-Length`` and ``Transfer-Encoding`` are kept so
+            # the body framing the relay forwards to the client stays correct.
+            framing = {b"content-length", b"transfer-encoding"}
+            nominated = set()
+            if connection_value:
+                nominated.update(
+                    token.strip()
+                    for token in connection_value.split(b",")
+                    if token.strip()
+                )
+            drop = (nominated - framing) | {
+                b"keep-alive", b"te", b"trailer", b"upgrade",
+            }
+            buf = bytearray(status_line)
+            for line in header_lines:
+                if line.split(b":", 1)[0].strip().lower() in drop:
+                    continue
+                buf.extend(line)
+            buf.extend(b"Connection: close\r\n\r\n")
+            if 100 <= status_code < 200 and status_code != 101:
+                c_writer.write(buf)
+                await c_writer.drain()
+                buf.clear()
+                continue
+            break
 
         async def flush(threshold: int = 65536):
             if len(buf) >= threshold:
@@ -782,8 +821,8 @@ class PinningProxy:
                 buf.clear()
 
         no_body = (
-            method.upper() == b"HEAD"
-            or 100 <= status_code < 200
+            method.upper() == "HEAD"
+            or status_code == 101
             or status_code in (204, 304)
         )
         if no_body:

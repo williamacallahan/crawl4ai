@@ -1046,6 +1046,183 @@ class TestDirectDialNoSmuggling:
         assert [chunk for chunk in received if chunk] == [received[0]]
         assert b"rebind.evil" not in b"".join(received)
 
+    async def test_direct_path_rewrites_response_hop_by_hop_headers(
+        self, monkeypatch
+    ):
+        """The relay must not forward the origin's ``Connection`` and
+        ``Keep-Alive`` headers verbatim: the proxy forces a single response
+        and closes both sockets, so the client must see ``Connection: close``
+        (not ``keep-alive``) or a keep-alive client will reuse the socket for
+        a second, unvalidated request.  ``Content-Length`` and body framing
+        must be preserved so the client still reads the response correctly."""
+        async def handle(reader, writer):
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            # Origin sends keep-alive and nominates X-Custom via Connection.
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 2\r\n"
+                b"Connection: keep-alive, X-Custom\r\n"
+                b"Keep-Alive: timeout=30\r\n"
+                b"X-Custom: should-be-stripped\r\n"
+                b"\r\nhi"
+            )
+            await writer.drain()
+            await asyncio.sleep(1)
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"GET http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n\r\n").encode()
+            )
+            await w.drain()
+            data = await asyncio.wait_for(r.read(4096), timeout=5)
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        # The proxy rewrites the response so the client sees Connection: close.
+        assert b"Connection: close" in data
+        # Origin-nominated and standard hop-by-hop response headers are dropped.
+        assert b"keep-alive" not in data.lower()
+        assert b"x-custom" not in data.lower()
+        # Body framing is preserved so the client can still read the body.
+        assert b"Content-Length: 2" in data
+        assert data.endswith(b"hi")
+
+    async def test_direct_path_head_completes_without_body(self, monkeypatch):
+        """A HEAD response has no body.  ``_handle`` decodes ``method`` to a
+        ``str`` and uppercases it; the relay must compare with ``"HEAD"`` (not
+        ``b"HEAD"``) or it falls through to the body-reading path.  With a
+        keep-alive origin that sends ``Content-Length`` but no body, the body
+        branch would block on ``u_reader.read(N)`` waiting for bytes the origin
+        never sends; the HEAD path instead forwards the headers and closes both
+        sockets without waiting for a body."""
+        async def handle(reader, writer):
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            # HEAD response: headers only, no body, keep the socket open.
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 5\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            # Hold the socket open well past the test's read timeout so the
+            # buggy body-reading path (which waits for the 5 advertised body
+            # bytes that never arrive) cannot accidentally complete via EOF.
+            await asyncio.sleep(10)
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"HEAD http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n\r\n").encode()
+            )
+            await w.drain()
+            # Must complete promptly without waiting for the 5-byte body the
+            # origin never sends; the buggy body-reading path would block here
+            # for the origin's 10s hold (or its EOF) and trip the 3s timeout.
+            data = await asyncio.wait_for(r.read(4096), timeout=3)
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        assert b"HTTP/1.1 200 OK" in data
+        assert b"Content-Length: 5" in data
+        assert b"Connection: close" in data
+        # No body bytes for a HEAD response.
+        assert not data.endswith(b"hello")
+        assert b"\r\n\r\n" in data
+
+    async def test_direct_path_forwards_interim_1xx_then_final(self, monkeypatch):
+        """An origin may emit an interim ``100 Continue`` (or ``103 Early
+        Hints``) response before the final response on the same socket.  The
+        relay must forward each interim block and keep reading until the final
+        response, instead of treating the first ``1xx`` as the complete
+        response and closing both sockets (which would drop the final
+        response on the floor)."""
+        async def handle(reader, writer):
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            # Interim 100 Continue, then the final 200 OK with a body.
+            writer.write(
+                b"HTTP/1.1 100 Continue\r\n\r\n"
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 5\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\nhello"
+            )
+            await writer.drain()
+            await asyncio.sleep(1)
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"GET http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n\r\n").encode()
+            )
+            await w.drain()
+            data = await asyncio.wait_for(r.read(8192), timeout=5)
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        # Both the interim 100 Continue and the final 200 OK reach the client.
+        assert b"HTTP/1.1 100 Continue" in data
+        assert b"HTTP/1.1 200 OK" in data
+        # The final body is forwarded after the interim response.
+        assert data.endswith(b"hello")
+        # The relay rewrites the final response's Connection to close.
+        assert b"Connection: close" in data
+
 
 def test_upstream_proxy_env_parsing(monkeypatch):
     assert egress_proxy.upstream_proxy() is None
