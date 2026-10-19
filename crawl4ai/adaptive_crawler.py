@@ -430,12 +430,18 @@ class StatisticalStrategy(CrawlStrategy):
         # fill the entire ``top_k_links`` slice -- causing the same URL to be
         # fetched multiple times concurrently within a single batch. Mirrors
         # the dedup already performed by ``EmbeddingStrategy.rank_links``.
-        seen_urls = set()
+        #
+        # When duplicate hrefs carry different preview scores (different anchor
+        # text / context), keep the highest-scoring representative for each href
+        # rather than the first one encountered. Otherwise a low-scoring
+        # duplicate selected first could fall below ``min_gain_threshold`` and
+        # cause the href to be skipped entirely, even when a higher-scoring
+        # duplicate would have cleared the threshold.
+        best_by_href: Dict[str, Tuple[Link, float]] = {}
 
         for link in state.pending_links:
-            if link.href in state.crawled_urls or link.href in seen_urls:
+            if link.href in state.crawled_urls or not link.href:
                 continue
-            seen_urls.add(link.href)
 
             # Calculate component scores
             relevance = self._calculate_relevance(link, state)
@@ -447,7 +453,11 @@ class StatisticalStrategy(CrawlStrategy):
                     config.novelty_weight * novelty +
                     config.authority_weight * authority)
 
-            scored_links.append((link, score))
+            current = best_by_href.get(link.href)
+            if current is None or score > current[1]:
+                best_by_href[link.href] = (link, score)
+
+        scored_links = list(best_by_href.values())
 
         # Sort by score descending
         scored_links.sort(key=lambda x: x[1], reverse=True)
@@ -1281,16 +1291,29 @@ class AdaptiveCrawler:
             # Track hrefs already present in ``pending_links`` so the same
             # uncrawled URL cannot accumulate multiple entries (a common case
             # via nav/footer links appearing on every crawled page). Built
-            # from any resumed ``pending_links`` (which naturally dedupes
-            # pre-existing duplicate entries from a state saved by an older
-            # version) and maintained as links are appended below. The ranked
-            # ``EmbeddingStrategy.rank_links`` already dedupes its output;
-            # ``StatisticalStrategy.rank_links`` now does the same, but
-            # deduping at the append site additionally prevents
-            # ``pending_links`` from growing unboundedly with duplicates
-            # across iterations (which would otherwise waste ranking work
-            # every cycle).
-            pending_urls = {link.href for link in self.state.pending_links}
+            # from any resumed ``pending_links`` and maintained as links are
+            # appended below. The ranked ``EmbeddingStrategy.rank_links``
+            # already dedupes its output; ``StatisticalStrategy.rank_links``
+            # now does the same, but deduping at the append site additionally
+            # prevents ``pending_links`` from growing unboundedly with
+            # duplicates across iterations (which would otherwise waste
+            # ranking work every cycle).
+            #
+            # A ``pending_links`` list loaded from a state file written by an
+            # older version can already contain duplicate hrefs. Normalize it
+            # once here -- dropping later duplicates while preserving the
+            # first occurrence and original order -- so the returned and
+            # re-saved state does not carry an inflated pending-link count and
+            # ``rank_links`` does not scan duplicates every cycle. ``pending_urls``
+            # is then built from the normalized list.
+            seen_hrefs: Set[str] = set()
+            normalized_pending: List[Link] = []
+            for link in self.state.pending_links:
+                if link.href and link.href not in seen_hrefs:
+                    seen_hrefs.add(link.href)
+                    normalized_pending.append(link)
+            self.state.pending_links = normalized_pending
+            pending_urls = seen_hrefs
 
             # Initial crawl if not resuming
             if start_url not in self.state.crawled_urls:
