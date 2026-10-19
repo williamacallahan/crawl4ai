@@ -97,6 +97,12 @@ class HTMLRequest(BaseModel):
     
 class ScreenshotRequest(BaseModel):
     url: str
+    # Bound 0-5s to match the untrusted-input clamp on CrawlerRunConfig.screenshot_wait_for
+    # (crawl4ai.async_configs._MAX_DELAY_SECONDS). The /screenshot endpoint builds its
+    # config via the trusted CrawlerRunConfig(**kwargs) constructor (api.server_crawler_config),
+    # which bypasses the untrusted gate's clamp; without this schema bound a client-supplied
+    # value flows straight into `await asyncio.sleep(config.screenshot_wait_for)` and can pin
+    # a crawl slot indefinitely (DoS).
     screenshot_wait_for: float | None = Field(default=2, ge=0, le=5)
     wait_for_images: bool | None = False
     # Deprecated no-op: results are written only to the server artifact store.
