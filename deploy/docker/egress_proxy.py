@@ -442,6 +442,16 @@ class PinningProxy:
             return
 
         headers = await self._read_headers(client_reader)
+        # RFC 7230 §3.3.3 forbids a request that carries both
+        # ``Content-Length`` and ``Transfer-Encoding``: an origin that uses
+        # ``Content-Length`` would read a different request boundary than the
+        # proxy, which relays the chunked body.  ``_body_framing`` parses
+        # framing from the original request headers so a ``Connection``
+        # nomination cannot hide either one.  Reject before opening the
+        # upstream connection or forwarding any bytes.
+        if self._has_conflicting_framing(headers):
+            await self._reply(client_writer, _BAD)
+            return
         try:
             _request_body_length(headers)
         except ValueError:
@@ -819,7 +829,11 @@ class PinningProxy:
             # ``Connection: close`` so the client treats this socket as
             # single-use and does not try to reuse it for a second (smuggled)
             # request.  ``Content-Length`` and ``Transfer-Encoding`` are kept so
-            # the body framing the relay forwards to the client stays correct.
+            # the body framing the relay forwards to the client stays correct,
+            # except that RFC 7230 §3.3.2 forbids sending ``Content-Length``
+            # alongside a ``Transfer-Encoding``: when the response is chunked we
+            # drop ``Content-Length`` and let the chunked framing speak for
+            # itself.
             framing = {b"content-length", b"transfer-encoding"}
             nominated = set()
             if connection_value:
@@ -831,6 +845,8 @@ class PinningProxy:
             drop = (nominated - framing) | {
                 b"keep-alive", b"te", b"trailer", b"upgrade",
             }
+            if chunked:
+                drop.add(b"content-length")
             buf = bytearray(status_line)
             for line in header_lines:
                 if line.split(b":", 1)[0].strip().lower() in drop:
@@ -949,6 +965,21 @@ class PinningProxy:
         except (OSError, ConnectionError) as error:
             logger.debug("proxy reply failed: %s", error)
         await self._safe_close(writer)
+
+    @staticmethod
+    def _has_conflicting_framing(headers: bytes) -> bool:
+        """True if the request headers carry both ``Content-Length`` and a
+        chunked ``Transfer-Encoding``.  RFC 7230 §3.3.3 requires such a request
+        to be rejected; relaying both lets the proxy and an origin that reads
+        ``Content-Length`` disagree on the request boundary."""
+        _, chunked = _body_framing(headers)
+        if not chunked:
+            return False
+        return any(
+            line.split(b":", 1)[0].strip().lower() == b"content-length"
+            for line in headers.split(b"\r\n")
+            if line
+        )
 
     @staticmethod
     def _unsupported_expect(headers: bytes) -> bool:

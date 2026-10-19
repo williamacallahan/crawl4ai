@@ -1365,6 +1365,113 @@ class TestDirectDialNoSmuggling:
         assert b"417 Expectation Failed" in data
         assert b"Expectation Failed" in data
 
+    async def test_direct_path_rejects_both_content_length_and_transfer_encoding(
+        self, monkeypatch
+    ):
+        """RFC 7230 §3.3.3 forbids a request that carries both ``Content-Length``
+        and ``Transfer-Encoding``.  Relaying both would let the proxy (which
+        follows the chunked body) and an origin that reads ``Content-Length``
+        disagree on the request boundary, which is the request-side smuggling
+        surface this PR closes.  The proxy rejects the request with ``400 Bad
+        Request`` before opening the upstream connection."""
+        connected = {"value": False}
+
+        async def handle(reader, writer):
+            connected["value"] = True
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"POST http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n"
+                 "Transfer-Encoding: chunked\r\n"
+                 "Content-Length: 5\r\n\r\n"
+                 "0\r\n\r\n").encode()
+            )
+            await w.drain()
+            data = await asyncio.wait_for(r.read(4096), timeout=3)
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        assert not connected["value"], "origin was contacted for a conflicting-framing request"
+        assert b"400 Bad Request" in data
+        assert b"Bad Request" in data
+
+    async def test_direct_path_chunked_response_drops_content_length(
+        self, monkeypatch
+    ):
+        """RFC 7230 §3.3.2 forbids sending ``Content-Length`` alongside a
+        ``Transfer-Encoding``.  When the origin sends both, the relay keeps the
+        chunked framing (it streams the chunked body verbatim) and must drop the
+        ``Content-Length`` header from the response it forwards to the client so
+        the client does not see both framing headers at once."""
+        async def handle(reader, writer):
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                req += chunk
+            # Origin sends both Transfer-Encoding: chunked and Content-Length.
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 2\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\n"
+                b"5\r\nhello\r\n0\r\n\r\n"
+            )
+            await writer.drain()
+            await asyncio.sleep(1)
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"GET http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n\r\n").encode()
+            )
+            await w.drain()
+            data = b""
+            while True:
+                chunk = await asyncio.wait_for(r.read(8192), timeout=5)
+                if not chunk:
+                    break
+                data += chunk
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        # The relay forwards the chunked body intact.
+        assert b"Transfer-Encoding: chunked" in data
+        assert data.endswith(b"5\r\nhello\r\n0\r\n\r\n")
+        # Content-Length is dropped so the client does not see both framing headers.
+        assert b"Content-Length" not in data
+        # Connection: close is still appended.
+        assert b"Connection: close" in data
+
 
 def test_upstream_proxy_env_parsing(monkeypatch):
     assert egress_proxy.upstream_proxy() is None
