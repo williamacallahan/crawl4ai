@@ -224,7 +224,16 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
                     for item in queue_items
                 ]
         else:
-            # Original initialization
+            # Original initialization for a fresh (non-resume) run.
+            # Reset per-run state so a reused strategy instance starts with a
+            # fresh page budget and clean stats (mirrors the _cancel_event
+            # reset above). Without this, _pages_crawled carries over from
+            # the previous run and silently shrinks (or, once max_pages was
+            # exhausted, zeroes out) the budget for every subsequent run --
+            # including across arun_many seeds, which all share the same
+            # strategy instance off the CrawlerRunConfig.
+            self._pages_crawled = 0
+            self.stats = TraversalStats(start_time=datetime.now())
             initial_score = self.url_scorer.score(start_url) if self.url_scorer else 0
             await queue.put((-initial_score, 0, start_url, None))
             visited: Set[str] = set()

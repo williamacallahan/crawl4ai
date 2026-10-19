@@ -226,7 +226,16 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             depths = dict(self._resume_state.get("depths", {}))
             self._pages_crawled = self._resume_state.get("pages_crawled", 0)
         else:
-            # Original initialization
+            # Original initialization for a fresh (non-resume) run.
+            # Reset per-run state so a reused strategy instance starts with a
+            # fresh page budget and clean stats (mirrors the _cancel_event
+            # reset above). Without this, _pages_crawled carries over from
+            # the previous run and silently shrinks (or, once max_pages was
+            # exhausted, zeroes out) the budget for every subsequent run --
+            # including across arun_many seeds, which all share the same
+            # strategy instance off the CrawlerRunConfig.
+            self._pages_crawled = 0
+            self.stats = TraversalStats(start_time=datetime.now())
             visited: Set[str] = set()
             # current_level holds tuples: (url, parent_url)
             current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
@@ -333,7 +342,16 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             depths = dict(self._resume_state.get("depths", {}))
             self._pages_crawled = self._resume_state.get("pages_crawled", 0)
         else:
-            # Original initialization
+            # Original initialization for a fresh (non-resume) run.
+            # Reset per-run state so a reused strategy instance starts with a
+            # fresh page budget and clean stats (mirrors the _cancel_event
+            # reset above). Without this, _pages_crawled carries over from
+            # the previous run and silently shrinks (or, once max_pages was
+            # exhausted, zeroes out) the budget for every subsequent run --
+            # including across arun_many seeds, which all share the same
+            # strategy instance off the CrawlerRunConfig.
+            self._pages_crawled = 0
+            self.stats = TraversalStats(start_time=datetime.now())
             visited: Set[str] = set()
             current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
             depths: Dict[str, int] = {start_url: 0}

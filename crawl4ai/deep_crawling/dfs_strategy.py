@@ -1,9 +1,10 @@
 # dfs_deep_crawl_strategy.py
 import asyncio
+from datetime import datetime
 from urllib.parse import urljoin, urldefrag
 from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple
 
-from ..models import CrawlResult
+from ..models import CrawlResult, TraversalStats
 from .bfs_strategy import BFSDeepCrawlStrategy  # noqa
 from ..types import AsyncWebCrawler, CrawlerRunConfig
 from ..utils import normalize_url_for_deep_crawl
@@ -55,7 +56,16 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
             self._dfs_seen = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("dfs_seen", [])}
             results: List[CrawlResult] = []
         else:
-            # Original initialization
+            # Original initialization for a fresh (non-resume) run.
+            # Reset per-run state so a reused strategy instance starts with a
+            # fresh page budget and clean stats (mirrors the _cancel_event
+            # reset above). Without this, _pages_crawled carries over from
+            # the previous run and silently shrinks (or, once max_pages was
+            # exhausted, zeroes out) the budget for every subsequent run --
+            # including across arun_many seeds, which all share the same
+            # strategy instance off the CrawlerRunConfig.
+            self._pages_crawled = 0
+            self.stats = TraversalStats(start_time=datetime.now())
             visited: Set[str] = set()
             # Stack items: (url, parent_url, depth)
             stack: List[Tuple[str, Optional[str], int]] = [(start_url, None, 0)]
@@ -175,7 +185,16 @@ class DFSDeepCrawlStrategy(BFSDeepCrawlStrategy):
             self._pages_crawled = self._resume_state.get("pages_crawled", 0)
             self._dfs_seen = {normalize_url_for_deep_crawl(u, u) for u in self._resume_state.get("dfs_seen", [])}
         else:
-            # Original initialization
+            # Original initialization for a fresh (non-resume) run.
+            # Reset per-run state so a reused strategy instance starts with a
+            # fresh page budget and clean stats (mirrors the _cancel_event
+            # reset above). Without this, _pages_crawled carries over from
+            # the previous run and silently shrinks (or, once max_pages was
+            # exhausted, zeroes out) the budget for every subsequent run --
+            # including across arun_many seeds, which all share the same
+            # strategy instance off the CrawlerRunConfig.
+            self._pages_crawled = 0
+            self.stats = TraversalStats(start_time=datetime.now())
             visited: Set[str] = set()
             stack: List[Tuple[str, Optional[str], int]] = [(start_url, None, 0)]
             depths: Dict[str, int] = {start_url: 0}
