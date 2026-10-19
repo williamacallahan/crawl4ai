@@ -310,6 +310,24 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                                             # unpack 1-, 2-, and 4-bit predictor
                                             # output and scale to 8-bit.
                                             bits = xobj.get('/BitsPerComponent', 8)
+                                            # ``/Indexed`` color spaces map each
+                                            # sample to a palette entry; the
+                                            # ``L``/``RGB`` paths below would
+                                            # treat palette indices as
+                                            # luminance and emit a wrong-color
+                                            # PNG. Retain the raw ``bin``
+                                            # fallback until indexed conversion
+                                            # is supported.
+                                            if (
+                                                isinstance(color_space, (list, tuple))
+                                                and color_space
+                                                and color_space[0] == '/Indexed'
+                                            ) or color_space == '/Indexed':
+                                                raise ValueError(
+                                                    "Indexed ColorSpace: palette "
+                                                    "conversion unsupported, using "
+                                                    "raw bin fallback"
+                                                )
                                             if bits in (1, 2, 4):
                                                 channels = 3 if color_space == '/DeviceRGB' else 1
                                                 row_bytes = (width * bits * channels + 7) // 8

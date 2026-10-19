@@ -450,6 +450,50 @@ def test_plain_flate_no_predictor_still_extracts_as_png(monkeypatch, tmp_path):
     assert _png_bytes(entry["data"]) == img._raw
 
 
+class _IndexedImage:
+    """FlateDecode XObject whose ``/ColorSpace`` is ``[/Indexed, ...]``;
+    each sample is a palette index, so the ``L`` mode would emit a
+    wrong-color PNG. Retain the raw ``bin`` fallback for these."""
+
+    def __init__(self, width=2, height=2):
+        self._w, self._h = width, height
+        self._raw = bytes((i + j) % 4 for i in range(height) for j in range(width))
+
+    def get_object(self):
+        return self
+
+    def get(self, key, default=None):
+        return {
+            "/Subtype": "/Image", "/Width": self._w, "/Height": self._h,
+            "/ColorSpace": ["/Indexed", "/DeviceRGB", 3,
+                            b"\x00\x00\x00\xff\x00\x00\x00\xff\x00\x00\x00\xff"],
+            "/BitsPerComponent": 8, "/Filter": ["/FlateDecode"], "/DecodeParms": {},
+        }.get(key, default)
+
+    def get_data(self):
+        return self._raw
+
+
+def test_indexed_colorspace_falls_back_to_bin(monkeypatch, tmp_path):
+    """An ``/Indexed`` ``/ColorSpace`` must not be unpacked as grayscale;
+    palette indices misread as luminance would emit a wrong-color PNG.
+    The FlateDecode path retains the raw ``bin`` fallback until indexed
+    conversion is supported."""
+    img = _IndexedImage(width=2, height=2)
+    _patch_reader(monkeypatch, img)
+    proc = NaivePDFProcessorStrategy(extract_images=True, save_images_locally=False)
+    result = proc.process(_dummy_pdf(tmp_path))
+
+    entry = result.pages[0].images[0]
+    assert entry["format"] == "bin", (
+        f"indexed colorspace should fall back to raw bin, got "
+        f"format={entry['format']!r}; palette was applied as grayscale"
+    )
+    assert (entry["width"], entry["height"], entry["bits_per_component"]) == (2, 2, 8)
+    assert "data" in entry and "path" not in entry
+    assert base64.b64decode(entry["data"]) == img._raw
+
+
 if __name__ == "__main__":
     import sys
 
