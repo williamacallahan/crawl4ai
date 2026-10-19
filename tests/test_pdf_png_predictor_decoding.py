@@ -1,39 +1,6 @@
-"""Regression tests for PNG predictor stride math + predictor double-decode
-in PDF image extraction.
-
-Bug 1 -- stride math (``crawl4ai/processors/pdf/utils.py::apply_png_predictor``):
-the function computed the predictor row stride as
-``width * ceil(bits * color_channels / 8)``. The PNG/PDF spec (PDF 1.7 sec
-7.4.4.3 / PNG spec sec 9) defines the stride as
-``ceil(width * bits * color_channels / 8)``. These only coincide when
-``bits * color_channels`` is a multiple of 8; for 1/2/4-bit images the buggy
-formula was ``8 / bits`` times too large, which either rejected valid
-predictor rows with a spurious ``ValueError("Invalid scanline structure")``
-(dropping the image) or, when ``len(data) % wrong_scanline_length == 0`` by
-coincidence, silently decoded misaligned rows into garbage bytes.
-
-Bug 2 -- double-decode (``crawl4ai/processors/pdf/processor.py::_extract_images``):
-the FlateDecode branch called ``apply_png_predictor(data, width, bits,
-colors)`` on the bytes returned by ``xobj.get_data()``. In pypdf >= 2.x
-(including the pinned 6.4.1), ``EncodedStreamObject.get_data`` ->
-``decode_stream_data`` -> ``FlateDecode.decode`` -> ``_decode_png_prediction``
-already applies the PNG predictor using the spec-correct ``/Columns``-based
-row length and strips the filter bytes. Calling ``apply_png_predictor`` on
-that output re-decodes already-decoded data, dropping every
-``/Predictor >= 10`` image (byte-aligned ones included) into the raw ``bin``
-fallback. Fixing the stride math alone does not restore predictor image
-extraction -- the redundant call must also be removed.
-
-Fix:
-  1. ``apply_png_predictor`` now uses ``stride = (width * bits *
-     color_channels + 7) // 8`` (the spec-correct packed row length). The
-     existing ``bytes_per_pixel`` (``ceil(bits * color_channels / 8)``) is
-     kept for the per-byte Sub/Average/Paeth lookahead distance -- exactly
-     what the PNG spec uses it for.
-  2. ``_extract_images`` no longer calls ``apply_png_predictor`` on bytes
-     from ``xobj.get_data()``; the raw post-predictor bytes go straight to
-     ``PIL.Image.frombytes``. ``apply_png_predictor`` is retained in
-     ``utils.py`` for callers that feed it raw pre-decode stream bytes.
+"""Regression tests for PNG predictor stride math and the predictor
+double-decode in PDF image extraction (see ``apply_png_predictor`` in
+``utils.py`` and ``_extract_images`` in ``processor.py``).
 
 Run:
     PYTHONPATH="$PWD:$PWD/deploy/docker" .venv/bin/python -m pytest -xvs \
@@ -403,6 +370,39 @@ def test_predictor_image_extracts_as_png_not_bin(predictor, monkeypatch, tmp_pat
     assert "data" in entry
     assert "path" not in entry
     assert _png_bytes(entry["data"]) == img._raw
+
+
+@pytest.mark.parametrize("bits", [1, 2, 4])
+def test_packed_predictor_image_extracts_as_scaled_png(bits, monkeypatch, tmp_path):
+    """End-to-end: packed 1/2/4-bit grayscale predictor images unpack and
+    scale to 8-bit through ``_extract_images`` (not just
+    ``apply_png_predictor``). Exercises the sub-byte unpack-and-scale
+    branch that the 8-bit ``_PredictorImage`` does not reach."""
+    w, smax = 5, (1 << bits) - 1
+    samples = [0, smax, smax // 2, 1, smax - 1]
+    row_bytes = (w * bits + 7) // 8
+    packed = bytearray(row_bytes)
+    for i, s in enumerate(samples):
+        bo = i * bits
+        packed[bo // 8] |= s << (8 - bits - bo % 8)
+    expected = bytes(s * 255 // smax for s in samples)
+
+    class _PackedImg:
+        def get_object(self): return self
+        def get(self, key, default=None):
+            return {"/Subtype": "/Image", "/Width": w, "/Height": 1,
+                    "/ColorSpace": "/DeviceGray", "/BitsPerComponent": bits,
+                    "/Filter": ["/FlateDecode"], "/DecodeParms": {
+                        "/Predictor": 10, "/Columns": w,
+                        "/Colors": 1, "/BitsPerComponent": bits}}.get(key, default)
+        def get_data(self): return bytes(packed)
+
+    _patch_reader(monkeypatch, _PackedImg())
+    proc = NaivePDFProcessorStrategy(extract_images=True, save_images_locally=False)
+    result = proc.process(_dummy_pdf(tmp_path))
+    entry = result.pages[0].images[0]
+    assert entry["format"] == "png", f"packed {bits}-bit fell back to bin"
+    assert _png_bytes(entry["data"]) == expected
 
 
 def test_predictor_12_image_local_save_writes_png(monkeypatch, tmp_path):
