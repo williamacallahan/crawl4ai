@@ -55,13 +55,16 @@ PUBLIC_PROOF_ATTEMPTS = REPLICAS * 8
 # immutable clock inside the deployed image while the runner's deadline is
 # `refresh`-ed at those same boundaries, so its journal window must outlive
 # their full legitimate sum (arming + queue admission + processing + update +
-# proofs + finish, each bounded by its own fresh TIMEOUT_SECONDS).
-# Six full windows cover every documented backlog (issue #163) and keep the
+# proofs + finish, each bounded by its own fresh TIMEOUT_SECONDS) plus the
+# inter-phase transition work (metadata, route, submission, and proof calls
+# that run between those bounded phases and are not themselves bounded by any
+# single window).
+# Seven full windows cover every documented backlog (issue #163) and keep the
 # internal `_collect` loop alive past every caller phase; the `check()` guard
 # inside each wait loop fails fast on a collector death rather than letting a
 # stale runner deadline misreport a healthy collector as `"expired"` at the
 # finish barrier after a successful rollout (the 2e49c6e7 regression).
-WITHDRAWAL_COLLECT_SECONDS = TIMEOUT_SECONDS * 6
+WITHDRAWAL_COLLECT_SECONDS = TIMEOUT_SECONDS * 7
 
 
 # Crawl4AI's durable job queue and task state live in this one external Redis.
