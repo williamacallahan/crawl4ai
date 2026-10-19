@@ -305,6 +305,26 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                                             # calling ``apply_png_predictor``
                                             # again would double-decode.
                                             from PIL import Image
+                                            # ``Image.frombytes`` with mode ``L``
+                                            # or ``RGB`` requires 8-bit samples;
+                                            # unpack 1-, 2-, and 4-bit predictor
+                                            # output and scale to 8-bit.
+                                            bits = xobj.get('/BitsPerComponent', 8)
+                                            if bits in (1, 2, 4):
+                                                channels = 3 if color_space == '/DeviceRGB' else 1
+                                                row_bytes = (width * bits * channels + 7) // 8
+                                                sample_max = (1 << bits) - 1
+                                                unpacked = bytearray()
+                                                for row_start in range(0, height * row_bytes, row_bytes):
+                                                    row = data[row_start:row_start + row_bytes]
+                                                    for sample_index in range(width * channels):
+                                                        bit_offset = sample_index * bits
+                                                        sample = (
+                                                            row[bit_offset // 8]
+                                                            >> (8 - bits - (bit_offset % 8))
+                                                        ) & sample_max
+                                                        unpacked.append(sample * 255 // sample_max)
+                                                data = bytes(unpacked)
                                             mode = 'RGB' if color_space == '/DeviceRGB' else 'L'
                                             img = Image.frombytes(mode, (width, height), data)
                                             
