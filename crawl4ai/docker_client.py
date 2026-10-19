@@ -24,16 +24,52 @@ class RequestError(Crawl4aiClientError):
     pass
 
 
+_ERROR_BODY_LIMIT = 512
+
+
+def _bounded_response_text(response: httpx.Response) -> str:
+    """Return up to ``_ERROR_BODY_LIMIT`` chars of ``response`` body as text.
+
+    Used when an error response carries no JSON ``detail`` — typically a
+    reverse proxy's plain-text 502/503 or an HTML error page — so the
+    diagnostic body that explains the failure is not lost behind the bare
+    HTTPX error text. The body must already have been read
+    (``response.aread()`` for a streamed response, or the default auto-read
+    for a regular request). Decode errors are replaced rather than raised so
+    a non-UTF-8 body never breaks building the message; the result is capped
+    so a multi-megabyte error page never floods the log or exception.
+    """
+    try:
+        text = response.text
+    except (UnicodeDecodeError, httpx.RequestError):
+        return f"<{len(response.content)} undecodable bytes>"
+    if len(text) <= _ERROR_BODY_LIMIT:
+        return text
+    return f"{text[:_ERROR_BODY_LIMIT]}... ({len(text)} bytes total)"
+
+
 def _http_error_detail(response: httpx.Response, error: httpx.HTTPStatusError) -> Any:
-    """Return an object-shaped JSON detail or the HTTPX error text."""
+    """Return an object-shaped JSON ``detail``, or the HTTPX error text with a
+    bounded slice of the response body appended.
+
+    A reverse proxy in front of the server often returns a plain-text 502/503
+    (or an HTML error page) with no JSON ``detail``; the bare ``str(error)``
+    HTTPX renders in that case drops the proxy's diagnostic body. To keep
+    those failures diagnosable we retain the HTTPX text and append the first
+    ``_ERROR_BODY_LIMIT`` chars of the decoded response body whenever no JSON
+    ``detail`` is available (non-JSON content type, JSON parse failure, or a
+    JSON payload without a ``detail`` field).
+    """
     fallback = str(error)
     if "application/json" not in response.headers.get("content-type", ""):
-        return fallback
+        return f"{fallback}: {_bounded_response_text(response)}"
     try:
         payload = response.json()
     except ValueError:
-        return fallback
-    return payload.get("detail", fallback) if isinstance(payload, dict) else fallback
+        return f"{fallback}: {_bounded_response_text(response)}"
+    if isinstance(payload, dict) and "detail" in payload:
+        return payload["detail"]
+    return f"{fallback}: {_bounded_response_text(response)}"
 
 
 def _decode_pdf(result: Dict[str, Any]) -> Dict[str, Any]:

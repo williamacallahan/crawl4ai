@@ -181,6 +181,30 @@ async def test_check_server_propagates_request_error_as_connection_error(prefixe
     assert "connection refused" in str(exc_info.value)
 
 
+# --- _check_server: plain-text proxy error body is retained ----------------
+@pytest.mark.asyncio
+async def test_check_server_retains_plain_text_proxy_body(prefixed_client):
+    """A non-JSON proxy error (e.g. a 502 from a reverse proxy) surfaces its
+    body in the ``ConnectionError`` so the failure stays diagnosable.
+
+    ``_http_error_detail`` previously returned the bare ``str(error)`` for
+    non-JSON responses, dropping the proxy's diagnostic text. The fix
+    appends a bounded slice of the response body to the HTTPX error text.
+    """
+    def handler(request):
+        return httpx.Response(
+            502,
+            content=b"Bad Gateway: upstream timed out",
+            headers={"content-type": "text/plain"},
+        )
+
+    _install_mock(prefixed_client, handler)
+    with pytest.raises(ConnectionError) as exc_info:
+        await prefixed_client._check_server()
+    assert "502" in str(exc_info.value)
+    assert "Bad Gateway: upstream timed out" in str(exc_info.value)
+
+
 # --- authenticate ---------------------------------------------------------
 @pytest.mark.asyncio
 async def test_authenticate_preserves_base_url_path_prefix(prefixed_client):
