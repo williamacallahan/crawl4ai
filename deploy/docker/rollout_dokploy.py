@@ -131,8 +131,14 @@ def _wait_deployment(
     prior_ids: set[str],
     title: str,
     description: str,
+    collector: withdrawals.Withdrawals | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
+    if collector is not None:
+        # Refresh at the same boundary the caller's own deadline does, so a
+        # queue wait within its own TIMEOUT_SECONDS bound never fails a
+        # collector whose runner deadline the earlier arming consumed.
+        collector.refresh()
     admitted = False
     while time.monotonic() < deadline:
         try:
@@ -161,12 +167,22 @@ def _wait_deployment(
             if not admitted:
                 admitted = True
                 deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
+                if collector is not None:
+                    # The processing phase gets its own fresh caller bound; the
+                    # runner keeps pace so a slow processing wait reports its
+                    # own error, not a stale queue-admission collector expiry.
+                    collector.refresh()
                 print("stock Dokploy deployment was admitted; waiting for processing", flush=True)
             status = owned.get("status")
             if status == "done":
                 return owned
             if status in {"error", "cancelled"}:
                 raise withdrawals.StateError(f"stock Dokploy deployment ended in {status}", status)
+        if collector is not None:
+            # Surface a collector death inside the wait that owns it instead of
+            # at the finish barrier, so a journal that expired or a collector
+            # that failed during queue/processing is attributed to this phase.
+            collector.check()
         time.sleep(5)
     if admitted:
         raise TimeoutError("stock Dokploy deployment did not finish after queue admission")

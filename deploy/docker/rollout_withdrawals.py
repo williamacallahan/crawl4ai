@@ -223,14 +223,49 @@ def validate(journal: Journal, app: str, baseline: list[Task], candidate: list[T
 
 
 class Withdrawals:
-    def __init__(self, app: str, image: str, path: Path, seconds: int):
+    def __init__(self, app: str, image: str, path: Path, seconds: int,
+                 collect_seconds: int | None = None):
         self.app, self.image, self.path, self.seconds = app, image, path, seconds
+        # The runner refreshes this per-phase deadline at the same boundaries
+        # the caller does (queue admission, processing, Swarm-update wait, the
+        # public-proof span, and the finish barrier), so a phase within its own
+        # fresh TIMEOUT_SECONDS bound never fails a collector for an unrelated
+        # earlier phase. The collector program runs on a single immutable
+        # clock inside the image (set seconds before any Swarm event arrives),
+        # so its journal window must outlive the legitimate sum of every phase
+        # it spans; that is `collect_seconds` and defaults to `seconds` for
+        # callers that budget one window rather than per-phase windows.
+        self.collect_seconds = collect_seconds if collect_seconds is not None else seconds
         self.prefix = f"withdrawal-{uuid.uuid4().hex[:20]}"
         self.nodes = ready_nodes()
         self.services: list[str] = []
         self.collectors: dict[str, tuple[str, str, str]] = {}
         self.baseline: list[Task] = []
         self.deadline = time.monotonic() + seconds
+
+    def refresh(self) -> None:
+        """Reset the runner's per-phase deadline at a caller phase boundary.
+
+        The caller grants queue admission, processing, the Swarm update, the
+        public proofs, and the finish barrier each its own fresh
+        ``TIMEOUT_SECONDS``. Refresh at the same boundaries so a phase within
+        its own bound never fails an earlier phase's collector; only the slow
+        phase itself reports its own error.
+        """
+        self.deadline = time.monotonic() + self.seconds
+
+    def check(self) -> None:
+        """Surface a collector failure in the phase that owned the slow wait.
+
+        The guard fails fast on a collector that died (or whose internal
+        journal expired) in an earlier phase instead of misleadingly surfacing
+        as ``"expired": true`` at the final ``finish()`` barrier after a
+        successful rollout. Callers invoke this inside their wait loops so a
+        collector death is attributed to its phase rather than survive until
+        ``finish()``.
+        """
+        for node in self.nodes:
+            self._guard(node)
 
     def _save(self) -> None:
         self.path.write_text(json.dumps({"owner": self.prefix, "services": self.services}, separators=(",", ":")))
@@ -286,7 +321,7 @@ class Withdrawals:
         source = inspect.getsource(_collect)
         for node in self.nodes:
             name = f"{self.prefix}-{node}"
-            program = source + f"\n_collect({self.app!r}, {name + '-arm'!r}, {name + '-end'!r}, {self.seconds})"
+            program = source + f"\n_collect({self.app!r}, {name + '-arm'!r}, {name + '-end'!r}, {self.collect_seconds})"
             service = self._create(name, node, program, True)
             self.collectors[node] = (service, "", "")
         for node, (service, _, _) in list(self.collectors.items()):
