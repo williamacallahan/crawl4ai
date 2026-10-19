@@ -181,16 +181,27 @@ class DatabaseMigration:
                     stored_hashes = {}
                     for content_type, value in content_values.items():
                         pointer_key = (url, content_type)
-                        backing_file = (
-                            os.path.join(self.content_paths[content_type], value)
-                            if value
-                            else ""
-                        )
                         known = pointer_key in known_pointers
-                        legacy_pointer = (
-                            self._is_content_hash(value, content_type)
-                            and os.path.exists(backing_file)
-                        )
+                        # A 16-hex value is an already-migrated content-hash
+                        # pointer purely by its shape (see ``_is_content_hash``),
+                        # NOT by whether its backing ``*_content/<hash>`` file
+                        # currently exists. Re-gating pointer classification on
+                        # ``os.path.exists(backing_file)`` would leave any
+                        # unledgered 16-hex pointer whose backing file is missing
+                        # (a runtime-cached row written by ``acache_url`` that
+                        # predates the provenance ledger -- or whose ledger row
+                        # was lost -- with its content dir gone) classified as
+                        # raw legacy content, force it through ``_store_content``
+                        # with ``force=True``, bypass the idempotency guard, and
+                        # re-hash the 16-char hash *string* into a destructive
+                        # "hash-of-hash" pointer whose new file body is the old
+                        # hash string. The cache then serves that hash string as
+                        # the page's HTML on a HIT (silent, unrecoverable
+                        # corruption). The sound recovery for a missing backing
+                        # file is a self-healing cache miss on read
+                        # (``aget_cached_url`` returns ``None`` when
+                        # ``_load_content`` cannot find the file), not a re-hash.
+                        legacy_pointer = self._is_content_hash(value, content_type)
                         stored_hashes[content_type] = await self._store_content(
                             value,
                             content_type,
