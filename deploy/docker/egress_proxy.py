@@ -40,6 +40,7 @@ logger = logging.getLogger("crawl4ai.egress")
 _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _BLOCKED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
 _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
+_EXPECTATION_FAILED = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 18\r\n\r\nExpectation Failed"
 _MAX_HEADER_BYTES = 64 * 1024
 _HEX_DIGITS = b"0123456789abcdefABCDEF"
 # Hop-by-hop fields the proxy replaces with its own Connection: close.
@@ -445,6 +446,19 @@ class PinningProxy:
             _request_body_length(headers)
         except ValueError:
             await self._reply(client_writer, _BAD)
+            return
+        # Reject unsupported ``Expect`` values before opening the upstream
+        # connection or forwarding the request body.  ``_relay_one`` reads the
+        # full request body before the upstream response, so a client using
+        # ``Expect: x-...`` that waits for an interim/final response before
+        # sending its body would deadlock the relay.  ``100-continue`` is the
+        # only expectation handled locally (it is stripped from the upstream
+        # request and the proxy emits the interim ``100 Continue`` itself
+        # below); any other ``Expect`` is rejected with ``417`` per RFC 7231
+        # §5.1.1 so the client learns not to send the body and the proxy never
+        # opens or holds an upstream connection for an unsatisfiable request.
+        if self._unsupported_expect(headers):
+            await self._reply(client_writer, _EXPECTATION_FAILED)
             return
         path = sp.path or "/"
         if sp.query:
@@ -935,6 +949,22 @@ class PinningProxy:
         except (OSError, ConnectionError) as error:
             logger.debug("proxy reply failed: %s", error)
         await self._safe_close(writer)
+
+    @staticmethod
+    def _unsupported_expect(headers: bytes) -> bool:
+        """True if the request headers carry an ``Expect`` value other than
+        ``100-continue`` (which ``_handle_absolute`` handles locally)."""
+        for line in headers.split(b"\r\n"):
+            if not line:
+                continue
+            name, _, value = line.partition(b":")
+            if name.strip().lower() != b"expect":
+                continue
+            tokens = [t.strip().lower() for t in value.split(b",") if t.strip()]
+            if tokens and all(t == b"100-continue" for t in tokens):
+                continue
+            return True
+        return False
 
     @staticmethod
     async def _safe_close(writer):

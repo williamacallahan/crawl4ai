@@ -1321,6 +1321,50 @@ class TestDirectDialNoSmuggling:
         assert data.endswith(b"got it!")
         assert b"Connection: close" in data
 
+    async def test_direct_path_unsupported_expect_rejected_not_forwarded(self, monkeypatch):
+        """A client that sends an ``Expect`` value other than ``100-continue``
+        with a body must not hang the relay.  ``_relay_one`` reads the full
+        request body before the upstream response, so forwarding the request as
+        written would block the proxy on body bytes the client (correctly)
+        never sends while it waits for a ``417``/``400`` it expects first.
+        The proxy rejects the request locally with ``417 Expectation Failed``
+        before opening the upstream connection, and never reads the body."""
+        connected = {"value": False}
+
+        async def handle(reader, writer):
+            connected["value"] = True
+            writer.close()
+
+        origin = await asyncio.start_server(handle, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+
+        def fake_pin(url):
+            return PinnedTarget("http", "plain.example", origin_port, "127.0.0.1")
+        monkeypatch.setattr(egress_proxy, "resolve_and_pin", fake_pin)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(
+                (f"POST http://plain.example:{origin_port}/ HTTP/1.1\r\n"
+                 f"Host: plain.example:{origin_port}\r\n"
+                 "Expect: x-token-continue\r\n"
+                 "Content-Length: 5\r\n\r\n").encode()
+            )
+            await w.drain()
+            # The proxy must reject before forwarding; the origin must not be
+            # contacted, and the client must not have to send the body.
+            data = await asyncio.wait_for(r.read(4096), timeout=3)
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+            await origin.wait_closed()
+        assert not connected["value"], "origin was contacted for an unsupported Expect"
+        assert b"417 Expectation Failed" in data
+        assert b"Expectation Failed" in data
+
 
 def test_upstream_proxy_env_parsing(monkeypatch):
     assert egress_proxy.upstream_proxy() is None
