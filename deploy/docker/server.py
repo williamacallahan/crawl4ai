@@ -210,6 +210,7 @@ AsyncWebCrawler.arun = capped_arun
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    from brightdata_unlocker import close_unlocker, get_unlocker_fallback
     import monitor as monitor_module
     from crawler_pool import init_permanent
     from egress_proxy import start_pinning_proxy, stop_pinning_proxy
@@ -217,6 +218,7 @@ async def lifespan(_: FastAPI):
 
     # Enforce auth posture before serving any traffic.
     _resolve_auth()
+    get_unlocker_fallback(config)
 
     app.state.egress_proxy = None
     app.state.readiness_checks_active = False
@@ -283,6 +285,7 @@ async def lifespan(_: FastAPI):
             logger.error(f"Monitor cleanup failed: {e}")
 
         await close_all()
+        await close_unlocker()
         try:
             await stop_pinning_proxy(app.state.egress_proxy)
         except Exception:

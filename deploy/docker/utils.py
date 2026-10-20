@@ -84,7 +84,7 @@ DEFAULT_CONFIG = {
         "timeouts": {"stream_init": 30.0, "batch_process": 300.0},
         "pool": {"max_pages": 40, "idle_ttl_sec": 300},
         "browser": {
-            "kwargs": {"headless": True, "text_mode": True},
+            "kwargs": {"headless": True, "text_mode": True, "avoid_ads": True},
             "extra_args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",

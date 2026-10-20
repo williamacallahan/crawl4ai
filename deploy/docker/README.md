@@ -127,6 +127,14 @@ EOL
     `CRAWL4AI_UPSTREAM_PROXY` at it. Proxies that refuse CONNECT-to-an-IP, or
     containers with no DNS at all, are not yet supported.
 
+Bright Data Web Unlocker is an optional fallback after blocked or failed direct
+attempts. Supply the credential through `BRIGHTDATA_API_KEY` or the mounted secret
+file `/run/secrets/brightdata_api_key` (the environment variable takes precedence),
+and override any `UnlockerSettings` default (`brightdata_unlocker.py`) under
+`brightdata.unlocker` in `config.yml`. Billing is per successful
+Unlocker request; the circuit breaker pauses fallback requests after repeated
+provider failures.
+
 #### 4. Stopping the Container
 
 ```bash

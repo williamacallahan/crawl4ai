@@ -22,6 +22,9 @@ from typing import Optional, Tuple
 from lxml import html as lxml_html
 
 
+_CF_CHALLENGE_OPTIONS_RE = re.compile(r"window\._cf_chl_opt\s*=", re.IGNORECASE)
+
+
 # ---------------------------------------------------------------------------
 # Tier 1: High-confidence structural markers (single signal sufficient)
 # These are unique to block pages and virtually never appear in real content.
@@ -42,6 +45,10 @@ _TIER1_PATTERNS = [
     # Cloudflare — IUAM challenge script
     (re.compile(r'/cdn-cgi/challenge-platform/\S+orchestrate', re.IGNORECASE),
      "Cloudflare JS challenge"),
+    # Cloudflare — interstitial title and challenge script configuration
+    (re.compile(r"<title>\s*Just\s+a\s+moment", re.IGNORECASE),
+     "Cloudflare interstitial"),
+    (_CF_CHALLENGE_OPTIONS_RE, "Cloudflare challenge options"),
     # PerimeterX / HUMAN — block page with app ID assignment (not prose mentions)
     (re.compile(r"window\._pxAppId\s*=", re.IGNORECASE),
      "PerimeterX block"),
@@ -78,11 +85,9 @@ _TIER2_PATTERNS = [
     # Akamai / generic — "Access Denied" (extremely common on legit 403s too)
     (re.compile(r"Access\s+Denied", re.IGNORECASE),
      "Access Denied on short page"),
-    # Cloudflare — "Just a moment" / "Checking your browser"
+    # Cloudflare — generic browser-check body text
     (re.compile(r"Checking\s+your\s+browser", re.IGNORECASE),
      "Cloudflare browser check"),
-    (re.compile(r"<title>\s*Just\s+a\s+moment", re.IGNORECASE),
-     "Cloudflare interstitial"),
     # CAPTCHA on a block page (not a login form — login forms are big pages)
     (re.compile(r'class=["\']g-recaptcha["\']', re.IGNORECASE),
      "reCAPTCHA on block page"),
@@ -117,7 +122,7 @@ _TAG_RE = re.compile(r'<[^>]+>')
 # The large-page deep scan strips <script> blocks before re-running the Tier 1
 # pattern list (a deliberate false-positive guard for the site-wide sensors
 # window._pxAppId / captcha-delivery.com / KPSDK.scriptStart on legitimate
-# large 200 articles). That strip also deletes these two block-page-only
+# large 200 articles). That strip also deletes these block-page-only
 # markers, so a second pass iterates the script blocks themselves and searches
 # their content for just these. Site-wide markers are deliberately excluded
 # here so the false-positive guard keeps working for legitimate articles.
@@ -362,7 +367,11 @@ def is_blocked(
         # protected sites keep their existing false-positive guard.
         for _blk in _SCRIPT_BLOCK_RE.finditer(html[:500000]):
             _blob = _blk.group(0)
-            if _PX_CAPTCHA_RE.search(_blob) or _CF_ORCHESTRATE_RE.search(_blob):
+            if (
+                _PX_CAPTCHA_RE.search(_blob)
+                or _CF_ORCHESTRATE_RE.search(_blob)
+                or _CF_CHALLENGE_OPTIONS_RE.search(_blob)
+            ):
                 return True, "Anti-bot script marker in <script>"
 
     # --- HTTP 403/503 — always blocked for non-data HTML responses ---
