@@ -93,9 +93,9 @@ def test_credential_refusal_opens_breaker_after_configured_failures(caplog):
     ("status", "headers", "opens_breaker"),
     [
         (502, {}, True),
-        (403, {"x-brd-error": "upstream failure"}, True),
-        (200, {"x-brd-error": ""}, True),
-        (200, {"x-brd-err-code": "provider_failure"}, True),
+        (407, {}, True),
+        (502, {"x-brd-error-code": "reject_block"}, False),
+        (403, {"x-brd-error": "Forbidden: target site policy"}, False),
         (404, {}, False),
     ],
 )
@@ -113,7 +113,7 @@ def test_provider_failures_open_breaker_but_target_errors_do_not(
 
         unlocker = make_unlocker(handler, breaker_failures=1)
         try:
-            with pytest.raises(UnlockerError, match="provider refused|target returned"):
+            with pytest.raises(UnlockerError, match="provider refused|target returned|could not serve the target"):
                 await unlocker.fetch("https://example.com")
             if opens_breaker:
                 with pytest.raises(UnlockerError, match="circuit is open"):

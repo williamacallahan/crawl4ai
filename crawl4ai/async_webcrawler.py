@@ -586,9 +586,17 @@ class AsyncWebCrawler:
                     # Skip for raw: URLs — fallback expects a real URL, not raw HTML content.
                     _fallback_fn = getattr(config, "fallback_fetch_function", None)
                     if _fallback_fn and not _done and not _is_raw_url:
+                        # A TLS or certificate refusal is the server's own verification policy;
+                        # a fallback served over another network would bypass it.
+                        _tls_refusal = _target_outcome and any(
+                            marker in _block_reason
+                            for marker in ("net::ERR_CERT_", "net::ERR_SSL_")
+                        )
                         _needs_fallback = (
-                            crawl_result is None  # All proxies threw exceptions
-                            or is_blocked(crawl_result.status_code, crawl_result.html or "")[0]
+                            crawl_result is None and not _tls_refusal  # All proxies threw exceptions
+                        ) or (
+                            crawl_result is not None
+                            and is_blocked(crawl_result.status_code, crawl_result.html or "")[0]
                         )
                         if _needs_fallback:
                             self.logger.warning(

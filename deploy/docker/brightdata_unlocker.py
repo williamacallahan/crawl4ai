@@ -174,13 +174,18 @@ class BrightDataUnlocker:
                 "country": self.settings.country,
             },
         ) as response:
+            # Bright Data reports a target's outcome (a wall it could not pass, a relayed target
+            # status, a policy refusal, a page that would not load) in its error headers. Only a
+            # bare 5xx or a bare 401/407 credential refusal says the provider itself is unhealthy.
+            target_reason = response.headers.get("x-brd-error-code") or response.headers.get(
+                "x-brd-error"
+            )
+            if target_reason:
+                raise _TargetFailure(
+                    f"Web Unlocker could not serve the target (HTTP {response.status_code}, {target_reason[:80]})"
+                )
             credential_refused = response.status_code in (401, 407)
-            if (
-                credential_refused
-                or response.status_code >= 500
-                or "x-brd-error" in response.headers
-                or "x-brd-err-code" in response.headers
-            ):
+            if credential_refused or response.status_code >= 500:
                 raise _ProviderFailure(
                     f"Web Unlocker provider refused request (HTTP {response.status_code})",
                     credential_refused=credential_refused,

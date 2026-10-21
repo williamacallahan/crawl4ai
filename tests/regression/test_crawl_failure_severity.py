@@ -252,3 +252,36 @@ async def test_target_navigation_is_info_but_browser_failure_is_error(tmp_path):
     assert not any(
         event[:2] == ("info", "TARGET") for event in platform_logger.events
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refusal", "fallback_runs"),
+    [
+        ("Target navigation refused: net::ERR_CERT_AUTHORITY_INVALID", False),
+        ("Target navigation refused: net::ERR_CONNECTION_REFUSED", True),
+    ],
+)
+async def test_tls_refusal_never_reaches_the_fallback(tmp_path, refusal, fallback_runs):
+    crawler = AsyncWebCrawler(
+        crawler_strategy=_ResponseStrategy(error=TargetNavigationError(refusal)),
+        base_directory=str(tmp_path),
+        logger=_RecordingLogger(),
+    )
+    crawler.ready = True
+    crawler.aprocess_html = AsyncMock(
+        return_value=CrawlResult(url="https://example.com", html="<p>unlocked</p>", success=True)
+    )
+    fetched = []
+
+    async def fallback(url):
+        fetched.append(url)
+        return "<p>unlocked</p>"
+
+    result = await crawler.arun(
+        "https://example.com",
+        CrawlerRunConfig(cache_mode=CacheMode.BYPASS, fallback_fetch_function=fallback),
+    )
+
+    assert result.success is fallback_runs
+    assert fetched == (["https://example.com"] if fallback_runs else [])
