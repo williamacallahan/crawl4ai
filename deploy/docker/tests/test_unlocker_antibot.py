@@ -34,10 +34,15 @@ def test_cloudflare_challenge_options_block_large_http_200_page(padding_size):
         + "</body></html>"
     )
 
-    blocked, reason = is_blocked(200, html)
+    assert is_blocked(200, html) == (True, "Anti-bot script marker in <script>")
 
-    assert blocked is True
-    assert reason in (
-        "Cloudflare challenge options",
-        "Anti-bot script marker in <script>",
+
+def test_article_quoting_cloudflare_challenge_options_is_not_blocked():
+    html = (
+        "<html><head><title>Scraping behind Cloudflare</title></head><body><article><p>"
+        + "Solvers read the challenge configuration before submitting it. " * 200
+        + "</p><pre><code>window._cf_chl_opt = {cType: 'managed'};</code></pre>"
+        + "</article></body></html>"
     )
+
+    assert is_blocked(200, html) == (False, "")

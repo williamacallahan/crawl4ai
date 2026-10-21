@@ -23,6 +23,7 @@ from lxml import html as lxml_html
 
 
 _CF_CHALLENGE_OPTIONS_RE = re.compile(r"window\._cf_chl_opt\s*=", re.IGNORECASE)
+_CF_INTERSTITIAL_TITLE_RE = re.compile(r"<title>\s*Just\s+a\s+moment", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -45,10 +46,6 @@ _TIER1_PATTERNS = [
     # Cloudflare — IUAM challenge script
     (re.compile(r'/cdn-cgi/challenge-platform/\S+orchestrate', re.IGNORECASE),
      "Cloudflare JS challenge"),
-    # Cloudflare — interstitial title and challenge script configuration
-    (re.compile(r"<title>\s*Just\s+a\s+moment", re.IGNORECASE),
-     "Cloudflare interstitial"),
-    (_CF_CHALLENGE_OPTIONS_RE, "Cloudflare challenge options"),
     # PerimeterX / HUMAN — block page with app ID assignment (not prose mentions)
     (re.compile(r"window\._pxAppId\s*=", re.IGNORECASE),
      "PerimeterX block"),
@@ -85,9 +82,10 @@ _TIER2_PATTERNS = [
     # Akamai / generic — "Access Denied" (extremely common on legit 403s too)
     (re.compile(r"Access\s+Denied", re.IGNORECASE),
      "Access Denied on short page"),
-    # Cloudflare — generic browser-check body text
+    # Cloudflare — "Just a moment" / "Checking your browser"
     (re.compile(r"Checking\s+your\s+browser", re.IGNORECASE),
      "Cloudflare browser check"),
+    (_CF_INTERSTITIAL_TITLE_RE, "Cloudflare interstitial"),
     # CAPTCHA on a block page (not a login form — login forms are big pages)
     (re.compile(r'class=["\']g-recaptcha["\']', re.IGNORECASE),
      "reCAPTCHA on block page"),
@@ -359,20 +357,22 @@ def is_blocked(
         for pattern, reason in _TIER1_PATTERNS:
             if pattern.search(_deep_snippet):
                 return True, reason
-        # Block-page-only markers live inside <script> tags, which the strip
-        # above destroys. Iterate the script blocks and search their content
-        # for those markers only. Site-wide sensor markers (window._pxAppId,
-        # captcha-delivery.com, KPSDK.scriptStart) are deliberately excluded
-        # so legitimate large 200 pages on PerimeterX/DataDome/Kasada-
-        # protected sites keep their existing false-positive guard.
-        for _blk in _SCRIPT_BLOCK_RE.finditer(html[:500000]):
-            _blob = _blk.group(0)
-            if (
-                _PX_CAPTCHA_RE.search(_blob)
-                or _CF_ORCHESTRATE_RE.search(_blob)
-                or _CF_CHALLENGE_OPTIONS_RE.search(_blob)
-            ):
-                return True, "Anti-bot script marker in <script>"
+
+    # Block-page-only markers live inside <script> tags, which the strip above
+    # destroys. Iterate the script blocks at any page size and search their
+    # content for those markers only, so prose quoting them is never a block.
+    # Site-wide sensor markers (window._pxAppId, captcha-delivery.com,
+    # KPSDK.scriptStart) are deliberately excluded so legitimate large 200
+    # pages on PerimeterX/DataDome/Kasada-protected sites keep their existing
+    # false-positive guard.
+    for _blk in _SCRIPT_BLOCK_RE.finditer(html[:500000]):
+        _blob = _blk.group(0)
+        if (
+            _PX_CAPTCHA_RE.search(_blob)
+            or _CF_ORCHESTRATE_RE.search(_blob)
+            or _CF_CHALLENGE_OPTIONS_RE.search(_blob)
+        ):
+            return True, "Anti-bot script marker in <script>"
 
     # --- HTTP 403/503 — always blocked for non-data HTML responses ---
     # Rationale: 403/503 are never the content the user wants. Modern block pages
@@ -404,6 +404,12 @@ def is_blocked(
         for pattern, reason in _TIER2_PATTERNS:
             if pattern.search(snippet):
                 return True, f"{reason} (HTTP {status_code}, {html_len} bytes)"
+
+    # --- Cloudflare interstitial title at any size or status ---
+    # Checked after the vendor-specific tiers so their reasons win; a 200-status
+    # challenge carries enough inline CSS/JS to exceed the Tier 2 size cap.
+    if _CF_INTERSTITIAL_TITLE_RE.search(snippet):
+        return True, "Cloudflare interstitial"
 
     # --- HTTP 200 + near-empty content (JS-rendered empty page) ---
     if status_code == 200:
