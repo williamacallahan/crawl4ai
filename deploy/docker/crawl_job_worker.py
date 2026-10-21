@@ -286,11 +286,8 @@ class CrawlJobWorker:
 
 
 async def run_worker() -> None:
-    from brightdata_unlocker import close_unlocker, get_unlocker_fallback
-
     config = load_config()
     setup_logging(config)
-    get_unlocker_fallback(config)
     redis = aioredis.from_url(
         build_redis_url(config), decode_responses=True, **RESILIENT_CLIENT_KWARGS
     )
@@ -316,12 +313,9 @@ async def run_worker() -> None:
             await close_all()
         finally:
             try:
-                await close_unlocker()
+                await stop_pinning_proxy(proxy)
             finally:
-                try:
-                    await stop_pinning_proxy(proxy)
-                finally:
-                    await redis.aclose()
+                await redis.aclose()
 
 
 def main() -> None:

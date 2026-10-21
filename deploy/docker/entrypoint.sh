@@ -36,11 +36,6 @@ if [[ -z "${CRAWL4AI_API_TOKEN:-}" && -n "${CRAWL4AI_API_TOKEN_FROM_HOST:-}" ]];
 fi
 unset CRAWL4AI_API_TOKEN_FROM_HOST
 
-# --- Bright Data API key: existing env var takes precedence over the secret. --
-if [[ -z "${BRIGHTDATA_API_KEY:-}" && -f /run/secrets/brightdata_api_key ]]; then
-    export BRIGHTDATA_API_KEY="$(cat /run/secrets/brightdata_api_key)"
-fi
-
 # --- Bind resolution: loopback unless a credential is present. ---------------
 PORT="${CRAWL4AI_PORT:-11235}"
 read -r CONFIG_API_TOKEN_SET CONFIG_JWT_ENABLED < <(

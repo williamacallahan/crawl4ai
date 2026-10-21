@@ -11,7 +11,6 @@ from urllib.parse import unquote
 from uuid import uuid4
 
 import psutil
-from brightdata_unlocker import get_unlocker_fallback
 from crawl_job_queue import (
     CrawlJobPayloadRejected,
     CrawlJobPrincipalQuotaExceeded,
@@ -210,7 +209,7 @@ def _apply_server_browser_policy(browser_config, config):
 
 
 def apply_server_crawler_defaults(loaded_config, request_config, config):
-    """Apply omitted defaults and the server-owned fallback fetch policy."""
+    """Apply server defaults only when the wire request omitted the field."""
     request_config = request_config or {}
     request_params = (
         request_config.get("params", {})
@@ -222,7 +221,6 @@ def apply_server_crawler_defaults(loaded_config, request_config, config):
     for key, value in config["crawler"]["base_config"].items():
         if key not in request_params and hasattr(loaded_config, key):
             setattr(loaded_config, key, value)
-    loaded_config.fallback_fetch_function = get_unlocker_fallback(config)
     return loaded_config
 
 
