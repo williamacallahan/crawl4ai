@@ -2,6 +2,7 @@ import os
 import sys
 from datetime import timedelta
 
+import httpx
 import jwt
 import pytest
 
@@ -31,3 +32,31 @@ def test_expired_access_token_is_rejected():
 
     with pytest.raises(jwt.ExpiredSignatureError):
         auth.decode_token(token)
+
+
+@pytest.mark.asyncio
+async def test_comma_separated_api_tokens_each_authenticate(
+    server_module, monkeypatch
+):
+    monkeypatch.setenv("CRAWL4AI_API_TOKEN", " old-token , new-token ,, ")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app),
+        base_url="http://test",
+    ) as client:
+        old = await client.get("/schema", headers={"Authorization": "Bearer old-token"})
+        new = await client.get("/schema", headers={"Authorization": "Bearer new-token"})
+        unknown = await client.get(
+            "/schema", headers={"Authorization": "Bearer other-token"}
+        )
+        joined = await client.get(
+            "/schema", headers={"Authorization": "Bearer old-token,new-token"}
+        )
+
+    assert old.status_code == 200
+    assert new.status_code == 200
+    assert unknown.status_code == 401
+    assert joined.status_code == 401
+    assert server_module._internal_service_auth_headers() == {
+        "Authorization": "Bearer old-token"
+    }

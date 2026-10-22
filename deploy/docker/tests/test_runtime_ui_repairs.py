@@ -538,34 +538,6 @@ def test_runtime_api_token_override_has_one_owner(server_module, monkeypatch):
     assert server_module._current_api_tokens() == ("runtime-token",)
 
 
-@pytest.mark.asyncio
-async def test_comma_separated_api_tokens_each_authenticate(
-    server_module, monkeypatch
-):
-    monkeypatch.setenv("CRAWL4AI_API_TOKEN", " old-token , new-token ,, ")
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=server_module.app),
-        base_url="http://test",
-    ) as client:
-        old = await client.get("/schema", headers={"Authorization": "Bearer old-token"})
-        new = await client.get("/schema", headers={"Authorization": "Bearer new-token"})
-        unknown = await client.get(
-            "/schema", headers={"Authorization": "Bearer other-token"}
-        )
-        joined = await client.get(
-            "/schema", headers={"Authorization": "Bearer old-token,new-token"}
-        )
-
-    assert old.status_code == 200
-    assert new.status_code == 200
-    assert unknown.status_code == 401
-    assert joined.status_code == 401
-    assert server_module._internal_service_auth_headers() == {
-        "Authorization": "Bearer old-token"
-    }
-
-
 def test_internal_mcp_auth_prefers_existing_static_operator_token(
     server_module, monkeypatch
 ):
