@@ -27,7 +27,7 @@ def _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtim
     monkeypatch.setattr(
         rollout_dokploy, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
-    monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: ("completed", "2026-10-21T10:00:00Z"))
     monkeypatch.setattr(rollout_tasks, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
     monkeypatch.setattr(rollout_tasks, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout_tasks, "_verify_redis", lambda: None)
@@ -67,7 +67,7 @@ def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(monkeypatch, tmp_
     monkeypatch.setattr(
         rollout_dokploy, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
-    monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: ("completed", "2026-10-21T10:00:00Z"))
     monkeypatch.setattr(rollout_tasks, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
     monkeypatch.setattr(rollout_tasks, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout_tasks, "_verify_redis", lambda: None)
@@ -198,7 +198,7 @@ def test_deploy_noop_rerun_passes_lenient_converged_to_the_candidate_proof(
     monkeypatch.setattr(
         rollout_dokploy, "_wait_deployment", lambda *_args: pytest.fail("no deployment may be submitted")
     )
-    monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: "completed")
+    monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: ("completed", "2026-10-21T10:00:00Z"))
     monkeypatch.setattr(rollout_tasks, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
     monkeypatch.setattr(rollout_tasks, "_service_spec", lambda _name: service_spec(candidate, REVISION))
     monkeypatch.setattr(rollout_tasks, "_verify_redis", lambda: None)

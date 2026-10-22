@@ -10,6 +10,23 @@ import verify_rollout as rollout
 from conftest import BASELINE, CANDIDATE, ELIGIBLE_NODES, REVISION, _healed_baseline_rows, _wire_verify_tasks, health
 
 
+@pytest.mark.parametrize("status", [
+    None,
+    {"State": "rollback_paused", "StartedAt": "2026-10-22T10:00:00.123456789Z"},
+])
+def test_update_state_reads_state_and_start_from_one_service_snapshot(monkeypatch, status):
+    def run(command, **_kwargs):
+        assert command == [
+            "docker", "service", "inspect", "crawl4ai", "--format", "{{json .UpdateStatus}}",
+        ]
+        return subprocess.CompletedProcess(command, 0, json.dumps(status) + "\n", "")
+
+    monkeypatch.setattr(rollout_tasks.subprocess, "run", run)
+
+    expected = (status["State"], status["StartedAt"]) if status else ("", "")
+    assert rollout_tasks._update_state("crawl4ai") == expected
+
+
 def _node_commands(nodes):
     """Stub docker node ls/inspect for a fleet of (hostname, labeled, state, availability)."""
     def run(cmd, **_kwargs):

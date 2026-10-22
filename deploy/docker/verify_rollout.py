@@ -30,10 +30,13 @@ def _deploy() -> None:
     # A native environment reload can outlive the CI build. Join its bounded
     # wait before capturing the baseline; never submit a competing update.
     deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
-    state = rollout_tasks._update_state(app_name)
+    state, _ = rollout_tasks._update_state(app_name)
     waited = False
     while state not in {"", "completed"}:
         if state not in {"updating", "rollback_started"}:
+            if state in {"paused", "rollback_paused", "rollback_completed"}:
+                print(f"prior Crawl4AI Swarm update ended in {state}; proving the running baseline", flush=True)
+                break
             raise withdrawals.StateError(f"prior Crawl4AI Swarm update ended in {state}", state)
         if time.monotonic() >= deadline:
             raise TimeoutError("prior Crawl4AI Swarm update did not finish")
@@ -41,7 +44,7 @@ def _deploy() -> None:
             print("waiting for the prior native Crawl4AI Swarm update", flush=True)
             waited = True
         time.sleep(5)
-        state = rollout_tasks._update_state(app_name)
+        state, _ = rollout_tasks._update_state(app_name)
     if waited:
         application = rollout_dokploy._application(base, api_key, application_id)
     rollout_policy._policy(application)
@@ -136,6 +139,7 @@ def _deploy() -> None:
                 or current.get("placementSwarm") != placement):
             raise RuntimeError("baseline metadata changed while arming withdrawal proof")
         rollout_tasks.verify_route(base, api_key, application_id, app_name)
+        _, prior_started_at = rollout_tasks._update_state(app_name)
         rollout_http._post_json(
             f"{base.rstrip('/')}/api/application.update",
             api_key,
@@ -161,10 +165,13 @@ def _deploy() -> None:
         )["deploymentId"]
         deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
         while True:
-            state = rollout_tasks._update_state(app_name)
-            if state == "completed":
+            state, started_at = rollout_tasks._update_state(app_name)
+            # Swarm can still expose the previous terminal result while
+            # Dokploy's newly submitted update is waiting to start.
+            current_update = started_at != "" and started_at != prior_started_at
+            if current_update and state == "completed":
                 break
-            if state in {"paused", "rollback_paused", "rollback_completed"}:
+            if current_update and state in {"paused", "rollback_paused", "rollback_completed"}:
                 raise withdrawals.StateError(
                     f"Swarm update ended in {state}; manual reconciliation required", state
                 )

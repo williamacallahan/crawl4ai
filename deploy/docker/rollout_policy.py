@@ -60,12 +60,15 @@ REDIS_NODE = "haiku-18"
 # everysec, never always: appendfsync=always was half of the 2026-08-28 fleet
 # kill, stalling every crawl behind Redis. Pinned so a console edit cannot
 # reintroduce it silently.
+# Bound below the 1GiB limit; volatile-lru preserves the no-TTL durable queue and renewed permit.
 REDIS_COMMAND = [
     "redis-server",
     "--dir", "/data",
     "--appendonly", "yes",
     "--appendfsync", "everysec",
     "--loglevel", "notice",
+    "--maxmemory", "700mb",
+    "--maxmemory-policy", "volatile-lru",
 ]
 REDIS_MOUNTS = [{"Type": "volume", "Source": "crawl4ai-redis-data", "Target": "/data"}]
 REDIS_HEALTHCHECK_TEST = ["CMD", "redis-cli", "ping"]

@@ -23,7 +23,7 @@ def _service_spec(app_name: str) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
-def _update_state(app_name: str) -> str:
+def _update_state(app_name: str) -> tuple[str, str]:
     result = subprocess.run(
         [
             "docker",
@@ -31,11 +31,12 @@ def _update_state(app_name: str) -> str:
             "inspect",
             app_name,
             "--format",
-            "{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}",
+            "{{json .UpdateStatus}}",
         ],
         check=True, capture_output=True, text=True,
     )
-    return result.stdout.strip()
+    status = json.loads(result.stdout) or {}
+    return status.get("State", ""), status.get("StartedAt", "")
 
 
 def _task_runtime(task_id: str, network_id: str) -> dict[str, Any]:
