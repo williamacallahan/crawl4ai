@@ -286,7 +286,7 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         raise
 
 
-async def get_dedicated_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
+async def get_dedicated_crawler(cfg: BrowserConfig, *, crawler_strategy=None) -> AsyncWebCrawler:
     """Create one request-owned crawler under the canonical pool admission.
 
     Dedicated hook crawlers are never returned by ``get_crawler``. They are
@@ -306,7 +306,9 @@ async def get_dedicated_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     )
                 close_task = _make_browser_capacity()
                 if close_task is None:
-                    crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
+                    crawler = AsyncWebCrawler(
+                        config=cfg, thread_safe=False, crawler_strategy=crawler_strategy,
+                    )
                     await _start_or_retire(crawler)
 
                     sig = f"dedicated:{uuid.uuid4().hex}"

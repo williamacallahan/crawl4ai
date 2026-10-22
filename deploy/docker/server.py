@@ -808,25 +808,31 @@ async def generate_html(
     # Fetch archive URLs through the node budget before taking a pooled
     # browser: the crawl runs on the raw body, so the browser never contacts
     # archive.org. A spent budget raises ArchiveBudgetSpent (429) here.
-    materialized = await archive_budget.materialize(redis, config, [body.url])
+    from archive_transport import acquire_crawler, prefetch_archive
+    from api import _await_before_deadline, _dispose_crawler
+    from governor import wall_clock_seconds
+    seconds = wall_clock_seconds(config)
+    deadline = asyncio.get_running_loop().time() + seconds if seconds > 0 else None
     crawler = None
     try:
-        crawler = await get_crawler(get_default_browser_config())
-        results = await crawler.arun(url=materialized[0], config=cfg)
-        results[0].url = body.url
+        responses = await _await_before_deadline(prefetch_archive(redis, config, [body.url]), deadline)
+        crawler = await _await_before_deadline(acquire_crawler(get_default_browser_config(), responses), deadline)
+        results = await _await_before_deadline(crawler.arun(url=body.url, config=cfg), deadline)
         _raise_for_crawl_failure(results[0])
 
         raw_html = results[0].html
         from crawl4ai.utils import preprocess_html_for_schema
         processed_html = preprocess_html_for_schema(raw_html)
         return JSONResponse({"html": processed_html, "url": body.url, "success": True})
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, detail=str(e))
     finally:
         if crawler:
-            await release_crawler(crawler)
+            await _dispose_crawler(crawler)
 
 
 @app.post("/archive/fetch")

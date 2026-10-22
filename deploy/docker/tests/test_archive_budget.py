@@ -2,7 +2,7 @@
 
 Tests run a real Redis (REDIS_URL, else a temporary redis-server — the same
 pattern as test_crawl_job_queue_redis.py) and assert on observable results:
-waits, exception contracts, materialized crawl input, and HTTP surfaces.
+waits, exception contracts, prefetched crawl input, and HTTP surfaces.
 """
 
 import os
@@ -300,12 +300,12 @@ async def test_fetch_text_gate(redis_client, monkeypatch):
         assert out["body"] == "body"
 
 
-# ───────────────────────── materialize ─────────────────────────
+# ───────────────────────── prefetch ─────────────────────────
 @pytest.mark.asyncio
-async def test_materialize_rewrites_archive_urls(redis_client, monkeypatch):
-    """Archive URLs become raw: bodies — a 4xx/5xx status keeps its body —
-    while anything else passes through untouched."""
-    monkeypatch.setenv("CRAWL4AI_NODE", "materialize-node")
+async def test_prefetch_preserves_archive_responses(redis_client, monkeypatch):
+    """Prefetch only archive seeds, preserving their status, body and origin."""
+    from archive_transport import prefetch_archive
+    monkeypatch.setenv("CRAWL4AI_NODE", "prefetch-node")
     fetched = []
 
     async def opener(url, max_body):
@@ -320,13 +320,13 @@ async def test_materialize_rewrites_archive_urls(redis_client, monkeypatch):
         "https://example.com/",
         "https://archive.org/details/missing",
     ]
-    out = await archive_budget.materialize(redis_client, budget_config(), urls)
+    out = await prefetch_archive(redis_client, budget_config(), urls)
     assert fetched == [urls[0], urls[2]]
-    assert out == [
-        f"raw:<html>{urls[0]}</html>",
-        urls[1],
-        "raw:<html>not found</html>",
-    ]
+    assert list(out) == [urls[0], urls[2]]
+    assert out[urls[0]]["body"] == f"<html>{urls[0]}</html>"
+    assert out[urls[2]]["status"] == 404
+    assert out[urls[2]]["body"] == "<html>not found</html>"
+    assert out[urls[2]]["url"] == urls[2]
 
 
 # ─────────────────── /crawl handler and the job worker ───────────────────
@@ -345,7 +345,7 @@ async def test_crawl_fetches_archive_seeds_sequentially(
 
     async def opener(url, max_body):
         fetch_starts.append(time.monotonic())
-        return 200, {"Content-Type": "text/html"}, f"<html>{url}</html>".encode()
+        return 200, {"Content-Type": "text/html"}, b"<html>Identical archived content</html>"
 
     monkeypatch.setattr(archive_budget, "_default_opener", opener)
     crawled_urls = []
@@ -363,6 +363,7 @@ async def test_crawl_fetches_archive_seeds_sequentially(
         return _FakeCrawler()
 
     monkeypatch.setattr(crawler_pool, "get_crawler", fake_get_crawler)
+    monkeypatch.setattr(crawler_pool, "get_dedicated_crawler", fake_get_crawler)
 
     urls = [
         "https://archive.org/details/a",
@@ -376,10 +377,10 @@ async def test_crawl_fetches_archive_seeds_sequentially(
 
     assert response["success"] is True
     # Each result carries the caller's original URL even though the results
-    # came back out of order — the restore matches by materialized URL.
+    # came back out of order, including when every body is identical.
     assert [r["url"] for r in response["results"]] == list(reversed(urls))
-    # The browser saw raw: materializations, never an archive.org URL.
-    assert all(u.startswith("raw:") for u in crawled_urls)
+    # Dispatch preserves identity; the strategy owns offline HTML rendering.
+    assert crawled_urls == urls
 
     # Three fetches, one reservation each, serialized and spaced.
     assert len(fetch_starts) == 3

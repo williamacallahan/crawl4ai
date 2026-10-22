@@ -16,9 +16,8 @@ itself throttles (429/503/connection refused) ``pause`` pushes the node's next
 start out by ``archive.throttle_pause_seconds``.
 
 Every archive.org URL a request names is fetched through ``fetch`` (one
-reservation per hop, redirects followed manually so a Location can never pull
-the browser off the archive hosts) and ``materialize`` hands the crawl a
-``raw:`` body instead, so the browser never contacts archive.org at all.
+reservation per hop, with manual archive-only redirects). archive_transport
+renders the supplied HTML offline while dispatch retains the caller's URL.
 
 Node identity comes from ``CRAWL4AI_NODE`` (the Swarm ``{{.Node.Hostname}}``
 service template). Falling back to the container hostname would split one
@@ -64,7 +63,9 @@ redis.call('SET', KEYS[1], new_next, 'PX', math.max(math.floor(new_next - now), 
 return {1, math.floor(wait_ms)}
 """
 
-# KEYS[1]: the node's next-start key. ARGV: pause_ms. Never moves the stored
+# KEYS[1]: the node's next-start key; KEYS[2]: its pause marker. ARGV: pause_ms.
+# Publish both atomically so already-queued starts see a newly imposed pause.
+# Never moves the stored
 # start earlier — an in-flight slow request must not shorten a pause another
 # caller already recorded. Returns the pushed-back wait in ms.
 _PAUSE_LUA = """
@@ -74,6 +75,7 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local stored = tonumber(redis.call('GET', KEYS[1]) or '0') or 0
 local target = math.max(stored, now + pause_ms)
 redis.call('SET', KEYS[1], target, 'PX', math.max(math.floor(target - now), 1))
+redis.call('SET', KEYS[2], '1', 'PX', math.max(math.floor(target - now), 1))
 return math.floor(target - now)
 """
 
@@ -152,8 +154,9 @@ async def pause(redis, config: dict) -> float:
     Never moves the stored start earlier. Returns the pushed-back wait in
     seconds, suitable for ArchiveBudgetSpent's retry_after.
     """
+    key = BUDGET_KEY_PREFIX + node()
     wait_ms = await redis.eval(
-        _PAUSE_LUA, 1, BUDGET_KEY_PREFIX + node(), _ms(config, "throttle_pause_seconds"),
+        _PAUSE_LUA, 2, key, key + ":pause", _ms(config, "throttle_pause_seconds"),
     )
     return int(wait_ms) / 1000.0
 
@@ -217,7 +220,7 @@ async def _default_opener(url: str, max_body_bytes: int):
         ) from exc
 
 
-async def fetch(redis, config: dict, url: str, *, opener=None) -> dict:
+async def fetch(redis, config: dict, url: str, *, opener=None, include_headers=False) -> dict:
     """Reserve a budget slot, GET an archive.org URL, and return its body.
 
     Redirects are followed manually — one reservation per hop, at most
@@ -249,6 +252,12 @@ async def fetch(redis, config: dict, url: str, *, opener=None) -> dict:
         wait = await reserve(redis, config)
         if wait > 0:
             await asyncio.sleep(wait)
+        # Queue allocation is not a throttle: only the separately published
+        # pause invalidates a slot that was reserved before a 429/503/refusal.
+        node_name = node()
+        pause_ms = await redis.pttl(BUDGET_KEY_PREFIX + node_name + ":pause")
+        if pause_ms > 0:
+            raise ArchiveBudgetSpent(pause_ms / 1000.0, node_name)
         try:
             status_code, headers, body = await open_url(current, max_body)
         except _ArchiveUpstreamRefused:
@@ -284,27 +293,12 @@ async def fetch(redis, config: dict, url: str, *, opener=None) -> dict:
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail="archive body is not text",
         )
-    return {
+    result = {
         "url": current,
         "status": status_code,
         "contentType": content_type,
         "body": body.decode("utf-8", errors="replace"),
     }
-
-
-async def materialize(redis, config: dict, urls) -> list[str]:
-    """Fetch each archive.org URL through the node budget; the crawl runs on raw bodies.
-
-    Archive entries become ``raw:<body>`` so the browser never contacts
-    archive.org; every other URL passes through unchanged. Fetches run one at
-    a time, each behind its own reservation, so a request never bursts. A
-    throttle inside any fetch raises ArchiveBudgetSpent.
-    """
-    materialized = []
-    for url in urls or []:
-        if not is_archive_url(url):
-            materialized.append(url)
-            continue
-        fetched = await fetch(redis, config, str(url))
-        materialized.append("raw:" + fetched["body"])
-    return materialized
+    if include_headers:
+        result["responseHeaders"] = dict(headers)
+    return result

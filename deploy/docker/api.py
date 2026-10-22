@@ -38,7 +38,8 @@ from utils import (
     validate_url_destination,
 )
 from webhook import WebhookDeliveryService
-from archive_budget import materialize
+from archive_transport import acquire_crawler, collect_results, grouped_results, prefetch_archive
+from governor import wall_clock_seconds
 
 from crawl4ai import (
     AsyncWebCrawler,
@@ -171,10 +172,8 @@ async def _enqueue_job(background_tasks, factory, principal=None, on_cancel=None
         )
 
 
-def _attach_declarative_hooks(crawler, hooks_config: dict) -> dict:
-    """Build and attach server-authored hooks from declarative specs."""
-    specs = hooks_config.get("hooks", []) or []
-    hooks = build_declarative_hooks(specs)
+def _attach_declarative_hooks(crawler, hooks: dict) -> dict:
+    """Attach the server-authored functions already validated for this request."""
     for hook_point, fn in hooks.items():
         crawler.crawler_strategy.set_hook(hook_point, fn)
     return {"status": "success", "attached": list(hooks.keys())}
@@ -638,9 +637,8 @@ async def handle_markdown_request(
 
         cache_mode = CacheMode.ENABLED if cache == "1" else CacheMode.WRITE_ONLY
 
-        from crawler_pool import get_crawler, release_crawler
         from utils import load_config as _load_config
-        _cfg = _load_config()
+        _cfg = config or _load_config()
         browser_cfg = BrowserConfig(
             extra_args=get_browser_extra_args(_cfg),
             **_cfg["crawler"]["browser"].get("kwargs", {}),
@@ -656,14 +654,17 @@ async def handle_markdown_request(
         # Fetch archive URLs through the node budget before taking a pooled
         # browser: the crawl runs on the raw body, so no browser touches
         # archive.org. A spent budget raises ArchiveBudgetSpent (429) here.
-        materialized_urls = await materialize(redis, config, [decoded_url])
-        crawler = await get_crawler(browser_cfg)
-        result = await _crawler_arun(
-            crawler,
-            url=materialized_urls[0],
-            config=crawler_config,
+        seconds = wall_clock_seconds(_cfg)
+        deadline = asyncio.get_running_loop().time() + seconds if seconds > 0 else None
+        responses = await _await_before_deadline(
+            prefetch_archive(redis, _cfg, [decoded_url]), deadline
         )
-        result.url = decoded_url
+        crawler = await _await_before_deadline(acquire_crawler(browser_cfg, responses), deadline)
+        result = await _await_before_deadline(_crawler_arun(
+            crawler,
+            url=decoded_url,
+            config=crawler_config,
+        ), deadline)
 
         _raise_for_crawl_failure(result, correlate_error=True)
 
@@ -684,7 +685,7 @@ async def handle_markdown_request(
             # _docker_admission_released), so the finally block must not
             # release it a second time -- that would leak a semaphore permit
             # and over-report pool capacity.
-            await release_crawler(crawler)
+            await _dispose_crawler(crawler)
             crawler = None
             effective_temperature = (
                 temperature if temperature is not None else llm["temperature"]
@@ -713,9 +714,11 @@ async def handle_markdown_request(
             return markdown
 
         return (result.markdown.raw_markdown
-               if filter_type == FilterType.RAW
-               else result.markdown.fit_markdown)
+                if filter_type == FilterType.RAW
+                else result.markdown.fit_markdown)
 
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
     except HTTPException:
         raise
     except LLMProviderNotAllowed as e:
@@ -728,7 +731,7 @@ async def handle_markdown_request(
         )
     finally:
         if crawler:
-            await release_crawler(crawler)
+            await _dispose_crawler(crawler)
 
 async def handle_llm_request(
     redis: aioredis.Redis,
@@ -1111,7 +1114,12 @@ async def stream_results(
                 )
             except BaseException:
                 pass  # Monitor not critical; never shadow the disposal below.
-        await _dispose_crawler(crawler)
+        try:
+            close = getattr(results_gen, "aclose", None)
+            if close:
+                await close()
+        finally:
+            await _dispose_crawler(crawler)
 
 
 async def _normalize_and_validate_seeds(urls: List[str]) -> List[str]:
@@ -1122,25 +1130,6 @@ async def _normalize_and_validate_seeds(urls: List[str]) -> List[str]:
     for url in urls:
         await asyncio.to_thread(validate_url_destination, url)
     return urls
-
-
-async def _restore_result_urls(results_gen: AsyncGenerator, url_map: Dict[str, str]):
-    """Tag each streamed result with the caller's URL, not a materialized raw: one.
-
-    Dispatcher results arrive in completion order, so the materialized-URL
-    lookup — not position — ties each result back to the caller's URL.
-    Discovered deep-crawl URLs are absent from the map and pass through.
-    """
-    async for result in results_gen:
-        if isinstance(result, dict):
-            original = url_map.get(result.get("url"))
-            if original is not None:
-                result["url"] = original
-        elif hasattr(result, "url"):
-            original = url_map.get(result.url)
-            if original is not None:
-                result.url = original
-        yield result
 
 
 async def handle_crawl_request(
@@ -1154,8 +1143,6 @@ async def handle_crawl_request(
     redis=None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
-    from governor import wall_clock_seconds
-
     deadline_seconds = wall_clock_seconds(config)
     deadline_at = (
         asyncio.get_running_loop().time() + deadline_seconds
@@ -1203,36 +1190,40 @@ async def handle_crawl_request(
                 config,
             )
 
-        # Fetch archive URLs through the node budget once the configs have
-        # validated and before a pooled browser is taken: each result then
-        # crawls the raw body, the browser never contacts archive.org, and a
-        # spent budget raises ArchiveBudgetSpent (429) holding no browser.
-        materialized_urls = await materialize(redis, config, urls)
-        url_restore = dict(zip(materialized_urls, urls))
+        # Validate hooks before spending a reservation or acquiring a browser.
+        hooks = build_declarative_hooks(
+            hooks_config.get("hooks", []) or []
+        ) if hooks_config else {}
+        responses = await _await_before_deadline(
+            prefetch_archive(redis, config, urls), deadline_at
+        )
 
         from crawler_pool import get_crawler
 
         hooks_status = {}
-        if hooks_config:
-            crawler = await _await_before_deadline(
-                _new_hook_crawler(loaded_browser_config), deadline_at
-            )
-            hooks_status = _attach_declarative_hooks(crawler, hooks_config)
-            logger.info(f"Hooks attachment status: {hooks_status['status']}")
+        if responses:
+            if hooks_config:
+                hooks_status = {"status": "success", "attached": list(hooks)}
+            results = await _await_before_deadline(collect_results(grouped_results(
+                urls, loaded_browser_config, effective_config, responses, hooks,
+                lambda: _memory_dispatcher(config),
+            )), deadline_at)
         else:
-            crawler = await _await_before_deadline(
-                get_crawler(loaded_browser_config), deadline_at
-            )
-
-        dispatcher = _memory_dispatcher(config)
-
-        results = []
-        func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
-        partial_func = partial(func,
-                                materialized_urls[0] if len(urls) == 1 else materialized_urls,
-                                config=effective_config,
-                                dispatcher=dispatcher)
-        results = await _await_before_deadline(partial_func(), deadline_at)
+            if hooks_config:
+                crawler = await _await_before_deadline(
+                    _new_hook_crawler(loaded_browser_config), deadline_at
+                )
+                hooks_status = _attach_declarative_hooks(crawler, hooks)
+                logger.info(f"Hooks attachment status: {hooks_status['status']}")
+            else:
+                crawler = await _await_before_deadline(
+                    get_crawler(loaded_browser_config), deadline_at
+                )
+            dispatcher = _memory_dispatcher(config)
+            func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
+            partial_func = partial(func, urls[0] if len(urls) == 1 else urls,
+                                   config=effective_config, dispatcher=dispatcher)
+            results = await _await_before_deadline(partial_func(), deadline_at)
         
         # Ensure results is always a list
         if not isinstance(results, list):
@@ -1268,14 +1259,6 @@ async def handle_crawl_request(
                             "Crawl failed", f"unexpected result type: {type(result)!r}"
                         ),
                     }
-
-                # A materialized archive seed crawls as raw:<body>; the result
-                # must still carry the caller's URL. Results arrive in
-                # completion order, so restore by the materialized-URL lookup
-                # rather than position.
-                original = url_restore.get(result_dict.get("url"))
-                if original is not None:
-                    result_dict["url"] = original
 
                 # if fit_html is not a string, set it to None to avoid serialization errors
                 if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
@@ -1404,7 +1387,6 @@ async def handle_stream_crawl_request(
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
     crawler: Optional[AsyncWebCrawler] = None
-    from governor import wall_clock_seconds
 
     deadline_seconds = wall_clock_seconds(config)
     deadline_at = (
@@ -1474,11 +1456,24 @@ async def handle_stream_crawl_request(
         else:
             effective_config = loaded_crawler_config
 
-        # Same archive.org materialization as handle_crawl_request, before a
-        # browser is taken: the stream crawls raw bodies and a spent budget
-        # raises ArchiveBudgetSpent (429) holding no browser.
-        materialized_urls = await materialize(redis, config, urls)
-        url_restore = dict(zip(materialized_urls, urls))
+        # Build hooks and prefetch under the same request deadline, before
+        # either archive or ordinary dispatch acquires a browser.
+        hooks = build_declarative_hooks(
+            hooks_config.get("hooks", []) or []
+        ) if hooks_config else {}
+        responses = await _await_before_deadline(
+            prefetch_archive(redis, config, urls), deadline_at
+        )
+        if responses:
+            if hooks_config:
+                hooks_info = {"status": {"status": "success", "attached": list(hooks)}}
+            results_gen = grouped_results(
+                urls, loaded_browser_config, effective_config, responses, hooks,
+                lambda: _memory_dispatcher(config),
+            )
+            if deadline_at is not None:
+                results_gen = _stream_before_deadline(results_gen, deadline_at)
+            return None, results_gen, hooks_info, request_id
 
         from crawler_pool import get_crawler
 
@@ -1487,7 +1482,7 @@ async def handle_stream_crawl_request(
                 _new_hook_crawler(loaded_browser_config),
                 deadline_at,
             )
-            hooks_status = _attach_declarative_hooks(crawler, hooks_config)
+            hooks_status = _attach_declarative_hooks(crawler, hooks)
             logger.info(f"Hooks attachment status for streaming: {hooks_status['status']}")
             hooks_info = {'status': hooks_status}
         else:
@@ -1502,7 +1497,7 @@ async def handle_stream_crawl_request(
         if loaded_crawler_config.deep_crawl_strategy is not None and len(urls) == 1:
             results_gen = await _await_before_deadline(
                 crawler.arun(
-                    materialized_urls[0],
+                    urls[0],
                     config=loaded_crawler_config,
                 ),
                 deadline_at,
@@ -1511,7 +1506,7 @@ async def handle_stream_crawl_request(
             # Default multi-URL streaming via arun_many
             results_gen = await _await_before_deadline(
                 crawler.arun_many(
-                    urls=materialized_urls,
+                    urls=urls,
                     config=effective_config,
                     dispatcher=_memory_dispatcher(config),
                 ),
@@ -1520,7 +1515,7 @@ async def handle_stream_crawl_request(
 
         if deadline_at is not None:
             results_gen = _stream_before_deadline(results_gen, deadline_at)
-        return crawler, _restore_result_urls(results_gen, url_restore), hooks_info, request_id
+        return crawler, results_gen, hooks_info, request_id
 
     except (UntrustedConfigError, HookValidationError) as e:
         await _dispose_crawler(crawler)
