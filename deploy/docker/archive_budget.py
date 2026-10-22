@@ -115,10 +115,14 @@ def node() -> str:
     return name
 
 
-def is_archive_url(url, config: dict) -> bool:
-    """True when ``url``'s host is an ``archive.hosts`` host or a subdomain of one."""
+# The Internet Archive's own domain; web.archive.org and every other host it serves are subdomains.
+ARCHIVE_HOST = "archive.org"
+
+
+def is_archive_url(url) -> bool:
+    """True when ``url``'s host is archive.org or one of its subdomains."""
     hostname = (urlparse(str(url)).hostname or "").rstrip(".")
-    return any(hostname == host or hostname.endswith("." + host) for host in config["archive"]["hosts"])
+    return hostname == ARCHIVE_HOST or hostname.endswith("." + ARCHIVE_HOST)
 
 
 def _ms(config: dict, key: str) -> float:
@@ -228,7 +232,7 @@ async def fetch(redis, config: dict, url: str, *, opener=None) -> dict:
     ``opener(url, max_body_bytes)`` it returns ``(status, headers, body_bytes)``
     and raises _ArchiveUpstreamRefused on a refused connection.
     """
-    if not is_archive_url(url, config):
+    if not is_archive_url(url):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="url host is not an archive.org host",
@@ -256,7 +260,7 @@ async def fetch(redis, config: dict, url: str, *, opener=None) -> dict:
         location = _header(headers, "location")
         if status_code in _REDIRECT_STATUSES and location:
             target = urljoin(current, location)
-            if not is_archive_url(target, config):
+            if not is_archive_url(target):
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail="archive redirect left archive.org",
@@ -298,7 +302,7 @@ async def materialize(redis, config: dict, urls) -> list[str]:
     """
     materialized = []
     for url in urls or []:
-        if not is_archive_url(url, config):
+        if not is_archive_url(url):
             materialized.append(url)
             continue
         fetched = await fetch(redis, config, str(url))

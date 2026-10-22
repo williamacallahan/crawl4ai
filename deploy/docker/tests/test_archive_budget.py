@@ -111,7 +111,6 @@ async def redis_client(redis_url):
 def budget_config(**overrides):
     """Fast budget timings; production values live in config.yml."""
     archive = {
-        "hosts": ["archive.org", "web.archive.org"],
         "spacing_seconds": 0.25,
         "max_wait_seconds": 1.0,
         "throttle_pause_seconds": 6.0,
@@ -159,16 +158,15 @@ async def test_missing_node_fails_loud_503(redis_client, monkeypatch):
 
 
 def test_is_archive_url_hosts_and_subdomains():
-    cfg = budget_config()
-    assert archive_budget.is_archive_url("https://archive.org/details/x", cfg)
-    assert archive_budget.is_archive_url("https://web.archive.org/web/2020id_/https://a.b/", cfg)
-    assert archive_budget.is_archive_url("https://wayback.archive.org/x", cfg)
-    assert archive_budget.is_archive_url("https://WEB.ARCHIVE.ORG/web/x", cfg)
-    assert not archive_budget.is_archive_url("https://example.com/", cfg)
-    assert not archive_budget.is_archive_url("https://archive.org.evil.com/", cfg)
-    assert not archive_budget.is_archive_url("https://notarchive.org/", cfg)
-    assert not archive_budget.is_archive_url("https://archive.org@evil.com/", cfg)
-    assert not archive_budget.is_archive_url("not a url", cfg)
+    assert archive_budget.is_archive_url("https://archive.org/details/x")
+    assert archive_budget.is_archive_url("https://web.archive.org/web/2020id_/https://a.b/")
+    assert archive_budget.is_archive_url("https://wayback.archive.org/x")
+    assert archive_budget.is_archive_url("https://WEB.ARCHIVE.ORG/web/x")
+    assert not archive_budget.is_archive_url("https://example.com/")
+    assert not archive_budget.is_archive_url("https://archive.org.evil.com/")
+    assert not archive_budget.is_archive_url("https://notarchive.org/")
+    assert not archive_budget.is_archive_url("https://archive.org@evil.com/")
+    assert not archive_budget.is_archive_url("not a url")
 
 
 # ───────────────────────── fetch ─────────────────────────

@@ -76,7 +76,6 @@ crawl_jobs:
 # IP's budget across keys. A spent budget answers 429 archive_budget_spent so
 # the caller can route the overflow elsewhere.
 archive:
-  hosts: ["archive.org", "web.archive.org"]
   spacing_seconds: 4        # minimum gap between request starts on one node
   max_wait_seconds: 8       # refuse (429) instead of waiting past this
   throttle_pause_seconds: 300  # push the next start out after upstream 429/503/refused
