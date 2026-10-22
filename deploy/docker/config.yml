@@ -68,6 +68,19 @@ crawl_jobs:
   # Canonicalized request persisted per durable job (bounds Redis backlog size).
   max_payload_bytes: 262144
 
+# Per-Swarm-node archive.org pacing. archive.org rate-limits per client IP,
+# so each node keeps one shared budget in Redis (crawl4ai:archive:next:{node})
+# and every replica on the node — including co-located ones — reserves through
+# it. Node identity comes from the CRAWL4AI_NODE env (Swarm {{.Node.Hostname}}
+# template); without it archive requests fail with 503 rather than split one
+# IP's budget across keys. A spent budget answers 429 archive_budget_spent so
+# the caller can route the overflow elsewhere.
+archive:
+  hosts: ["archive.org", "web.archive.org"]
+  spacing_seconds: 4        # minimum gap between request starts on one node
+  max_wait_seconds: 8       # refuse (429) instead of waiting past this
+  throttle_pause_seconds: 300  # push the next start out after upstream 429/503/refused
+
 # Resource governance (DoS protection). Any limit set to 0 means "unbounded"
 # (the pre-hardening behavior), so you can relax or disable each one.
 limits:

@@ -38,6 +38,7 @@ from utils import (
     validate_url_destination,
 )
 from webhook import WebhookDeliveryService
+from archive_budget import gate_url, gate_urls, maybe_pause_for_result
 
 from crawl4ai import (
     AsyncWebCrawler,
@@ -625,6 +626,7 @@ async def handle_markdown_request(
         if not decoded_url.startswith(('http://', 'https://')) and not decoded_url.startswith(("raw:", "raw://")):
             decoded_url = 'https://' + decoded_url
         await asyncio.to_thread(validate_url_destination, decoded_url)
+        await gate_url(redis, decoded_url, config)
 
         if filter_type in {FilterType.RAW, FilterType.LLM}:
             md_generator = DefaultMarkdownGenerator()
@@ -659,6 +661,11 @@ async def handle_markdown_request(
             config=crawler_config,
         )
 
+        await maybe_pause_for_result(
+            redis, config, decoded_url,
+            getattr(result, "status_code", None),
+            getattr(result, "error_message", None),
+        )
         _raise_for_crawl_failure(result, correlate_error=True)
 
         if filter_type == FilterType.LLM:
@@ -1036,6 +1043,8 @@ async def stream_results(
     crawler: AsyncWebCrawler,
     results_gen: AsyncGenerator,
     request_id: Optional[str] = None,
+    redis=None,
+    config: Optional[dict] = None,
 ) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers.
 
@@ -1055,6 +1064,12 @@ async def stream_results(
             try:
                 server_memory_mb = _get_memory_mb()
                 result_dict = result.model_dump()
+                await maybe_pause_for_result(
+                    redis, config,
+                    result_dict.get("url"),
+                    result_dict.get("status_code"),
+                    result_dict.get("error_message"),
+                )
                 if result_dict.get("error_message"):
                     result_dict["error_message"] = public_crawl_error(
                         result_dict["error_message"], result_dict.get("url")
@@ -1126,6 +1141,7 @@ async def handle_crawl_request(
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
     result_fields: Optional[List[str]] = None,
+    redis=None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
     from governor import wall_clock_seconds
@@ -1146,6 +1162,7 @@ async def handle_crawl_request(
 
     try:
         urls = await _normalize_and_validate_seeds(urls)
+        await gate_urls(redis, urls, config)
         loaded_browser_config = BrowserConfig.load(
             browser_config,
             provenance=Provenance.UNTRUSTED,
@@ -1237,12 +1254,18 @@ async def handle_crawl_request(
                 # if fit_html is not a string, set it to None to avoid serialization errors
                 if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
                     result_dict["fit_html"] = None
-                    
+
                 # If PDF exists, encode it to base64
                 pdf = result_dict.get('pdf')
                 if isinstance(pdf, bytes):
                     result_dict['pdf'] = b64encode(pdf).decode('utf-8')
 
+                await maybe_pause_for_result(
+                    redis, config,
+                    result_dict.get("url"),
+                    result_dict.get("status_code"),
+                    result_dict.get("error_message"),
+                )
                 # Sanitize before projection so a caller-requested
                 # error_message field carries the client-safe text.
                 if result_dict.get("error_message"):
@@ -1356,6 +1379,7 @@ async def handle_stream_crawl_request(
     config: dict,
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
+    redis=None,
 ) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict], str]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
@@ -1376,6 +1400,7 @@ async def handle_stream_crawl_request(
         # mirroring handle_crawl_request. The streaming path previously skipped
         # this, leaving /crawl/stream (and /crawl with stream=true) unguarded.
         urls = await _normalize_and_validate_seeds(urls)
+        await gate_urls(redis, urls, config)
         loaded_browser_config = BrowserConfig.load(
             browser_config,
             provenance=Provenance.UNTRUSTED,

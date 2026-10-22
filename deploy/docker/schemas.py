@@ -76,6 +76,10 @@ class MarkdownRequest(BaseModel):
 class RawCode(BaseModel):
     code: str
 
+class ArchiveFetchRequest(BaseModel):
+    """Request body for /archive/fetch (archive.org hosts only)."""
+    url: str
+
 class HTMLRequest(BaseModel):
     url: str
     

@@ -30,6 +30,8 @@ from api import (
     server_crawler_config,
     stream_results,
 )
+import archive_budget
+from archive_budget import ArchiveBudgetSpent
 from auth import (
     TokenRequest,
     create_access_token,
@@ -68,6 +70,7 @@ from redis_config import (
     build_redis_url as _build_redis_url,
 )
 from schemas import (
+    ArchiveFetchRequest,
     CrawlRequestWithHooks,
     HTMLRequest,
     JSEndpointRequest,
@@ -654,6 +657,21 @@ async def _http_exception_handler(request: Request, exc: _StarletteHTTPException
     )
 
 
+@app.exception_handler(ArchiveBudgetSpent)
+async def _archive_budget_spent_handler(request: Request, exc: ArchiveBudgetSpent):
+    """Typed per-node archive.org budget refusal for the back-end's overflow."""
+    return JSONResponse(
+        {
+            "detail": "archive.org budget for this node is spent",
+            "code": "archive_budget_spent",
+            "node": exc.node,
+            "retryAfterSeconds": exc.retry_after,
+        },
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        headers={"Retry-After": str(exc.retry_after)},
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_exception_handler(request: Request, exc: RequestValidationError):
     """Return JSON-safe validation details without echoing untrusted inputs."""
@@ -786,11 +804,17 @@ async def generate_html(
     Use when you need sanitized HTML structures for building schemas or further processing.
     """
     await validate_url_scheme(body.url, allow_raw=True)
+    await archive_budget.gate_url(redis, body.url, config)
     cfg = server_crawler_config(config)
     crawler = None
     try:
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
+        await archive_budget.maybe_pause_for_result(
+            redis, config, body.url,
+            getattr(results[0], "status_code", None),
+            getattr(results[0], "error_message", None),
+        )
         _raise_for_crawl_failure(results[0])
 
         raw_html = results[0].html
@@ -804,6 +828,20 @@ async def generate_html(
     finally:
         if crawler:
             await release_crawler(crawler)
+
+
+@app.post("/archive/fetch")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def archive_fetch(
+    request: Request,
+    body: ArchiveFetchRequest,
+    _td: Dict = Depends(token_dep),
+):
+    """Fetch one archive.org (or web.archive.org) URL through this node's
+    shared per-IP budget. Non-archive hosts get 400; a spent node budget gets
+    a typed 429 ``archive_budget_spent`` for the back-end's overflow lane."""
+    return JSONResponse(await archive_budget.fetch(redis, config, body.url))
+
 
 # ── artifact store helpers ───────────────────────────────────
 def _store_artifact(kind: str, data: bytes) -> dict:
@@ -1182,6 +1220,7 @@ async def crawl(
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        redis=redis,
     )
     if not results["success"]:
         # Every URL failed upstream: surface the first reason as a gateway
@@ -1227,6 +1266,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        redis=redis,
     )
     
     # Add hooks info to response headers if available
@@ -1242,7 +1282,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         headers["X-Hooks-Warning"] = _HOOKS_CODE_WARNING
     
     return StreamingResponse(
-        stream_results(crawler, gen, request_id),
+        stream_results(crawler, gen, request_id, redis=redis, config=config),
         media_type="application/x-ndjson",
         headers=headers,
     )

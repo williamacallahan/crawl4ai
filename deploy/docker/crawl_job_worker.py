@@ -248,6 +248,7 @@ class CrawlJobWorker:
             crawler_config=payload["crawler_config"],
             config=self.config,
             result_fields=payload.get("result_fields"),
+            redis=self.queue.redis,
         )
 
     async def _heartbeat(
