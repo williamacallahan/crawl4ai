@@ -188,7 +188,7 @@ class TestErrorSanitization:
         assert public_error_detail(cert) == cert.strip()[:500]
 
     def test_public_crawl_error_mints_correlation_id_when_tunnel_swap_rewrites_clean_message(
-        self, monkeypatch
+        self, monkeypatch, caplog
     ):
         """When the tunnel swap rewrites a clean "All proxies failed" message,
         something is withheld (the verbatim message was replaced), so
@@ -206,12 +206,16 @@ class TestErrorSanitization:
             "All proxies failed: Failed on navigating ACS-GOTO:\n"
             "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://dead.example:443/\n"
         )
-        public = public_crawl_error(message, "https://dead.example:443/")
+        with caplog.at_level("INFO", logger="utils"):
+            public = public_crawl_error(message, "https://dead.example:443/")
         assert re.fullmatch(
             r"Crawl failed: net::ERR_CONNECTION_REFUSED \(correlation_id=[0-9a-f]{12}\)",
             public,
         )
         assert public.correlation_id
+        # A target-site failure is logged for grep by id, below the ERROR level Sentry reports.
+        logged = [r for r in caplog.records if public.correlation_id in r.getMessage()]
+        assert [r.levelname for r in logged] == ["WARNING"]
 
         # No recording -> verbatim pass-through -> NO correlation id minted.
         failures.clear()

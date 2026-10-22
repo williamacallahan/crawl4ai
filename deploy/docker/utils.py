@@ -301,7 +301,10 @@ class CorrelatedError(str):
 
 
 def correlated_error(
-    public: str, detail: object, context: str = "crawl failure"
+    public: str,
+    detail: object,
+    context: str = "crawl failure",
+    level: int = logging.ERROR,
 ) -> CorrelatedError:
     """Stamp a client-safe message with the correlation id its full text is logged under.
 
@@ -310,7 +313,8 @@ def correlated_error(
     capped because this runs once per failed URL and a batch can be large.
     """
     cid = uuid.uuid4().hex[:12]
-    logger.error(
+    logger.log(
+        level,
         "%s [cid=%s]: %s",
         context,
         cid,
@@ -334,7 +338,11 @@ def public_crawl_error(
     public = public_error_detail(raw)
     if not message or public == message[:500]:
         return CorrelatedError(public)
-    return correlated_error(public, raw, f"crawl failure url={url or 'unknown'}")
+    # The target site failed (blocked, timed out, navigated away), not this
+    # server, so it stays below the ERROR level that Sentry reports.
+    return correlated_error(
+        public, raw, f"crawl failure url={url or 'unknown'}", logging.WARNING
+    )
 
 
 def datetime_handler(obj: any) -> Optional[str]:

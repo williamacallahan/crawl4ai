@@ -280,12 +280,12 @@ async def lifespan(_: FastAPI):
             except Exception:
                 pass
 
-        from monitor import get_monitor
-
-        try:
-            await get_monitor().cleanup()
-        except Exception as e:
-            logger.error(f"Monitor cleanup failed: {e}")
+        # An aborted startup never created the monitor; its failure is already logged.
+        if monitor_module.monitor_stats is not None:
+            try:
+                await monitor_module.monitor_stats.cleanup()
+            except Exception as e:
+                logger.error(f"Monitor cleanup failed: {e}")
 
         await close_all()
         try:
