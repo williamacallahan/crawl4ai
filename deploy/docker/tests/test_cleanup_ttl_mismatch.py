@@ -8,18 +8,16 @@ The *consumer* (the lazy delete-after-read gate inside ``handle_task_status``,
 gated by ``should_cleanup_task``) was left on its hard-coded ``3600`` default
 with no ``0 == disabled`` handling and no way to receive the operator config.
 
-Effect: a completed/failed task whose configured ``task_ttl_seconds`` was
-``86400`` (24h retention) -- or ``0`` (TTL explicitly disabled) -- was deleted
-on the first status poll occurring more than one wall-clock hour after
-creation, silently contradicting the operator's retention setting.
+A positive ``task_ttl_seconds`` is the expiry for a terminal hash that nobody
+has fetched. The status handler shortens that hash's TTL to
+``delivered_task_ttl_seconds`` on a successful read of a completed or failed
+task (unless ``keep``), so a re-read still finds it. ``0`` still disables both
+the producer expiry and that shortening.
 
-These tests exercise both halves of the contract -- the producer
-``api.hset_with_ttl`` and the consumer ``api.handle_task_status`` -- against a
-shared stateful async Redis stub, and assert producer/consumer agreement at
-default, long, and disabled TTLs. They also cover the helper-level ``0``
-sentinel directly, the ``keep`` opt-out, the ``config=None`` historical default,
-the FAILED (not just COMPLETED) terminal state, and the ``handle_llm_request``
-task-id wiring path.
+These tests exercise both halves against a shared stateful async Redis stub:
+the producer expiry, the delivered-read TTL, the disabled sentinel, the ``keep``
+opt-out, the ``config=None`` default, the FAILED terminal state, and the
+``handle_llm_request`` task-id wiring path.
 """
 
 import os
@@ -38,13 +36,12 @@ from utils import should_cleanup_task  # noqa: E402
 
 
 class _FakeRedis:
-    """Minimal async Redis stub recording hset/expire/delete on a task hash.
+    """Minimal async Redis stub holding one task hash and its TTL.
 
     Real redis-py returns bytes keys/values from ``hgetall`` and encodes
     str->bytes on ``hset``; ``decode_redis_hash`` expects that contract, so we
-    preserve it. The stub also records every call so the producer
-    (``hset``/``expire``) and consumer (``delete``) retention behaviors can be
-    asserted against shared state.
+    preserve it. The stub stores the key TTL and deletion so retention is
+    asserted from Redis state.
     """
 
     def __init__(self, mapping=None):
@@ -55,7 +52,7 @@ class _FakeRedis:
                 for k, v in mapping.items()
             }
         self.hset_calls: list[tuple[str, dict]] = []
-        self.expire_calls: list[tuple[str, int]] = []
+        self._ttl: dict[str, int] = {}
         self.deleted_keys: list[str] = []
 
     async def hset(self, key, mapping=None):
@@ -66,9 +63,16 @@ class _FakeRedis:
         }
         return len(mapping)
 
-    async def expire(self, key, ttl):
-        self.expire_calls.append((key, int(ttl)))
+    async def expire(self, key, ttl, lt=False):
+        # LT: a key with no TTL counts as infinite, as in Redis.
+        current = self._ttl.get(key)
+        if lt and current is not None and current <= int(ttl):
+            return False
+        self._ttl[key] = int(ttl)
         return True
+
+    def ttl_seconds(self, key) -> int | None:
+        return self._ttl.get(key)
 
     async def hgetall(self, key):
         return dict(self._hash)
@@ -76,6 +80,7 @@ class _FakeRedis:
     async def delete(self, key):
         self.deleted_keys.append(key)
         self._hash = {}
+        self._ttl.pop(key, None)
         return 1
 
 
@@ -111,27 +116,26 @@ def _failed_task(age_hours: float = 2.0) -> dict:
 class TestProducerConsumerTTLContract:
     """Both halves of the retention contract against shared Redis state.
 
-    The producer (``hset_with_ttl``) records an ``expire(key, ttl)`` reflecting
-    the operator config (and skips ``expire`` when ``ttl == 0``). The consumer
-    (``handle_task_status``) must perform its lazy delete-after-read on the same
-    schedule: delete only when the task age exceeds the configured TTL, and
-    never when TTL is disabled.
+    The producer (``hset_with_ttl``) records an ``expire(key, ttl)`` on a
+    terminal write (and skips ``expire`` when ``ttl == 0``). That TTL is how
+    long an unread finished hash lives. The consumer (``handle_task_status``)
+    shortens it to the delivered TTL once it has returned that finished
+    payload, for any positive TTL, and never when TTL is disabled.
     """
 
-    def test_long_retention_ttl_asymmetry_end_to_end(self):
-        """config=86400 (24h), task age=2h: producer keeps 24h, consumer keeps."""
+    def test_long_retention_ttl_expires_unread_and_read_shortens(self):
+        """config=86400: producer arms a 24h unread TTL; a fetch shortens it."""
         config = _config_with_ttl(86400)
         redis = _FakeRedis()
         key = "task:llm_abc"
 
-        # Producer side: write the task with the configured 24h TTL.
+        # Producer side: a terminal write arms the configured unread TTL.
         asyncio_run(api.hset_with_ttl(redis, key, _completed_task(2.0), config))
 
-        assert redis.expire_calls == [(key, 86400)], (
-            "producer should record expire(key, 86400) for 24h retention"
+        assert redis.ttl_seconds(key) == 86400, (
+            "a terminal write arms the configured unread TTL"
         )
 
-        # Consumer side: status-read a 2h-old completed task.
         resp = asyncio_run(
             api.handle_task_status(
                 redis, "llm_abc", "http://t/", collection="llm/job", config=config,
@@ -139,10 +143,10 @@ class TestProducerConsumerTTLContract:
         )
 
         assert resp.status_code == 200
-        assert redis.deleted_keys == [], (
-            "consumer must NOT delete a task younger than the configured 24h TTL; "
-            "before the fix the hard-coded 3600s gate silently deleted it"
+        assert redis.ttl_seconds(key) == 120, (
+            "a delivered terminal task keeps only the delivered TTL"
         )
+        assert redis.deleted_keys == []
 
     def test_ttl_disabled_asymmetry_end_to_end(self):
         """config=0 (TTL disabled), task age=2h: producer skips expire, consumer keeps."""
@@ -152,8 +156,8 @@ class TestProducerConsumerTTLContract:
 
         asyncio_run(api.hset_with_ttl(redis, key, _completed_task(2.0), config))
 
-        assert redis.expire_calls == [], (
-            "producer must skip expire() entirely when ttl == 0 (disabled sentinel)"
+        assert redis.ttl_seconds(key) is None, (
+            "ttl == 0 leaves the terminal hash with no expiry"
         )
 
         resp = asyncio_run(
@@ -163,20 +167,20 @@ class TestProducerConsumerTTLContract:
         )
 
         assert resp.status_code == 200
-        assert redis.deleted_keys == [], (
-            "consumer must NOT delete when TTL is explicitly disabled (0); "
-            "before the fix should_cleanup_task(t, 0) returned True"
+        assert redis.ttl_seconds(key) is None, (
+            "TTL disabled (0): the read arms no expiry"
         )
+        assert redis.deleted_keys == []
 
     def test_default_ttl_producer_and_consumer_agree_fresh_task(self):
-        """config=3600 (default), fresh task: both agree to keep."""
+        """config=3600: producer arms the unread TTL; the fetch shortens it."""
         config = _config_with_ttl(3600)
         redis = _FakeRedis()
         key = "task:llm_abc"
 
         asyncio_run(api.hset_with_ttl(redis, key, _completed_task(0.0), config))
 
-        assert redis.expire_calls == [(key, 3600)]
+        assert redis.ttl_seconds(key) == 3600
 
         resp = asyncio_run(
             api.handle_task_status(
@@ -185,19 +189,18 @@ class TestProducerConsumerTTLContract:
         )
 
         assert resp.status_code == 200
-        assert redis.deleted_keys == [], (
-            "a fresh task well inside the 3600s default TTL must not be cleaned up"
-        )
+        assert redis.ttl_seconds(key) == 120
+        assert redis.deleted_keys == []
 
     def test_default_ttl_producer_and_consumer_agree_aged_task(self):
-        """config=3600 (default), aged task (2h): both agree to drop."""
+        """config=3600 (default), aged task (2h): the fetch still shortens the TTL."""
         config = _config_with_ttl(3600)
         redis = _FakeRedis()
         key = "task:llm_abc"
 
         asyncio_run(api.hset_with_ttl(redis, key, _completed_task(2.0), config))
 
-        assert redis.expire_calls == [(key, 3600)]
+        assert redis.ttl_seconds(key) == 3600
 
         resp = asyncio_run(
             api.handle_task_status(
@@ -206,9 +209,8 @@ class TestProducerConsumerTTLContract:
         )
 
         assert resp.status_code == 200
-        assert redis.deleted_keys == [key], (
-            "an aged task past the 3600s default TTL must be cleaned up"
-        )
+        assert redis.ttl_seconds(key) == 120
+        assert redis.deleted_keys == []
 
 
 # ───────────────────────── helper-level sentinel ─────────────────────────
@@ -231,7 +233,7 @@ class TestShouldCleanupTaskHelper:
 
 class TestHandleTaskStatusWiring:
     def test_config_none_preserves_historical_3600_default(self):
-        """Callers that omit config keep the 3600s historical behavior."""
+        """Callers that omit config use the defaults: the read arms the 120s delivered TTL."""
         redis = _FakeRedis(_completed_task(2.0))
         resp = asyncio_run(
             api.handle_task_status(
@@ -239,9 +241,8 @@ class TestHandleTaskStatusWiring:
             )
         )
         assert resp.status_code == 200
-        assert redis.deleted_keys == ["task:llm_abc"], (
-            "config=None -> get_redis_task_ttl({}) returns 3600 -> 2h-aged task deleted"
-        )
+        assert redis.ttl_seconds("task:llm_abc") == 120
+        assert redis.deleted_keys == []
 
     def test_keep_true_short_circuits_even_when_aged(self):
         """keep=True must bypass the cleanup branch regardless of TTL/age."""
@@ -253,10 +254,11 @@ class TestHandleTaskStatusWiring:
             )
         )
         assert resp.status_code == 200
-        assert redis.deleted_keys == [], "keep=True must never delete"
+        assert redis.ttl_seconds("task:llm_abc") is None, "keep=True leaves the TTL alone"
+        assert redis.deleted_keys == []
 
-    def test_failed_task_respects_configured_long_ttl(self):
-        """FAILED (not just COMPLETED) terminal state honors the configured TTL."""
+    def test_failed_terminal_read_shortens_under_long_ttl(self):
+        """FAILED is terminal: a fetch shortens it even inside a long unread TTL."""
         redis = _FakeRedis(_failed_task(2.0))
         resp = asyncio_run(
             api.handle_task_status(
@@ -265,9 +267,8 @@ class TestHandleTaskStatusWiring:
             )
         )
         assert resp.status_code == 200
-        assert redis.deleted_keys == [], (
-            "FAILED task under 24h retention must not be deleted at 2h age"
-        )
+        assert redis.ttl_seconds("task:llm_abc") == 120
+        assert redis.deleted_keys == []
 
 
 # ────────────────────── handle_llm_request wiring ────────────────────────
@@ -277,19 +278,18 @@ class TestHandleLlmRequestTaskIdPath:
     """The third status-read caller threads config into handle_task_status.
 
     handle_llm_request already accepts ``config`` and, when ``input_path`` is a
-    task id, delegates to handle_task_status. This verifies the wiring fix so
-    an operator's long-retention config reaches the cleanup gate through this
-    path too (previously a wiring defect: config was in scope but not passed).
+    task id, delegates to handle_task_status. A disabled TTL forwarded through
+    that path must suppress the delivered TTL; dropping the config would fall
+    through to the 3600s default and shorten it.
     """
 
-    def test_task_id_path_honors_long_retention(self, monkeypatch):
+    def test_task_id_path_forwards_disabled_ttl(self, monkeypatch):
         from fastapi import BackgroundTasks
         from types import SimpleNamespace
 
         # is_task_id() must recognize our synthetic id so the task-id branch runs.
         monkeypatch.setattr(api, "is_task_id", lambda s: True)
 
-        long_config = _config_with_ttl(86400)
         redis = _FakeRedis(_completed_task(2.0))
         # get_base_url() reads request.url.scheme/.netloc.
         request = SimpleNamespace(
@@ -302,17 +302,17 @@ class TestHandleLlmRequestTaskIdPath:
                 BackgroundTasks(),
                 request,
                 "llm_abc",
-                config=long_config,
+                config=_config_with_ttl(0),
             )
 
         resp = asyncio_run(call())
         assert resp.status_code == 200
-        assert redis.deleted_keys == [], (
+        assert redis.ttl_seconds("task:llm_abc") is None, (
             "handle_llm_request -> handle_task_status must forward config; "
-            "at 24h retention a 2h-old task must survive"
+            "TTL 0 disables the delivered TTL"
         )
 
-    def test_task_id_path_cleans_up_at_default_ttl(self, monkeypatch):
+    def test_task_id_path_shortens_at_default_ttl(self, monkeypatch):
         from fastapi import BackgroundTasks
         from types import SimpleNamespace
 
@@ -334,7 +334,7 @@ class TestHandleLlmRequestTaskIdPath:
 
         resp = asyncio_run(call())
         assert resp.status_code == 200
-        assert redis.deleted_keys == ["task:llm_abc"]
+        assert redis.ttl_seconds("task:llm_abc") == 120
 
 
 # ───────────────────────────── helpers ───────────────────────────────────

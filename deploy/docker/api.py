@@ -29,12 +29,12 @@ from utils import (
     decode_redis_hash,
     get_base_url,
     get_browser_extra_args,
+    get_redis_delivered_task_ttl,
     get_redis_task_ttl,
     is_task_id,
     public_error_detail,
     correlated_error,
     public_crawl_error,
-    should_cleanup_task,
     validate_llm_provider,
     validate_url_destination,
 )
@@ -289,8 +289,21 @@ def _get_memory_mb():
         return None
 
 
+def _terminal_task_status(status: Any) -> bool:
+    """True when a task write records completed or failed."""
+    if isinstance(status, TaskStatus):
+        status = status.value
+    return status in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value)
+
+
 async def hset_with_ttl(redis, key: str, mapping: dict, config: dict):
-    """Set Redis hash with automatic TTL expiry.
+    """Write a task hash, expiring it only once the write is terminal.
+
+    In-flight writes leave the key with no TTL, matching the crawl-job queue
+    until its completion script. ``volatile-lru`` evicts only keys that have a
+    TTL, so a live task hash is not an eviction candidate. A ``completed`` or
+    ``failed`` status applies ``redis.task_ttl_seconds``. A TTL of 0 still
+    disables that expiry.
 
     Args:
         redis: Redis client instance
@@ -299,6 +312,8 @@ async def hset_with_ttl(redis, key: str, mapping: dict, config: dict):
         config: Application config containing redis.task_ttl_seconds
     """
     await redis.hset(key, mapping=mapping)
+    if not _terminal_task_status(mapping.get("status")):
+        return
     ttl = get_redis_task_ttl(config)
     if ttl > 0:
         await redis.expire(key, ttl)
@@ -789,15 +804,12 @@ async def handle_task_status(
     it; a different requester gets 404 (not 403, so task existence is not
     revealed). Admin-scope principals may read any task.
 
-    The lazy delete-after-read gate (for COMPLETED/FAILED tasks when ``keep`` is
-    false) honors the operator's ``redis.task_ttl_seconds`` via
-    :func:`get_redis_task_ttl`, mirroring the producer-side TTL set by
-    :func:`hset_with_ttl`. This keeps the consumer and producer on the same
-    retention contract: a configured TTL of N seconds retains the task for N
-    seconds on both the write and read sides, and a TTL of 0 disables automatic
-    deletion on both sides. ``config`` defaults to ``None`` so the historical
-    effective TTL of 3600s (via :func:`get_redis_task_ttl`'s own default) is
-    preserved for callers that do not forward the app config.
+    A completed or failed payload is copied into the response and its hash TTL
+    is shortened to ``redis.delivered_task_ttl_seconds`` when ``keep`` is false
+    and ``redis.task_ttl_seconds`` is positive. That bounds a result the client
+    has already received; the full TTL still expires a terminal hash nobody
+    fetches. ``keep`` leaves the TTL alone. A TTL of 0 disables both the
+    producer expiry and this shortening.
     """
     task = await redis.hgetall(f"task:{task_id}")
     if not task:
@@ -818,10 +830,16 @@ async def handle_task_status(
 
     response = create_task_response(task, task_id, base_url, collection)
 
-    if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
-        ttl_seconds = get_redis_task_ttl(config or {})
-        if not keep and should_cleanup_task(task["created_at"], ttl_seconds=ttl_seconds):
-            await redis.delete(f"task:{task_id}")
+    if (
+        not keep
+        and task["status"] in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        and get_redis_task_ttl(config or {}) > 0
+    ):
+        # Shorten, never delete: a caller re-reads a delivered task (a resume
+        # probe, then its poll; a retry after a lost response).
+        await redis.expire(
+            f"task:{task_id}", get_redis_delivered_task_ttl(config or {}), lt=True
+        )
 
     return JSONResponse(response)
 

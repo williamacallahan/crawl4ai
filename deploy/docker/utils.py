@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
         "db": 0,
         "password": "",
         "task_ttl_seconds": 3600,
+        "delivered_task_ttl_seconds": 120,
         "ssl": False,
     },
     "crawl_jobs": {
@@ -352,14 +353,12 @@ def datetime_handler(obj: any) -> Optional[str]:
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 def should_cleanup_task(created_at: str, ttl_seconds: int = 3600) -> bool:
-    """Check if task should be cleaned up based on creation time.
+    """Return whether ``created_at`` is older than ``ttl_seconds``.
 
-    A ``ttl_seconds`` of 0 (or any negative value) disables cleanup, mirroring
-    the "0 == disabled" sentinel documented for ``redis.task_ttl_seconds`` and
-    honored by :func:`hset_with_ttl` on the producer side. This keeps the
-    consumer-side lazy delete-after-read gate consistent with the producer-side
-    Redis key TTL contract: an operator who sets ``task_ttl_seconds: 0`` to
-    disable automatic expiry gets no delete-after-read either.
+    A ``ttl_seconds`` of 0 (or any negative value) returns False, mirroring the
+    "0 == disabled" sentinel of ``redis.task_ttl_seconds``. The status handler
+    does not use this age check: a fetched terminal task's TTL is shortened to
+    ``redis.delivered_task_ttl_seconds`` whenever that TTL is positive.
     """
     if ttl_seconds <= 0:
         return False
@@ -381,6 +380,11 @@ def get_redis_task_ttl(config: Dict) -> int:
         TTL in seconds (default 3600). Returns 0 if TTL is disabled.
     """
     return config.get("redis", {}).get("task_ttl_seconds", 3600)
+
+
+def get_redis_delivered_task_ttl(config: Dict) -> int:
+    """Seconds a terminal task hash stays readable after a successful fetch (default 120)."""
+    return config.get("redis", {}).get("delivered_task_ttl_seconds", 120)
 
 
 def get_llm_api_key(config: Dict, provider: Optional[str] = None) -> Optional[str]:
