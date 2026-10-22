@@ -45,7 +45,6 @@ DEFAULT_CONFIG = {
         "db": 0,
         "password": "",
         "task_ttl_seconds": 3600,
-        "delivered_task_ttl_seconds": 120,
         "ssl": False,
     },
     "crawl_jobs": {
@@ -357,8 +356,7 @@ def should_cleanup_task(created_at: str, ttl_seconds: int = 3600) -> bool:
 
     A ``ttl_seconds`` of 0 (or any negative value) returns False, mirroring the
     "0 == disabled" sentinel of ``redis.task_ttl_seconds``. The status handler
-    does not use this age check: a fetched terminal task's TTL is shortened to
-    ``redis.delivered_task_ttl_seconds`` whenever that TTL is positive.
+    does not use this age check: polling leaves producer-set expiry unchanged.
     """
     if ttl_seconds <= 0:
         return False
@@ -380,11 +378,6 @@ def get_redis_task_ttl(config: Dict) -> int:
         TTL in seconds (default 3600). Returns 0 if TTL is disabled.
     """
     return config.get("redis", {}).get("task_ttl_seconds", 3600)
-
-
-def get_redis_delivered_task_ttl(config: Dict) -> int:
-    """Seconds a terminal task hash stays readable after a successful fetch (default 120)."""
-    return config.get("redis", {}).get("delivered_task_ttl_seconds", 120)
 
 
 def get_llm_api_key(config: Dict, provider: Optional[str] = None) -> Optional[str]:

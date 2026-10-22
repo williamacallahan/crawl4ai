@@ -29,7 +29,6 @@ from utils import (
     decode_redis_hash,
     get_base_url,
     get_browser_extra_args,
-    get_redis_delivered_task_ttl,
     get_redis_task_ttl,
     is_task_id,
     public_error_detail,
@@ -804,12 +803,9 @@ async def handle_task_status(
     it; a different requester gets 404 (not 403, so task existence is not
     revealed). Admin-scope principals may read any task.
 
-    A completed or failed payload is copied into the response and its hash TTL
-    is shortened to ``redis.delivered_task_ttl_seconds`` when ``keep`` is false
-    and ``redis.task_ttl_seconds`` is positive. That bounds a result the client
-    has already received; the full TTL still expires a terminal hash nobody
-    fetches. ``keep`` leaves the TTL alone. A TTL of 0 disables both the
-    producer expiry and this shortening.
+    Terminal retention is set by the producer. Polling leaves the hash and
+    its expiry unchanged. ``keep`` and ``config`` remain accepted for caller
+    compatibility; neither changes retention on a status read.
     """
     task = await redis.hgetall(f"task:{task_id}")
     if not task:
@@ -829,17 +825,6 @@ async def handle_task_status(
         )
 
     response = create_task_response(task, task_id, base_url, collection)
-
-    if (
-        not keep
-        and task["status"] in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-        and get_redis_task_ttl(config or {}) > 0
-    ):
-        # Shorten, never delete: a caller re-reads a delivered task (a resume
-        # probe, then its poll; a retry after a lost response).
-        await redis.expire(
-            f"task:{task_id}", get_redis_delivered_task_ttl(config or {}), lt=True
-        )
 
     return JSONResponse(response)
 

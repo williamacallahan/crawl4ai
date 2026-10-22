@@ -440,3 +440,59 @@ def test_durable_quota_lease_never_expires(redis_url):
             await client.aclose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("kind,terminal_status", [("crawl", "completed"), ("llm", "failed")])
+def test_terminal_status_reads_preserve_absolute_expiry(redis_url, kind, terminal_status):
+    """Real Redis expiry must not be shortened or refreshed by status reads."""
+    from uuid import uuid4
+    import api
+    from crawl_job_queue import CrawlJobQueue
+    from fastapi import HTTPException
+
+    async def exercise():
+        client = aioredis.from_url(redis_url)
+        config = queue_config()
+        config["redis"]["task_ttl_seconds"] = 86400
+        config["limits"]["queue"]["per_principal"] = 0
+        config["crawl_jobs"]["stream"] = f"retention-{uuid4().hex}"
+        queue = CrawlJobQueue(client, config)
+        task_id = f"llm_{uuid4().hex}"
+        try:
+            if kind == "crawl":
+                await queue.ensure_group()
+                task_id = await queue.enqueue(["https://example.com"], {}, {}, None, None, owner="alice")
+                entry = (await queue.read_new("retention-worker"))[0]
+                payload = await queue.load_payload(task_id)
+                assert payload is not None
+                attempt = await queue.start_attempt(entry, payload, "retention-worker")
+                await queue.complete(entry, payload, attempt, result={"markdown": "body"})
+            else:
+                await api.hset_with_ttl(client, f"task:{task_id}", {
+                    "status": terminal_status, "created_at": "2026-10-22T07:00:00",
+                    "url": "https://example.com", "owner": "alice", "error": "extraction failed",
+                }, config)
+            key = f"task:{task_id}"
+            deadline = await client.pexpiretime(key)
+            assert deadline > 0
+            assert await client.ttl(key) > 86000
+            with pytest.raises(HTTPException) as denied:
+                await api.handle_task_status(client, task_id, "https://crawl.example/",
+                                             collection=f"{kind}/job", requester="mallory", config=config)
+            assert denied.value.status_code == 404
+            assert await client.pexpiretime(key) == deadline
+            for _ in range(2):
+                response = await api.handle_task_status(client, task_id, "https://crawl.example/",
+                                                       collection=f"{kind}/job", requester="alice", config=config)
+                assert response.status_code == 200
+                body = json.loads(response.body)
+                assert body["status"] == terminal_status
+                if kind == "crawl":
+                    assert body["result"] == {"markdown": "body"}
+                else:
+                    assert body["error"] == "extraction failed"
+                assert await client.pexpiretime(key) == deadline
+        finally:
+            await client.delete(f"task:{task_id}", queue.payload_key(task_id), queue.settings.stream)
+            await client.aclose()
+    asyncio.run(exercise())

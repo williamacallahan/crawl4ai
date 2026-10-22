@@ -1,8 +1,7 @@
 """
 In-flight task hashes carry no TTL. A terminal write arms ``task_ttl_seconds``.
-A successful read of that finished hash returns the payload and shortens its
-TTL to ``delivered_task_ttl_seconds``, unless ``keep`` is set, so a re-read
-(a resume probe followed by its poll) still finds it.
+A status read returns the payload without changing expiry, so polling does
+not shorten the configured retention window.
 
 Outcomes are the key's TTL and whether the hash is still present after the
 read. ``volatile-lru`` can evict only keys that have a TTL, so a missing TTL
@@ -156,8 +155,8 @@ def test_processing_read_leaves_the_hash_and_its_ttl_alone():
     assert _stored(redis, key)["created_at"] == "2026-10-22T07:00:00"
 
 
-def test_delivered_crawl_result_keeps_only_the_delivered_ttl():
-    """The hash that dominates memory expires soon after delivery, yet a re-read still finds it."""
+def test_crawl_result_reads_preserve_the_terminal_ttl():
+    """A status read and a retry preserve the result and its configured TTL."""
     redis = _Redis()
     key = "task:crawl_abc"
     payload = {"markdown": "page body"}
@@ -190,7 +189,7 @@ def test_delivered_crawl_result_keeps_only_the_delivered_ttl():
 
     assert response.status_code == 200
     assert json.loads(response.body)["result"] == payload
-    assert redis.ttl_seconds(key) == 120
+    assert redis.ttl_seconds(key) == 3600
 
     again = asyncio_run(
         api.handle_task_status(
@@ -203,7 +202,7 @@ def test_delivered_crawl_result_keeps_only_the_delivered_ttl():
         )
     )
     assert json.loads(again.body)["result"] == payload
-    assert redis.ttl_seconds(key) == 120
+    assert redis.ttl_seconds(key) == 3600
 
 
 def test_keep_retains_a_delivered_result():
