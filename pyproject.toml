@@ -123,6 +123,7 @@ server = [
     "mcp>=1.18.0,<2",
     "websockets>=15.0.1",
     "httpx[http2]>=0.27.2",
+    "sentry-sdk[fastapi]>=2,<3",
 ]
 
 [tool.pytest.ini_options]
