@@ -81,6 +81,10 @@ return 0
 """
 
 
+class LlmCapacityBusy(HTTPException):
+    """Expected shared-permit backpressure, not a server failure."""
+
+
 @asynccontextmanager
 async def llm_permit(redis, config):
     token = uuid4().hex
@@ -92,7 +96,7 @@ async def llm_permit(redis, config):
         ex=ttl,
     )
     if not acquired:
-        raise HTTPException(
+        raise LlmCapacityBusy(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Crawl4AI LLM capacity is busy",
             headers={"Retry-After": "30"},
@@ -552,12 +556,15 @@ async def process_llm_extraction(
         # This runs as a background task, so the central 500 handler never sees
         # it: str(e) would land verbatim in the task hash that /llm/job/{id}
         # returns and in the caller-supplied webhook.
+        level = logging.WARNING if isinstance(e, LlmCapacityBusy) else logging.ERROR
         error_message = (
             str(e)
             if isinstance(e, LlmExtractionRejected)
-            else correlated_error("LLM extraction failed", e, f"llm extraction task={task_id}")
+            else correlated_error(
+                "LLM extraction failed", e, f"llm extraction task={task_id}", level=level
+            )
         )
-        logger.error("LLM extraction error: %s", e, exc_info=True)
+        logger.log(level, "LLM extraction error: %s", e, exc_info=True)
         await hset_with_ttl(redis, f"task:{task_id}", {
             "status": TaskStatus.FAILED,
             "error": error_message
