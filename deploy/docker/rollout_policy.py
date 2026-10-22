@@ -60,7 +60,8 @@ REDIS_NODE = "haiku-18"
 # everysec, never always: appendfsync=always was half of the 2026-08-28 fleet
 # kill, stalling every crawl behind Redis. Pinned so a console edit cannot
 # reintroduce it silently.
-# Bound below the 1GiB limit; volatile-lru preserves the no-TTL durable queue and renewed permit.
+# Bound below the 1GiB limit; volatile-lru evicts only expiring finished results, never the
+# no-TTL queue or in-flight task hashes. The LLM permit has a TTL; its 100s renewals keep it warm.
 REDIS_COMMAND = [
     "redis-server",
     "--dir", "/data",
