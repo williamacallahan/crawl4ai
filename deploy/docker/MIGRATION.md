@@ -22,7 +22,9 @@ The server no longer serves an unauthenticated API on `0.0.0.0`. It binds
 loopback by default and will not expose itself without a credential.
 
 Provide the existing operator-managed credential through
-`CRAWL4AI_API_TOKEN` (or the `/run/secrets/api_token` mount). Credential
+`CRAWL4AI_API_TOKEN` (or the `/run/secrets/api_token` mount). The value is a
+comma-separated list so a rotation can accept the old and new token in
+parallel; clients present exactly one entry. Credential
 lifecycle remains owned by the operator and secret manager; this migration
 makes no credential-lifecycle changes.
 

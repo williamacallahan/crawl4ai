@@ -97,7 +97,9 @@ security:
   # same effective value controls socket exposure and /token issuance. The
   # gate still verifies already-issued JWTs when issuance is disabled.
   jwt_enabled: false
-  api_token: ""  # Effective value also reads CRAWL4AI_API_TOKEN
+  # Comma-separated list; each entry is accepted, the first is what the server
+  # sends on its own internal calls. CRAWL4AI_API_TOKEN overrides this value.
+  api_token: ""
   https_redirect: false
   trusted_hosts: ["*"]
   cors_allow_origins: []  # deny-by-default; list explicit origins to allow CORS

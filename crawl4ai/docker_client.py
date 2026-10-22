@@ -67,7 +67,7 @@ class Crawl4aiDockerClient:
         log_file: Optional[str] = None,
         api_token: Optional[str] = None,
     ):
-        """``api_token`` is the server's static ``CRAWL4AI_API_TOKEN``. It is
+        """``api_token`` is one entry of the server's ``CRAWL4AI_API_TOKEN`` list. It is
         sent as a Bearer credential on every request and also reused as the
         operator credential when ``authenticate(email)`` mints a JWT on a
         JWT-enabled server (the ``/token`` handler requires it in the request
