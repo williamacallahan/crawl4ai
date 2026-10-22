@@ -9,6 +9,7 @@ from typing import Dict, Optional
 
 import dns.resolver
 import yaml
+from error_reporting import init_error_reporting
 from fastapi import Request
 
 from egress_proxy import tunnel_failure_code
@@ -208,6 +209,7 @@ def setup_logging(config: Dict) -> None:
     crlf = CRLFSafeFilter()
     for handler in logging.getLogger().handlers:
         handler.addFilter(crlf)
+    init_error_reporting()
 
 def get_base_url(request: Request) -> str:
     """Get base URL including scheme and host."""
