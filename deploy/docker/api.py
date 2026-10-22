@@ -1203,6 +1203,13 @@ async def handle_crawl_request(
                 config,
             )
 
+        # Fetch archive URLs through the node budget once the configs have
+        # validated and before a pooled browser is taken: each result then
+        # crawls the raw body, the browser never contacts archive.org, and a
+        # spent budget raises ArchiveBudgetSpent (429) holding no browser.
+        materialized_urls = await materialize(redis, config, urls)
+        url_restore = dict(zip(materialized_urls, urls))
+
         from crawler_pool import get_crawler
 
         hooks_status = {}
@@ -1216,14 +1223,6 @@ async def handle_crawl_request(
             crawler = await _await_before_deadline(
                 get_crawler(loaded_browser_config), deadline_at
             )
-
-        # Fetch archive URLs through the node budget once every request input
-        # has validated: each result then crawls the raw body, the browser
-        # never contacts archive.org, and a spent budget raises
-        # ArchiveBudgetSpent (429) before any reservation is wasted on a
-        # rejected request.
-        materialized_urls = await materialize(redis, config, urls)
-        url_restore = dict(zip(materialized_urls, urls))
 
         dispatcher = _memory_dispatcher(config)
 
@@ -1475,6 +1474,12 @@ async def handle_stream_crawl_request(
         else:
             effective_config = loaded_crawler_config
 
+        # Same archive.org materialization as handle_crawl_request, before a
+        # browser is taken: the stream crawls raw bodies and a spent budget
+        # raises ArchiveBudgetSpent (429) holding no browser.
+        materialized_urls = await materialize(redis, config, urls)
+        url_restore = dict(zip(materialized_urls, urls))
+
         from crawler_pool import get_crawler
 
         if hooks_config:
@@ -1491,11 +1496,6 @@ async def handle_stream_crawl_request(
                 deadline_at,
             )
 
-        # Same archive.org materialization as handle_crawl_request, after all
-        # request validation: the stream then crawls raw bodies and a spent
-        # budget raises ArchiveBudgetSpent (429).
-        materialized_urls = await materialize(redis, config, urls)
-        url_restore = dict(zip(materialized_urls, urls))
 
         # Deep crawl with single URL: use arun() which returns an async generator
         # mirroring the Python library's streaming behavior
