@@ -338,11 +338,11 @@ def public_crawl_error(
     public = public_error_detail(raw)
     if not message or public == message[:500]:
         return CorrelatedError(public)
-    # The target site failed (blocked, timed out, navigated away), not this
-    # server, so it stays below the ERROR level that Sentry reports.
-    return correlated_error(
-        public, raw, f"crawl failure url={url or 'unknown'}", logging.WARNING
-    )
+    # A recovered Chromium code or goto timeout means the target site failed, so
+    # it stays below the ERROR level that Sentry reports. A bare "Crawl failed"
+    # withheld a traceback or container path: a server-side fault.
+    level = logging.ERROR if public == "Crawl failed" else logging.WARNING
+    return correlated_error(public, raw, f"crawl failure url={url or 'unknown'}", level)
 
 
 def datetime_handler(obj: any) -> Optional[str]:

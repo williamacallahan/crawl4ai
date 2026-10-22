@@ -213,9 +213,15 @@ class TestErrorSanitization:
             public,
         )
         assert public.correlation_id
-        # A target-site failure is logged for grep by id, below the ERROR level Sentry reports.
-        logged = [r for r in caplog.records if public.correlation_id in r.getMessage()]
-        assert [r.levelname for r in logged] == ["WARNING"]
+        # A target-site failure is logged for grep by id, below the ERROR level Sentry reports;
+        # a withheld traceback is a server-side fault and stays at ERROR.
+        with caplog.at_level("INFO", logger="utils"):
+            internal = public_crawl_error('Unexpected error in _crawl_web\nFile "/app/x.py"')
+        levels = {
+            cid: [r.levelname for r in caplog.records if cid in r.getMessage()]
+            for cid in (public.correlation_id, internal.correlation_id)
+        }
+        assert levels == {public.correlation_id: ["WARNING"], internal.correlation_id: ["ERROR"]}
 
         # No recording -> verbatim pass-through -> NO correlation id minted.
         failures.clear()

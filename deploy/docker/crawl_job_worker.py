@@ -195,8 +195,19 @@ class CrawlJobWorker:
             if isinstance(error, HTTPException) and error.status_code < 500:
                 error_message = str(error.detail)
             else:
+                # 502/503/504 are a failed target, a busy server, or a crawl
+                # deadline; a server-side fault behind a 502 was already logged
+                # at ERROR by public_crawl_error.
+                upstream = isinstance(error, HTTPException) and error.status_code in {
+                    status.HTTP_502_BAD_GATEWAY,
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    status.HTTP_504_GATEWAY_TIMEOUT,
+                }
                 error_message = correlated_error(
-                    "Crawl job failed", error, f"crawl job={entry.task_id}"
+                    "Crawl job failed",
+                    error,
+                    f"crawl job={entry.task_id}",
+                    logging.WARNING if upstream else logging.ERROR,
                 )
             terminal_input = isinstance(error, HTTPException) and error.status_code in {
                 status.HTTP_400_BAD_REQUEST,
