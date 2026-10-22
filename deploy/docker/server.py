@@ -32,9 +32,10 @@ from api import (
 )
 from auth import (
     TokenRequest,
-    constant_time_eq,
     create_access_token,
     get_token_dependency,
+    matches_any_token,
+    parse_api_tokens,
     resolve_secret_key,
 )
 from auth_gate import AuthGateMiddleware
@@ -111,12 +112,16 @@ HOOKS_ENABLED = os.environ.get("CRAWL4AI_HOOKS_ENABLED", "false").lower() == "tr
 # /execute_js disabled by default (arbitrary JS + SSRF risk). Set to "true" to enable.
 EXECUTE_JS_ENABLED = os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lower() == "true"
 
-def _current_api_token() -> str:
-    """The effective static operator token (config or environment)."""
+def _current_api_tokens() -> tuple[str, ...]:
+    """The accepted static operator tokens (config or environment).
+
+    The setting is a comma-separated list so a rotation can accept the old and
+    new token in parallel; the first entry is the one this server sends itself.
+    """
     configured = config.get("security", {}).get("api_token", "")
     if configured and not isinstance(configured, str):
         raise RuntimeError("security.api_token must be a string")
-    return os.environ.get("CRAWL4AI_API_TOKEN", "") or configured
+    return parse_api_tokens(os.environ.get("CRAWL4AI_API_TOKEN", "") or configured)
 
 
 def _current_jwt_enabled() -> bool:
@@ -143,9 +148,9 @@ def _current_jwt_enabled() -> bool:
 
 def _internal_service_auth_headers() -> dict:
     """Use the effective operator token, or a JWT in JWT-only deployments."""
-    token = _current_api_token()
-    if token:
-        return {"Authorization": f"Bearer {token}"}
+    tokens = _current_api_tokens()
+    if tokens:
+        return {"Authorization": f"Bearer {tokens[0]}"}
     return {
         "Authorization": (
             "Bearer " + create_access_token({"sub": "mcp-service"}, scope="data")
@@ -163,7 +168,7 @@ def _effective_bind_host() -> str:
     return bind.rsplit(":", 1)[0]
 
 
-if not _current_api_token() and not _current_jwt_enabled():
+if not _current_api_tokens() and not _current_jwt_enabled():
     logging.getLogger("crawl4ai.security").warning(
         "No API token or JWT posture is configured; startup will restrict the "
         "service to loopback."
@@ -455,7 +460,7 @@ app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body_bytes_from_config
 # unauthorized callers are rejected before their body is read or buffered.
 app.add_middleware(
     AuthGateMiddleware,
-    token_provider=_current_api_token,
+    token_provider=_current_api_tokens,
     public_paths={HEALTH_PATH, "/token", "/", "/monitor"},
     public_prefixes=_UI_PREFIXES,
 )
@@ -481,7 +486,7 @@ def _resolve_auth():
         "localhost",
         "::1",
     )
-    api_token = _current_api_token()
+    api_token = _current_api_tokens()
     jwt_enabled = _current_jwt_enabled()
 
     if api_token or jwt_enabled:
@@ -674,15 +679,15 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 async def get_token(req: TokenRequest):
     if not _current_jwt_enabled():
         raise HTTPException(403, "JWT issuance is disabled on the server.")
-    expected_token = _current_api_token()
-    if not expected_token:
+    accepted_tokens = _current_api_tokens()
+    if not accepted_tokens:
         # Fail closed: without a configured api_token the old behavior minted a
         # JWT to anyone whose email merely had an MX record. Refuse instead.
         raise HTTPException(
             403,
             "Token issuance is disabled: no operator API token is configured.",
         )
-    if not req.api_token or not constant_time_eq(req.api_token, expected_token):
+    if not req.api_token or not matches_any_token(req.api_token, accepted_tokens):
         raise HTTPException(401, "Invalid or missing api_token")
     if not await asyncio.to_thread(verify_email_domain, req.email):
         raise HTTPException(400, "Invalid email domain")

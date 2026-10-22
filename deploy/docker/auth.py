@@ -14,10 +14,12 @@ gate (and the /token endpoint) call:
   * decode_token         - verify an HS256 JWT (algorithms passed as a LIST,
                            which kills the substring-match bug and rejects
                            alg:none / other algorithms)
-  * constant_time_eq     - timing-safe comparison for the static API token
+  * parse_api_tokens     - split the comma-separated static operator token list
+  * matches_any_token    - timing-safe membership test against that list
   * resolve_secret_key   - fail fast when a real secret is required but missing
 """
 
+import functools
 import hmac
 import os
 from datetime import datetime, timedelta, timezone
@@ -103,9 +105,28 @@ def decode_token(token: str) -> dict:
     )
 
 
-def constant_time_eq(a: str, b: str) -> bool:
-    """Timing-safe string comparison for the static API token."""
-    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+@functools.cache
+def parse_api_tokens(raw: str) -> tuple[str, ...]:
+    """Split the static operator token setting into its accepted entries.
+
+    A comma-separated list lets an operator rotate the credential by accepting
+    the old and new value in parallel. Cached per distinct value, so the list is
+    parsed once at startup rather than on every request.
+    """
+    return tuple(entry for entry in (part.strip() for part in raw.split(",")) if entry)
+
+
+def matches_any_token(presented: str, accepted: tuple[str, ...]) -> bool:
+    """Timing-safe membership test.
+
+    Every entry is compared with no early exit, so response time does not reveal
+    which entry matched or how many are configured ahead of it.
+    """
+    presented_bytes = presented.encode("utf-8")
+    matched = False
+    for entry in accepted:
+        matched |= hmac.compare_digest(presented_bytes, entry.encode("utf-8"))
+    return matched
 
 
 def get_principal(request: Request) -> dict | None:

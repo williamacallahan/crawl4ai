@@ -4,7 +4,7 @@ The hardened (0.9.0+) ``deploy/docker/server.py`` ``/token`` handler requires
 the server's operator ``CRAWL4AI_API_TOKEN`` in the request body (it mints a
 JWT over it rather than accepting it as a Bearer credential). The shipped
 client's ``authenticate(email)`` previously POSTed only ``{"email": email}``,
-so the server's ``constant_time_eq`` guard returned ``401 "Invalid or missing
+so the server's ``matches_any_token`` guard returned ``401 "Invalid or missing
 api_token"`` before a token was ever issued, leaving the documented JWT
 issuance path unusable on every JWT-enabled 0.9.0+ deployment (the bug was
 introduced in commit 60886d1a, the 0.9.0 secure-by-default hardening).
@@ -55,7 +55,7 @@ TEST_SECRET = "test-only-secret-key-value-000000"
 def _jwt_enabled_env(monkeypatch, operator_token=OPERATOR_TOKEN):
     """Configure the real server env for a JWT-enabled posture, per-request.
 
-    ``_current_jwt_enabled`` / ``_current_api_token`` / ``resolve_secret_key``
+    ``_current_jwt_enabled`` / ``_current_api_tokens`` / ``resolve_secret_key``
     all re-read the environment at request time, so monkeypatching these before
     the request hits the handler is sufficient (no re-import needed).
     """
@@ -87,7 +87,7 @@ def _install_mock(client, handler):
 # Mirrors test_docker_client_hooks_unit.py:55 (the server hook schema pin).
 # The client body must round-trip through the server's TokenRequest with the
 # api_token populated; before the fix, the body lacked the field the handler's
-# constant_time_eq guard requires.
+# matches_any_token guard requires.
 
 def test_token_request_schema_has_email_and_api_token_fields():
     assert set(auth.TokenRequest.model_fields) == {"email", "api_token"}
@@ -99,7 +99,7 @@ async def test_authenticate_posts_email_and_api_token_in_body():
     """The /token POST body carries both ``email`` and ``api_token``.
 
     Cross-contract: the body round-trips through the server's ``TokenRequest``
-    with both fields populated, so the handler's ``constant_time_eq`` guard has
+    with both fields populated, so the handler's ``matches_any_token`` guard has
     a non-empty ``req.api_token`` to compare. Before the fix only
     ``{"email": email}`` was sent (the exact regression this test pins).
     """
@@ -265,7 +265,7 @@ async def test_authenticate_with_wrong_token_surfaces_server_401_as_connection_e
     """A wrong body ``api_token`` surfaces the server's 401 as ``ConnectionError``.
 
     This is the original bug's symptom: the operator-token guard
-    (``constant_time_eq``) returns 401 when the body token doesn't match. The
+    (``matches_any_token``) returns 401 when the body token doesn't match. The
     fixed client now reaches a *real* comparison (a non-empty body token) instead
     of the pre-fix missing-token 401, and the 4xx is normalized to the client's
     own ``ConnectionError`` with the server's JSON ``detail`` (never a leaked

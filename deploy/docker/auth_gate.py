@@ -11,7 +11,7 @@ route, mount and sub-app (HTTP + WebSocket) uniformly, and it fails closed: a
 request without a valid credential is rejected before it reaches any handler.
 
 Accepted credentials:
-  * the static operator API token (constant-time compared) -> admin scope, or
+  * any static operator API token entry (constant-time compared) -> admin scope, or
   * a valid HS256 JWT minted by this server -> the token's own scope claim.
 
 Public paths (health, token issuance, and exact UI redirects) pass through.
@@ -28,7 +28,7 @@ import json
 from collections.abc import Callable, Iterable
 
 import jwt
-from auth import constant_time_eq, decode_token
+from auth import decode_token, matches_any_token
 
 
 class AuthGateMiddleware:
@@ -36,7 +36,7 @@ class AuthGateMiddleware:
         self,
         app,
         *,
-        token_provider: Callable[[], str],
+        token_provider: Callable[[], tuple[str, ...]],
         public_paths: Iterable[str] = (),
         public_prefixes: Iterable[str] = (),
     ):
@@ -110,8 +110,7 @@ class AuthGateMiddleware:
             return None
 
         # 1) static operator token -> admin scope
-        static_token = self._token_provider() or ""
-        if static_token and constant_time_eq(token, static_token):
+        if matches_any_token(token, self._token_provider()):
             return {"sub": "operator", "scope": "admin", "via": "api_token"}
 
         # 2) A valid HS256 JWT.  The effective JWT flag controls whether this

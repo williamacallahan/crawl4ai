@@ -185,7 +185,7 @@ class TestMonitorAuthStructural(unittest.TestCase):
         async def send(message):
             sent.append(message)
 
-        gate = AuthGateMiddleware(inner, token_provider=lambda: "operator-token")
+        gate = AuthGateMiddleware(inner, token_provider=lambda: ("operator-token",))
         asyncio.run(
             gate(
                 {
