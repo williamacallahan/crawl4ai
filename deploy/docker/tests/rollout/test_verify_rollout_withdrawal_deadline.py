@@ -76,9 +76,16 @@ def test_deploy_refreshes_and_checks_withdrawal_deadline_at_each_phase(
     monkeypatch.setattr(rollout_http, "_post_json", post)
 
     # The prior-update wait takes the first "completed" so it skips its loop.
+    # The next call captures prior_started_at before the application.update POST.
     # The Swarm-update wait then takes "updating" (one iteration that calls
-    # check()) and "completed" (loop exits).
-    update_states = iter(["completed", "updating", "completed"])
+    # check()) and "completed" (loop exits); both use a started_at that differs
+    # from the prior one so current_update is True.
+    update_states = iter([
+        ("completed", ""),
+        ("", "2026-01-01T00:00:00Z"),
+        ("updating", "2026-01-01T00:01:00Z"),
+        ("completed", "2026-01-01T00:01:00Z"),
+    ])
     monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: next(update_states))
 
     monkeypatch.setattr(rollout_tasks, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ELIGIBLE_NODES))
