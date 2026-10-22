@@ -154,6 +154,29 @@ def test_verify_tasks_rejects_record_label_drift_beside_control_plane_labels(
         )
 
 
+@pytest.mark.parametrize("retain_terminal_predecessor", [False, True])
+def test_converged_rollout_ignores_a_never_started_assigned_predecessor(
+    monkeypatch, retain_terminal_predecessor,
+):
+    rows, runtimes = _healed_baseline_rows()
+    rows[1].update(ID="assigned1", CurrentState="Assigned 12 hours ago")
+    if retain_terminal_predecessor:
+        rows.insert(2, dict(rows[1], ID="old1", CurrentState="Shutdown 1m"))
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    task_state = rollout_tasks._task_state
+    monkeypatch.setattr(rollout_tasks, "_task_state", lambda task: (
+        ("shutdown", "assigned") if task == "assigned1" else task_state(task)
+    ))
+
+    proof = rollout_tasks._verify_tasks(
+        "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES),
+    )
+
+    assert proof["tasks"] == ["task1", "task2", "task3"]
+    assert proof["instances"] == ["container1", "container2", "container3"]
+    assert len(proof["nodes"]) == 3 and set(proof["nodes"]) <= ELIGIBLE_NODES
+
+
 def test_baseline_tolerates_a_ghost_predecessor_on_a_down_node(monkeypatch):
     rows, runtimes = _healed_baseline_rows()
     ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})

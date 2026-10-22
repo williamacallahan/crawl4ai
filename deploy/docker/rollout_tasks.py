@@ -265,7 +265,15 @@ def _verify_tasks(
         desired, state = _task_state(str(candidate["ID"])[:12])
         if desired != "running" or state != "running":
             raise RuntimeError("Swarm task history contradicts the start-first rollout")
-        history = by_slot[str(candidate.get("Name"))]
+        # A withdrawn task still in assigned state never started a backend.
+        # Swarm can retain it even after reaping the real terminal predecessor.
+        history = [
+            row for row in by_slot[str(candidate.get("Name"))]
+            if not (
+                str(row.get("DesiredState", "")).lower() == "shutdown"
+                and _task_state(str(row["ID"])[:12]) == ("shutdown", "assigned")
+            )
+        ]
         # Swarm reaps terminal predecessors with task-history-limit=1, but
         # retains a predecessor that is still running. Verify retained history
         # when present; exact VIP membership below also excludes old backends.
