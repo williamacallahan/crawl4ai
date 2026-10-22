@@ -15,6 +15,11 @@ sleep, so the back-end can route the overflow elsewhere. When archive.org
 itself throttles (429/503/connection refused) ``pause`` pushes the node's next
 start out by ``archive.throttle_pause_seconds``.
 
+Every archive.org URL a request names is fetched through ``fetch`` (one
+reservation per hop, redirects followed manually so a Location can never pull
+the browser off the archive hosts) and ``materialize`` hands the crawl a
+``raw:`` body instead, so the browser never contacts archive.org at all.
+
 Node identity comes from ``CRAWL4AI_NODE`` (the Swarm ``{{.Node.Hostname}}``
 service template). Falling back to the container hostname would split one
 node's budget across two keys, so an unset variable fails loudly with 503.
@@ -26,12 +31,16 @@ import asyncio
 import errno
 import math
 import os
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from fastapi import HTTPException, status
 
 FETCH_USER_AGENT = "aVentureBot/1.0 (+https://aventure.vc) crawl4ai"
 FETCH_TIMEOUT_SECONDS = 60.0
+FETCH_CHUNK_BYTES = 65536
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_TEXT_CONTENT_TYPES = frozenset({"application/json", "application/xml"})
 
 BUDGET_KEY_PREFIX = "crawl4ai:archive:next:"
 
@@ -72,8 +81,8 @@ return math.floor(target - now)
 class ArchiveBudgetSpent(HTTPException):
     """This node's archive.org budget is spent for ``retry_after`` seconds.
 
-    Answered as HTTP 429 by the exception handler in server.py; the worker
-    treats it like any deliberate 4xx/5xx HTTPException.
+    Answered as HTTP 429 by the exception handler in server.py; the durable
+    crawl-job worker records it terminally (no lease retry).
     """
 
     def __init__(self, retry_after: float, node_name: str):
@@ -145,56 +154,35 @@ async def pause(redis, config: dict) -> float:
     return int(wait_ms) / 1000.0
 
 
-async def gate_url(redis, url, config: dict) -> None:
-    """Reserve one archive.org slot for ``url`` and sleep the returned wait.
-
-    Non-archive URLs pass through without touching Redis.
-    """
-    if not is_archive_url(url, config):
-        return
-    if redis is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="archive budget store is not configured",
-        )
-    wait = await reserve(redis, config)
-    if wait > 0:
-        await asyncio.sleep(wait)
-
-
-async def gate_urls(redis, urls, config: dict) -> None:
-    """Reserve one slot per archive URL in a request, in order."""
-    for url in urls or []:
-        await gate_url(redis, url, config)
-
-
-def _names_connection_refused(error_message) -> bool:
-    lowered = (error_message or "").lower()
-    return "connection refused" in lowered or "connection_refused" in lowered
-
-
-async def maybe_pause_for_result(redis, config: dict, url,
-                                 status_code, error_message) -> bool:
-    """Pause the node budget when a crawl result shows archive.org throttling.
-
-    Covers HTTP 429/503 statuses and errors naming connection refused
-    (ERR_CONNECTION_REFUSED / Connection refused).
-    """
-    if redis is None or not is_archive_url(url, config):
-        return False
-    if status_code not in (429, 503) and not _names_connection_refused(error_message):
-        return False
-    await pause(redis, config)
-    return True
-
-
 def _is_connection_refused(exc: BaseException) -> bool:
     err = getattr(exc, "os_error", None) or exc
     return getattr(err, "errno", None) == errno.ECONNREFUSED or "connection refused" in str(exc).lower()
 
 
-async def _default_opener(url: str):
-    """GET ``url`` with aiohttp; returns (status, content_type, body_text)."""
+def _header(headers, name: str):
+    for key, value in (headers or {}).items():
+        if key.lower() == name:
+            return value
+    return None
+
+
+def _is_text_content_type(content_type) -> bool:
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    return (
+        mime.startswith("text/")
+        or mime in _TEXT_CONTENT_TYPES
+        or mime.endswith("+json")
+        or mime.endswith("+xml")
+    )
+
+
+async def _default_opener(url: str, max_body_bytes: int):
+    """One GET with redirect following off; returns (status, headers, body).
+
+    The body is read in chunks and reading stops once it passes
+    ``max_body_bytes`` (0 = unbounded), so an oversized page never buffers in
+    full — ``fetch`` still answers the cap violation itself.
+    """
     import aiohttp
 
     timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)
@@ -202,9 +190,15 @@ async def _default_opener(url: str):
         async with aiohttp.ClientSession(
             timeout=timeout, headers={"User-Agent": FETCH_USER_AGENT},
         ) as session:
-            async with session.get(url) as response:
-                body = (await response.read()).decode("utf-8", errors="replace")
-                return response.status, response.headers.get("Content-Type", ""), body
+            async with session.get(url, allow_redirects=False) as response:
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.content.iter_chunked(FETCH_CHUNK_BYTES):
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if 0 < max_body_bytes < size:
+                        break
+                return response.status, dict(response.headers), b"".join(chunks)
     except aiohttp.ClientError as exc:
         if _is_connection_refused(exc):
             raise _ArchiveUpstreamRefused(str(exc)) from exc
@@ -222,30 +216,91 @@ async def _default_opener(url: str):
 async def fetch(redis, config: dict, url: str, *, opener=None) -> dict:
     """Reserve a budget slot, GET an archive.org URL, and return its body.
 
-    ``opener`` is the transport seam (defaults to aiohttp); it returns
-    (status, content_type, body_text) and raises _ArchiveUpstreamRefused on a
-    refused connection. Archive 429/503 and refused connections pause the node
-    budget and re-raise ArchiveBudgetSpent.
+    Redirects are followed manually — one reservation per hop, at most
+    ``archive.max_redirect_hops`` hops — and a Location that leaves the archive
+    hosts stops the fetch with 502. The body is capped at
+    ``limits.max_body_bytes`` (0 = unbounded) and must be text (text/*, JSON,
+    or XML); violations answer 502 and 415. Archive 429/503 and refused
+    connections pause the node budget and raise ArchiveBudgetSpent; any other
+    archive status keeps its body for the caller to report.
+
+    ``opener`` is the transport seam (defaults to aiohttp): called as
+    ``opener(url, max_body_bytes)`` it returns ``(status, headers, body_bytes)``
+    and raises _ArchiveUpstreamRefused on a refused connection.
     """
     if not is_archive_url(url, config):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="url host is not an archive.org host",
         )
-    wait = await reserve(redis, config)
-    if wait > 0:
-        await asyncio.sleep(wait)
-    try:
-        status_code, content_type, body = await (opener or _default_opener)(url)
-    except _ArchiveUpstreamRefused:
-        retry_after = await pause(redis, config)
-        raise ArchiveBudgetSpent(retry_after, node())
-    if status_code in (429, 503):
-        retry_after = await pause(redis, config)
-        raise ArchiveBudgetSpent(retry_after, node())
+    if redis is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="archive budget store is not configured",
+        )
+    max_body = int(config["limits"]["max_body_bytes"])
+    open_url = opener or _default_opener
+    current = str(url)
+    for _hop in range(int(config["archive"]["max_redirect_hops"])):
+        wait = await reserve(redis, config)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            status_code, headers, body = await open_url(current, max_body)
+        except _ArchiveUpstreamRefused:
+            retry_after = await pause(redis, config)
+            raise ArchiveBudgetSpent(retry_after, node())
+        if status_code in (429, 503):
+            retry_after = await pause(redis, config)
+            raise ArchiveBudgetSpent(retry_after, node())
+        location = _header(headers, "location")
+        if status_code in _REDIRECT_STATUSES and location:
+            target = urljoin(current, location)
+            if not is_archive_url(target, config):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="archive redirect left archive.org",
+                )
+            current = target
+            continue
+        break
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="archive redirect exceeded max_redirect_hops",
+        )
+    if 0 < max_body < len(body):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="archive body exceeds max_body_bytes",
+        )
+    content_type = _header(headers, "content-type") or ""
+    if not _is_text_content_type(content_type):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="archive body is not text",
+        )
     return {
-        "url": url,
+        "url": current,
         "status": status_code,
         "contentType": content_type,
-        "body": body,
+        "body": body.decode("utf-8", errors="replace"),
     }
+
+
+async def materialize(redis, config: dict, urls) -> list[str]:
+    """Fetch each archive.org URL through the node budget; the crawl runs on raw bodies.
+
+    Archive entries become ``raw:<body>`` so the browser never contacts
+    archive.org; every other URL passes through unchanged. Fetches run one at
+    a time, each behind its own reservation, so a request never bursts. A
+    throttle inside any fetch raises ArchiveBudgetSpent.
+    """
+    materialized = []
+    for url in urls or []:
+        if not is_archive_url(url, config):
+            materialized.append(url)
+            continue
+        fetched = await fetch(redis, config, str(url))
+        materialized.append("raw:" + fetched["body"])
+    return materialized

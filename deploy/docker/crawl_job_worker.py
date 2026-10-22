@@ -9,6 +9,7 @@ import socket
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from archive_budget import ArchiveBudgetSpent
 from crawl_job_queue import (
     CrawlJobAttempt,
     CrawlJobEntry,
@@ -186,6 +187,15 @@ class CrawlJobWorker:
             result = await self.crawl(payload)
         except asyncio.CancelledError:
             raise
+        except ArchiveBudgetSpent as error:
+            # Terminal, never a lease retry: the node's archive.org budget is
+            # spent and the poller routes the job through the overflow lane
+            # when it sees the code in the stored error.
+            error_message = (
+                f"archive_budget_spent: {error.detail}; retry after {error.retry_after}s"
+            )
+            await self.queue.complete(entry, payload, attempt, error=error_message)
+            return "failed", None, error_message
         except (HTTPException, OSError, RuntimeError, TypeError, ValueError) as error:
             # This worker is a separate process: the API's central 500 handler
             # never sees these, so nothing else genericizes them before they

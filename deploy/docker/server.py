@@ -804,17 +804,16 @@ async def generate_html(
     Use when you need sanitized HTML structures for building schemas or further processing.
     """
     await validate_url_scheme(body.url, allow_raw=True)
-    await archive_budget.gate_url(redis, body.url, config)
     cfg = server_crawler_config(config)
+    # Fetch archive URLs through the node budget before taking a pooled
+    # browser: the crawl runs on the raw body, so the browser never contacts
+    # archive.org. A spent budget raises ArchiveBudgetSpent (429) here.
+    materialized = await archive_budget.materialize(redis, config, [body.url])
     crawler = None
     try:
         crawler = await get_crawler(get_default_browser_config())
-        results = await crawler.arun(url=body.url, config=cfg)
-        await archive_budget.maybe_pause_for_result(
-            redis, config, body.url,
-            getattr(results[0], "status_code", None),
-            getattr(results[0], "error_message", None),
-        )
+        results = await crawler.arun(url=materialized[0], config=cfg)
+        results[0].url = body.url
         _raise_for_crawl_failure(results[0])
 
         raw_html = results[0].html
@@ -1282,7 +1281,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         headers["X-Hooks-Warning"] = _HOOKS_CODE_WARNING
     
     return StreamingResponse(
-        stream_results(crawler, gen, request_id, redis=redis, config=config),
+        stream_results(crawler, gen, request_id),
         media_type="application/x-ndjson",
         headers=headers,
     )

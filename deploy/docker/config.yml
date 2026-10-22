@@ -80,6 +80,7 @@ archive:
   spacing_seconds: 4        # minimum gap between request starts on one node
   max_wait_seconds: 8       # refuse (429) instead of waiting past this
   throttle_pause_seconds: 300  # push the next start out after upstream 429/503/refused
+  max_redirect_hops: 3      # redirect follow bound per fetched URL; each hop reserves a slot
 
 # Resource governance (DoS protection). Any limit set to 0 means "unbounded"
 # (the pre-hardening behavior), so you can relax or disable each one.
