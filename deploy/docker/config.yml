@@ -189,6 +189,7 @@ observability:
     endpoint: "/metrics"
   health_check:
     endpoint: "/health"
+    liveness_endpoint: "/health/live"
 
 # Webhook Configuration
 webhooks:

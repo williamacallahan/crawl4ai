@@ -28,6 +28,7 @@ class MonitorStats:
 
         # Endpoint stats (persisted in Redis)
         self.endpoint_stats: Dict[str, Dict] = {}  # endpoint -> {count, total_time, errors, ...}
+        self._loaded_from_redis = False
 
         # Background persistence queue (max 10 pending persist requests)
         self._persist_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
@@ -166,6 +167,10 @@ class MonitorStats:
 
     async def _persist_endpoint_stats(self):
         """Persist endpoint stats to Redis."""
+        # Requests can finish before Redis recovers; never overwrite its
+        # saved baseline with counters that have not been restored yet.
+        if not self._loaded_from_redis:
+            return
         try:
             await self.redis.set(
                 "monitor:endpoint_stats",
@@ -217,14 +222,18 @@ class MonitorStats:
             logger.error(f"Monitor cleanup error: {e}")
 
     async def load_from_redis(self):
-        """Load persisted stats from Redis."""
-        try:
-            data = await self.redis.get("monitor:endpoint_stats")
-            if data:
-                self.endpoint_stats = json.loads(data)
-                logger.info("Loaded endpoint stats from Redis")
-        except Exception as e:
-            logger.warning(f"Failed to load from Redis: {e}")
+        """Load persisted stats; the readiness owner retries failures."""
+        data = await self.redis.get("monitor:endpoint_stats")
+        if data:
+            restored = json.loads(data)
+            # Preserve requests collected in memory while startup was degraded.
+            for endpoint, counters in self.endpoint_stats.items():
+                baseline = restored.setdefault(endpoint, {})
+                for name, value in counters.items():
+                    baseline[name] = baseline.get(name, 0) + value
+            self.endpoint_stats = restored
+            logger.info("Loaded endpoint stats from Redis")
+        self._loaded_from_redis = True
 
     async def get_health_summary(self) -> Dict:
         """Get current system health snapshot."""

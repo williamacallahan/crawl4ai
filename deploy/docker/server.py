@@ -13,6 +13,7 @@ import base64
 import logging
 import os
 import pathlib
+import random
 import re
 import sys
 import time
@@ -249,12 +250,9 @@ async def lifespan(_: FastAPI):
         await app.state.job_queue.start()
         set_job_queue(app.state.job_queue)
 
-        # Initialize monitor and prove the effective (possibly external,
-        # authenticated) Redis is reachable before readiness becomes active.
-        await asyncio.wait_for(redis.ping(), timeout=5.0)
+        # Keep in-memory monitoring available while Redis recovers. Dependency
+        # outages must not tear down every replica and its in-flight crawls.
         monitor_module.monitor_stats = MonitorStats(redis)
-        await monitor_module.monitor_stats.load_from_redis()
-        monitor_module.monitor_stats.start_persistence_worker()
 
         # Permanent browser must be initialized from the same post-proxy
         # effective config used by per-request crawlers.
@@ -262,13 +260,15 @@ async def lifespan(_: FastAPI):
 
         app.state.janitor = asyncio.create_task(janitor())
         app.state.timeline_updater = asyncio.create_task(_timeline_updater())
-        app.state.readiness_checks_active = True
+        app.state.readiness_initializer = asyncio.create_task(_initialize_readiness())
 
         yield
     finally:
         app.state.readiness_checks_active = False
         background_tasks = []
-        for task_name in ("janitor", "timeline_updater", "artifact_janitor"):
+        for task_name in (
+            "readiness_initializer", "janitor", "timeline_updater", "artifact_janitor"
+        ):
             task = getattr(app.state, task_name, None)
             if task is not None:
                 task.cancel()
@@ -295,6 +295,25 @@ async def lifespan(_: FastAPI):
             await stop_pinning_proxy(app.state.egress_proxy)
         except Exception:
             pass
+
+async def _initialize_readiness():
+    """Recover Redis readiness without restarting browsers or the process."""
+    from monitor import get_monitor
+
+    delay = 1.0
+    while True:
+        try:
+            # Bound both operations: a responding PING alone does not prove
+            # persisted monitor state has loaded successfully.
+            await asyncio.wait_for(redis.ping(), timeout=5.0)
+            await asyncio.wait_for(get_monitor().load_from_redis(), timeout=5.0)
+            get_monitor().start_persistence_worker()
+            app.state.readiness_checks_active = True
+            return
+        except Exception as exc:
+            logger.warning("Redis readiness initialization failed: %s", type(exc).__name__)
+        await asyncio.sleep(random.uniform(delay / 2, delay))
+        delay = min(delay * 2, 30.0)
 
 async def _artifact_janitor():
     """Periodically reap expired / over-quota artifacts."""
@@ -454,6 +473,7 @@ async def add_security_headers(request: Request, call_next):
 # transports and the metrics endpoint, for HTTP and WebSocket alike. Only the
 # health/token endpoints and the exact UI redirects are public.
 HEALTH_PATH = config["observability"]["health_check"]["endpoint"]
+LIVENESS_PATH = config["observability"]["health_check"]["liveness_endpoint"]
 
 
 # ── request body-size limit (DoS) ─────────────────────────────────────
@@ -464,7 +484,7 @@ app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body_bytes_from_config
 app.add_middleware(
     AuthGateMiddleware,
     token_provider=_current_api_tokens,
-    public_paths={HEALTH_PATH, "/token", "/", "/monitor"},
+    public_paths={HEALTH_PATH, LIVENESS_PATH, "/token", "/", "/monitor"},
     public_prefixes=_UI_PREFIXES,
 )
 
@@ -1121,6 +1141,16 @@ async def get_hooks_info():
             "max_hooks": 10,
         },
     })
+
+
+@app.get(LIVENESS_PATH)
+async def liveness():
+    # Serving a response proves startup finished; dependencies own readiness.
+    return {
+        "status": "alive",
+        "revision": os.environ.get("C4AI_GIT_SHA", ""),
+        "instance": os.environ.get("HOSTNAME", ""),
+    }
 
 
 @app.get(HEALTH_PATH)

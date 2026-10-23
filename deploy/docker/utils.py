@@ -144,7 +144,7 @@ DEFAULT_CONFIG = {
     },
     "observability": {
         "prometheus": {"enabled": True, "endpoint": "/metrics"},
-        "health_check": {"endpoint": "/health"},
+        "health_check": {"endpoint": "/health", "liveness_endpoint": "/health/live"},
     },
     "webhooks": {
         "enabled": True,
