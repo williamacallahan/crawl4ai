@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from hook_registry import HookValidationError, build_declarative_hooks
 from llm_broker import LLMProviderNotAllowed
 from redis import asyncio as aioredis
+from redis.exceptions import RedisError
 from utils import (
     FilterType,
     TaskStatus,
@@ -319,12 +320,14 @@ async def hset_with_ttl(redis, key: str, mapping: dict, config: dict):
         await redis.expire(key, ttl)
 
 
+# Redis TIME stamps and judges heartbeats, so clock skew between replica hosts
+# cannot fail a live job.
 _LLM_TASK_HEARTBEAT_SCRIPT = """
 -- crawl4ai:llm-task-heartbeat
 if redis.call('HGET', KEYS[1], 'status') ~= 'processing' then
   return 0
 end
-redis.call('HSET', KEYS[1], 'heartbeat_at', ARGV[1])
+redis.call('HSET', KEYS[1], 'heartbeat_at', redis.call('TIME')[1])
 return 1
 """
 
@@ -340,19 +343,19 @@ end
 return 1
 """
 
+# A hash with no heartbeat_at came from a release that never heartbeats; during
+# a rolling deploy its worker may still be running on an old replica, so it is
+# never judged lost.
 _RECOVER_LLM_TASK_SCRIPT = """
 -- crawl4ai:recover-llm-task
 if redis.call('HGET', KEYS[1], 'status') == 'processing' then
-  local heartbeat = redis.call('HGET', KEYS[1], 'heartbeat_at')
-  local last_seen = tonumber(heartbeat)
-  if not heartbeat and redis.call('HGET', KEYS[1], 'created_at') == ARGV[2] then
-    last_seen = tonumber(ARGV[3])
-  end
-  if last_seen and last_seen < tonumber(ARGV[1]) then
+  local last_seen = tonumber(redis.call('HGET', KEYS[1], 'heartbeat_at'))
+  local now = tonumber(redis.call('TIME')[1])
+  if last_seen and last_seen < now - tonumber(ARGV[1]) then
     redis.call('HSET', KEYS[1], 'status', 'failed',
       'error', 'worker lost before completion')
-    if tonumber(ARGV[4]) > 0 then
-      redis.call('EXPIRE', KEYS[1], ARGV[4])
+    if tonumber(ARGV[2]) > 0 then
+      redis.call('EXPIRE', KEYS[1], ARGV[2])
     end
   end
 end
@@ -372,8 +375,13 @@ async def _heartbeat_llm_task(redis, task_id: str, config: dict) -> None:
     # The non-expiring task hash cannot be evicted by volatile-lru.
     while True:
         await asyncio.sleep(interval)
-        if not await redis.eval(_LLM_TASK_HEARTBEAT_SCRIPT, 1, f"task:{task_id}", time.time()):
-            return
+        try:
+            if not await redis.eval(_LLM_TASK_HEARTBEAT_SCRIPT, 1, f"task:{task_id}"):
+                return
+        except RedisError:
+            # A Redis restart lasts seconds; ending the loop here would let a
+            # later poll fail this live job once three intervals pass.
+            logger.warning("LLM task %s heartbeat failed; retrying", task_id, exc_info=True)
 
 
 async def _stop_llm_heartbeat(heartbeat: asyncio.Task) -> None:
@@ -517,11 +525,7 @@ async def process_llm_extraction(
     try:
         webhook_service = WebhookDeliveryService(config)
         # Recovery may have won while this factory was waiting in the queue.
-        if heartbeat.done():
-            heartbeat.result()
-        if not await redis.eval(
-            _LLM_TASK_HEARTBEAT_SCRIPT, 1, f"task:{task_id}", time.time(),
-        ):
+        if not await redis.eval(_LLM_TASK_HEARTBEAT_SCRIPT, 1, f"task:{task_id}"):
             return
         # Validate provider
         is_valid, error_msg = validate_llm_provider(config, provider)
@@ -917,22 +921,25 @@ async def handle_task_status(
             detail="Task not found"
         )
 
-    if collection == "llm/job" and task["status"] == TaskStatus.PROCESSING:
-        config = config or {}
-        cutoff = time.time() - 3 * llm_task_heartbeat_seconds(config)
-        created_at = task["created_at"]
-        created_epoch = datetime.fromisoformat(created_at).timestamp()
-        last_seen = float(task.get("heartbeat_at", created_epoch))
-        if last_seen < cutoff:
-            # Recheck the current heartbeat/status in Redis: completion or a
-            # renewal may have won since the authorized read above.
-            fields = await redis.eval(
-                _RECOVER_LLM_TASK_SCRIPT, 1, f"task:{task_id}", cutoff,
-                created_at, created_epoch, get_redis_task_ttl(config),
-            )
-            task = decode_redis_hash(dict(zip(fields[::2], fields[1::2])))
-            if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
+    # Only LLM tasks heartbeat; a crawl job read through this route keeps its
+    # own lease-based recovery.
+    config = config or {}
+    stale_after = 3 * llm_task_heartbeat_seconds(config)
+    if (
+        collection == "llm/job" and task_id.startswith("llm_")
+        and task["status"] == TaskStatus.PROCESSING and "heartbeat_at" in task
+        and float(task["heartbeat_at"]) < time.time() - stale_after
+    ):
+        # The local clock only skips the round trip for fresh beats; the
+        # script decides against Redis TIME and rechecks status, so a
+        # completion or renewal since the read above always wins.
+        fields = await redis.eval(
+            _RECOVER_LLM_TASK_SCRIPT, 1, f"task:{task_id}",
+            stale_after, get_redis_task_ttl(config),
+        )
+        task = decode_redis_hash(dict(zip(fields[::2], fields[1::2])))
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
 
     response = create_task_response(task, task_id, base_url, collection)
 
@@ -974,9 +981,11 @@ async def create_new_task(
     if webhook_config:
         task_data["webhook_config"] = json.dumps(webhook_config)
 
+    # heartbeat_at marks this hash recoverable from accept, so work waiting in
+    # the local queue is covered; the first Redis-TIME beat replaces this
+    # local stamp one interval later.
+    task_data["heartbeat_at"] = int(time.time())
     await hset_with_ttl(redis, f"task:{task_id}", task_data, config)
-
-    # Accepted work can wait longer than the stale threshold in the local queue.
     heartbeat = asyncio.create_task(_heartbeat_llm_task(redis, task_id, config))
 
     async def cancel_task() -> None:

@@ -11,6 +11,7 @@ from uuid import uuid4
 import api
 import pytest
 from redis import asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from test_crawl_job_queue_redis import redis_url  # noqa: F401
 from utils import TaskStatus, decode_redis_hash
 
@@ -18,11 +19,17 @@ from utils import TaskStatus, decode_redis_hash
 CONFIG = {"llm": {"task_heartbeat_seconds": 30}, "redis": {"task_ttl_seconds": 60}}
 
 
-@pytest.mark.parametrize("legacy", [False, True], ids=["heartbeat", "legacy-created-at"])
-def test_stale_task_recovers_while_live_sibling_survives(redis_url, legacy):
+@pytest.mark.parametrize(
+    "case", ["heartbeat", "pre-heartbeat-release", "crawl-id"],
+)
+def test_stale_task_recovers_while_live_sibling_survives(redis_url, case):
+    """Only a heartbeating LLM hash can be judged lost: a hash written by a
+    release without heartbeats may still be running on an old replica during
+    a rolling deploy, and a crawl job keeps its own lease recovery."""
     async def exercise():
         client = aioredis.from_url(redis_url)
-        ids = [f"llm_{uuid4().hex}" for _ in range(2)]
+        prefix = "crawl_" if case == "crawl-id" else "llm_"
+        ids = [f"{prefix}{uuid4().hex}" for _ in range(2)]
         stale, live = ids
         old = time.time() - 91
         try:
@@ -32,7 +39,7 @@ def test_stale_task_recovers_while_live_sibling_survives(redis_url, legacy):
                     "created_at": datetime.fromtimestamp(old).isoformat(),
                     "url": "https://example.com",
                 }
-                if task_id == live or not legacy:
+                if task_id == live or case != "pre-heartbeat-release":
                     mapping["heartbeat_at"] = time.time() if task_id == live else old
                 await client.hset(f"task:{task_id}", mapping=mapping)
 
@@ -44,7 +51,7 @@ def test_stale_task_recovers_while_live_sibling_survives(redis_url, legacy):
                 stored = decode_redis_hash(await client.hgetall(f"task:{task_id}"))
                 ttl = await client.ttl(f"task:{task_id}")
                 assert response.status_code == 200
-                if task_id == live:
+                if task_id == live or case != "heartbeat":
                     assert body["status"] == stored["status"] == TaskStatus.PROCESSING.value
                     assert ttl == -1
                 else:
@@ -195,6 +202,38 @@ def test_running_worker_refreshes_heartbeat_and_stops_at_completion(redis_url, e
             if worker is not None and not worker.done():
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
+            await client.delete(key)
+            await client.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_heartbeat_survives_a_redis_outage(redis_url):
+    """A Redis restart takes seconds; the heartbeat must resume after it, or a
+    later poll fails a job that is still running."""
+    async def exercise():
+        client = aioredis.from_url(redis_url)
+        task_id = f"llm_{uuid4().hex}"
+        key = f"task:{task_id}"
+        evaluate = client.eval
+        outages = iter([True])
+
+        async def eval_after_outage(*args):
+            if next(outages, False):
+                raise RedisConnectionError("Error 111 connecting to redis")
+            return await evaluate(*args)
+
+        client.eval = eval_after_outage
+        config = {"llm": {"task_heartbeat_seconds": 1}}
+        beating = asyncio.create_task(api._heartbeat_llm_task(client, task_id, config))
+        try:
+            await client.hset(key, mapping={"status": TaskStatus.PROCESSING.value})
+            await asyncio.sleep(2.2)
+            assert not beating.done()
+            assert await client.hget(key, "heartbeat_at") is not None
+        finally:
+            beating.cancel()
+            await asyncio.gather(beating, return_exceptions=True)
             await client.delete(key)
             await client.aclose()
 
