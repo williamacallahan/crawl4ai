@@ -172,12 +172,11 @@ crawler:
       renderer_cpu_cores: 0.9
       renderer_cpu_seconds: 65.0  # page_timeout (60 s) + termination (5 s): only renderers termination missed
       renderer_rss_mb: 768
-      # Summed RSS of one browser's whole process tree (browser, renderers,
-      # GPU/utility), which counts shared pages more than once. The three
-      # browser-owning processes (gunicorn + 2 job workers) at 600 MiB each hold
-      # 1.8 GiB, under recovery_threshold_percent (65% = 2.6 GiB of the 4 GiB
-      # container) with room for their heaps and Redis. Above it the browser
-      # drains and restarts, permanent included.
+      # Summed RSS of one browser's non-renderer processes (browser, GPU,
+      # utility, zygote); renderers have renderer_rss_mb. Idle production
+      # browsers measure ~330-390 MiB (browser ~101-112, gpu ~44-51, audio
+      # ~52-60, network ~73-87, zygote ~57-87), so this leaves ~210 MiB of
+      # growth before the browser drains and restarts, permanent included.
       browser_rss_mb: 600
       browser_probe_timeout_seconds: 5.0
       consecutive_failure_limit: 3

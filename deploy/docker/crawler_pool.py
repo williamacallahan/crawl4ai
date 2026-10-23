@@ -67,6 +67,8 @@ if "RENDERER_KILL_METRIC" not in globals():
         "Renderer processes terminated by the browser resource watchdog",
         ["reason"],
     )
+    BROWSER_RECYCLE_METRIC = Counter(
+        "crawl4ai_browser_recycles_total", "Browsers drained by the watchdog", ["reason"])
 
 
 @dataclass
@@ -850,7 +852,7 @@ async def _recycle_busiest_browser() -> None:
 
 
 def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, float]]:
-    """Sample renderers and the whole tree's RSS under this manager's owned browser PID."""
+    """Sample renderers, and non-renderer RSS, under this manager's owned browser PID."""
     manager = crawler.crawler_strategy.browser_manager
     browser_pid = getattr(manager, "browser_pid", None)
     if isinstance(browser_pid, bool) or not isinstance(browser_pid, int):
@@ -866,8 +868,8 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
     for process in descendants:
         try:
             rss_bytes = process.memory_info().rss
-            tree_rss_bytes += rss_bytes
             if "--type=renderer" not in process.cmdline():
+                tree_rss_bytes += rss_bytes
                 continue
             identity = (process.pid, process.create_time())
             seen.add(identity)
@@ -897,7 +899,6 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                 reason = "cpu"
             if reason is not None:
                 process.kill()  # psutil sends SIGKILL on the supported Linux image.
-                tree_rss_bytes -= rss_bytes
                 RENDERER_KILLS[reason] += 1
                 RENDERER_KILL_METRIC.labels(reason=reason).inc()
                 _RENDERER_SAMPLES.pop(identity, None)
@@ -910,14 +911,13 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
             # Renderers exit while pages navigate; losing one during a sample
             # must not stop sampling the other browsers.
             continue
-    # Renderer kills cannot return the browser, GPU and network-service growth
-    # that only a restart releases; the permanent browser has no idle TTL to
-    # reach. Same drain-then-restart as a fault, once it has served a page.
+    # Only a restart returns browser/GPU/utility/zygote growth (the permanent browser has
+    # no idle TTL). Renderers are left out, or one heavy page would drain a fresh browser.
     tree_limit_bytes = WATCHDOG.browser_rss_mb * 1024 * 1024
-    if (tree_rss_bytes > tree_limit_bytes and getattr(manager, "_pages_served", 0) > 0
-            and not getattr(manager, "_recycle_due", False)):
-        logger.warning("Recycling browser pid=%s: process tree rss_bytes=%s > %s",
+    if tree_rss_bytes > tree_limit_bytes and not getattr(manager, "_pool_recycle_pending", False):
+        logger.warning("Recycling browser pid=%s: non-renderer rss_bytes=%s > %s",
                        browser_pid, tree_rss_bytes, tree_limit_bytes)
+        BROWSER_RECYCLE_METRIC.labels(reason="browser_tree_rss").inc()
         manager.request_pool_recycle("browser process tree rss")
     return seen
 
