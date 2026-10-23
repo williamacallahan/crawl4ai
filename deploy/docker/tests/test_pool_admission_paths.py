@@ -42,6 +42,7 @@ async def admission(monkeypatch, tmp_path):
         "LOCK": asyncio.Lock(), "_CLOSE_TASKS": set(),
         "ADMISSION_SEM": asyncio.Semaphore(4),
         "ADMISSION": utils.PoolAdmissionSettings(replica_max_pages=1, admission_wait_seconds=0),
+        "_WORKER_PROCESS": False,
         "PAGE_BUDGET": pool.ReplicaPageBudget(1, tmp_path),
         "MAX_BROWSER_INSTANCES": 10, "MEM_LIMIT": 90,
         "get_container_memory_percent": lambda: 10,

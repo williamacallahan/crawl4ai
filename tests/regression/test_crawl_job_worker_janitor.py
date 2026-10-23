@@ -23,6 +23,8 @@ import crawl_job_worker  # noqa: E402
 
 @pytest.mark.asyncio
 async def test_run_worker_sweeps_its_own_pool(monkeypatch):
+    # The worker role is process-wide state; this process also runs HTTP tests.
+    monkeypatch.setattr(crawl_job_worker, "use_worker_admission_wait", lambda: None)
     janitor_running = asyncio.Event()
     janitor_cancelled = asyncio.Event()
 

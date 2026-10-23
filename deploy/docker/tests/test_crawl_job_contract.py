@@ -449,6 +449,8 @@ def test_worker_proxy_lifecycle_wraps_execution_and_cleanup(monkeypatch, worker_
     monkeypatch.setattr(crawl_job_worker, "start_pinning_proxy", start_proxy)
     monkeypatch.setattr(crawl_job_worker, "stop_pinning_proxy", stop_proxy)
     monkeypatch.setattr(crawl_job_worker, "close_all", close_pool)
+    # The worker role is process-wide state; this process also runs HTTP tests.
+    monkeypatch.setattr(crawl_job_worker, "use_worker_admission_wait", lambda: None)
 
     if worker_error:
         with pytest.raises(RuntimeError, match="worker failed"):
