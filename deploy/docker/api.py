@@ -427,8 +427,8 @@ async def hset_with_ttl(redis, key: str, mapping: dict, config: dict):
     """Write a task hash, expiring it only once the write is terminal.
 
     In-flight writes leave the key with no TTL, matching the crawl-job queue
-    until its completion script. ``volatile-lru`` evicts only keys that have a
-    TTL, so a live task hash is not an eviction candidate. A ``completed`` or
+    until its completion script. Redis runs ``noeviction``, so no task hash is
+    ever evicted; a write past maxmemory fails instead. A ``completed`` or
     ``failed`` status applies ``redis.task_ttl_seconds``. A TTL of 0 still
     disables that expiry.
 
@@ -570,7 +570,6 @@ async def reap_llm_tasks(redis, config: dict) -> None:
 
 async def _heartbeat_llm_task(redis, task_id: str, config: dict) -> None:
     interval = llm_task_heartbeat_seconds(config)
-    # The non-expiring task hash cannot be evicted by volatile-lru.
     delay = interval
     while True:
         await asyncio.sleep(delay)
