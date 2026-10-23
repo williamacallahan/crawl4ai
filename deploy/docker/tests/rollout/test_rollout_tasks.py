@@ -261,13 +261,13 @@ def test_eligible_nodes_excludes_a_down_member_without_failing(monkeypatch):
     # Down nodes retain membership but cannot supply rollout capacity.
     monkeypatch.setattr(rollout.subprocess, "run", _node_commands([
         ("haiku-0", False, "ready", "active"),
-        ("haiku-18", True, "down", "drain"),
-        ("haiku-5", True, "ready", "active"),
-        ("haiku-6", True, "ready", "active"),
-        ("haiku-9", True, "ready", "active"),
+        *(
+            (node, True, "down", "drain") if node == rollout_policy.REDIS_NODE else (node, True, "ready", "active")
+            for node in sorted(ELIGIBLE_NODES)
+        ),
     ]))
     assert rollout_tasks._eligible_nodes() == (
-        ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-6", "haiku-9"})
+        ELIGIBLE_NODES, ELIGIBLE_NODES - {rollout_policy.REDIS_NODE}
     )
 
 

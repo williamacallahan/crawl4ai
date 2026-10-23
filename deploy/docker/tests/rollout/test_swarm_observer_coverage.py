@@ -3,13 +3,16 @@ from dataclasses import fields
 
 import pytest
 
+import rollout_policy
 import swarm_observer as observer
 
 
 OBSERVER_MISMATCH = observer.NetworkDbFdbComparison.DESTINATION_MISMATCH
 
 
-OBSERVER_COMPLETE = observer.CoverageSnapshot(3, 3, 3)
+OBSERVER_COMPLETE = observer.CoverageSnapshot(
+    rollout_policy.REPLICAS, rollout_policy.REPLICAS, rollout_policy.REPLICAS
+)
 
 
 OBSERVER_INCOMPLETE = observer.CoverageSnapshot(3, 2, 1)
@@ -91,8 +94,9 @@ def test_coverage_metrics_are_fixed_unlabeled_and_zero_is_incomplete():
     empty = observer.CoverageSnapshot(0, 0, 0)
     assert empty.complete == 0
     assert "crawl4ai_coverage_complete 0\n" in empty.metrics_text(1789000000.125)
-    two_surviving_tasks = observer.CoverageSnapshot(2, 2, 2)
-    assert two_surviving_tasks.complete == 0
+    assert OBSERVER_COMPLETE.complete == 1
+    one_task_short = rollout_policy.REPLICAS - 1
+    assert observer.CoverageSnapshot(one_task_short, one_task_short, one_task_short).complete == 0
     with pytest.raises(ValueError, match="exceeds direct_healthy_count"):
         observer.CoverageSnapshot(3, 1, 2)
 

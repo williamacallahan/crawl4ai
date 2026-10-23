@@ -10,7 +10,12 @@ from typing import Any
 import yaml
 
 
-REPLICAS = 3
+REPLICAS = 6
+# Two tasks per start-first batch keep a six-replica rollout inside the window
+# three replicas took one at a time; each batch needs two spare placement slots.
+PARALLELISM = 2
+# Three distinct Ready nodes, so losing one never takes every replica with it.
+MIN_READY_NODES = 3
 LLM_PROVIDER = yaml.safe_load(Path(__file__).with_name("config.yml").read_text())["llm"]["provider"]
 LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"
 HEALTH_URLS = (
@@ -40,6 +45,7 @@ PLACEMENTS = (
     PLACEMENT, _CAPPED_PLACEMENT, _SPREAD_PLACEMENT,
     {**_SPREAD_PLACEMENT, "MaxReplicas": 1},
     {**_SPREAD_PLACEMENT, "MaxReplicas": 2},
+    {**_SPREAD_PLACEMENT, "MaxReplicas": 3},
 )
 RESOURCES = {
     "Reservations": {"NanoCPUs": 500_000_000, "MemoryBytes": 1_073_741_824},
@@ -89,6 +95,14 @@ REDIS_HEALTHCHECK_FLOORS = {
 }
 
 
+def placement_capacity(ready_nodes: int, placement: dict[str, Any]) -> float:
+    """Tasks the Ready eligible nodes can hold under the placement's per-node cap."""
+    if ready_nodes < MIN_READY_NODES:
+        return 0
+    cap = placement.get("MaxReplicas")
+    return ready_nodes * cap if cap else math.inf
+
+
 def _labels(revision: str) -> dict[str, str]:
     return {
         "otel.logs.enabled": "true",
@@ -130,7 +144,7 @@ def _verify_llm_environment(environment: Any) -> None:
 
 def _rollout_policy(failure_action: str) -> dict[str, Any]:
     return {
-        "Parallelism": 1,
+        "Parallelism": PARALLELISM,
         "Delay": DELAY_NS,
         "FailureAction": failure_action,
         "Monitor": DELAY_NS,
@@ -225,7 +239,7 @@ def _policy(application: dict[str, Any]) -> None:
         raise ValueError("Crawl4AI must remain a stock Dokploy Docker-image app")
     _verify_llm_environment(application.get("env"))
     if application.get("replicas") != REPLICAS:
-        raise ValueError("Crawl4AI must keep three replicas")
+        raise ValueError(f"Crawl4AI must keep {REPLICAS} replicas")
     if application.get("healthCheckSwarm") != HEALTHCHECK:
         raise ValueError("Crawl4AI admission healthcheck drifted")
     if application.get("placementSwarm") not in PLACEMENTS:

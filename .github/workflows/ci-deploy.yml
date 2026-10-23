@@ -242,8 +242,8 @@ jobs:
   deploy:
     needs: merge
     runs-on: [self-hosted, Linux, X64, williamacallahan, canonical-haiku-0]
-    # The native update policy (400s monitor and delay per replica, one at a
-    # time) makes a healthy rollout take ~29 minutes; a failed one also rolls
+    # The native update policy (400s monitor and delay per batch of two
+    # replicas) makes a healthy rollout take ~29 minutes; a failed one also rolls
     # back. Stay above one rollout_policy.py TIMEOUT_SECONDS wait so a single
     # stuck phase reports its own error; each phase keeps its own bound (#163).
     timeout-minutes: 75

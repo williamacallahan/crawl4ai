@@ -7,11 +7,16 @@ import rollout_policy
 import rollout_http
 import rollout_tasks
 import verify_rollout as rollout
-from conftest import BASELINE, CANDIDATE, ELIGIBLE_NODES, REVISION, _healed_baseline_rows, _wire_verify_tasks, health
+from conftest import (
+    BASELINE, CANDIDATE, ELIGIBLE_NODES, HEALED_READY, REVISION, SLOTS, _healed_baseline_rows, _healed_colocation_rows,
+    _running_nodes, _wire_verify_tasks, health,
+)
 
 
 @pytest.mark.parametrize("retain_predecessors", [True, False])
 def test_verify_tasks_proves_each_overlay_backend(monkeypatch, retain_predecessors):
+    # Each slot runs on its own node; its predecessor ran on the next one.
+    nodes = sorted(ELIGIBLE_NODES)
     rows = [
         {
             "ID": f"task{index}",
@@ -20,7 +25,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch, retain_predecesso
             "DesiredState": "Running",
             "CurrentState": "Running 1m",
         }
-        for index, node in enumerate(("haiku-6", "haiku-5", "haiku-9"), 1)
+        for index, node in enumerate(nodes[:rollout_policy.REPLICAS], 1)
     ]
     predecessors = [
         {
@@ -30,7 +35,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch, retain_predecesso
             "DesiredState": "Shutdown",
             "CurrentState": "Shutdown 1m",
         }
-        for index, node in enumerate(("haiku-5", "haiku-9", "haiku-18"), 1)
+        for index, node in enumerate(nodes[1:rollout_policy.REPLICAS + 1], 1)
     ]
     if retain_predecessors:
         rows += predecessors
@@ -41,7 +46,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch, retain_predecesso
             "image": CANDIDATE,
             "addresses": {f"10.0.1.{index}"},
         }
-        for index in range(1, 4)
+        for index in SLOTS
     }
     # Dokploy's own stamp beside the record's labels must not read as drift.
     runtimes["task1"]["labels"]["dokploy.deployment.id"] = "row"
@@ -54,7 +59,7 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch, retain_predecesso
                         "Name": f"{row['Name']}.{row['ID']}",
                         "EndpointIP": next(iter(runtimes[row["ID"]]["addresses"])),
                     }
-                    for row in rows[:3]
+                    for row in rows[:rollout_policy.REPLICAS]
                 ]
             }
         },
@@ -93,12 +98,12 @@ def test_verify_tasks_proves_each_overlay_backend(monkeypatch, retain_predecesso
 
     monkeypatch.setattr(rollout_http, "_request_json", direct_health)
     proof = rollout_tasks._verify_tasks("crawl4ai", CANDIDATE, REVISION, (ELIGIBLE_NODES, ELIGIBLE_NODES))
-    assert proof["nodes"] == ["haiku-5", "haiku-6", "haiku-9"]
-    assert len(proof["instances"]) == 3
+    assert proof["nodes"] == nodes[:rollout_policy.REPLICAS]
+    assert len(proof["instances"]) == rollout_policy.REPLICAS
     assert ingress_calls == [None]
     assert len(direct_probe) == rollout_policy.REPLICAS
     assert {url for url, _container in direct_probe} == {
-        f"http://10.0.1.{index}:11235/health" for index in range(1, 4)
+        f"http://10.0.1.{index}:11235/health" for index in SLOTS
     }
     assert {container for _url, container in direct_probe} == {"a" * 64}
 
@@ -127,7 +132,7 @@ def test_verify_tasks_rejects_vip_membership_drift(monkeypatch, drift):
             "crawl4ai",
             BASELINE,
             "baseline",
-            (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})),
+            (ELIGIBLE_NODES, HEALED_READY),
             False,
         )
 
@@ -149,7 +154,7 @@ def test_verify_tasks_rejects_record_label_drift_beside_control_plane_labels(
             "crawl4ai",
             BASELINE,
             "baseline",
-            (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})),
+            (ELIGIBLE_NODES, HEALED_READY),
             False,
         )
 
@@ -172,17 +177,18 @@ def test_converged_rollout_ignores_a_never_started_assigned_predecessor(
         "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES),
     )
 
-    assert proof["tasks"] == ["task1", "task2", "task3"]
-    assert proof["instances"] == ["container1", "container2", "container3"]
-    assert len(proof["nodes"]) == 3 and set(proof["nodes"]) <= ELIGIBLE_NODES
+    assert proof["tasks"] == sorted(f"task{slot}" for slot in SLOTS)
+    assert proof["instances"] == sorted(f"container{slot}" for slot in SLOTS)
+    assert len(proof["nodes"]) == rollout_policy.REPLICAS and set(proof["nodes"]) <= ELIGIBLE_NODES
 
 
 def test_baseline_tolerates_a_ghost_predecessor_on_a_down_node(monkeypatch):
     rows, runtimes = _healed_baseline_rows()
-    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    ready = HEALED_READY
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     proof = rollout_tasks._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
-    assert sorted(proof["nodes"]) == ["haiku-18", "haiku-5", "haiku-9"]
+    assert proof["nodes"] == _running_nodes(rows)
+    assert len(proof["nodes"]) == rollout_policy.REPLICAS
     # The same state must still fail a converged proof: the ghost's shutdown
     # was never confirmed, so this deploy's own withdrawals stay strict.
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
@@ -191,14 +197,12 @@ def test_baseline_tolerates_a_ghost_predecessor_on_a_down_node(monkeypatch):
 
 @pytest.mark.parametrize("converged", [False, True])
 def test_capped_rollout_rejects_colocation(monkeypatch, converged):
-    rows, runtimes = _healed_baseline_rows()
-    for row in rows:
-        if row["ID"] == "task1":
-            row["Node"] = "haiku-5"  # healed replica doubled up
-    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    rows, runtimes = _healed_colocation_rows()
+    ready = HEALED_READY
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     proof = rollout_tasks._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
-    assert sorted(proof["nodes"]) == ["haiku-5", "haiku-9"]
+    assert proof["nodes"] == _running_nodes(rows)
+    assert len(proof["nodes"]) == rollout_policy.REPLICAS - 1
     with pytest.raises(RuntimeError, match="not on distinct eligible nodes"):
         rollout_tasks._verify_tasks(
             "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), converged,
@@ -226,7 +230,7 @@ def test_verify_tasks_does_not_retry_an_ingress_exec_failure(monkeypatch):
             "crawl4ai",
             BASELINE,
             "baseline",
-            (ELIGIBLE_NODES, frozenset({"haiku-5", "haiku-9", "haiku-18"})),
+            (ELIGIBLE_NODES, HEALED_READY),
             False,
         )
 
@@ -236,16 +240,16 @@ def test_verify_tasks_does_not_retry_an_ingress_exec_failure(monkeypatch):
 
 @pytest.mark.parametrize("placement", [rollout_policy.PLACEMENT, rollout_policy._SPREAD_PLACEMENT])
 def test_uncapped_rollout_accepts_colocation_with_clean_withdrawals(monkeypatch, placement):
-    rows, runtimes = _healed_baseline_rows()
-    rows[0]["Node"] = "haiku-5"
+    rows, runtimes = _healed_colocation_rows()
     rows[1].update(ID="old1", CurrentState="Shutdown 1m")
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     proof = rollout_tasks._verify_tasks(
         "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES),
         placement=placement,
     )
-    assert proof["nodes"] == ["haiku-5", "haiku-9"]
-    assert len(proof["instances"]) == 3
+    assert proof["nodes"] == _running_nodes(rows)
+    assert len(proof["nodes"]) == rollout_policy.REPLICAS - 1
+    assert len(proof["instances"]) == rollout_policy.REPLICAS
 
 
 @pytest.mark.parametrize("converged", [False, True])
@@ -265,7 +269,7 @@ def test_baseline_looks_past_a_rejection_on_an_eligible_node(monkeypatch):
     rows, runtimes = _healed_baseline_rows()
     rows.insert(3, {"ID": "reject2", "Name": "crawl4ai.2", "Node": "haiku-18",
                     "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"})
-    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    ready = HEALED_READY
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     rollout_tasks._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
 
@@ -280,7 +284,7 @@ def test_baseline_accepts_a_slot_placed_only_by_scheduler_recovery(monkeypatch):
     rows, runtimes = _healed_baseline_rows()
     rows[3] = {"ID": "reject2", "Name": "crawl4ai.2", "Node": "haiku-18",
                "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"}
-    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    ready = HEALED_READY
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     rollout_tasks._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)
 
@@ -295,7 +299,7 @@ def test_baseline_keeps_unassigned_attempts_strict(monkeypatch):
     rows, runtimes = _healed_baseline_rows()
     rows.insert(1, {"ID": "reject1", "Name": "crawl4ai.1", "Node": "",
                     "DesiredState": "Shutdown", "CurrentState": "Rejected 1h"})
-    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
+    ready = HEALED_READY
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
         rollout_tasks._verify_tasks("crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ready), False)

@@ -12,8 +12,8 @@
 # admission threshold.
 #
 # `docker service update --force` re-creates the tasks under the service's own
-# UpdateConfig -- Parallelism 1, 400s Delay, start-first, FailureAction rollback
-# -- so this is one replica at a time, health-gated, with automatic rollback. It
+# UpdateConfig -- Parallelism 2, 400s Delay, start-first, FailureAction rollback
+# -- so this is two replicas at a time, health-gated, with automatic rollback. It
 # introduces no new container, daemon or dependency.
 #
 # This lives here rather than in a Dokploy scheduled task because Dokploy's
@@ -61,8 +61,8 @@ jobs:
 
           docker service update --force --detach "$SERVICE"
 
-          # Parallelism 1 over 3 replicas at 400s Delay, plus the 400s Monitor on
-          # the last task, is ~20 minutes; give it room and fail loudly if the
+          # Parallelism 2 over 6 replicas at 400s Delay, plus the 400s Monitor on
+          # the last batch, is ~20 minutes; give it room and fail loudly if the
           # rollout pauses or rolls back rather than reporting a false success.
           for _ in $(seq 1 80); do
             sleep 30

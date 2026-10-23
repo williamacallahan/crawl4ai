@@ -8,7 +8,10 @@ import rollout_http
 import rollout_tasks
 import rollout_dokploy
 import verify_rollout as rollout
-from conftest import CANDIDATE, ELIGIBLE_NODES, REVISION, _candidate_runtimes, _deploy_env, _wire_verify_tasks, application, health, service_spec
+from conftest import (
+    CANDIDATE, ELIGIBLE_NODES, HEALED_READY, REVISION, _candidate_runtimes, _deploy_env, _healed_baseline_rows,
+    _healed_colocation_rows, _running_nodes, _wire_verify_tasks, application, health, service_spec, task_proof,
+)
 
 
 def _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, ready):
@@ -50,13 +53,18 @@ def _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtim
     monkeypatch.setattr(rollout_http, "_request_json", request_json)
 
 
-def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(monkeypatch, tmp_path):
+@pytest.mark.parametrize("placement", rollout_policy.PLACEMENTS)
+@pytest.mark.parametrize("ready_count", range(len(ELIGIBLE_NODES) + 1))
+def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(
+    monkeypatch, tmp_path, capsys, placement, ready_count
+):
     # Exempting the no-op rerun from the start-first spare gate does not exempt
-    # it from capacity: with fewer than REPLICAS Ready eligible nodes it cannot
-    # place every replica, so the post-rollout < REPLICAS bar must still fire.
+    # it from capacity: when the Ready eligible nodes cannot hold REPLICAS
+    # tasks under the placement's per-node cap, the post-rollout bar must
+    # still fire. Capacity short only of the spare batch must prove in place.
     candidate = "registry.example/crawl4ai@sha256:candidate"
-    state = application(image=candidate, revision=REVISION)
-    ready = frozenset({"haiku-5", "haiku-18"})
+    state = application(image=candidate, revision=REVISION, placement=placement)
+    ready = frozenset(sorted(ELIGIBLE_NODES)[:ready_count])
     _deploy_env(monkeypatch)
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
     monkeypatch.setattr(rollout_dokploy, "_application", lambda *_args: copy.deepcopy(state))
@@ -69,18 +77,10 @@ def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(monkeypatch, tmp_
     )
     monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: ("completed", "2026-10-21T10:00:00Z"))
     monkeypatch.setattr(rollout_tasks, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
-    monkeypatch.setattr(rollout_tasks, "_service_spec", lambda _name: service_spec(candidate, REVISION))
+    monkeypatch.setattr(rollout_tasks, "_service_spec", lambda _name: service_spec(candidate, REVISION, placement))
     monkeypatch.setattr(rollout_tasks, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout_tasks, "verify_route", lambda *_args: None)
-    monkeypatch.setattr(
-        rollout_tasks,
-        "_verify_tasks",
-        lambda *_args: {
-            "tasks": ["1", "2", "3"],
-            "nodes": sorted(ready),
-            "instances": ["a", "b", "c"],
-        },
-    )
+    monkeypatch.setattr(rollout_tasks, "_verify_tasks", lambda *_args: task_proof(ready))
     monkeypatch.setattr(
         rollout_tasks,
         "_verify_public",
@@ -88,8 +88,14 @@ def test_deploy_noop_rerun_still_requires_replicas_ready_nodes(monkeypatch, tmp_
     )
     monkeypatch.setattr(rollout_http, "_request_json", lambda *_args: health(revision=REVISION))
 
-    with pytest.raises(RuntimeError, match="not enough Ready eligible nodes to place every replica"):
+    if rollout_policy.placement_capacity(ready_count, placement) < rollout_policy.REPLICAS:
+        with pytest.raises(RuntimeError, match="not enough Ready eligible nodes to place every replica"):
+            rollout.deploy()
+    else:
         rollout.deploy()
+        receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert receipt["deploymentId"] is None
+        assert receipt["nodes"] == sorted(ready)
 
 
 def test_deploy_noop_rerun_proves_healed_colocation_in_place(monkeypatch, tmp_path, capsys):
@@ -98,23 +104,9 @@ def test_deploy_noop_rerun_proves_healed_colocation_in_place(monkeypatch, tmp_pa
     # tolerates that; the strict converged proof rejects it as a placement
     # fault. A no-op rerun performed no start-first placement, so its final
     # proof must be lenient and re-prove the live SHA in place.
-    rows = [
-        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-5",
-         "DesiredState": "Running", "CurrentState": "Running 1m"},
-        {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-6",
-         "DesiredState": "Shutdown", "CurrentState": "Running 12 hours ago"},
-        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-5",
-         "DesiredState": "Running", "CurrentState": "Running 1h"},
-        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-9",
-         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
-        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-9",
-         "DesiredState": "Running", "CurrentState": "Running 1h"},
-        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-18",
-         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
-    ]
+    rows, _baseline_runtimes = _healed_colocation_rows()
     runtimes = _candidate_runtimes()
-    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
-    _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, ready)
+    _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, HEALED_READY)
 
     rollout.deploy()
 
@@ -124,7 +116,8 @@ def test_deploy_noop_rerun_proves_healed_colocation_in_place(monkeypatch, tmp_pa
     assert receipt["revision"] == REVISION
     # The lenient proof accepted the healed co-location: two replicas sit on
     # haiku-5. A strict converged proof would have raised before reaching here.
-    assert receipt["nodes"] == ["haiku-5", "haiku-9"]
+    assert receipt["nodes"] == _running_nodes(rows)
+    assert len(receipt["nodes"]) == rollout_policy.REPLICAS - 1
 
 
 def test_deploy_noop_rerun_proves_a_failed_predecessor_in_place(monkeypatch, tmp_path, capsys):
@@ -133,23 +126,10 @@ def test_deploy_noop_rerun_proves_a_failed_predecessor_in_place(monkeypatch, tmp
     # node. The lenient baseline proof tolerates that "failed" exemption; the
     # strict converged proof rejects it. A no-op rerun made no withdrawal of
     # its own, so its final proof must stay lenient and re-prove in place.
-    rows = [
-        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-5",
-         "DesiredState": "Running", "CurrentState": "Running 1h"},
-        {"ID": "failed1", "Name": "crawl4ai.1", "Node": "haiku-9",
-         "DesiredState": "Shutdown", "CurrentState": "Failed 30m ago"},
-        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-9",
-         "DesiredState": "Running", "CurrentState": "Running 1h"},
-        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-5",
-         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
-        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-18",
-         "DesiredState": "Running", "CurrentState": "Running 1h"},
-        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-9",
-         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
-    ]
+    rows, _baseline_runtimes = _healed_baseline_rows()
+    rows[1].update(ID="failed1", Node=rows[3]["Node"], CurrentState="Failed 30m ago")
     runtimes = _candidate_runtimes()
-    ready = frozenset({"haiku-5", "haiku-9", "haiku-18"})
-    _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, ready)
+    _wire_noop_deploy_with_real_verify_tasks(monkeypatch, tmp_path, rows, runtimes, HEALED_READY)
     monkeypatch.setattr(
         rollout_tasks,
         "_task_state",
@@ -166,7 +146,8 @@ def test_deploy_noop_rerun_proves_a_failed_predecessor_in_place(monkeypatch, tmp
     assert receipt["deploymentId"] is None
     assert receipt["image"] == CANDIDATE
     assert receipt["revision"] == REVISION
-    assert receipt["nodes"] == ["haiku-18", "haiku-5", "haiku-9"]
+    assert receipt["nodes"] == _running_nodes(rows)
+    assert len(receipt["nodes"]) == rollout_policy.REPLICAS
 
 
 def test_deploy_noop_rerun_passes_lenient_converged_to_the_candidate_proof(
@@ -180,11 +161,7 @@ def test_deploy_noop_rerun_passes_lenient_converged_to_the_candidate_proof(
 
     def spy(_app, image, _revision, _ready, converged=True, placement=rollout_policy.PLACEMENT):
         calls.append((image, converged))
-        return {
-            "tasks": ["1", "2", "3"],
-            "nodes": sorted(ELIGIBLE_NODES),
-            "instances": ["a", "b", "c"],
-        }
+        return task_proof()
 
     candidate = CANDIDATE
     state = application(image=candidate, revision=REVISION)

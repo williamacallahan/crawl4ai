@@ -81,10 +81,11 @@ def _deploy() -> None:
         f"{rollout_policy.REPLICAS} replicas, {len(ready)} Ready ({', '.join(sorted(ready)) or 'none'}), "
         f"not Ready: {', '.join(sorted(eligible - ready)) or 'none'}"
     )
-    if not already_deployed and len(ready) < rollout_policy.REPLICAS:
+    capacity = rollout_policy.placement_capacity(len(ready), placement)
+    if not already_deployed and capacity < rollout_policy.REPLICAS:
         raise RuntimeError(f"not enough Ready eligible nodes to place every replica: {census}")
-    # Only a one-per-node cap makes a spare mandatory for start-first.
-    if not already_deployed and placement.get("MaxReplicas") == 1 and len(ready) <= rollout_policy.REPLICAS:
+    # A per-node cap makes each start-first batch need its own spare slots.
+    if not already_deployed and capacity < rollout_policy.REPLICAS + rollout_policy.PARALLELISM:
         raise RuntimeError(f"start-first needs a spare eligible node: {census}")
     baseline_proof = rollout_tasks._verify_tasks(
         app_name, baseline, baseline_revision, eligibility, False, placement
@@ -188,7 +189,7 @@ def _deploy() -> None:
     )
     eligibility = rollout_tasks._eligible_nodes()
     _, ready = eligibility
-    if len(ready) < rollout_policy.REPLICAS:
+    if rollout_policy.placement_capacity(len(ready), placement) < rollout_policy.REPLICAS:
         raise RuntimeError("not enough Ready eligible nodes to place every replica")
     # Real rollouts require clean predecessor withdrawals. A no-op rerun
     # proves the live revision without attributing older withdrawals to this run.

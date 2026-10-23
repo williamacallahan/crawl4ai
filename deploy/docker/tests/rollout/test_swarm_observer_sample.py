@@ -166,9 +166,9 @@ def test_sample_fails_loudly_when_it_cannot_enter_the_ingress_namespace(monkeypa
 def test_sampling_failure_does_not_report_bogus_zero_coverage_for_a_healthy_fleet(
     monkeypatch, tmp_path, capsys
 ):
-    # A healthy three-task fleet whose sampler cannot enter the ingress
-    # namespace must read as "sampling failed" (0/0/0), not the misleading
-    # authoritative=3/direct_healthy=0/public_covered=0 signature.
+    # A healthy full fleet whose sampler cannot enter the ingress namespace
+    # must read as "sampling failed" (0/0/0), not the misleading
+    # authoritative=REPLICAS/direct_healthy=0/public_covered=0 signature.
     rows = [
         {
             "ID": f"task-{index}",
@@ -176,7 +176,7 @@ def test_sampling_failure_does_not_report_bogus_zero_coverage_for_a_healthy_flee
             "DesiredState": "Running",
             "CurrentState": "Running 1m",
         }
-        for index in range(3)
+        for index in range(rollout_policy.REPLICAS)
     ]
     runtimes = {
         f"task-{index}": {
@@ -184,7 +184,7 @@ def test_sampling_failure_does_not_report_bogus_zero_coverage_for_a_healthy_flee
             "addresses": {f"10.0.1.{index + 10}"},
             "labels": {"otel.service.version": REVISION},
         }
-        for index in range(3)
+        for index in range(rollout_policy.REPLICAS)
     }
     monkeypatch.setenv("CRAWL4AI_SWARM_SERVICE", "crawl4ai")
     monkeypatch.setenv("CRAWL4AI_OBSERVER_STATE_PATH", str(tmp_path / "state"))
@@ -221,7 +221,7 @@ def test_sampling_failure_does_not_report_bogus_zero_coverage_for_a_healthy_flee
 
     out = capsys.readouterr().out
     assert "crawl4ai coverage sampling failed: RuntimeError" in out
-    assert "authoritative_tasks=3" not in out
+    assert f"authoritative_tasks={rollout_policy.REPLICAS}" not in out
     assert (tmp_path / "metrics").read_text() == (
         "crawl4ai_authoritative_task_count 0\n"
         "crawl4ai_direct_healthy_task_count 0\n"
