@@ -136,6 +136,33 @@ class TestPinningProxy:
             await proxy.stop()
             up.close()
 
+    async def test_stop_ends_open_tunnels(self, monkeypatch):
+        # Server.wait_closed() waits for every open connection, so stop() used
+        # to hang behind any idle tunnel; it must end them and return.
+        async def silent_upstream(reader, writer):
+            await reader.read()
+        up = await asyncio.start_server(silent_upstream, "127.0.0.1", 0)
+        up_port = up.sockets[0].getsockname()[1]
+        monkeypatch.setattr(
+            egress_proxy,
+            "resolve_and_pin",
+            lambda url: PinnedTarget("https", "idle.example", up_port, "127.0.0.1"),
+        )
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT idle.example:{up_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            assert b"200" in await asyncio.wait_for(r.readline(), timeout=5)
+            await r.readline()
+            await asyncio.wait_for(proxy.stop(), timeout=5)
+            assert await asyncio.wait_for(r.read(), timeout=5) == b""
+            w.close()
+        finally:
+            up.close()
+
     async def test_malformed_connect_400(self):
         proxy = PinningProxy()
         await proxy.start()

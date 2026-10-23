@@ -241,6 +241,10 @@ class PinningProxy:
         self._host = host
         self._port = port
         self._server: asyncio.AbstractServer | None = None
+        # asyncio.start_server drops its reference to a connection's handler
+        # task once the client socket is lost, so the proxy owns each handler
+        # until it finishes and cancels the survivors on stop().
+        self._connections: set[asyncio.Task] = set()
         self.bound_host: str | None = None
         self.bound_port: int | None = None
 
@@ -270,6 +274,12 @@ class PinningProxy:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
+            # Server.wait_closed() waits for every open tunnel, so end them first.
+            open_connections = set(self._connections)
+            for connection in open_connections:
+                connection.cancel()
+            if open_connections:
+                await asyncio.wait(open_connections)
             try:
                 await self._server.wait_closed()
             except OSError as error:
@@ -277,6 +287,8 @@ class PinningProxy:
 
     # ─────────────────────────── connection handling ───────────────────────────
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        connection = asyncio.current_task()
+        self._connections.add(connection)
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=30)
             if not request_line:
@@ -296,6 +308,8 @@ class PinningProxy:
             await self._reply(writer, _BAD)
         except (OSError, ValueError, UnicodeError) as e:
             logger.debug("proxy connection error: %s", e)
+        finally:
+            self._connections.discard(connection)
             await self._safe_close(writer)
 
     async def _handle_connect(self, target, client_reader, client_writer):
@@ -457,13 +471,25 @@ class PinningProxy:
                     await dst.drain()
             except (OSError, ConnectionError) as error:
                 logger.debug("proxy splice closed: %s", error)
-            finally:
-                await self._safe_close(dst)
 
-        await asyncio.gather(
-            pipe(c_reader, u_writer),
-            pipe(u_reader, c_writer),
-        )
+        # The tunnel ends when either direction ends. Closing a transport that
+        # still holds unsent bytes never wakes a read waiting on that same
+        # transport, so the surviving direction is cancelled, not left waiting.
+        pipes = {
+            asyncio.create_task(pipe(c_reader, u_writer)),
+            asyncio.create_task(pipe(u_reader, c_writer)),
+        }
+        try:
+            await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for direction in pipes:
+                direction.cancel()
+            await asyncio.wait(pipes)
+            await self._safe_close(u_writer)
+            await self._safe_close(c_writer)
+        for direction in pipes:
+            if not direction.cancelled():
+                direction.result()
 
     async def _reply(self, writer, payload: bytes):
         try:
