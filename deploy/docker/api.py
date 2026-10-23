@@ -1300,7 +1300,7 @@ async def stream_results(
         async for result in results_gen:
             try:
                 server_memory_mb = _get_memory_mb()
-                result_dict = result.model_dump()
+                result_dict = await asyncio.to_thread(result.model_dump)
                 if result_dict.get("error_message"):
                     result_dict["error_message"] = public_crawl_error(
                         result_dict["error_message"], result_dict.get("url")
@@ -1315,8 +1315,10 @@ async def stream_results(
                 if result_dict.get('pdf') is not None:
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
                 logger.info(f"Streaming result for {result_dict.get('url', 'unknown')}")
-                data = json.dumps(result_dict, default=datetime_handler) + "\n"
-                yield data.encode('utf-8')
+                data = await asyncio.to_thread(
+                    lambda: (json.dumps(result_dict, default=datetime_handler) + "\n").encode("utf-8")
+                )
+                yield data
             except Exception as e:
                 streamed_url = getattr(result, 'url', 'unknown')
                 error_response = {
@@ -1482,7 +1484,7 @@ async def handle_crawl_request(
                 result_dict: Dict[str, Any]
                 # Check if result has model_dump method (is a proper CrawlResult)
                 if hasattr(result, 'model_dump'):
-                    result_dict = result.model_dump()
+                    result_dict = await asyncio.to_thread(result.model_dump)
                 elif isinstance(result, dict):
                     result_dict = dict(result)
                 else:

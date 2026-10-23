@@ -10,6 +10,8 @@ Crawl4AI FastAPI entry‑point
 import ast
 import asyncio
 import base64
+import gzip
+import json
 import logging
 import os
 import pathlib
@@ -46,11 +48,13 @@ from crawler_pool import close_all, get_crawler, janitor, release_crawler
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
@@ -84,6 +88,8 @@ from schemas import (
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.exceptions import HTTPException as _StarletteHTTPException
+from starlette.datastructures import Headers
+from starlette.middleware.gzip import GZipResponder, IdentityResponder
 from utils import (
     get_browser_extra_args,
     load_config,
@@ -434,6 +440,33 @@ def _setup_security(app_: FastAPI):
 
 
 _setup_security(app)
+
+
+class _CrawlGZipResponder(GZipResponder):
+    async def send_with_compression(self, message):
+        await super().send_with_compression(message)
+        if message["type"] == "http.response.start":
+            # Starlette 1.3.1 excludes SSE, but buffers NDJSON in GzipFile
+            # until its buffer fills. Exclude by media type, including the
+            # /crawl crawler_config.stream alias, before the first body.
+            content_type = Headers(raw=message["headers"]).get("content-type", "")
+            self.content_type_is_excluded |= content_type.startswith("application/x-ndjson")
+
+
+class CrawlGZipMiddleware(GZipMiddleware):
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path", "").split("/")[1:2] == ["mcp"]:
+            await self.app(scope, receive, send)
+            return
+        responder = (
+            _CrawlGZipResponder(self.app, self.minimum_size, self.compresslevel)
+            if "gzip" in Headers(scope=scope).get("accept-encoding", "")
+            else IdentityResponder(self.app, self.minimum_size)
+        )
+        await responder(scope, receive, send)
+
+
+app.add_middleware(CrawlGZipMiddleware, minimum_size=1024, compresslevel=5)
 
 if config["observability"]["prometheus"]["enabled"]:
     Instrumentator().instrument(app).expose(
@@ -1280,6 +1313,7 @@ async def crawl(
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        result_fields=crawl_request.result_fields,
         redis=redis,
     )
     if not results["success"]:
@@ -1296,7 +1330,23 @@ async def crawl(
         if not crawl_request.hooks.hooks:
             hooks_resp["status"] = "ignored"
         hooks_resp["warning"] = _HOOKS_CODE_WARNING
-    return JSONResponse(results)
+    accepts_gzip = "gzip" in request.headers.get("accept-encoding", "")
+
+    def encode() -> tuple[bytes, dict[str, str]]:
+        body = json.dumps(
+            results, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")
+        ).encode("utf-8")
+        if not accepts_gzip or len(body) < 1024:
+            return body, {}
+        # Compressed here, off the event loop: a multi-megabyte result would
+        # otherwise stall every request while the middleware gzips it inline.
+        # The middleware passes a response that already sets Content-Encoding.
+        return gzip.compress(body, compresslevel=5), {
+            "Content-Encoding": "gzip", "Vary": "Accept-Encoding",
+        }
+
+    encoded, headers = await asyncio.to_thread(encode)
+    return Response(content=encoded, media_type="application/json", headers=headers)
 
 
 @app.post("/crawl/stream")
