@@ -677,13 +677,6 @@ async def get_chromium_path(browser_type) -> str:
     if not browser_type:
         raise RuntimeError(f"Unsupported browser type: {browser_type}")
 
-    # Check if a path has already been saved for this browser type
-    home_folder = get_home_folder()
-    path_file = os.path.join(home_folder, f"{browser_type.lower()}.path")
-    if os.path.exists(path_file):
-        with open(path_file, "r") as f:
-            return f.read()
-
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         browsers = {
@@ -697,15 +690,11 @@ async def get_chromium_path(browser_type) -> str:
                 f"Invalid browser type. Must be one of: {', '.join(browsers.keys())}"
             )
             
-        # Save the path int the crawl4ai home folder
-        home_folder = get_home_folder()
+        # Resolve against the installed driver: a persisted path can still point
+        # at an old (or removed) browser revision after a Playwright upgrade.
         browser_path = browsers[browser_type.lower()].executable_path
         if not browser_path:
             raise RuntimeError(f"Browser executable not found for type: {browser_type}")
-        # Save the path in a text file with browser type name
-        with open(os.path.join(home_folder, f"{browser_type.lower()}.path"), "w") as f:
-            f.write(browser_path)
-        
         return browser_path
 
 def beautify_html(escaped_html):

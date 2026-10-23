@@ -59,22 +59,17 @@ PAGE_CLOSE_SECONDS = 30.0
 # attaching to an arbitrary tab.
 TARGET_ID_DISCOVERY_SECONDS = 2.0
 
-# Playwright Python 1.53.0 bundled-driver defaults (chromiumSwitches.js). Chromium uses the
+# Playwright 1.64.1 / Patchright 1.64.2 bundled-driver defaults. Chromium uses the
 # last --disable-features switch, so appending ours alone drops these defaults.
 PLAYWRIGHT_DISABLED_FEATURES = (
-    "AcceptCHFrame", "AutoExpandDetailsElement",
-    "AvoidUnnecessaryBeforeUnloadCheckSync",
-    "CertificateTransparencyComponentUpdater", "DestroyProfileOnBrowserClose",
-    "DialMediaRouteProvider", "ExtensionManifestV2Disabled", "GlobalMediaControls",
-    "HttpsUpgrades", "ImprovedCookieControls", "LazyFrameLoading", "LensOverlay",
-    "MediaRouter", "PaintHolding", "ThirdPartyStoragePartitioning", "Translate",
+    "AvoidUnnecessaryBeforeUnloadCheckSync", "DestroyProfileOnBrowserClose",
+    "DialMediaRouteProvider", "GlobalMediaControls", "HttpsUpgrades", "LensOverlay",
+    "MediaRouter", "PaintHolding", "ThirdPartyStoragePartitioning",
+    "BlockOriginHeaderModificationOnRedirect", "AvoidCorsURLLoaderRestartOnRedirect",
+    "Translate", "AutoDeElevate", "OptimizationHints", "NetworkTimeServiceQuerying",
+    "AimEnabled", "msForceBrowserSignIn", "msEdgeUpdateLaunchServicesPreferredVersion",
 )
-PATCHRIGHT_DISABLED_FEATURES = (
-    "AcceptCHFrame", "AvoidUnnecessaryBeforeUnloadCheckSync",
-    "DestroyProfileOnBrowserClose", "DialMediaRouteProvider", "GlobalMediaControls",
-    "HttpsUpgrades", "LensOverlay", "MediaRouter", "PaintHolding",
-    "ThirdPartyStoragePartitioning", "Translate", "AutoDeElevate", "RenderDocument",
-)
+PATCHRIGHT_DISABLED_FEATURES = PLAYWRIGHT_DISABLED_FEATURES
 
 
 def _merge_disabled_features(args, defaults=()):
@@ -96,12 +91,18 @@ def _chromium_launch_options(args, use_undetected=False):
         PATCHRIGHT_DISABLED_FEATURES if use_undetected
         else PLAYWRIGHT_DISABLED_FEATURES
     )
+    args = _merge_disabled_features(args, defaults)
+    default_features = "--disable-features=" + ",".join(defaults)
+    ignore_default_args = ["--disable-ipc-flooding-protection"]
+    if default_features in args:
+        # ignore_default_args also filters user arguments. If our merged switch
+        # is identical, let the driver supply it instead of filtering both out.
+        args.remove(default_features)
+    else:
+        ignore_default_args.insert(0, default_features)
     return {
-        "args": _merge_disabled_features(args, defaults),
-        "ignore_default_args": [
-            "--disable-features=" + ",".join(defaults),
-            "--disable-ipc-flooding-protection",
-        ],
+        "args": args,
+        "ignore_default_args": ignore_default_args,
     }
 
 

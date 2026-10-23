@@ -460,13 +460,9 @@ async def test_sustained_cpu_watchdog_kills_renderer_before_long_page_deadline(
 async def test_effective_chromium_flags_preserve_protections(browser_probe):
     from crawl4ai.browser_manager import PLAYWRIGHT_DISABLED_FEATURES
 
-    browser = browser_probe.crawler.crawler_strategy.browser_manager.browser
-    session = await browser.new_browser_cdp_session()
-    try:
-        command = await session.send("Browser.getBrowserCommandLine")
-    finally:
-        await session.detach()
-    args = command["arguments"]
+    # Playwright no longer sets --enable-automation, which the CDP command
+    # Browser.getBrowserCommandLine requires. Inspect this fixture's own process.
+    args = browser_probe.process.cmdline()
     disabled = [arg for arg in args if arg.startswith("--disable-features=")]
     assert len(disabled) == 1, disabled
     assert set(PLAYWRIGHT_DISABLED_FEATURES) <= set(disabled[0].split("=", 1)[1].split(","))
