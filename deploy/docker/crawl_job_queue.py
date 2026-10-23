@@ -333,6 +333,7 @@ class CrawlJobQueueSettings:
     max_serialized_result_bytes: int
     max_stored_result_bytes: int
     redis_headroom_bytes: int
+    consumer_reap_batch: int
 
     @classmethod
     def from_config(cls, config: dict) -> CrawlJobQueueSettings:
@@ -388,6 +389,7 @@ class CrawlJobQueueSettings:
             max_serialized_result_bytes=positive_int("max_serialized_result_bytes"),
             max_stored_result_bytes=positive_int("max_stored_result_bytes"),
             redis_headroom_bytes=positive_int("redis_headroom_bytes"),
+            consumer_reap_batch=positive_int("consumer_reap_batch"),
         )
 
 

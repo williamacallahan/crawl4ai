@@ -148,6 +148,7 @@ DEFAULT_CONFIG = {
         "max_attempt_seconds": 600,
         "max_payload_bytes": 262144,
         "redis_headroom_bytes": 100663296,
+        "consumer_reap_batch": 100,
     },
     "rate_limiting": {
         "enabled": True,

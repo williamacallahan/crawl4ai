@@ -82,6 +82,9 @@ crawl_jobs:
   # 4 MiB query buffer = 64 MiB; LLM results, the webhook outbox and stream
   # metadata take ~32 MiB more. 96 MiB in all.
   redis_headroom_bytes: 100663296
+  # Exited workers' empty consumers each idle worker deletes per group per
+  # lease_seconds (crawl_job_consumers.py); bounds one XINFO-driven script.
+  consumer_reap_batch: 100
 
 # Per-Swarm-node archive.org pacing. archive.org rate-limits per client IP,
 # so each node keeps one shared budget in Redis (crawl4ai:archive:next:{node})
