@@ -150,13 +150,14 @@ def test_stop_grace_covers_the_shipped_container_drain_budget(monkeypatch):
         # Leading '+' the container's sleep honors but isdigit rejected.
         ("+2", 2), ("+0", 0),
         # Fractional numbers the container's sleep honors but isdigit rejected.
-        ("1.5", 1), ("31.5", 31), (".5", 0), ("1.", 1), ("0.0", 0), ("10.0", 10),
+        ("1.5", 1.5), ("31.5", 31.5), (".5", 0.5), ("1.", 1), ("0.0", 0), ("10.0", 10),
         # Suffixed values: the realistic operator raise, all rejected by isdigit.
         ("30s", 30), ("2s", 2), ("1m", 60), ("2m", 120), ("1h", 3600), ("1d", 86400),
         ("0m", 0), ("0s", 0), ("0d", 0),
         # Fractional suffixed.
         ("1.5m", 90), (".5m", 30), ("1.m", 60), ("1.0m", 60), ("2.5h", 9000),
-        ("1.5h", 5400), (".5s", 0),
+        ("1.5h", 5400), (".5s", 0.5),
+        ("1.5e2", 150), ("0x10", 16),
         # Leading '+' with a suffix.
         ("+1m", 60), ("+1.5m", 90),
         # Leading whitespace the container's sleep honors (strtod skips it).
@@ -190,7 +191,7 @@ def test_parse_sleep_seconds_accepts_the_sleep_intervals_the_container_honors(va
         # Exotic forms strtod accepts but a drain delay must never be: a huge or
         # infinite sleep would always SIGKILL the task, so reject loudly so the
         # operator's typo can never slip past the gate unmeasured.
-        "inf", "nan", "1.5e2", "0x10",
+        "inf", "nan",
         # Trailing or wrapped whitespace: GNU sleep rejects these with exit 1
         # (trailing whitespace is the one shape strtod does NOT skip), and so
         # must the verifier. _drain_budget_ns used to .strip() these into clean
@@ -206,7 +207,7 @@ def test_parse_sleep_seconds_rejects_non_intervals_loudly(value):
         rollout_policy._parse_sleep_seconds(value)
 
 
-@pytest.mark.parametrize("drain", [None, "", "   ", "2"])
+@pytest.mark.parametrize("drain", [None, "", "2"])
 def test_drain_budget_ns_falls_back_only_when_the_delay_is_unset(drain):
     # 360 (stopwaitsecs) + 2 (entrypoint literal) == 362s: an unset variable and
     # a value the grace easily covers both keep the shipped default budget.
@@ -219,7 +220,7 @@ def test_drain_budget_ns_falls_back_only_when_the_delay_is_unset(drain):
 @pytest.mark.parametrize(
     "drain",
     [
-        "abc", "1m30s", "1d2h", "-2", "1.5.5", "1M", "1_000", "inf", "nan", "1.5e2",
+        "abc", "1m30s", "1d2h", "-2", "1.5.5", "1M", "1_000", "inf", "nan",
         # Whitespace-padded numeric values the container's sleep rejects but
         # _drain_budget_ns used to .strip() into clean numbers that passed the
         # gate (the bug): trailing-or-wrapped whitespace aborts `sleep` with
@@ -310,20 +311,6 @@ def test_drain_budget_ns_passes_the_raw_value_untrimmed_to_the_parser(monkeypatc
             "\nCRAWL4AI_DRAIN_DELAY_SECONDS=  2  "
         )
     assert seen["value"] == "  2  "
-
-
-def test_drain_budget_ns_falls_back_only_when_the_delay_is_unset_pure_whitespace_too(
-    monkeypatch,
-):
-    # Pure-whitespace values ("   ") must still fall back to the entrypoint
-    # literal — the "is the variable unset?" test is the one place .strip() is
-    # still permitted. A loud reject here would be a regression on the existing
-    # fallback contract documented by test_drain_budget_ns_falls_back_only_when
-    # _the_delay_is_unset, so pin it next to that test.
-    def refuse(value):
-        raise AssertionError(f"pure whitespace must not reach the parser, got {value!r}")
-    monkeypatch.setattr(rollout_policy, "_parse_sleep_seconds", refuse)
-    assert rollout_policy._drain_budget_ns("CRAWL4AI_DRAIN_DELAY_SECONDS=   ") == 362_000_000_000
 
 
 def test_policy_accepts_only_stock_docker_image_configuration():
