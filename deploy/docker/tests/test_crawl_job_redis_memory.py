@@ -1,6 +1,7 @@
 """Real-Redis checks that crawl-job writes respect Redis maxmemory."""
 
 from contextlib import contextmanager
+from random import Random
 
 import pytest
 import redis
@@ -53,11 +54,11 @@ async def enqueue(queue):
 async def test_enqueue_reserves_a_stored_result_until_completion_releases_it(redis_url):
     from crawl_job_queue import CrawlJobQueue, CrawlJobResultBudgetFull
 
-    # 64 MiB above current use, 58 MiB of headroom: one 4 MiB result fits, two do not.
+    # 10 MiB of slack: one two-copy reservation fits, two do not.
     with redis_maxmemory(redis_url, used_memory(redis_url) + 64 * MIB):
         client = aioredis.from_url(redis_url, decode_responses=True)
         try:
-            queue = CrawlJobQueue(client, memory_config(58 * MIB))
+            queue = CrawlJobQueue(client, memory_config(54 * MIB))
             await queue.ensure_group()
             first = await enqueue(queue)
             keys_before = await client.dbsize()
@@ -79,10 +80,10 @@ async def test_enqueue_reserves_a_stored_result_until_completion_releases_it(red
 
 
 @pytest.mark.asyncio
-async def test_enqueue_reserves_a_second_copy_for_a_webhook_carrying_the_result(redis_url):
+async def test_enqueue_reserves_two_copies_for_every_job(redis_url):
     from crawl_job_queue import CrawlJobQueue, CrawlJobResultBudgetFull
 
-    # 6 MiB of slack: one 4 MiB result fits, its outbox copy as well does not.
+    # 6 MiB of slack cannot hold a two-copy reservation, even for an ordinary job.
     with redis_maxmemory(redis_url, used_memory(redis_url) + 64 * MIB):
         client = aioredis.from_url(redis_url, decode_responses=True)
         try:
@@ -94,8 +95,68 @@ async def test_enqueue_reserves_a_second_copy_for_a_webhook_carrying_the_result(
                     webhook_config={"webhook_url": "https://example.com/hook",
                                     "webhook_data_in_payload": True})
             assert await client.xlen(queue.settings.stream) == 0
-            task_id = await enqueue(queue)
-            assert await client.hget(queue.task_key(task_id), "status") == "processing"
+            with pytest.raises(CrawlJobResultBudgetFull):
+                await enqueue(queue)
+            assert await client.xlen(queue.settings.stream) == 0
+        finally:
+            await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("webhook_first", [True, False], ids=["webhook-ordinary", "ordinary-webhook"])
+async def test_mixed_backlog_keeps_result_and_outbox_reservations(redis_url, webhook_first):
+    from crawl_job_queue import CrawlJobQueue, CrawlJobResultBudgetFull
+    from utils import decode_task_result
+
+    # 17 MiB admits two two-copy reservations, but cannot cover a third.
+    # The old incoming-job multiplier admits that third ordinary job.
+    maxmemory = used_memory(redis_url) + 64 * MIB
+    with redis_maxmemory(redis_url, maxmemory, "noeviction"):
+        client = aioredis.from_url(redis_url)
+        try:
+            queue = CrawlJobQueue(client, memory_config(47 * MIB))
+            await queue.ensure_group()
+            webhook = {"webhook_url": "https://example.com/hook",
+                       "webhook_data_in_payload": True}
+            task_ids = []
+            for config in ([webhook, None] if webhook_first else [None, webhook]):
+                task_ids.append(await queue.enqueue(
+                    urls=["https://example.com"], browser_config={}, crawler_config={},
+                    result_fields=None, webhook_config=config, owner="alice"))
+            keys_before = await client.dbsize()
+            with pytest.raises(CrawlJobResultBudgetFull):
+                await enqueue(queue)
+            assert await client.dbsize() == keys_before
+            assert await client.xlen(queue.settings.stream) == 2
+            for task_id in task_ids:
+                assert await client.hget(queue.task_key(task_id), "status") == b"processing"
+                assert await queue.load_payload(task_id) is not None
+
+            # Incompressible data exercises MiB-sized stored results, not tiny markers.
+            result = {"data": Random(0).randbytes(3 * MIB).hex()}
+            for task_id in task_ids:
+                entry = (await queue.read_new("worker-a"))[0]
+                assert entry.task_id == task_id
+                payload = await queue.load_payload(task_id)
+                attempt = await queue.start_attempt(entry, payload, "worker-a")
+                assert await queue.complete(entry, payload, attempt, result=result) == (
+                    "completed", result, None)
+                task = await client.hgetall(queue.task_key(task_id))
+                assert task[b"status"] == b"completed"
+                assert len(task[b"result"]) > 3 * MIB
+                assert decode_task_result({key.decode(): value for key, value in task.items()}, task_id) == result
+                assert used_memory(redis_url) < maxmemory
+
+            assert await client.xlen(queue.settings.stream) == 0
+            events = await queue.pending_outbox("worker-a")
+            assert len(events) == 1
+            assert events[0][1]["task_id"] == task_ids[0 if webhook_first else 1]
+            assert events[0][1]["result"] == result
+            # Retained task/outbox bytes still count after the backlog is released.
+            with pytest.raises(CrawlJobResultBudgetFull):
+                await enqueue(queue)
+            assert await client.xlen(queue.outbox_stream) == 1
+            assert (await client.info("stats"))["evicted_keys"] == 0
         finally:
             await client.aclose()
 
