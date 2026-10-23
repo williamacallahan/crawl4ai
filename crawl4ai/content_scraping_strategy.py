@@ -622,11 +622,14 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 if parent is not None:
                     # Preserve .tail text before removing the element
                     tail = el.tail
-                    if el.text and not text_content:
-                        # Keep a separator where a whitespace-only element was.
+                    prev = el.getprevious()
+                    has_before = prev is not None or bool((parent.text or "").strip())
+                    has_after = bool((tail or "").strip()) or el.getnext() is not None
+                    if el.text and not text_content and has_before and has_after:
+                        # Keep a separator between words a whitespace-only element
+                        # split; at an edge it would land inside "[ link]" or "##  ".
                         tail = " " + (tail or "")
                     if tail:
-                        prev = el.getprevious()
                         if prev is not None:
                             prev.tail = (prev.tail or "") + tail
                         else:

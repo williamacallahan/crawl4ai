@@ -49,3 +49,21 @@ def test_whitespace_first_child_separates_parent_text_from_tail(strategy):
     )
 
     assert "Hello world" in md.raw_markdown
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('<p>See <a href="https://example.com/blog"><span> </span>Blog</a> now</p>', "[Blog](https://example.com/blog)"),
+        ('<p>See <a href="https://example.com/blog">Blog<span> </span></a> now</p>', "[Blog](https://example.com/blog)"),
+        ("<h2><span> </span>Title</h2>", "## Title"),
+    ],
+    ids=["link-leading", "link-trailing", "heading-leading"],
+)
+def test_edge_whitespace_element_adds_no_space_inside_markdown(body, expected):
+    html = f"<html><body><article>{body}<p>Padding paragraph with enough words.</p></article></body></html>"
+    cleaned = LXMLWebScrapingStrategy().scrap("https://example.com/", html).cleaned_html
+    markdown = DefaultMarkdownGenerator().generate_markdown(
+        input_html=cleaned, base_url="https://example.com/"
+    ).raw_markdown
+    assert expected in markdown

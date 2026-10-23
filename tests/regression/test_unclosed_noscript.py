@@ -94,7 +94,7 @@ def test_noscript_text_in_script_style_or_comment_is_not_counted(strategy, decoy
     assert "Real heading" in result.cleaned_html
 
 
-@pytest.mark.parametrize("opener", ["<!--", "<script>", "<style>"])
+@pytest.mark.parametrize("opener", ["<!--", "<script>", "<style>", "<noscript "])
 def test_many_unclosed_raw_text_openers_stay_fast(opener):
     html = (opener + "a" * 42) * 20_000  # About 1 MB.
 

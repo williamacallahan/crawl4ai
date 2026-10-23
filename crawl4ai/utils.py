@@ -3120,7 +3120,9 @@ class HeadPeekr:
         title_match = re.search(r'<title>(.*?)</title>', head_content, re.IGNORECASE | re.DOTALL)
         return title_match.group(1) if title_match else None
 
-NOSCRIPT_OPEN_REGEX = re.compile(r"<noscript\b[^>]*>", re.IGNORECASE)
+# Stop the attribute scan at the next "<": with [^>]* every unterminated
+# "<noscript " rescanned to the document end, which is quadratic.
+NOSCRIPT_OPEN_REGEX = re.compile(r"<noscript\b[^<>]*>", re.IGNORECASE)
 NOSCRIPT_CLOSE_REGEX = re.compile(r"</noscript\s*>", re.IGNORECASE)
 RAW_TEXT_REGEX = re.compile(
     r"<script\b.*?(?:</script\s*>|\Z)|<style\b.*?(?:</style\s*>|\Z)|<!--.*?(?:-->|\Z)",
