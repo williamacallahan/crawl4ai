@@ -1,11 +1,13 @@
+import json
 import logging
 import os
 import re
 import uuid
+import zlib
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, assert_never
 
 import dns.resolver
 import yaml
@@ -19,6 +21,46 @@ class TaskStatus(str, Enum):
     PROCESSING = "processing"
     FAILED = "failed"
     COMPLETED = "completed"
+
+
+class ResultEncoding(str, Enum):
+    # Deploy these readers everywhere before enabling compressed writers.
+    IDENTITY = "identity"
+    ZLIB = "zlib"
+
+
+def encode_task_result(result: Any, encoding: ResultEncoding) -> str | bytes:
+    """Serialize task results at the hash-format owner."""
+    serialized = json.dumps(result)
+    match encoding:
+        case ResultEncoding.IDENTITY:
+            return serialized
+        case ResultEncoding.ZLIB:
+            return zlib.compress(serialized.encode("utf-8"), level=6)
+        case _:
+            assert_never(encoding)
+
+
+def decode_task_result(task: dict, task_id: str) -> Any:
+    """Missing markers are legacy JSON; unknown markers must never be guessed."""
+    marker = task.get("result_encoding", ResultEncoding.IDENTITY.value)
+    try:
+        if isinstance(marker, bytes):
+            marker = marker.decode("utf-8")
+        encoding = ResultEncoding(marker)
+    except (UnicodeError, ValueError) as error:
+        raise ValueError(f"task {task_id}: unknown result_encoding {marker!r}") from error
+    result = task.get("result")
+    if not result:
+        return None
+    match encoding:
+        case ResultEncoding.IDENTITY:
+            return json.loads(result)
+        case ResultEncoding.ZLIB:
+            return json.loads(zlib.decompress(result).decode("utf-8"))
+        case _:
+            assert_never(encoding)
+
 
 class FilterType(str, Enum):
     RAW = "raw"
@@ -363,9 +405,14 @@ def should_cleanup_task(created_at: str, ttl_seconds: int = 3600) -> bool:
     created = datetime.fromisoformat(created_at)
     return (datetime.now() - created).total_seconds() > ttl_seconds
 
-def decode_redis_hash(hash_data: Dict[bytes, bytes]) -> Dict[str, str]:
-    """Decode Redis hash data from bytes to strings."""
-    return {k.decode('utf-8'): v.decode('utf-8') for k, v in hash_data.items()}
+def decode_redis_hash(hash_data: dict) -> dict[str, str | bytes]:
+    """Decode metadata, preserving result bytes for the encoding-aware reader."""
+    return {
+        k.decode("utf-8") if isinstance(k, bytes) else k:
+        v if k in (b"result", "result", b"result_encoding", "result_encoding")
+        or not isinstance(v, bytes) else v.decode("utf-8")
+        for k, v in hash_data.items()
+    }
 
 
 def get_redis_task_ttl(config: Dict) -> int:

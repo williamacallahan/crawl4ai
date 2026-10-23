@@ -27,8 +27,11 @@ from redis import asyncio as aioredis
 from redis.exceptions import RedisError
 from utils import (
     FilterType,
+    ResultEncoding,
     TaskStatus,
     decode_redis_hash,
+    decode_task_result,
+    encode_task_result,
     get_base_url,
     get_browser_extra_args,
     get_redis_task_ttl,
@@ -637,7 +640,7 @@ async def process_llm_extraction(
 
         if not await _finish_llm_task(redis, f"task:{task_id}", {
             "status": TaskStatus.COMPLETED,
-            "result": json.dumps(content)
+            "result": encode_task_result(content, ResultEncoding.IDENTITY)
         }, config):
             return
 
@@ -1043,8 +1046,9 @@ def create_task_response(task: dict, task_id: str, base_url: str, collection: st
 
     # A crawl job whose URLs all failed is terminal-failed but still carries
     # its per-URL diagnostics, so result and error are not exclusive.
+    result = decode_task_result(task, task_id)
     if task.get("result"):
-        response["result"] = json.loads(task["result"])
+        response["result"] = result
     if task["status"] == TaskStatus.FAILED:
         response["error"] = task["error"]
 
