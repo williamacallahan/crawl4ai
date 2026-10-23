@@ -1,6 +1,6 @@
 from crawl4ai import BrowserConfig, AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.hub import BaseCrawler
-from crawl4ai.utils import optimize_html, get_home_folder, preprocess_html_for_schema
+from crawl4ai.utils import get_home_folder, preprocess_html_for_schema
 from crawl4ai import JsonCssExtractionStrategy
 from pathlib import Path
 import json
