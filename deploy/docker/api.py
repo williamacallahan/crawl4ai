@@ -216,16 +216,16 @@ async def _crawler_arun(crawler: AsyncWebCrawler, *args, **kwargs):
 def _apply_server_browser_policy(browser_config, config):
     """Apply server-owned launch flags and limits to caller browser config.
 
-    Kept from the fork alongside upstream's egress_broker/governor guards, which
-    cover SSRF and deep-crawl budgets but NOT Chromium's own memory growth. The
-    proxy-safety helper this used to sit beside is gone: enforce_egress()
-    supersedes it. Guarded by tests/test_resource_policy.py.
+    Upstream's egress_broker/governor guards cover SSRF and deep-crawl budgets,
+    not Chromium's own memory growth or its ad and tracker traffic.
     """
     browser_defaults = config["crawler"]["browser"].get("kwargs", {})
     browser_config.extra_args = get_browser_extra_args(config)
 
-    if browser_defaults.get("memory_saving_mode", False):
-        browser_config.memory_saving_mode = True
+    # Not text_mode: it changes the image scores back-end reads; server-built configs keep it.
+    for flag in ("memory_saving_mode", "avoid_ads"):
+        if browser_defaults.get(flag, False):
+            setattr(browser_config, flag, True)
 
     recycle_limit = browser_defaults.get("max_pages_before_recycle", 0)
     requested_recycle_limit = browser_config.max_pages_before_recycle
