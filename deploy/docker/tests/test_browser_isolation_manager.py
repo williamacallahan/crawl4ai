@@ -381,5 +381,7 @@ def test_launch_merges_default_and_custom_features_and_retains_ipc_protection():
     assert "--disable-ipc-flooding-protection" not in kwargs["args"]
     assert "--disable-ipc-flooding-protection" in kwargs["ignore_default_args"]
     managed = ManagedBrowser.build_browser_flags(instance.config)
-    assert len([arg for arg in managed if arg.startswith("--disable-features=")]) == 1
+    managed_switches = [arg for arg in managed if arg.startswith("--disable-features=")]
+    assert len(managed_switches) == 1
+    assert set(PLAYWRIGHT_DISABLED_FEATURES) <= set(managed_switches[0].split("=", 1)[1].split(","))
     assert "--disable-ipc-flooding-protection" not in managed

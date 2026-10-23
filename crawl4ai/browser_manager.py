@@ -211,8 +211,9 @@ class ManagedBrowser:
             flags.append(f"--proxy-server={config.proxy}")
         elif config.proxy_config:
             flags.append(f"--proxy-server={config.proxy_config.server}")
-        # dedupe
-        return _merge_disabled_features(flags)
+        # A browser crawl4ai launches itself gets no driver defaults, so carry
+        # them here; Chromium honors only the last --disable-features switch.
+        return _merge_disabled_features(flags, PLAYWRIGHT_DISABLED_FEATURES)
 
     browser_type: str
     user_data_dir: str
