@@ -23,7 +23,7 @@ local function append_outbox(event, result, encoding, limit, group, consumer)
     local evicted = redis.call('XRANGE', stream, '-', '+', 'COUNT', overflow)
     for _, row in ipairs(evicted) do
       redis.call('XACK', stream, group .. ':webhooks', row[1])
-      redis.call('HDEL', attempts, row[1], row[1] .. ':operation', row[1] .. ':failed')
+      redis.call('HDEL', attempts, row[1], row[1] .. ':operation')
     end
   end
   local id = redis.call('XADD', stream, 'MAXLEN', limit, '*',
@@ -74,9 +74,7 @@ class CrawlJobOutbox:
             await self._recover_outbox_group(error)
             return []
         self._outbox_cursor = claimed[0]
-        ids = [row[0] for row in claimed[1]]
-        ready = set(await self._deliverable_outbox_ids(ids))
-        return self._outbox_events([row for row in claimed[1] if row[0] in ready])
+        return self._outbox_events(claimed[1])
 
     async def pending_outbox(self, consumer: str) -> list[tuple[str, dict]]:
         try:
@@ -86,17 +84,9 @@ class CrawlJobOutbox:
             await self._recover_outbox_group(error)
             return []
         messages = []
-        for stream_id in await self._deliverable_outbox_ids([row["message_id"] for row in pending]):
-            messages.extend(await self.redis.xrange(self.outbox_stream, stream_id, stream_id))
+        for row in pending:
+            messages.extend(await self.redis.xrange(self.outbox_stream, row["message_id"], row["message_id"]))
         return self._outbox_events(messages)
-
-    async def _deliverable_outbox_ids(self, ids):
-        if not ids:
-            return []
-        from crawl_job_queue import _as_text
-        failed = await self.redis.hmget(f"{self.outbox_stream}:attempts",
-            *(f"{_as_text(stream_id)}:failed" for stream_id in ids))
-        return [stream_id for stream_id, failure in zip(ids, failed) if not failure]
 
     async def _recover_outbox_group(self, error: ResponseError) -> None:
         if "NOGROUP" not in str(error):
@@ -108,21 +98,16 @@ class CrawlJobOutbox:
         script = """
 local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
 if #pending == 0 or pending[1][2] ~= ARGV[2] then return 0 end
-if ARGV[4] == 'finish' then
+-- A send that spent its retry budget is dropped like a delivered one: kept
+-- in the PEL it would only queue ahead of crash-orphaned events.
+if ARGV[4] == 'finish' or ARGV[4] == 'fail' then
   redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
   redis.call('XDEL', KEYS[1], ARGV[3])
-  redis.call('HDEL', KEYS[2], ARGV[3], ARGV[3] .. ':operation', ARGV[3] .. ':failed')
+  redis.call('HDEL', KEYS[2], ARGV[3], ARGV[3] .. ':operation')
   return 1
 end
 redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, ARGV[3], 'IDLE', 0, 'JUSTID')
--- Only new completions extend retention; failed sends must eventually expire.
-if ARGV[4] == 'fail' then
-  redis.call('HSET', KEYS[2], ARGV[3] .. ':failed', '1')
-  redis.call('PEXPIREAT', KEYS[2], redis.call('PEXPIRETIME', KEYS[1]))
-  return 1
-end
 if ARGV[4] == 'reserve' then
-  if redis.call('HEXISTS', KEYS[2], ARGV[3] .. ':failed') == 1 then return -1 end
   if redis.call('HGET', KEYS[2], ARGV[3] .. ':operation') == ARGV[5] then
     return tonumber(redis.call('HGET', KEYS[2], ARGV[3]))
   end
@@ -148,7 +133,7 @@ return 1
             raise CrawlJobLeaseLost(f"webhook {stream_id} lease lost")
 
     async def fail_outbox(self, stream_id: str, consumer: str) -> None:
-        """Retain an undelivered event without restarting its spent retry policy."""
+        """Drop an event whose retry budget is spent; the receiver can still poll."""
         if not await self._outbox_owned(stream_id, consumer, "fail"):
             from crawl_job_queue import CrawlJobLeaseLost
             raise CrawlJobLeaseLost(f"webhook {stream_id} lease lost")
