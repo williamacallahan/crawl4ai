@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import os
 import subprocess
 import sys
@@ -278,10 +279,17 @@ def _public_failure(command: str, error: Exception) -> str:
 
 
 def main() -> None:
-    command = sys.argv[1] if len(sys.argv) > 1 else "deploy"
+    commands = {
+        "deploy": deploy, "monitor": rollout_evidence.monitor,
+        "evidence": rollout_evidence.evidence, "cleanup-withdrawals": cleanup_withdrawals,
+    }
+    parser = argparse.ArgumentParser(description=__doc__)
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    for name in commands:
+        subcommands.add_parser(name)
+    command = parser.parse_args().command
     try:
-        {"deploy": deploy, "monitor": rollout_evidence.monitor, "evidence": rollout_evidence.evidence,
-         "cleanup-withdrawals": cleanup_withdrawals}[command]()
+        commands[command]()
     except Exception as error:
         try:
             line = _public_failure(command, error)
