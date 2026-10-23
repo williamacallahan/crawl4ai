@@ -271,16 +271,36 @@ class ReplicaPageDispatcher(MemoryAdaptiveDispatcher):
 
     Each factory instance belongs to one admitted request. Its crawler lease
     covers one running page; that credit is handed on as soon as the page ends.
+    One request runs at most crawler.pool.request_max_pages at once, so a batch
+    job cannot starve new /md admissions, which back-end does not retry after
+    a 503.
     """
 
     def __init__(self, **kwargs):
+        from crawler_pool import ADMISSION
+
         super().__init__(**kwargs)
         self._first_page = asyncio.Event()
         self._first_page.set()
+        self._extra_pages = asyncio.Semaphore(ADMISSION.request_max_pages - 1)
+
+    async def _extra_lease(self):
+        from crawler_pool import PAGE_BUDGET, _admission_wait_seconds
+
+        await self._extra_pages.acquire()
+        try:
+            return await PAGE_BUDGET.acquire(_admission_wait_seconds())
+        except BaseException:
+            self._extra_pages.release()
+            raise
+
+    def _close_extra(self, lease) -> None:
+        lease.close()
+        self._extra_pages.release()
 
     @asynccontextmanager
     async def _page_slot(self):
-        from crawler_pool import PAGE_BUDGET, BrowserCapacityError, _admission_wait_seconds
+        from crawler_pool import BrowserCapacityError
 
         lease = None
         using_first = False
@@ -291,7 +311,7 @@ class ReplicaPageDispatcher(MemoryAdaptiveDispatcher):
                     self._first_page.clear()
                     using_first = True
                     break
-                acquisition = asyncio.create_task(PAGE_BUDGET.acquire(_admission_wait_seconds()))
+                acquisition = asyncio.create_task(self._extra_lease())
                 credit = asyncio.create_task(self._first_page.wait())
                 try:
                     await asyncio.wait((acquisition, credit), return_when=asyncio.FIRST_COMPLETED)
@@ -316,17 +336,17 @@ class ReplicaPageDispatcher(MemoryAdaptiveDispatcher):
                         if acquisition.done() and not acquisition.cancelled() and acquisition.exception() is None:
                             unused = acquisition.result()
                             if unused is not lease:
-                                unused.close()
+                                self._close_extra(unused)
             yield
         finally:
             if using_first:
                 self._first_page.set()
             if lease is not None:
-                lease.close()
+                self._close_extra(lease)
 
-    async def crawl_url(self, url, config, task_id, retry_count=0):
+    async def _run_page(self, url, config, session_id):
         async with self._page_slot():
-            return await super().crawl_url(url, config, task_id, retry_count)
+            return await super()._run_page(url, config, session_id)
 
     def run_urls_stream(self, urls, crawler, config):
         # arun_many's result transformer does not close its inner iterator.

@@ -23,17 +23,13 @@ class _Pages:
         self.release_url = {}
         self.cancelled = 0
 
-    async def crawl_url(self, dispatcher, url, config, task_id, retry_count=0):
+    async def run_page(self, dispatcher, url, config, session_id):
         self.active += 1
         self.peak = max(self.peak, self.active)
         self.started.put_nowait(url)
         try:
             await self.release_url.get(url, self.finish).wait()
-            return CrawlerTaskResult(
-                task_id=task_id, url=url,
-                result=CrawlResult(url=url, html="", success=True),
-                memory_usage=0, peak_memory=0, start_time=0, end_time=1,
-            )
+            return CrawlResult(url=url, html="", success=True)
         except asyncio.CancelledError:
             self.cancelled += 1
             raise
@@ -46,17 +42,20 @@ async def replica(monkeypatch, tmp_path):
     pages = _Pages()
     crawlers = []
 
-    async def crawl_url(dispatcher, *args, **kwargs):
-        return await pages.crawl_url(dispatcher, *args, **kwargs)
+    # Stub only the browser call: the real crawl_url, rate limiter and
+    # memory checks run, so the test sees exactly what the seam charges.
+    async def run_page(dispatcher, *args, **kwargs):
+        return await pages.run_page(dispatcher, *args, **kwargs)
 
-    monkeypatch.setattr(MemoryAdaptiveDispatcher, "crawl_url", crawl_url)
+    monkeypatch.setattr(MemoryAdaptiveDispatcher, "_run_page", run_page)
     monkeypatch.setattr(pool, "ADMISSION_SEM", asyncio.Semaphore(10))
     monkeypatch.setattr(pool, "_WORKER_PROCESS", False)
 
-    def configure(max_pages):
+    def configure(max_pages, request_max_pages=4):
         monkeypatch.setattr(pool, "PAGE_BUDGET", pool.ReplicaPageBudget(max_pages, tmp_path))
         monkeypatch.setattr(pool, "ADMISSION", utils.PoolAdmissionSettings(
-            replica_max_pages=max_pages, admission_wait_seconds=0.02,
+            replica_max_pages=max_pages, request_max_pages=request_max_pages,
+            admission_wait_seconds=0.02,
         ))
 
     async def admit():
@@ -307,3 +306,61 @@ async def test_api_stream_close_drains_real_dispatcher_before_releasing_admissio
         first_result.cancel()
         await asyncio.gather(first_result, return_exceptions=True)
         await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_one_batch_leaves_slots_for_other_requests(replica):
+    replica.configure(8, request_max_pages=2)
+    crawler = await replica.admit()
+    pending = asyncio.create_task(_run(crawler, "capped", False))
+    try:
+        await _wait_started(replica.pages, 2)
+        await asyncio.sleep(0.08)
+        assert replica.pages.peak == 2
+        # Six of eight slots stay free for /md while the batch runs.
+        independent = pool.ReplicaPageBudget(8, replica.directory)
+        leases = [await independent.acquire(0) for _ in range(6)]
+        for lease in leases:
+            lease.close()
+        replica.pages.finish.set()
+        results = await asyncio.wait_for(pending, timeout=3)
+        assert len(results) == 5 and all(result.success for result in results)
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_page_holds_no_slot_while_it_waits(replica):
+    replica.configure(3)
+    crawler = await replica.admit()
+    gate = asyncio.Event()
+
+    class HeldLimiter:
+        async def wait_if_needed(self, url):
+            await gate.wait()
+
+        def update_delay(self, url, status_code):
+            return True
+
+    dispatcher = _dispatcher()
+    dispatcher.rate_limiter = HeldLimiter()
+    pending = asyncio.create_task(crawler.arun_many(
+        urls=[f"https://example.com/limited/{index}" for index in range(3)],
+        config=CrawlerRunConfig(), dispatcher=dispatcher,
+    ))
+    try:
+        await asyncio.sleep(0.1)
+        assert replica.pages.active == 0
+        # Only the request's own crawler lease is held: two slots stay free.
+        independent = pool.ReplicaPageBudget(3, replica.directory)
+        leases = [await independent.acquire(0) for _ in range(2)]
+        for lease in leases:
+            lease.close()
+        gate.set()
+        replica.pages.finish.set()
+        results = await asyncio.wait_for(pending, timeout=3)
+        assert len(results) == 3
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)

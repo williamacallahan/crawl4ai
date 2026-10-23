@@ -229,6 +229,11 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
         # Standard priority based on retries
         return retry_count
     
+    async def _run_page(self, url: str, config: CrawlerRunConfig, session_id: str):
+        """Run one browser page; a subclass that budgets pages charges only this
+        call, not the rate limiter's wait or a memory requeue around it."""
+        return await self.crawler.arun(url, config=config, session_id=session_id)
+
     async def crawl_url(
         self,
         url: str,
@@ -321,7 +326,7 @@ class MemoryAdaptiveDispatcher(BaseDispatcher):
                 )
             
             # Execute the crawl with selected config
-            result = await self.crawler.arun(url, config=selected_config, session_id=task_id)
+            result = await self._run_page(url, selected_config, task_id)
             
             # Measure memory usage
             end_memory = process.memory_info().rss / (1024 * 1024)
