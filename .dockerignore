@@ -6,3 +6,5 @@
 .llm.env
 **/.env
 **/.llm.env
+.worktrees
+**/.venv
