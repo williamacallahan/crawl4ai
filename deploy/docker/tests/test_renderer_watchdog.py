@@ -193,7 +193,8 @@ def renderer_tree(pool, monkeypatch):
 
     def process(pid):
         assert pid == 1234
-        return SimpleNamespace(children=lambda recursive: [renderer])
+        return SimpleNamespace(children=lambda recursive: [renderer],
+                               memory_info=lambda: SimpleNamespace(rss=0))
 
     monkeypatch.setattr(pool.psutil, "Process", process)
     return target, renderer
@@ -240,6 +241,20 @@ def test_renderer_rss_limit_is_immediate_and_ignores_nonrenderers(pool, renderer
         "pid=42 reason=rss browser_pid=1234 created_at=123.0 "
         f"rss_bytes={renderer.rss} rss_limit_bytes=805306368"
     ) in caplog.text
+
+
+@pytest.mark.parametrize("limit_mb,pages_served,recycled", [(5, 1, True), (20, 1, False), (5, 0, False)])
+def test_browser_tree_rss_over_cap_drains_and_restarts(
+    pool, renderer_tree, monkeypatch, limit_mb, pages_served, recycled
+):
+    target, renderer = renderer_tree  # one 10 MiB renderer under the browser
+    manager = target.crawler_strategy.browser_manager
+    manager._pages_served = pages_served
+    monkeypatch.setattr(pool, "WATCHDOG", replace(pool.WATCHDOG, browser_rss_mb=limit_mb))
+    pool._watch_renderers(target, 0)
+    assert renderer.killed == 0
+    assert getattr(manager, "pool_recycle_reason", None) == (
+        "browser process tree rss" if recycled else None)
 
 
 @pytest.mark.parametrize("field,value", [
