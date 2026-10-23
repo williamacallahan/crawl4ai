@@ -18,3 +18,16 @@
 
 For explicitly authorized source changes, preserve the existing repository
 architecture and use its repository-owned validation lanes.
+
+## Landing and delivery
+
+- The working branch is `main`, which is also production: every push to it
+  runs `CI & Deploy`. Land with `git-land <repo-root> <task-slug> main`; the
+  fork carries upstream's stale `staging` branch, which `git-land`'s default
+  branch choice would otherwise pick.
+- Every workflow job runs on this fork's self-hosted runners
+  (`tests/regression/test_workflows_self_hosted.py` enforces it); never add a
+  GitHub-hosted runner or a `pull_request` trigger.
+- A stored Redis format change ships its readers one deploy before its
+  writers: start-first rolling updates run old and new replicas against the
+  same Redis for about 28 minutes.
