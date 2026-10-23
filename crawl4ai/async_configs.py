@@ -1926,6 +1926,9 @@ class CrawlerRunConfig():
                             Default: None.
 
         url: str = None  # This is not a compulsory parameter
+
+        max_html_bytes (int): Maximum UTF-8 HTML bytes before scraping/markdown.
+                              Positive integer; defaults to 8 MiB.
     """
     _UNWANTED_PROPS = {
         'disable_cache' : 'Instead, use cache_mode=CacheMode.DISABLED',
@@ -2057,12 +2060,17 @@ class CrawlerRunConfig():
         # Anti-Bot Retry Parameters
         max_retries: int = 0,
         fallback_fetch_function: Optional[Callable[[str], Awaitable[str]]] = None,
+        # Maximum UTF-8 HTML bytes accepted before content processing.
+        max_html_bytes: int = 8 * 1024 * 1024,
     ):
         # TODO: Planning to set properties dynamically based on the __init__ signature
         self.url = url
         self.base_url = base_url  # Base URL for markdown link resolution
 
         # Content Processing Parameters
+        if isinstance(max_html_bytes, bool) or not isinstance(max_html_bytes, int) or max_html_bytes <= 0:
+            raise ValueError("max_html_bytes must be a positive integer")
+        self.max_html_bytes = max_html_bytes
         self.word_count_threshold = word_count_threshold
         self.extraction_strategy = extraction_strategy
         self.chunking_strategy = chunking_strategy
@@ -2459,6 +2467,7 @@ class CrawlerRunConfig():
     def to_dict(self):
         return {
             "word_count_threshold": self.word_count_threshold,
+            "max_html_bytes": self.max_html_bytes,
             "extraction_strategy": self.extraction_strategy,
             "chunking_strategy": self.chunking_strategy,
             "markdown_generator": self.markdown_generator,

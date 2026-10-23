@@ -96,6 +96,9 @@ class LlmCapacityBusy(HTTPException):
 async def llm_permit(redis, config):
     token = uuid4().hex
     ttl = config["llm"].get("permit_ttl_seconds", 300)
+    # Start before the command: network latency must not extend our local
+    # view of a lease Redis may already be counting down.
+    confirmed_expiry = time.monotonic() + ttl
     acquired = await redis.set(
         LLM_PERMIT_KEY,
         token,
@@ -112,28 +115,47 @@ async def llm_permit(redis, config):
     lease_lost = asyncio.Event()
 
     async def renew_permit():
+        nonlocal confirmed_expiry
+        safety_margin = min(1.0, ttl / 10)
+        delay = ttl / 3
         try:
             while True:
-                await asyncio.sleep(ttl / 3)
-                renewed = await redis.eval(
-                    _RENEW_LLM_PERMIT,
-                    1,
-                    LLM_PERMIT_KEY,
-                    token,
-                    ttl,
-                )
-                if not renewed:
-                    lease_lost.set()
-                    if owner is not None:
-                        owner.cancel()
-                    return
+                retry_deadline = confirmed_expiry - safety_margin
+                await asyncio.sleep(min(delay, max(0, retry_deadline - time.monotonic())))
+                if time.monotonic() >= retry_deadline:
+                    # Leave room for the last in-flight renewal, but do not
+                    # cancel protected work while the confirmed lease lives.
+                    await asyncio.sleep(max(0, confirmed_expiry - time.monotonic()))
+                    break
+                renewal_started = time.monotonic()
+                try:
+                    renewed = await asyncio.wait_for(
+                        redis.eval(_RENEW_LLM_PERMIT, 1, LLM_PERMIT_KEY, token, ttl),
+                        timeout=confirmed_expiry - renewal_started,
+                    )
+                except (RedisError, asyncio.TimeoutError):
+                    # An unacknowledged renewal does not invalidate the last
+                    # confirmed lease. Keep trying within that lease only.
+                    logger.warning("LLM permit renewal failed; retrying within lease", exc_info=True)
+                    delay = min(1.0, ttl / 10)
+                    continue
+                if not renewed or time.monotonic() >= confirmed_expiry:
+                    break
+                confirmed_expiry = renewal_started + ttl
+                delay = ttl / 3
         except Exception:
-            lease_lost.set()
-            if owner is not None:
-                owner.cancel()
+            logger.exception("LLM permit renewal failed unexpectedly")
+        lease_lost.set()
+        if owner is not None:
+            owner.cancel()
 
     heartbeat = asyncio.create_task(renew_permit())
     try:
+        if time.monotonic() >= confirmed_expiry:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Crawl4AI LLM capacity lease was lost",
+            )
         yield
     except asyncio.CancelledError:
         if lease_lost.is_set():
@@ -357,6 +379,7 @@ return 1
 # never judged lost.
 _RECOVER_LLM_TASK_SCRIPT = """
 -- crawl4ai:recover-llm-task
+local recovered = 0
 if redis.call('HGET', KEYS[1], 'status') == 'processing' then
   local last_seen = tonumber(redis.call('HGET', KEYS[1], 'heartbeat_at'))
   local now = tonumber(redis.call('TIME')[1])
@@ -366,9 +389,10 @@ if redis.call('HGET', KEYS[1], 'status') == 'processing' then
     if tonumber(ARGV[2]) > 0 then
       redis.call('EXPIRE', KEYS[1], ARGV[2])
     end
+    recovered = 1
   end
 end
-return redis.call('HGETALL', KEYS[1])
+return {recovered, redis.call('HGETALL', KEYS[1])}
 """
 
 
@@ -379,18 +403,92 @@ def llm_task_heartbeat_seconds(config: dict) -> int:
     return interval
 
 
+def llm_orphan_scan_settings(config: dict) -> Tuple[int, int]:
+    llm = config.get("llm", {})
+    interval = llm.get("orphan_scan_seconds", 60)
+    count = llm.get("orphan_scan_count", 100)
+    for name, value in (("orphan_scan_seconds", interval), ("orphan_scan_count", count)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"llm.{name} must be a positive integer")
+    return interval, count
+
+
+async def _recover_llm_task(redis, task_id: str, config: dict) -> dict:
+    recovered, fields = await redis.eval(
+        _RECOVER_LLM_TASK_SCRIPT, 1, f"task:{task_id}",
+        3 * llm_task_heartbeat_seconds(config), get_redis_task_ttl(config),
+    )
+    task = decode_redis_hash(dict(zip(fields[::2], fields[1::2])))
+    if recovered:
+        # Only the atomic transition winner notifies, even when a status read
+        # and several replicas' reapers race each other or worker completion.
+        # Sent in the background: a poll or reaper page must not wait through
+        # a slow receiver's whole retry budget.
+        webhook_config = task.get("webhook_config")
+        _notify_llm_failure_later(
+            config, task_id, task["url"],
+            json.loads(webhook_config) if webhook_config else None, task["error"],
+        )
+    return task
+
+
+_LLM_NOTIFICATIONS: set[asyncio.Task] = set()
+
+
+def _notify_llm_failure_later(config, task_id, url, webhook_config, error) -> None:
+    notification = asyncio.create_task(WebhookDeliveryService(config).notify_job_completion(
+        task_id=task_id, task_type="llm_extraction", status="failed",
+        urls=[url], webhook_config=webhook_config, error=error,
+    ))
+    _LLM_NOTIFICATIONS.add(notification)
+    notification.add_done_callback(_LLM_NOTIFICATIONS.discard)
+
+
+async def scan_llm_orphans(redis, config: dict, cursor: int = 0) -> int:
+    """Recover one SCAN page; the caller carries the cursor between passes."""
+    _, count = llm_orphan_scan_settings(config)
+    cursor, keys = await redis.scan(cursor=cursor, match="task:llm_*", count=count)
+    for key in keys:
+        if isinstance(key, bytes):
+            key = key.decode("utf-8")
+        try:
+            # The script checks processing/heartbeat atomically and leaves
+            # live, terminal, and pre-heartbeat-release hashes untouched.
+            await _recover_llm_task(redis, key.removeprefix("task:"), config)
+        except RedisError:
+            raise
+        except Exception:
+            logger.exception("Failed to recover LLM task %s", key)
+    return cursor
+
+
+async def reap_llm_tasks(redis, config: dict) -> None:
+    interval, _ = llm_orphan_scan_settings(config)
+    cursor = 0
+    while True:
+        try:
+            cursor = await scan_llm_orphans(redis, config, cursor)
+        except RedisError:
+            logger.warning("LLM orphan scan failed; retrying next interval", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 async def _heartbeat_llm_task(redis, task_id: str, config: dict) -> None:
     interval = llm_task_heartbeat_seconds(config)
     # The non-expiring task hash cannot be evicted by volatile-lru.
+    delay = interval
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(delay)
         try:
             if not await redis.eval(_LLM_TASK_HEARTBEAT_SCRIPT, 1, f"task:{task_id}"):
                 return
+            delay = interval
         except RedisError:
             # A Redis restart lasts seconds; ending the loop here would let a
-            # later poll fail this live job once three intervals pass.
+            # later poll fail this live job once three intervals pass, and
+            # waiting a full interval after Redis returns risks the same.
             logger.warning("LLM task %s heartbeat failed; retrying", task_id, exc_info=True)
+            delay = 1.0
 
 
 async def _stop_llm_heartbeat(heartbeat: asyncio.Task) -> None:
@@ -933,20 +1031,12 @@ async def handle_task_status(
     # Only LLM tasks heartbeat; a crawl job read through this route keeps its
     # own lease-based recovery.
     config = config or {}
-    stale_after = 3 * llm_task_heartbeat_seconds(config)
     if (
         collection == "llm/job" and task_id.startswith("llm_")
         and task["status"] == TaskStatus.PROCESSING and "heartbeat_at" in task
-        and float(task["heartbeat_at"]) < time.time() - stale_after
     ):
-        # The local clock only skips the round trip for fresh beats; the
-        # script decides against Redis TIME and rechecks status, so a
-        # completion or renewal since the read above always wins.
-        fields = await redis.eval(
-            _RECOVER_LLM_TASK_SCRIPT, 1, f"task:{task_id}",
-            stale_after, get_redis_task_ttl(config),
-        )
-        task = decode_redis_hash(dict(zip(fields[::2], fields[1::2])))
+        # Redis TIME is the sole clock for both stamps and recovery verdicts.
+        task = await _recover_llm_task(redis, task_id, config)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
 
@@ -991,18 +1081,27 @@ async def create_new_task(
         task_data["webhook_config"] = json.dumps(webhook_config)
 
     # heartbeat_at marks this hash recoverable from accept, so work waiting in
-    # the local queue is covered; the first Redis-TIME beat replaces this
-    # local stamp one interval later.
-    task_data["heartbeat_at"] = int(time.time())
+    # the local queue is covered. Use the same clock as renewal and recovery.
+    task_data["heartbeat_at"] = (await redis.time())[0]
     await hset_with_ttl(redis, f"task:{task_id}", task_data, config)
     heartbeat = asyncio.create_task(_heartbeat_llm_task(redis, task_id, config))
 
     async def cancel_task() -> None:
+        error = "LLM extraction interrupted by server shutdown"
         try:
-            await _finish_llm_task(redis, f"task:{task_id}", {
-                "status": TaskStatus.FAILED,
-                "error": "LLM extraction interrupted by server shutdown",
-            }, config)
+            if await _finish_llm_task(redis, f"task:{task_id}", {
+                "status": TaskStatus.FAILED, "error": error,
+            }, config):
+                # The reaper skips terminal tasks, so this is the only notice
+                # a webhook-only client gets; bounded so shutdown cannot hang.
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        WebhookDeliveryService(config).notify_job_completion(
+                            task_id=task_id, task_type="llm_extraction", status="failed",
+                            urls=[decoded_url], webhook_config=webhook_config, error=error,
+                        ),
+                        timeout=10,
+                    )
         finally:
             await _stop_llm_heartbeat(heartbeat)
 

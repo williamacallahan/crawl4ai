@@ -26,6 +26,9 @@ llm:
   permit_ttl_seconds: 300
   # Three missed heartbeats let polling recover a lost local worker.
   task_heartbeat_seconds: 30
+  # Positive integers: scan interval and Redis SCAN count hint.
+  orphan_scan_seconds: 60
+  orphan_scan_count: 100
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
 # Redis Configuration
@@ -130,6 +133,7 @@ security:
 # Crawler Configuration
 crawler:
   base_config:
+    max_html_bytes: 8388608  # 8 MiB UTF-8 HTML, rejected before scraping/markdown
     # Give JavaScript application shells time to hydrate before validation.
     delay_before_return_html: 1.0
     max_iframes: 20
