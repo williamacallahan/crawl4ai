@@ -5,7 +5,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -46,6 +46,12 @@ def crawler(*, send=None, active=1):
         pool_recycle_requested=False,
         consecutive_failures=0,
     )
+
+    def request_pool_recycle(reason):
+        manager._recycle_due = True
+        manager.pool_recycle_reason = reason
+
+    manager.request_pool_recycle = Mock(side_effect=request_pool_recycle)
     return SimpleNamespace(
         crawler_strategy=SimpleNamespace(browser_manager=manager),
         active_requests=active,
@@ -114,21 +120,29 @@ async def test_wedged_probe_is_bounded_and_does_not_hold_pool_lock(pool, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["requested", "consecutive"])
-async def test_manager_failure_signal_retires_permanent_without_probe(pool, failure):
+async def test_manager_failure_signal_drains_permanent_and_still_probes(pool, failure):
     failed = crawler(active=2)
     manager = failed.crawler_strategy.browser_manager
     if failure == "requested":
-        manager.pool_recycle_requested = True
+        manager.request_pool_recycle("cleanup failed")
     else:
-        manager.consecutive_failures = 3
+        manager.consecutive_failures = pool.WATCHDOG.consecutive_failure_limit
     pool.PERMANENT = failed
     pool.DEFAULT_CONFIG_SIG = "default"
-    assert not pool._is_live(failed)
+    assert pool._is_live(failed)
     await pool._watchdog_pass()
     await drain_closes(pool)
-    assert pool.PERMANENT is None
-    assert pool.ADMISSION_SEM._value == 2
-    manager.browser.new_browser_cdp_session.assert_not_awaited()
+    assert pool.PERMANENT is failed
+    assert failed.active_requests == 2
+    assert pool.ADMISSION_SEM._value == 0
+    assert manager.consecutive_failures == 0
+    assert manager._recycle_due
+    assert not manager.pool_recycle_requested
+    failed.close.assert_not_awaited()
+    manager.request_pool_recycle.assert_called_once_with(
+        "cleanup failed" if failure == "requested" else "consecutive browser faults"
+    )
+    manager.browser.new_browser_cdp_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -187,25 +201,28 @@ def renderer_tree(pool, monkeypatch):
 
 def test_renderer_cpu_requires_sustained_window(pool, renderer_tree):
     target, renderer = renderer_tree
+    window = pool.WATCHDOG.renderer_cpu_seconds
     pool._watch_renderers(target, 0)
-    for second in (5, 10, 15):
+    for second in (window / 4, window / 2, window * 3 / 4):
         renderer.cpu = float(second)
         pool._watch_renderers(target, second)
         assert renderer.killed == 0
-    renderer.cpu = 20.0
-    pool._watch_renderers(target, 20)
+    renderer.cpu = float(window)
+    pool._watch_renderers(target, window)
     assert renderer.killed == 1
     assert pool.RENDERER_KILLS == {"cpu": 1, "rss": 0}
 
 
 def test_renderer_cpu_lull_resets_sustained_window(pool, renderer_tree):
     target, renderer = renderer_tree
-    for second, cpu in ((0, 0), (5, 5), (10, 10), (15, 10), (20, 15), (25, 20), (30, 25)):
-        renderer.cpu = cpu
-        pool._watch_renderers(target, second)
+    step = pool.WATCHDOG.renderer_cpu_seconds / 4
+    # Busy for three steps, idle for one (the lull), then busy for four more.
+    for tick, cpu_steps in ((0, 0), (1, 1), (2, 2), (3, 2), (4, 3), (5, 4), (6, 5)):
+        renderer.cpu = cpu_steps * step
+        pool._watch_renderers(target, tick * step)
     assert renderer.killed == 0
-    renderer.cpu = 30
-    pool._watch_renderers(target, 35)
+    renderer.cpu = 6 * step
+    pool._watch_renderers(target, 7 * step)
     assert renderer.killed == 1
 
 

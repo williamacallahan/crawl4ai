@@ -178,7 +178,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 class BrowserWatchdogSettings:
     interval_seconds: float = 5.0
     renderer_cpu_cores: float = 0.9
-    renderer_cpu_seconds: float = 20.0
+    renderer_cpu_seconds: float = 65.0
     renderer_rss_mb: int = 768
     browser_probe_timeout_seconds: float = 5.0
     consecutive_failure_limit: int = 3
