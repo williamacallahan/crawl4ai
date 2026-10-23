@@ -872,7 +872,7 @@ This release focuses on stability with 11 bug fixes addressing issues reported b
 
 - **🤖 Enhanced LLM Integration**: Custom providers with temperature control and base_url configuration
 - **🔒 HTTPS Preservation**: Secure internal link handling with `preserve_https_for_internal_links=True`
-- **🐍 Python 3.10+ Support**: Modern language features and enhanced performance
+- **🐍 Python 3.11+ Support**: Modern language features and enhanced performance
 - **🛠️ Bug Fixes**: Resolved multiple community-reported issues including URL processing, JWT authentication, and proxy configuration
 
 [Full v0.7.5 Release Notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.7.5.md)

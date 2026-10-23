@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from urllib.parse import unquote, urlparse
 import OpenSSL.crypto
 from cryptography import x509 as crypto_x509
-from cryptography.x509.oid import ExtensionOID
+from cryptography.x509.oid import AuthorityInformationAccessOID, ExtendedKeyUsageOID, ExtensionOID, ObjectIdentifier
 from pathlib import Path
 
 _EXTENSION_NAMES = {
@@ -41,13 +41,62 @@ _EXTENSION_NAMES = {
     ExtensionOID.SIGNED_CERTIFICATE_TIMESTAMPS: "ct_cert_scts",
     ExtensionOID.MS_CERTIFICATE_TEMPLATE: "msCertTemplate",
     ExtensionOID.ADMISSIONS: "x509ExtAdmission",
+    ObjectIdentifier("2.16.840.1.113730.1.1"): "nsCertType",
+    ObjectIdentifier("2.16.840.1.113730.1.13"): "nsComment",
 }
+
+# OpenSSL's long names, so extendedKeyUsage reads as it did through pyOpenSSL.
+_KEY_PURPOSES = {
+    ExtendedKeyUsageOID.SERVER_AUTH: "TLS Web Server Authentication",
+    ExtendedKeyUsageOID.CLIENT_AUTH: "TLS Web Client Authentication",
+    ExtendedKeyUsageOID.CODE_SIGNING: "Code Signing",
+    ExtendedKeyUsageOID.EMAIL_PROTECTION: "E-mail Protection",
+    ExtendedKeyUsageOID.TIME_STAMPING: "Time Stamping",
+    ExtendedKeyUsageOID.OCSP_SIGNING: "OCSP Signing",
+}
+_GENERAL_NAME_LABELS = {
+    crypto_x509.DNSName: "DNS", crypto_x509.RFC822Name: "email",
+    crypto_x509.UniformResourceIdentifier: "URI", crypto_x509.IPAddress: "IP Address",
+    crypto_x509.RegisteredID: "Registered ID",
+}
+
+
+def _general_name(name) -> str:
+    return f"{_GENERAL_NAME_LABELS.get(type(name), type(name).__name__)}:{name.value}"
 
 
 def _extension_value(value: crypto_x509.ExtensionType) -> str:
     """Render common values without depending on removed OpenSSL APIs."""
     if isinstance(value, crypto_x509.UnrecognizedExtension):
-        return value.public_bytes().hex()
+        raw = value.public_bytes()
+        # nsComment is a short DER IA5String; OpenSSL printed its text.
+        if value.oid.dotted_string == "2.16.840.1.113730.1.13" and len(raw) > 2 \
+                and raw[0] == 0x16 and raw[1] == len(raw) - 2:
+            return raw[2:].decode("ascii", "replace")
+        return raw.hex()
+    if isinstance(value, crypto_x509.ExtendedKeyUsage):
+        return ", ".join(_KEY_PURPOSES.get(purpose, purpose.dotted_string) for purpose in value)
+    if isinstance(value, crypto_x509.AuthorityInformationAccess):
+        methods = {AuthorityInformationAccessOID.OCSP: "OCSP",
+                   AuthorityInformationAccessOID.CA_ISSUERS: "CA Issuers"}
+        return "\n".join(
+            f"{methods.get(entry.access_method, entry.access_method.dotted_string)} - "
+            f"{_general_name(entry.access_location)}"
+            for entry in value
+        )
+    if isinstance(value, crypto_x509.CertificatePolicies):
+        return "\n".join(f"Policy: {policy.policy_identifier.dotted_string}" for policy in value)
+    if isinstance(value, crypto_x509.CRLDistributionPoints):
+        return "\n".join(
+            "Full Name:\n" + "\n".join(f"  {_general_name(name)}" for name in point.full_name)
+            for point in value if point.full_name
+        )
+    if isinstance(value, (crypto_x509.PrecertificateSignedCertificateTimestamps,
+                          crypto_x509.SignedCertificateTimestamps)):
+        return "\n".join(
+            f"Log ID: {sct.log_id.hex(':').upper()}, Timestamp: {sct.timestamp.isoformat()}"
+            for sct in value
+        )
     if isinstance(value, crypto_x509.BasicConstraints):
         return "CA:" + str(value.ca).upper() + (
             f", pathlen:{value.path_length}" if value.path_length is not None else ""
@@ -66,12 +115,7 @@ def _extension_value(value: crypto_x509.ExtensionType) -> str:
             usages += [("encipher_only", "Encipher Only"), ("decipher_only", "Decipher Only")]
         return ", ".join(label for attribute, label in usages if getattr(value, attribute))
     if isinstance(value, (crypto_x509.SubjectAlternativeName, crypto_x509.IssuerAlternativeName)):
-        labels = {
-            crypto_x509.DNSName: "DNS", crypto_x509.RFC822Name: "email",
-            crypto_x509.UniformResourceIdentifier: "URI", crypto_x509.IPAddress: "IP Address",
-            crypto_x509.RegisteredID: "Registered ID",
-        }
-        return ", ".join(f"{labels.get(type(name), type(name).__name__)}:{name.value}" for name in value)
+        return ", ".join(_general_name(name) for name in value)
     if isinstance(value, crypto_x509.SubjectKeyIdentifier):
         return value.digest.hex(":").upper()
     if isinstance(value, crypto_x509.AuthorityKeyIdentifier) and (
@@ -310,13 +354,18 @@ class SSLCertificate(dict):
                 "raw_cert": base64.b64encode(der_bytes),
             }
 
-            extensions = []
-            for ext in x509.to_cryptography().extensions:
-                extensions.append({
-                    "name": _EXTENSION_NAMES.get(ext.oid, "UNDEF"),
-                    "value": _extension_value(ext.value),
-                })
-            cert_info_raw["extensions"] = extensions
+            # cryptography parses every extension at once and rejects some that
+            # OpenSSL accepts; keep the certificate and say why its list is empty.
+            try:
+                parsed = x509.to_cryptography().extensions
+            except ValueError as error:
+                print(f"Certificate extensions could not be parsed: {error}")
+                parsed = []
+                cert_info_raw["extensions_error"] = str(error)
+            cert_info_raw["extensions"] = [
+                {"name": _EXTENSION_NAMES.get(ext.oid, "UNDEF"), "value": _extension_value(ext.value)}
+                for ext in parsed
+            ]
 
             return SSLCertificate(cert_info_raw)
         except Exception as e:
