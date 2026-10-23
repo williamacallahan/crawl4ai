@@ -147,6 +147,8 @@ crawler:
     stream_init: 30.0  # Timeout for stream initialization
     batch_process: 300.0  # Timeout for batch processing
   pool:
+    replica_max_pages: 8                   # Shared page budget across this replica's worker processes
+    admission_wait_seconds: 2.0            # Maximum wait for a page permit; 0 fails fast
     max_pages: 12                          # ← Per-worker GLOBAL_SEM and dispatcher permits
     max_browser_instances: 4               # ← Per-process browser ceiling; gunicorn + 2 job workers share one 4 GiB container
     idle_ttl_sec: 300                     # ← 30 min janitor cutoff

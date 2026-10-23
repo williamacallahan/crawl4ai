@@ -172,7 +172,12 @@ DEFAULT_CONFIG = {
         "memory_threshold_percent": 95.0,
         "rate_limiter": {"enabled": True, "base_delay": [1.0, 2.0]},
         "timeouts": {"stream_init": 30.0, "batch_process": 300.0},
-        "pool": {"max_pages": 40, "idle_ttl_sec": 300},
+        "pool": {
+            "max_pages": 40,
+            "idle_ttl_sec": 300,
+            "replica_max_pages": 8,
+            "admission_wait_seconds": 2.0,
+        },
         "browser": {
             "kwargs": {"headless": True, "text_mode": True},
             "extra_args": [
@@ -217,6 +222,30 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             merged[key] = value
     return merged
+
+
+@dataclass(frozen=True)
+class PoolAdmissionSettings:
+    replica_max_pages: int = 8
+    admission_wait_seconds: float = 2.0
+
+    @classmethod
+    def from_config(cls, config: dict) -> "PoolAdmissionSettings":
+        configured = config.get("crawler", {}).get("pool", {})
+        budget = configured.get("replica_max_pages", cls.replica_max_pages)
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+            raise ValueError("crawler.pool.replica_max_pages must be a positive integer")
+        wait = configured.get("admission_wait_seconds", cls.admission_wait_seconds)
+        if (
+            isinstance(wait, bool)
+            or not isinstance(wait, (int, float))
+            or not isfinite(wait)
+            or wait < 0
+        ):
+            raise ValueError(
+                "crawler.pool.admission_wait_seconds must be a finite nonnegative number"
+            )
+        return cls(replica_max_pages=budget, admission_wait_seconds=float(wait))
 
 
 @dataclass(frozen=True)

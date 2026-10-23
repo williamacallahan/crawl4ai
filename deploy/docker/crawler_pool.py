@@ -2,6 +2,7 @@
 import asyncio
 import ctypes
 import ctypes.util
+import fcntl
 import hashlib
 import json
 import logging
@@ -9,13 +10,20 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Dict, Optional
+from pathlib import Path
+from typing import BinaryIO, Callable, Dict, Optional
 
 import psutil
+from fastapi import HTTPException
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from prometheus_client import Counter
-from utils import BrowserWatchdogSettings, get_container_memory_percent, load_config
+from utils import (
+    BrowserWatchdogSettings,
+    PoolAdmissionSettings,
+    get_container_memory_percent,
+    load_config,
+)
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig
 
@@ -44,7 +52,10 @@ MAX_ACTIVE_REQUESTS = CONFIG.get("crawler", {}).get("pool", {}).get("max_pages",
 MAX_BROWSER_INSTANCES = CONFIG.get("crawler", {}).get("pool", {}).get(
     "max_browser_instances", MAX_ACTIVE_REQUESTS
 )
+# Keep the optional tighter per-process max_pages cap, sharing its wait deadline
+# with the replica budget. It cannot increase the replica's total allowance.
 ADMISSION_SEM = asyncio.Semaphore(MAX_ACTIVE_REQUESTS)
+ADMISSION = PoolAdmissionSettings.from_config(CONFIG)
 DEFAULT_CONFIG_SIG = None  # Cached sig for default config
 _CLOSE_TASKS = set()  # In-flight background closes; close_all() drains them at shutdown
 WATCHDOG = BrowserWatchdogSettings.from_config(CONFIG)
@@ -99,6 +110,91 @@ _LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
 _LIBC.mallopt(_M_ARENA_MAX, 2)
 
 
+class BrowserCapacityError(HTTPException, RuntimeError):
+    """Retryable capacity refusal, preserved by the API's HTTPException paths."""
+
+    def __init__(self, detail: str = "Crawler browser pool is at capacity"):
+        super().__init__(503, detail=detail, headers={"Retry-After": "2"})
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+class MemoryCapacityError(BrowserCapacityError, MemoryError):
+    """Memory pressure is the same retryable admission refusal."""
+
+
+class ReplicaPageBudget:
+    """One independent flock per slot, shared by every container process.
+
+    Files are never unlinked: every contender must lock the same inode. Each
+    lease owns a fresh, non-inheritable descriptor; close or process death
+    releases the kernel lock. No PID files or stale-slot cleanup are needed.
+    """
+
+    def __init__(self, max_pages: int, directory: str | Path = "/tmp/crawl4ai-page-budget"):
+        self.max_pages = max_pages
+        self.directory = Path(directory)
+
+    async def acquire(
+        self, wait_seconds: float, *, before_acquire: Optional[Callable[[], None]] = None,
+    ) -> BinaryIO:
+        deadline = time.monotonic() + wait_seconds
+        self.directory.mkdir(parents=True, exist_ok=True)
+        while True:
+            if before_acquire is not None:
+                before_acquire()
+            for slot in range(self.max_pages):
+                lease = (self.directory / f"{slot}.lock").open("a+b")
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return lease
+                except BlockingIOError:
+                    lease.close()
+                except BaseException:
+                    lease.close()
+                    raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrowserCapacityError()
+            await asyncio.sleep(min(0.05, remaining))
+
+
+PAGE_BUDGET = ReplicaPageBudget(ADMISSION.replica_max_pages)
+
+
+def _check_admission_memory() -> None:
+    mem_pct = get_container_memory_percent()
+    if mem_pct >= MEM_LIMIT:
+        raise MemoryCapacityError(f"Memory at {mem_pct:.1f}%, refusing page admission")
+
+
+async def _acquire_admission() -> BinaryIO:
+    deadline = time.monotonic() + ADMISSION.admission_wait_seconds
+    try:
+        if ADMISSION_SEM.locked():
+            await asyncio.wait_for(ADMISSION_SEM.acquire(), ADMISSION.admission_wait_seconds)
+        else:
+            await ADMISSION_SEM.acquire()
+    except asyncio.TimeoutError as error:
+        raise BrowserCapacityError() from error
+    try:
+        return await PAGE_BUDGET.acquire(
+            max(0, deadline - time.monotonic()), before_acquire=_check_admission_memory,
+        )
+    except BaseException:
+        ADMISSION_SEM.release()
+        raise
+
+
+def _attach_admission(crawler: AsyncWebCrawler, lease: BinaryIO) -> None:
+    leases = getattr(crawler, "_docker_page_leases", None)
+    if not isinstance(leases, list):
+        leases = []
+        setattr(crawler, "_docker_page_leases", leases)
+    leases.append(lease)
+
+
 def get_pool_snapshot() -> dict:
     """Return a point-in-time snapshot of pool state for monitoring.
 
@@ -149,7 +245,7 @@ async def _start_or_retire(crawler: AsyncWebCrawler) -> None:
 
 
 def _retire_crawler(crawler: AsyncWebCrawler) -> int:
-    """Release every admission lease after a crawler is detached for good."""
+    """Retire local bookkeeping; shared leases stay held until browser close."""
     if getattr(crawler, "_docker_admission_released", False) is True:
         return 0
 
@@ -310,14 +406,17 @@ def _make_browser_capacity(*, refuse_when_full: bool = True) -> Optional[asyncio
 
     if not refuse_when_full:
         return None
-    raise RuntimeError("Crawler browser pool is at capacity")
+    raise BrowserCapacityError()
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Get crawler from pool with tiered strategy."""
-    await ADMISSION_SEM.acquire()
+    lease = await _acquire_admission()
     try:
-        return await _get_admitted_crawler(cfg)
+        crawler = await _get_admitted_crawler(cfg)
+        _attach_admission(crawler, lease)
+        return crawler
     except BaseException:
+        lease.close()
         ADMISSION_SEM.release()
         raise
 
@@ -330,16 +429,11 @@ async def get_dedicated_crawler(cfg: BrowserConfig, *, crawler_strategy=None) ->
     an unreachable signature so every browser instance is counted while its
     admission lease remains held from creation through disposal.
     """
-    await ADMISSION_SEM.acquire()
+    lease = await _acquire_admission()
     try:
         while True:
             close_task = None
             async with LOCK:
-                mem_pct = get_container_memory_percent()
-                if mem_pct >= MEM_LIMIT:
-                    raise MemoryError(
-                        f"Memory at {mem_pct:.1f}%, refusing dedicated browser"
-                    )
                 close_task = _make_browser_capacity()
                 if close_task is None:
                     crawler = AsyncWebCrawler(
@@ -354,9 +448,11 @@ async def get_dedicated_crawler(cfg: BrowserConfig, *, crawler_strategy=None) ->
                     COLD_POOL[sig] = crawler
                     LAST_USED[sig] = time.time()
                     USAGE_COUNT[sig] = 1
+                    _attach_admission(crawler, lease)
                     return crawler
             await asyncio.shield(close_task)
     except BaseException:
+        lease.close()
         ADMISSION_SEM.release()
         raise
 
@@ -365,7 +461,7 @@ async def release_dedicated_crawler(crawler: AsyncWebCrawler) -> None:
     """Close a request-owned crawler, then release its admission lease.
 
     Cleanup runs in a shielded task so caller cancellation cannot leave a live
-    browser registered or leak the shared semaphore permit.
+    browser registered or leak its admission leases.
     """
     existing_cleanup = getattr(crawler, "_docker_release_task", None)
     if isinstance(existing_cleanup, asyncio.Task):
@@ -483,16 +579,10 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
                     return crawler
 
             if not replace_permanent and close_task is None:
-                # Memory check before creating new
-                mem_pct = get_container_memory_percent()
-                if mem_pct >= MEM_LIMIT:
-                    logger.error(f"💥 Memory pressure: {mem_pct:.1f}% >= {MEM_LIMIT}%")
-                    raise MemoryError(f"Memory at {mem_pct:.1f}%, refusing new browser")
-
                 # Create new in cold pool
                 close_task = _make_browser_capacity()
                 if close_task is None:
-                    logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]}, mem={mem_pct:.1f}%)")
+                    logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]})")
                     crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
                     await _start_or_retire(crawler)
                     _set_active_requests(crawler, 1)
@@ -522,7 +612,10 @@ async def release_crawler(crawler: AsyncWebCrawler):
     active = _active_requests(crawler)
     if active > 0:
         _set_active_requests(crawler, active - 1)
-    ADMISSION_SEM.release()
+        leases = getattr(crawler, "_docker_page_leases", None)
+        if isinstance(leases, list) and leases:
+            leases.pop().close()
+        ADMISSION_SEM.release()
 
 
 async def _init_permanent_locked(
@@ -648,6 +741,13 @@ def _close_in_background(crawler: AsyncWebCrawler) -> asyncio.Task:
                 )
         except Exception:
             pass
+        finally:
+            # Detachment is not page teardown. Other processes cannot see our
+            # _CLOSE_TASKS, so keep charging retired pages through their close.
+            leases = getattr(crawler, "_docker_page_leases", None)
+            if isinstance(leases, list):
+                while leases:
+                    leases.pop().close()
     task = asyncio.create_task(_close())
     setattr(crawler, "_docker_close_task", task)
     _CLOSE_TASKS.add(task)

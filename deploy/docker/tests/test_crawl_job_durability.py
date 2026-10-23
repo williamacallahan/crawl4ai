@@ -408,3 +408,26 @@ def test_lua_replay_has_one_enqueue_attempt_and_terminal_event(redis_url, replay
             assert events[0][1]["result"] == {"ok": True}
             assert await queue.read_outbox("delivery") == []
     asyncio.run(exercise())
+
+
+def test_capacity_refusal_waits_without_spending_an_attempt(redis_url):
+    from crawler_pool import BrowserCapacityError
+
+    async def exercise():
+        async with isolated_queue(redis_url) as (client, queue, enqueue, _owner):
+            task_id = await enqueue()
+            entry = (await queue.read_new("busy"))[0]
+            refusals = []
+
+            async def crawl(_payload):
+                if len(refusals) < 2:
+                    refusals.append(True)
+                    raise BrowserCapacityError()
+                return {"success": True, "body": "admitted"}
+
+            await CrawlJobWorker(queue, queue.config, "busy", crawl=crawl).process(entry)
+            task = await client.hgetall(queue.task_key(task_id))
+            assert task[b"status"] == b"completed"
+            assert task[b"attempt"] == b"1"
+            assert len(refusals) == 2
+    asyncio.run(exercise())
