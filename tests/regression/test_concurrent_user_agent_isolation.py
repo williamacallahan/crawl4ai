@@ -105,7 +105,9 @@ def _build_strategy_with_capturing_pages():
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         tag = await queue.get()
-        return make_page(tag), MagicMock()
+        context = MagicMock()
+        context.new_cdp_session = AsyncMock(return_value=AsyncMock())
+        return make_page(tag), context
 
     strategy.browser_manager = MagicMock()
     strategy.browser_manager.get_page = get_page
@@ -257,7 +259,9 @@ async def test_persistent_context_skips_per_crawl_ua_block():
     page.set_extra_http_headers = set_extra_http_headers
     page.goto = AsyncMock(side_effect=RuntimeError("STOP_AFTER_UA"))
     strategy.browser_manager = MagicMock()
-    strategy.browser_manager.get_page = AsyncMock(return_value=(page, MagicMock()))
+    context = MagicMock()
+    context.new_cdp_session = AsyncMock(return_value=AsyncMock())
+    strategy.browser_manager.get_page = AsyncMock(return_value=(page, context))
     strategy.browser_manager.release_page_with_context = AsyncMock()
 
     original_ua = strategy.browser_config.user_agent

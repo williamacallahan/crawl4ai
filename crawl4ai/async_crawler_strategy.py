@@ -31,7 +31,8 @@ from .async_configs import (
 )
 from .async_logger import AsyncLogger
 from .browser_adapter import BrowserAdapter, PlaywrightAdapter, UndetectedAdapter
-from .browser_manager import BrowserManager
+from .browser_manager import BrowserManager, PAGE_CLOSE_SECONDS
+from .browser_budget import page_deadline, within_page_budget
 from .config import SCREENSHOT_HEIGHT_TRESHOLD
 from .js_snippet import load_js_script
 from .models import AsyncCrawlResponse
@@ -374,7 +375,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # For timeout or other cases, just return False
             return False
 
-    async def process_iframes(self, page):
+    async def process_iframes(self, page, max_iframes: int = 20):
         """
         Process iframes on a page. This function will extract the content of each iframe and replace it with a div containing the extracted content.
 
@@ -387,7 +388,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         # Find all iframes
         iframes = await page.query_selector_all("iframe")
 
-        for i, iframe in enumerate(iframes):
+        for i, iframe in enumerate(iframes[:max_iframes]):
             try:
                 # Add a unique identifier to the iframe
                 await iframe.evaluate(f'(element) => element.id = "iframe-{i}"')
@@ -547,6 +548,35 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
     async def _crawl_web(
         self, url: str, config: CrawlerRunConfig
     ) -> AsyncCrawlResponse:
+        # A navigation timeout alone does not bound evaluate(), content(), hooks,
+        # or iframe work. They all spend the same budget, starting at admission.
+        seconds = config.page_timeout / 1000
+        token = page_deadline.set(asyncio.get_running_loop().time() + seconds)
+        try:
+            return await asyncio.wait_for(self._crawl_web_impl(url, config), seconds)
+        except asyncio.TimeoutError as error:
+            raise asyncio.TimeoutError(f"Page timeout after {config.page_timeout}ms") from error
+        finally:
+            page_deadline.reset(token)
+
+    async def _terminate_page(self, page: Page, timeout: float, session=None) -> None:
+        """Interrupt through a session attached before site JavaScript can wedge it."""
+        if getattr(self.browser_config, "browser_type", None) != "chromium":
+            return
+        try:
+            async def terminate():
+                target = session or await page.context.new_cdp_session(page)
+                await target.send("Runtime.terminateExecution")
+            await asyncio.wait_for(terminate(), timeout)
+        except asyncio.TimeoutError:
+            self.browser_manager.request_pool_recycle("script termination timed out")
+        except Exception:
+            # A crashed/already-closed renderer has no script left to interrupt.
+            pass
+
+    async def _crawl_web_impl(
+        self, url: str, config: CrawlerRunConfig
+    ) -> AsyncCrawlResponse:
         """
         Internal method to crawl web URLs with the specified configuration.
         Includes optional network and console capturing.
@@ -621,6 +651,19 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
         page = None
         context = None
+        execution_session = None
+        renderer_crashed = False
+        crash_cleanup = None
+
+        def on_crash(crashed_page):
+            nonlocal renderer_crashed, crash_cleanup
+            renderer_crashed = True
+            # Closing the crashed target rejects its pending Playwright calls;
+            # cancelling only the Python waiter leaves protocol promises alive.
+            crash_cleanup = asyncio.create_task(
+                self.browser_manager._close_page_quietly(crashed_page)
+            )
+
         try:
             # Thread the per-crawl UA / hint into ``get_page`` so the context
             # created (or reused) for this crawl is baked with THIS crawl's UA
@@ -638,6 +681,14 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 user_agent=override_ua if ua_changed else None,
                 browser_hint=override_hint if ua_changed else None,
             )
+
+            # Playwright evaluate promises can remain pending after SIGKILL.
+            # The page crash event is the renderer's terminal signal.
+            page.on("crash", on_crash)
+            # Attaching CDP to an already-busy renderer can itself hang. Attach
+            # while this page is still blank, before hooks/navigation run JS.
+            if getattr(self.browser_config, "browser_type", None) == "chromium":
+                execution_session = await within_page_budget(context.new_cdp_session(page))
 
             # Push configured headers to the live page so headers added after
             # context creation reach the wire. Per-crawl UA locals are applied
@@ -1165,7 +1216,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
             # Process iframes if needed
             if config.process_iframes:
-                page = await self.process_iframes(page)
+                page = await within_page_budget(self.process_iframes(page, config.max_iframes))
 
             # Handle CMP/consent popup removal (before generic overlay removal)
             if config.remove_consent_popups:
@@ -1187,7 +1238,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         message="Shadow DOM flattening returned no content, falling back to page.content()",
                         tag="SCRAPE",
                     )
-                    html = await page.content()
+                    html = await within_page_budget(page.content())
             elif config.css_selector:
                 try:
                     selectors = [s.strip() for s in config.css_selector.split(',')]
@@ -1208,7 +1259,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 except Error as e:
                     raise RuntimeError(f"Failed to extract HTML content: {str(e)}")
             else:
-                html = await page.content()
+                html = await within_page_budget(page.content())
 
             await self.execute_hook(
                 "before_return_html", page=page, html=html, context=context, config=config
@@ -1259,7 +1310,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 # HTML captured at crawl time.
                 if config.session_id and page is not None and not page.is_closed():
                     try:
-                        return await page.content()
+                        return await asyncio.wait_for(page.content(), config.page_timeout / 1000)
                     except Error as error:
                         if "closed" in str(error).lower():
                             return html
@@ -1289,6 +1340,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 captured_console.extend(final_messages or [])
 
             # Return complete response
+            self.browser_manager.consecutive_failures = 0
             return AsyncCrawlResponse(
                 html=html,
                 response_headers=response_headers,
@@ -1309,19 +1361,41 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 console_messages=captured_console if config.capture_console_messages else None,
             )
 
+        except BaseException as error:
+            # Timeout cancellation reaches here before finally closes the page.
+            # Playwright navigation errors may wrap its TimeoutError in RuntimeError.
+            failure = str(error).lower()
+            cancelled = isinstance(error, asyncio.CancelledError)
+            deadline = page_deadline.get()
+            timed_out = (isinstance(error, (asyncio.TimeoutError, PlaywrightTimeoutError))
+                         or "timeout" in failure
+                         or (cancelled and deadline is not None
+                             and asyncio.get_running_loop().time() >= deadline))
+            if page is not None and not renderer_crashed and (timed_out or cancelled):
+                await self._terminate_page(page, config.page_termination_timeout, execution_session)
+            if renderer_crashed or timed_out or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
+                self.browser_manager.consecutive_failures += 1
+            if renderer_crashed:
+                raise Error("Target page crashed") from error
+            raise
+
         finally:
             if page is not None:
                 cleanup_cancelled = False
                 # Always clean up event listeners to prevent accumulation across
                 # reuses (even for session pages).
                 try:
+                    page.remove_listener("crash", on_crash)
+                    if crash_cleanup is not None:
+                        await crash_cleanup
                     if config.capture_network_requests:
                         page.remove_listener("request", handle_request_capture)
                         page.remove_listener("response", handle_response_capture)
                         page.remove_listener("requestfailed", handle_request_failed_capture)
                     if config.capture_console_messages:
-                        final_messages = await self.adapter.cleanup_console_capture(
-                            page, handle_console, handle_error
+                        final_messages = await asyncio.wait_for(
+                            self.adapter.cleanup_console_capture(page, handle_console, handle_error),
+                            PAGE_CLOSE_SECONDS,
                         )
                         captured_console.extend(final_messages or [])
                     # Remove the download listener registered in the try: block
@@ -1334,16 +1408,17 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         for task in list(_inflight_downloads):
                             task.cancel()
                         if _inflight_downloads:
-                            await asyncio.gather(
-                                *_inflight_downloads, return_exceptions=True
+                            await asyncio.wait_for(
+                                asyncio.gather(*_inflight_downloads, return_exceptions=True),
+                                PAGE_CLOSE_SECONDS,
                             )
                 except asyncio.CancelledError:
                     cleanup_cancelled = True
                 except Exception:
                     pass
                 if not config.session_id:
-                    # ALWAYS decrement refcount first — must succeed even if the
-                    # browser crashed or cleanup itself was cancelled.
+                    # The manager owns bounded page/context teardown and settles
+                    # the allocation token even if cleanup is cancelled.
                     try:
                         await self.browser_manager.release_page_with_context(page)
                     except asyncio.CancelledError:
@@ -1351,23 +1426,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     except Exception:
                         pass
 
-                    # Keep only a managed browser's last page: get_page reuses
-                    # it. Every other page is freshly created per crawl, so a
-                    # kept one is never reused and its renderer lives as long
-                    # as the browser.
+                if config.session_id and execution_session is not None:
                     try:
-                        all_contexts = page.context.browser.contexts
-                        total_pages = sum(len(context.pages) for context in all_contexts)
-                        if not (
-                            total_pages <= 1
-                            and self.browser_config.use_managed_browser
-                        ):
-                            await page.close()
+                        await asyncio.wait_for(execution_session.detach(), config.page_termination_timeout)
                     except asyncio.CancelledError:
                         cleanup_cancelled = True
                     except Exception:
                         pass
-
                 if cleanup_cancelled:
                     raise asyncio.CancelledError
 

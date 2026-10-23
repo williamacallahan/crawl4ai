@@ -1,38 +1,10 @@
-"""Regression tests for the crawler pool janitor evicting a browser mid-recycle.
+"""The pool janitor must not evict a browser during its own recycle.
 
-``BrowserManager`` recycles an owned Chromium process in place after
-``max_pages_before_recycle`` pages, running ``close(_for_recycle=True)`` ->
-``start()`` in a shielded, fire-and-forget background task
-(``_recycle_browser``). While that runs, the manager lies fallow at
-``active_requests == 0`` and ``_recycling is True`` with its ``browser``/
-``default_context`` temporarily ``None``.
-
-Commit ``93b3d77`` taught the *admission* path (``_is_live`` /
-``_discard_if_unavailable``) to treat a recycling manager as live so the pool
-blocks on the library's own restart instead of force-replacing a healthy
-browser. The *janitor's* eviction loop (``_janitor_pass``) was never updated:
-a recycling browser at ``active_requests == 0`` past its TTL is
-indistinguishable from a long-dead idle browser, so the janitor detached and
-``_close_in_background``-ed it. The janitor's 60s close cap then cancelled
-``close()`` at the shielded recycle-task await, the keeps-running shielded
-``start()`` finished a fresh driver + Chromium on the now-detached manager
-(left ``_closing=True``), and nothing ever closed it again - a monotonic
-Chromium process leak (the exact class ``bdccf62`` / ``d0f57c0`` closed).
-
-These tests drive the real ``BrowserManager.close(_for_recycle=True)`` recycle
-machinery with only the Playwright/Chromium transport stubbed (mirroring the
-doubles ``tests/regression/test_browser_lifecycle_residuals.py`` and
-``test_is_live_recycle.py`` use), then exercise the real
-``crawler_pool._janitor_pass``. They assert:
-
-* the new ``_is_recycling`` gate skips a mid-recycle browser past TTL (the fix),
-* the browser stays registered, healthy and closeable after the pass (no
-  orphan), and is evicted normally once the recycle clears (no regression),
-* plain idle browsers past TTL are still evicted (no regression), and
-* the orphan mechanism the janitor now avoids reproduces directly when the
-  close budget fires during a straddling ``start()``.
-
-Browser-free: ``-m "not browser"`` picks these up in the CI unit gate.
+These browser-free tests drive BrowserManager's real close/start lifecycle
+with only the Playwright transport stubbed. They verify that TTL eviction
+skips a recycling browser, then resumes after recycling completes. Ordinary
+idle browsers still expire. A counterfactual close-budget test reproduces
+the orphaned Chromium mechanism that the recycling guard prevents.
 """
 
 import asyncio
@@ -87,13 +59,28 @@ class _Context:
     def __init__(self):
         self.pages = []
         self.closed = False
+        self.handlers = {}
+        self.headers = {}
+
+    def on(self, event, handler):
+        self.handlers.setdefault(event, []).append(handler)
+
+    async def set_extra_http_headers(self, headers):
+        self.headers = dict(headers)
 
     def is_closed(self):
         return self.closed
 
+    def remove_listener(self, event, handler):
+        callbacks = self.handlers.get(event, [])
+        if handler in callbacks:
+            callbacks.remove(handler)
+
     async def new_page(self):
         page = _Page(self)
         self.pages.append(page)
+        for handler in self.handlers.get("page", []):
+            handler(page)
         return page
 
     async def close(self):
@@ -109,6 +96,9 @@ class _Browser:
 
     def is_connected(self):
         return self._connected
+
+    async def new_context(self, **_settings):
+        return _Context()
 
     async def close(self):
         self._connected = False

@@ -10,6 +10,8 @@ import time
 import json
 import weakref
 
+from .browser_budget import within_page_budget
+
 # Import both, but use conditionally
 try:
     from playwright.async_api import Page
@@ -57,8 +59,8 @@ class PlaywrightAdapter(BrowserAdapter):
     async def evaluate(self, page: Page, expression: str, arg: Any = None) -> Any:
         """Standard Playwright evaluate"""
         if arg is not None:
-            return await page.evaluate(expression, arg)
-        return await page.evaluate(expression)
+            return await within_page_budget(page.evaluate(expression, arg))
+        return await within_page_budget(page.evaluate(expression))
     
     async def setup_console_capture(self, page: Page, captured_console: List[Dict]) -> Optional[Callable]:
         """Setup console capture using Playwright's event system"""
@@ -168,8 +170,8 @@ class StealthAdapter(BrowserAdapter):
     async def evaluate(self, page: Page, expression: str, arg: Any = None) -> Any:
         """Standard Playwright evaluate with stealth applied"""
         if arg is not None:
-            return await page.evaluate(expression, arg)
-        return await page.evaluate(expression)
+            return await within_page_budget(page.evaluate(expression, arg))
+        return await within_page_budget(page.evaluate(expression))
 
     async def setup_console_capture(self, page: Page, captured_console: List[Dict]) -> Optional[Callable]:
         """Setup console capture using Playwright's event system with stealth"""
@@ -271,8 +273,8 @@ class UndetectedAdapter(BrowserAdapter):
         )
         
         if arg is not None:
-            return await page.evaluate(expression, arg, isolated_context=isolated)
-        return await page.evaluate(expression, isolated_context=isolated)
+            return await within_page_budget(page.evaluate(expression, arg, isolated_context=isolated))
+        return await within_page_budget(page.evaluate(expression, isolated_context=isolated))
     
     async def setup_console_capture(self, page: UndetectedPage, captured_console: List[Dict]) -> Optional[Callable]:
         """Setup console capture using JavaScript injection for undetected browsers"""

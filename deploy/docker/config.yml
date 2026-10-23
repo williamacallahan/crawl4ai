@@ -129,6 +129,8 @@ crawler:
   base_config:
     # Give JavaScript application shells time to hydrate before validation.
     delay_before_return_html: 1.0
+    max_iframes: 20
+    page_termination_timeout: 5.0
   memory_threshold_percent: 80.0
   recovery_threshold_percent: 65.0
   rate_limiter:
@@ -144,6 +146,13 @@ crawler:
     stale_lease_s: 0                      # leak backstop ceiling; 0 = auto: max(2 x limits.wall_clock_s, 21600).
                                           # If you set wall_clock_s: 0 for very long crawls, raise this above
                                           # your longest crawl or the janitor may force-close it mid-flight.
+    watchdog:
+      interval_seconds: 5.0
+      renderer_cpu_cores: 0.9
+      renderer_cpu_seconds: 20.0
+      renderer_rss_mb: 768
+      browser_probe_timeout_seconds: 5.0
+      consecutive_failure_limit: 3
   browser:
     kwargs:
       headless: true
@@ -169,9 +178,6 @@ crawler:
       - "--disable-dev-shm-usage"
       - "--disable-gpu"
       - "--disable-software-rasterizer"
-      # Up to max_pages concurrent pages share at most this many renderer
-      # processes per browser instead of one renderer each.
-      - "--renderer-process-limit=4"
       # --disable-web-security removed for security (enables cross-origin access)
       # --allow-insecure-localhost / --ignore-certificate-errors removed: they
       # disabled TLS verification for every crawl (MITM / SSRF-to-internal-TLS).

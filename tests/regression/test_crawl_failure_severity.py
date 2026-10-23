@@ -53,8 +53,10 @@ def _navigation_strategy(error_detail):
     page.goto = AsyncMock(side_effect=Error(error_detail))
     page.context.browser.contexts = []
     strategy.browser_manager = MagicMock()
+    context = MagicMock()
+    context.new_cdp_session = AsyncMock(return_value=AsyncMock())
     strategy.browser_manager.get_page = AsyncMock(
-        return_value=(page, MagicMock())
+        return_value=(page, context)
     )
     strategy.browser_manager.release_page_with_context = AsyncMock()
     return strategy
