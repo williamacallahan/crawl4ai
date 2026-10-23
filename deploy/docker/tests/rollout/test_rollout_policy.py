@@ -62,7 +62,7 @@ def test_redis_pins_encode_the_2026_08_28_incident_invariants():
     assert rollout_policy.REDIS_COMMAND[rollout_policy.REDIS_COMMAND.index("--appendfsync") + 1] == "everysec"
     assert rollout_policy.REDIS_COMMAND[rollout_policy.REDIS_COMMAND.index("--appendonly") + 1] == "yes"
     assert rollout_policy.REDIS_COMMAND[rollout_policy.REDIS_COMMAND.index("--maxmemory") + 1] == "700mb"
-    assert rollout_policy.REDIS_COMMAND[rollout_policy.REDIS_COMMAND.index("--maxmemory-policy") + 1] == "volatile-lru"
+    assert rollout_policy.REDIS_COMMAND[rollout_policy.REDIS_COMMAND.index("--maxmemory-policy") + 1] == "noeviction"
     assert rollout_policy.REDIS_MOUNTS == [
         {"Type": "volume", "Source": "crawl4ai-redis-data", "Target": "/data"}
     ]
