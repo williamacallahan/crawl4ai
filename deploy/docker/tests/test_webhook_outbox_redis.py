@@ -91,35 +91,24 @@ def test_takeover_keeps_persisted_retry_budget_and_rejects_previous_owner(redis_
                 replacement = CrawlJobWorker(queue, queue.config, "replacement")
                 await replacement.process_outbox(*reclaimed[0])
                 # The configured maximum is two attempts across both workers,
-                # so replacement sends once and retains the failed delivery.
+                # so replacement sends once and then drops the spent event.
                 assert len(requests) == 2
                 assert requests[0]["event_id"] == requests[1]["event_id"] == event["event_id"]
                 assert requests[0]["data"] == requests[1]["data"] == event["result"]
-                retained = await client.xrange(queue.outbox_stream)
-                assert len(retained) == 1
-                assert await client.hget(attempts_key, stream_id) == b"2"
-                assert await client.hget(attempts_key, stream_id + ":failed") == b"1"
-                assert await queue.pending_outbox("replacement") == []
-                assert 0 < await client.ttl(queue.outbox_stream) <= 86400
-                assert 0 < await client.ttl(attempts_key) <= 86400
-                for consumer in ("another-restart", "third-restart", "fourth-restart"):
-                    await age_outbox(client, queue)
-                    assert await queue.read_outbox(consumer) == []
-                    assert await queue.pending_outbox(consumer) == []
-                    # A sender retaining the old decoded event still cannot send.
-                    await CrawlJobWorker(queue, queue.config, consumer).process_outbox(stream_id, event)
-                    assert len(requests) == 2
-                    assert await client.xrange(queue.outbox_stream) == retained
-                    assert await client.hget(attempts_key, stream_id) == b"2"
-                    pending = await client.xpending_range(queue.outbox_stream, queue.outbox_group, "-", "+", 1)
-                    assert pending[0]["message_id"] == stream_id.encode()
-                    assert pending[0]["consumer"] == consumer.encode()
+                assert await client.xlen(queue.outbox_stream) == 0
+                assert await client.hget(attempts_key, stream_id) is None
+                await age_outbox(client, queue)
+                assert await queue.read_outbox("another-restart") == []
+                assert await queue.pending_outbox("another-restart") == []
+                # A sender retaining the old decoded event still cannot send.
+                await CrawlJobWorker(queue, queue.config, "another-restart").process_outbox(stream_id, event)
+                assert len(requests) == 2
                 assert await client.hget(queue.task_key(task_id), "status") == b"completed"
 
     asyncio.run(exercise())
 
 
-def test_client_rejection_is_retained_without_http_retry_after_reclaim(redis_url, local_webhook):
+def test_client_rejection_is_dropped_without_http_retry(redis_url, local_webhook):
     async def exercise():
         with unavailable_receiver(400) as (url, requests, _received):
             async with isolated_queue(redis_url) as (client, queue, enqueue, _owner):
@@ -128,28 +117,19 @@ def test_client_rejection_is_retained_without_http_retry_after_reclaim(redis_url
                 stream_id, event = (await queue.pending_outbox("crawl"))[0]
                 await CrawlJobWorker(queue, queue.config, "crawl").process_outbox(stream_id, event)
                 assert len(requests) == 1
-                attempts_key = f"{queue.outbox_stream}:attempts"
-                assert await client.hget(attempts_key, stream_id) == b"1"
-                assert await client.hget(attempts_key, stream_id + ":failed") == b"1"
-                assert await queue.pending_outbox("crawl") == []
-                retained = await client.xrange(queue.outbox_stream)
-                assert len(retained) == 1
+                assert await client.xlen(queue.outbox_stream) == 0
+                assert await client.hget(f"{queue.outbox_stream}:attempts", stream_id) is None
                 for consumer in ("replacement", "another-restart"):
                     await age_outbox(client, queue)
                     assert await queue.read_outbox(consumer) == []
-                    assert await queue.pending_outbox(consumer) == []
                     await CrawlJobWorker(queue, queue.config, consumer)._deliver_pending_webhooks()
                     assert len(requests) == 1
-                    assert await client.hget(attempts_key, stream_id) == b"1"
-                    assert await client.xrange(queue.outbox_stream) == retained
-                    assert (await client.xpending(queue.outbox_stream, queue.outbox_group))["pending"] == 1
-                assert 0 < await client.ttl(queue.outbox_stream) <= 86400
-                assert 0 < await client.ttl(attempts_key) <= 86400
+                    assert (await client.xpending(queue.outbox_stream, queue.outbox_group))["pending"] == 0
 
     asyncio.run(exercise())
 
 
-def test_exhausted_delivery_expires_and_next_completion_recreates_group(redis_url, local_webhook):
+def test_exhausted_delivery_is_dropped_and_expired_group_is_recreated(redis_url, local_webhook):
     async def exercise():
         with unavailable_receiver() as (failed_url, failed_requests, _received), receiver() as (url, requests):
             async with isolated_queue(redis_url) as (client, queue, enqueue, _owner):
@@ -159,23 +139,15 @@ def test_exhausted_delivery_expires_and_next_completion_recreates_group(redis_ur
                 await CrawlJobWorker(queue, queue.config, "crawl").process_outbox(stream_id, event)
                 assert len(failed_requests) == 2
                 attempts_key = f"{queue.outbox_stream}:attempts"
-                assert await client.hget(attempts_key, stream_id) == b"2"
-                assert await queue.pending_outbox("crawl") == []
-                assert 0 < await client.ttl(queue.outbox_stream) <= 86400
-                assert 0 < await client.ttl(attempts_key) <= 86400
-
-                # Accelerate the same Redis expiry; reclaim must not renew a spent event.
-                await client.pexpire(queue.outbox_stream, 200)
-                await client.pexpire(attempts_key, 200)
+                assert await client.xlen(queue.outbox_stream) == 0
+                assert await client.hget(attempts_key, stream_id) is None
                 await age_outbox(client, queue)
                 assert await queue.read_outbox("restart") == []
-                assert await queue.pending_outbox("restart") == []
                 await CrawlJobWorker(queue, queue.config, "restart").process_outbox(stream_id, event)
                 assert len(failed_requests) == 2
-                assert await client.xlen(queue.outbox_stream) == 1
-                assert 0 < await client.pttl(queue.outbox_stream) <= 200
-                assert 0 < await client.pttl(attempts_key) <= 200
 
+                # An idle stream still expires with its group.
+                await client.pexpire(queue.outbox_stream, 200)
                 async def expired():
                     while await client.exists(queue.outbox_stream, attempts_key):
                         await asyncio.sleep(0.01)
@@ -256,8 +228,6 @@ def test_outbox_trims_at_capacity_without_blocking_enqueue_and_cleans_metadata(r
             attempts_key = f"{queue.outbox_stream}:attempts"
             assert await queue.reserve_outbox_attempt(stream_id, "delivery") == 1
             assert await client.hget(attempts_key, stream_id) == b"1"
-            await queue.fail_outbox(stream_id, "delivery")
-            assert await client.hget(attempts_key, stream_id + ":failed") == b"1"
             assert 0 < await client.ttl(queue.outbox_stream) <= 86400
             assert 0 < await client.ttl(attempts_key) <= 86400
 
@@ -270,7 +240,6 @@ def test_outbox_trims_at_capacity_without_blocking_enqueue_and_cleans_metadata(r
             assert [entry[0] for entry in after[:3]] == [entry[0] for entry in before[1:]]
             assert await client.hget(attempts_key, stream_id) is None
             assert await client.hget(attempts_key, stream_id + ":operation") is None
-            assert await client.hget(attempts_key, stream_id + ":failed") is None
             pending = await client.xpending_range(
                 queue.outbox_stream, queue.outbox_group, "-", "+", queue.settings.max_pending_jobs
             )

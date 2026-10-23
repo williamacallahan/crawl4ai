@@ -42,9 +42,6 @@ class CrawlJobLeaseLost(RuntimeError):
     """Raised when another consumer has taken over a pending crawl job."""
 
 
-class CrawlJobWorkerDied(RuntimeError):
-    """A running attempt lost its worker; repeating it can kill another replica."""
-
 
 class CrawlJobQueueFull(RuntimeError):
     """Raised when the configured durable crawl-job backlog is full."""
@@ -119,16 +116,10 @@ if #messages > 0 then
   if task_id and protocol_version == ARGV[7] then
     local payload_key = ARGV[6] .. task_id
     if redis.call('HEXISTS', payload_key, 'payload') == 1 then
-      local fence = redis.call('HGET', payload_key, 'fence_token')
-      local state = redis.call('HGET', payload_key, 'attempt_state')
-      local owned = redis.call('HGET', payload_key, 'start_operation') == fence
-      -- Old scripts retain unknown fields: a foreign fence invalidates them.
-      if (state == 'running' and owned)
-        or redis.call('HGET', payload_key, 'worker_died') == fence then
-        redis.call('HSET', payload_key, 'worker_died', ARGV[5])
-      else
-        redis.call('HDEL', payload_key, 'worker_died', 'attempt_state', 'start_operation')
-      end
+      -- A stale lease is not proof of a crash: SIGTERM at deploy, a Redis
+      -- blip or a stalled loop look the same, so reclaim always retries on
+      -- the attempt budget; the HTML byte bound stops the OOM chain upstream.
+      redis.call('HDEL', payload_key, 'worker_died', 'attempt_state', 'start_operation')
       redis.call(
         'HSET', payload_key,
         'lease_owner', ARGV[2], 'fence_token', ARGV[5]
@@ -154,9 +145,8 @@ if redis.call('HGET', KEYS[2], 'start_operation') == ARGV[4]
   return {1, tonumber(redis.call('HGET', KEYS[2], 'attempt'))}
 end
 local fence = redis.call('HGET', KEYS[2], 'fence_token')
-if redis.call('HGET', KEYS[2], 'worker_died') == fence
-  or (redis.call('HGET', KEYS[2], 'attempt_state') == 'running'
-      and redis.call('HGET', KEYS[2], 'start_operation') == fence) then return {0, 0} end
+if redis.call('HGET', KEYS[2], 'attempt_state') == 'running'
+  and redis.call('HGET', KEYS[2], 'start_operation') == fence then return {0, 0} end
 local attempt = redis.call('HINCRBY', KEYS[2], 'attempt', 1)
 redis.call(
   'HSET', KEYS[2], 'attempt', attempt, 'lease_owner', ARGV[2],
@@ -555,23 +545,7 @@ class CrawlJobQueue(CrawlJobOutbox):
 
         next_start_id, messages, _deleted = response
         self._claim_cursor = _as_text(next_start_id)
-        entries = []
-        for entry in self._messages_to_entries(messages):
-            key = self.payload_key(entry.task_id)
-            died, fence = await self.redis.hmget(key, "worker_died", "fence_token")
-            if died and died == fence:
-                payload = await self.load_payload(entry.task_id)
-                if payload is not None:
-                    number, fence = await self.redis.hmget(key, "attempt", "fence_token")
-                    attempt = CrawlJobAttempt(int(number), _as_text(fence), consumer)
-                    try:
-                        await self.complete(entry, payload, attempt,
-                            error=f"worker_died: {CrawlJobWorkerDied('worker died while running this job')}")
-                    except CrawlJobLeaseLost:
-                        pass  # Another reclaim owns the same poison disposition.
-                    continue
-            entries.append(entry)
-        return entries
+        return self._messages_to_entries(messages)
 
     async def load_payload(self, task_id: str) -> dict | None:
         payload = await self.redis.hget(self.payload_key(task_id), "payload")

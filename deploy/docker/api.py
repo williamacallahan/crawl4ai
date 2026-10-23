@@ -1154,11 +1154,11 @@ def create_task_response(task: dict, task_id: str, base_url: str, collection: st
     # its per-URL diagnostics, so result and error are not exclusive.
     try:
         result = decode_task_result(task, task_id)
-    except ResultTooLarge:
+    except ResultTooLarge as error:
         # Stored before results were bounded: poll it as a terminal failure
         # instead of inflating it past the read budget into a 500.
         response["status"] = TaskStatus.FAILED.value
-        response["error"] = "result_too_large"
+        response["error"] = f"result_too_large: {error}"
         return response
     if task.get("result"):
         response["result"] = result

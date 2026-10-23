@@ -238,7 +238,9 @@ def child_worker(redis_url, queue, owner, mode):
         process.stderr.close()
 
 
-def test_killed_running_worker_is_failed_without_a_second_crawl(redis_url):
+def test_killed_running_worker_is_retried_on_its_attempt_budget(redis_url):
+    """A deploy's SIGTERM, a Redis blip and an OOM kill all leave a stale
+    running attempt; none of them is proof the job itself is poison."""
     async def exercise():
         async with isolated_queue(redis_url) as (client, queue, enqueue, owner):
             task_id = await enqueue()
@@ -251,18 +253,17 @@ def test_killed_running_worker_is_failed_without_a_second_crawl(redis_url):
             from crawl_job_queue import CrawlJobEntry
             entry = CrawlJobEntry(entries[0][0].decode(), task_id)
             await stale(client, queue, entry, "killed-worker")
-            claimed = await queue.claim_stale("replacement")
-            # A running attempt has unknown external effects after process death;
-            # only a deliberately marked, clean retry is safe to execute again.
-            assert claimed == []
+            assert await queue.claim_stale("replacement") == [entry]
+
+            async def crawl(_payload):
+                return {"success": True, "body": "retried"}
+
+            await CrawlJobWorker(queue, queue.config, "replacement", crawl=crawl).process(entry)
             task = await client.hgetall(queue.task_key(task_id))
-            assert task[b"status"] == b"failed"
-            assert b"worker_died" in task[b"error"]
-            assert task[b"attempt"] == b"1"
-            assert await client.get(options["counter"]) == b"1"
+            assert task[b"status"] == b"completed"
+            assert task[b"attempt"] == b"2"
             assert await client.xlen(queue.settings.stream) == 0
             assert await client.zscore(principal_lease_key(owner), task_id) is None
-            assert await enqueue() != task_id
     asyncio.run(exercise())
 
 

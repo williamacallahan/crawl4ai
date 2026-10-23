@@ -36,7 +36,7 @@ def test_legacy_oversized_result_decodes_to_polling_error(encoding):
     )
 
     assert response["status"] == "failed"
-    assert response["error"] == "result_too_large"
+    assert response["error"].startswith("result_too_large: ")
     assert "result" not in response
     assert task["status"] == "completed"
 
@@ -69,6 +69,7 @@ def test_legacy_oversized_result_returns_terminal_polling_error(redis_url, encod
             body = json.loads(response.body)
 
             assert response.status_code == 200
+            assert body["error"].startswith("result_too_large: ")
             assert body == {
                 "task_id": task_id,
                 "status": "failed",
@@ -78,7 +79,7 @@ def test_legacy_oversized_result_returns_terminal_polling_error(redis_url, encod
                     "self": {"href": f"https://crawl.example/crawl/job/{task_id}"},
                     "refresh": {"href": f"https://crawl.example/crawl/job/{task_id}"},
                 },
-                "error": "result_too_large",
+                "error": body["error"],
             }
             assert await client.hgetall(key) == stored
             assert await client.pexpiretime(key) == expiry

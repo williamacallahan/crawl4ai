@@ -151,7 +151,7 @@ class CrawlJobWorker:
                 await self.queue.finish_outbox(stream_id, consumer)
             else:
                 await self.queue.fail_outbox(stream_id, consumer)
-                logger.warning("Webhook %s remains undelivered within outbox retention", stream_id)
+                logger.warning("Webhook %s undelivered after its retry budget; dropped", stream_id)
         except CrawlJobLeaseLost:
             logger.warning("Webhook worker lost lease for %s; leaving it pending", stream_id)
         finally:
