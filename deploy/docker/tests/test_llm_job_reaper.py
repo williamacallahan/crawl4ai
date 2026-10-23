@@ -200,6 +200,13 @@ def test_recovery_race_delivers_one_real_webhook(redis_url, monkeypatch, competi
                 stored = decode_redis_hash(await client.hgetall(key))
                 assert stored["status"] == "failed"
                 assert 59 <= await client.ttl(key) <= 60
+                # Delivery runs in the background so a poll never waits on the
+                # receiver; wait for it, then make sure no second one follows.
+                for _ in range(50):
+                    if receipts:
+                        break
+                    await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
                 assert len(receipts) == 1
                 request_line, headers, payload = receipts[0]
                 assert request_line == "POST /orphan HTTP/1.1"
@@ -379,3 +386,34 @@ def test_orphan_scan_settings_defaults_and_overrides():
 def test_orphan_scan_settings_require_positive_integers(setting, value):
     with pytest.raises(ValueError, match=rf"llm\.{setting}"):
         api.llm_orphan_scan_settings({"llm": {setting: value}})
+
+
+def test_job_cancelled_at_shutdown_still_sends_its_failure_webhook(redis_url, monkeypatch):
+    """The reaper skips terminal tasks, so the shutdown cancel is the only notice."""
+    async def exercise():
+        client = aioredis.from_url(redis_url)
+        config = reaper_config()
+        cancelled = {}
+
+        async def enqueue_then_shut_down(_background, _factory, principal=None, on_cancel=None):
+            cancelled["done"] = await on_cancel()
+
+        monkeypatch.setattr(api, "_enqueue_job", enqueue_then_shut_down)
+        monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
+        try:
+            async with webhook_receiver(monkeypatch) as (url, receipts):
+                response = await api.create_new_task(
+                    client, None, "https://example.com", "extract", None, "0",
+                    "https://crawl.example/", config,
+                    webhook_config={"webhook_url": url, "webhook_headers": {}},
+                )
+                task_id = json.loads(response.body)["task_id"]
+                stored = decode_redis_hash(await client.hgetall(f"task:{task_id}"))
+                assert stored["status"] == TaskStatus.FAILED.value
+                assert len(receipts) == 1
+                assert receipts[0][2]["status"] == "failed"
+                assert receipts[0][2]["error"] == "LLM extraction interrupted by server shutdown"
+        finally:
+            await client.aclose()
+
+    asyncio.run(exercise())

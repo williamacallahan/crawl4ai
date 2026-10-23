@@ -422,16 +422,26 @@ async def _recover_llm_task(redis, task_id: str, config: dict) -> dict:
     if recovered:
         # Only the atomic transition winner notifies, even when a status read
         # and several replicas' reapers race each other or worker completion.
+        # Sent in the background: a poll or reaper page must not wait through
+        # a slow receiver's whole retry budget.
         webhook_config = task.get("webhook_config")
-        await WebhookDeliveryService(config).notify_job_completion(
-            task_id=task_id,
-            task_type="llm_extraction",
-            status="failed",
-            urls=[task["url"]],
-            webhook_config=json.loads(webhook_config) if webhook_config else None,
-            error=task["error"],
+        _notify_llm_failure_later(
+            config, task_id, task["url"],
+            json.loads(webhook_config) if webhook_config else None, task["error"],
         )
     return task
+
+
+_LLM_NOTIFICATIONS: set[asyncio.Task] = set()
+
+
+def _notify_llm_failure_later(config, task_id, url, webhook_config, error) -> None:
+    notification = asyncio.create_task(WebhookDeliveryService(config).notify_job_completion(
+        task_id=task_id, task_type="llm_extraction", status="failed",
+        urls=[url], webhook_config=webhook_config, error=error,
+    ))
+    _LLM_NOTIFICATIONS.add(notification)
+    notification.add_done_callback(_LLM_NOTIFICATIONS.discard)
 
 
 async def scan_llm_orphans(redis, config: dict, cursor: int = 0) -> int:
@@ -445,6 +455,8 @@ async def scan_llm_orphans(redis, config: dict, cursor: int = 0) -> int:
             # The script checks processing/heartbeat atomically and leaves
             # live, terminal, and pre-heartbeat-release hashes untouched.
             await _recover_llm_task(redis, key.removeprefix("task:"), config)
+        except RedisError:
+            raise
         except Exception:
             logger.exception("Failed to recover LLM task %s", key)
     return cursor
@@ -464,15 +476,19 @@ async def reap_llm_tasks(redis, config: dict) -> None:
 async def _heartbeat_llm_task(redis, task_id: str, config: dict) -> None:
     interval = llm_task_heartbeat_seconds(config)
     # The non-expiring task hash cannot be evicted by volatile-lru.
+    delay = interval
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(delay)
         try:
             if not await redis.eval(_LLM_TASK_HEARTBEAT_SCRIPT, 1, f"task:{task_id}"):
                 return
+            delay = interval
         except RedisError:
             # A Redis restart lasts seconds; ending the loop here would let a
-            # later poll fail this live job once three intervals pass.
+            # later poll fail this live job once three intervals pass, and
+            # waiting a full interval after Redis returns risks the same.
             logger.warning("LLM task %s heartbeat failed; retrying", task_id, exc_info=True)
+            delay = 1.0
 
 
 async def _stop_llm_heartbeat(heartbeat: asyncio.Task) -> None:
@@ -1071,11 +1087,21 @@ async def create_new_task(
     heartbeat = asyncio.create_task(_heartbeat_llm_task(redis, task_id, config))
 
     async def cancel_task() -> None:
+        error = "LLM extraction interrupted by server shutdown"
         try:
-            await _finish_llm_task(redis, f"task:{task_id}", {
-                "status": TaskStatus.FAILED,
-                "error": "LLM extraction interrupted by server shutdown",
-            }, config)
+            if await _finish_llm_task(redis, f"task:{task_id}", {
+                "status": TaskStatus.FAILED, "error": error,
+            }, config):
+                # The reaper skips terminal tasks, so this is the only notice
+                # a webhook-only client gets; bounded so shutdown cannot hang.
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        WebhookDeliveryService(config).notify_job_completion(
+                            task_id=task_id, task_type="llm_extraction", status="failed",
+                            urls=[decoded_url], webhook_config=webhook_config, error=error,
+                        ),
+                        timeout=10,
+                    )
         finally:
             await _stop_llm_heartbeat(heartbeat)
 
