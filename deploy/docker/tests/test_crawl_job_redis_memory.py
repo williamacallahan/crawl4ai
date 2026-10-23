@@ -79,6 +79,28 @@ async def test_enqueue_reserves_a_stored_result_until_completion_releases_it(red
 
 
 @pytest.mark.asyncio
+async def test_enqueue_reserves_a_second_copy_for_a_webhook_carrying_the_result(redis_url):
+    from crawl_job_queue import CrawlJobQueue, CrawlJobResultBudgetFull
+
+    # 6 MiB of slack: one 4 MiB result fits, its outbox copy as well does not.
+    with redis_maxmemory(redis_url, used_memory(redis_url) + 64 * MIB):
+        client = aioredis.from_url(redis_url, decode_responses=True)
+        try:
+            queue = CrawlJobQueue(client, memory_config(58 * MIB))
+            await queue.ensure_group()
+            with pytest.raises(CrawlJobResultBudgetFull):
+                await queue.enqueue(urls=["https://example.com"], browser_config={},
+                    crawler_config={}, result_fields=None, owner="alice",
+                    webhook_config={"webhook_url": "https://example.com/hook",
+                                    "webhook_data_in_payload": True})
+            assert await client.xlen(queue.settings.stream) == 0
+            task_id = await enqueue(queue)
+            assert await client.hget(queue.task_key(task_id), "status") == "processing"
+        finally:
+            await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_enqueue_is_uncapped_when_redis_has_no_maxmemory(redis_url):
     from crawl_job_queue import CrawlJobQueue
 

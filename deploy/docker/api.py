@@ -1923,6 +1923,8 @@ async def handle_crawl_job(
     except CrawlJobPrincipalQuotaExceeded as error:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(error)) from error
     except CrawlJobQueueFull as error:
+        # Both refusals share the queue-full detail the back-end retries on.
+        logger.warning("crawl job refused: %s", type(error).__name__)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error),
             headers={"Retry-After": "30"},

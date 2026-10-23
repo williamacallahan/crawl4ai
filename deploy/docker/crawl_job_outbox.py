@@ -39,13 +39,20 @@ end
 
 class CrawlJobOutbox:
     """Queue mixin; imports lease errors lazily to keep the queue owner canonical."""
+    def _webhook_includes_result(self, webhook: dict) -> bool:
+        """Whether this job's terminal webhook stores a second copy of its result."""
+        settings = self.config.get("webhooks", {})
+        url = webhook.get("webhook_url") or settings.get("default_url")
+        return bool(settings.get("enabled", True) and url
+                    and webhook.get("webhook_data_in_payload", settings.get("data_in_payload", False)))
+
     def _webhook_event(self, task_id: str, payload: dict, status: str, error: str | None):
         settings = self.config.get("webhooks", {})
         webhook = payload.get("webhook_config") or {}
         url = webhook.get("webhook_url") or settings.get("default_url")
         if not settings.get("enabled", True) or not url:
             return "", False
-        include = webhook.get("webhook_data_in_payload", settings.get("data_in_payload", False))
+        include = self._webhook_includes_result(webhook)
         # Freeze effective delivery configuration: a restart must not change the recipient.
         webhook = {**webhook, "webhook_url": url, "webhook_data_in_payload": include}
         event = dict(task_id=task_id, task_type="crawl", status=status,

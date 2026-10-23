@@ -81,14 +81,16 @@ local backlog = redis.call('XLEN', KEYS[1])
 if backlog >= tonumber(ARGV[1]) then
   return 0
 end
--- Each backlog entry reserves one stored result; the XDEL in the terminal
--- scripts releases it. This must precede the first write: Redis checks
+-- Each backlog entry reserves one stored result per copy (ARGV[17]: two when
+-- the webhook outbox also stores it); the XDEL in the terminal scripts
+-- releases it. This must precede the first write: Redis checks
 -- maxmemory only before a script's first deny-OOM write, and the
 -- ZREMRANGEBYSCORE below is not one, so a later HSET/XADD would bypass it.
 local memory = redis.call('INFO', 'memory')
 local maxmemory = tonumber(string.match(memory, 'maxmemory:(%d+)'))
 if maxmemory > 0 and tonumber(string.match(memory, 'used_memory:(%d+)'))
-    + (backlog + 1) * tonumber(ARGV[15]) + tonumber(ARGV[16]) + #ARGV[9] > maxmemory then
+    + (backlog + 1) * tonumber(ARGV[15]) * tonumber(ARGV[17]) + tonumber(ARGV[16]) + #ARGV[9]
+    > maxmemory then
   return -2
 end
 if tonumber(ARGV[2]) > 0 and ARGV[11] ~= '' then
@@ -537,6 +539,7 @@ class CrawlJobQueue(CrawlJobOutbox):
             json.dumps(webhook_config) if webhook_config else "", serialized_payload, task_id, owner or "",
             self.settings.protocol_version, time.time(), task_id,
             self.settings.max_stored_result_bytes, self.settings.redis_headroom_bytes,
+            2 if self._webhook_includes_result(webhook_config or {}) else 1,
         )
         if int(enqueued) == -2:
             raise CrawlJobResultBudgetFull(self.settings.max_pending_jobs)
