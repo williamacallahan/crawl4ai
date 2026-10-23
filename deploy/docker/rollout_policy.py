@@ -14,7 +14,7 @@ REPLICAS = 6
 # Two tasks per start-first batch keep a six-replica rollout inside the window
 # three replicas took one at a time; each batch needs two spare placement slots.
 PARALLELISM = 2
-# Three distinct Ready nodes, so losing one never takes every replica with it.
+# Placement needs at least three Ready eligible nodes before any rollout.
 MIN_READY_NODES = 3
 LLM_PROVIDER = yaml.safe_load(Path(__file__).with_name("config.yml").read_text())["llm"]["provider"]
 LLM_BASE_URL = "https://api.llm-gateway.iocloudhost.net/v1"

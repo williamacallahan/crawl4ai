@@ -43,7 +43,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, williamacallahan, canonical-haiku-0]
     timeout-minutes: 45
     steps:
-      - name: Recycle crawl4ai replicas one at a time
+      - name: Recycle crawl4ai replicas two at a time
         env:
           SERVICE: crawl4ai-yq1svi
         run: |

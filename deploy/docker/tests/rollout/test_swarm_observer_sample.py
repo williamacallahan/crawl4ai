@@ -10,6 +10,18 @@ import rollout_tasks
 from conftest import REVISION, health
 
 
+# The service spec the sampler reads its desired replica count from.
+DESIRED_TASKS = 3
+
+
+@pytest.fixture(autouse=True)
+def service_spec(monkeypatch):
+    monkeypatch.setattr(
+        rollout_tasks, "_service_spec",
+        lambda _service: {"Mode": {"Replicated": {"Replicas": DESIRED_TASKS}}},
+    )
+
+
 def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
     rows = [
         {
@@ -82,7 +94,7 @@ def test_sample_reuses_rollout_task_and_health_owners(monkeypatch):
 
     snapshot, comparison = observer.sample("crawl4ai")
 
-    assert snapshot == observer.CoverageSnapshot(3, 3, 2)
+    assert snapshot == observer.CoverageSnapshot(3, 3, 2, DESIRED_TASKS)
     assert comparison is observer.NetworkDbFdbComparison.CONSISTENT
     assert len(direct_probe) == 3
     assert {namespace_pid for _url, namespace_pid in direct_probe} == {4321}
@@ -285,7 +297,7 @@ def test_sample_still_swallows_a_per_task_health_failure(monkeypatch):
 
     snapshot, comparison = observer.sample("crawl4ai")
 
-    assert snapshot == observer.CoverageSnapshot(3, 2, 2)
+    assert snapshot == observer.CoverageSnapshot(3, 2, 2, DESIRED_TASKS)
     assert comparison is observer.NetworkDbFdbComparison.INCONCLUSIVE
 
 
