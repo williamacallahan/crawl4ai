@@ -167,6 +167,7 @@ class Renderer:
 
     def __init__(self):
         self.cpu = 0.0
+        self.run_queue = 0.0
         self.rss = 10 * 1024 * 1024
         self.killed = 0
         self.arguments = ["chromium", "--type=renderer"]
@@ -198,6 +199,7 @@ def renderer_tree(pool, monkeypatch):
         return SimpleNamespace(children=lambda recursive: [renderer])
 
     monkeypatch.setattr(pool.psutil, "Process", process)
+    monkeypatch.setattr(pool, "_run_queue_seconds", lambda pid: renderer.run_queue)
     return target, renderer
 
 
@@ -211,6 +213,20 @@ def test_renderer_cpu_requires_sustained_window(pool, renderer_tree):
         assert renderer.killed == 0
     renderer.cpu = float(window)
     pool._watch_renderers(target, window)
+    assert renderer.killed == 1
+    assert pool.RENDERER_KILLS == {"cpu": 1, "rss": 0}
+
+
+def test_renderer_starved_by_host_load_still_counts_its_cpu_demand(pool, renderer_tree):
+    # On a loaded host a spinning renderer runs a quarter of the time and
+    # waits in the run queue for the rest; usage alone never crosses 0.9.
+    target, renderer = renderer_tree
+    window = pool.WATCHDOG.renderer_cpu_seconds
+    pool._watch_renderers(target, 0)
+    for second in (window / 2, window):
+        renderer.cpu = second / 4
+        renderer.run_queue = second * 3 / 4
+        pool._watch_renderers(target, second)
     assert renderer.killed == 1
     assert pool.RENDERER_KILLS == {"cpu": 1, "rss": 0}
 

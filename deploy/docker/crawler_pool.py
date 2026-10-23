@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import suppress
@@ -72,6 +73,7 @@ if "RENDERER_KILL_METRIC" not in globals():
 @dataclass
 class _RendererSample:
     cpu_seconds: float
+    run_queue_seconds: float
     sampled_at: float
     over_cpu_since: Optional[float] = None
 
@@ -855,6 +857,34 @@ async def _recycle_busiest_browser() -> None:
         logger.warning(f"Memory pressure: recycling a browser after {pages_served} pages")
 
 
+def _run_queue_seconds(pid: int) -> float:
+    """Seconds the process's live threads spent runnable but waiting for a CPU.
+
+    CPU usage alone understates a spinning renderer on a loaded host, where it
+    gets only its share of the CPUs; a spinning thread is runnable the whole
+    time, so usage plus run-queue wait is its CPU demand whatever the load.
+    The second field of /proc/<pid>/task/<tid>/schedstat is that wait in ns.
+    """
+    task_dir = f"/proc/{pid}/task"
+    try:
+        tasks = os.listdir(task_dir)
+    except FileNotFoundError as error:
+        raise psutil.NoSuchProcess(pid) from error
+    waited_ns = 0
+    for tid in tasks:
+        try:
+            with open(f"{task_dir}/{tid}/schedstat") as schedstat:
+                waited_ns += int(schedstat.read().split()[1])
+        except FileNotFoundError:
+            if os.path.isdir(f"{task_dir}/{tid}"):
+                raise RuntimeError(
+                    f"{task_dir}/{tid}/schedstat is missing; the renderer CPU "
+                    "watchdog needs a kernel built with CONFIG_SCHED_INFO"
+                ) from None
+            # The thread exited between listing and reading.
+    return waited_ns / 1e9
+
+
 def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, float]]:
     """Sample only renderers descended from this manager's owned browser PID."""
     manager = crawler.crawler_strategy.browser_manager
@@ -875,10 +905,14 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
             seen.add(identity)
             cpu_times = process.cpu_times()
             cpu_seconds = cpu_times.user + cpu_times.system
+            run_queue_seconds = _run_queue_seconds(process.pid)
             previous = _RENDERER_SAMPLES.get(identity)
             over_cpu_since = None
             if previous is not None and now > previous.sampled_at:
-                cores = (cpu_seconds - previous.cpu_seconds) / (now - previous.sampled_at)
+                demanded_seconds = (cpu_seconds - previous.cpu_seconds) + (
+                    run_queue_seconds - previous.run_queue_seconds
+                )
+                cores = demanded_seconds / (now - previous.sampled_at)
                 if cores > WATCHDOG.renderer_cpu_cores:
                     over_cpu_since = (
                         previous.over_cpu_since
@@ -886,7 +920,10 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                         else previous.sampled_at
                     )
             _RENDERER_SAMPLES[identity] = _RendererSample(
-                cpu_seconds, now, over_cpu_since
+                cpu_seconds=cpu_seconds,
+                run_queue_seconds=run_queue_seconds,
+                sampled_at=now,
+                over_cpu_since=over_cpu_since,
             )
             reason = None
             rss_bytes = process.memory_info().rss
