@@ -889,7 +889,9 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                 cpu_seconds, now, over_cpu_since
             )
             reason = None
-            if process.memory_info().rss > WATCHDOG.renderer_rss_mb * 1024 * 1024:
+            rss_bytes = process.memory_info().rss
+            rss_limit_bytes = WATCHDOG.renderer_rss_mb * 1024 * 1024
+            if rss_bytes > rss_limit_bytes:
                 reason = "rss"
             elif (
                 over_cpu_since is not None
@@ -901,7 +903,11 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                 RENDERER_KILLS[reason] += 1
                 RENDERER_KILL_METRIC.labels(reason=reason).inc()
                 _RENDERER_SAMPLES.pop(identity, None)
-                logger.warning("Killed browser renderer pid=%s reason=%s", process.pid, reason)
+                logger.warning(
+                    "Killed browser renderer pid=%s reason=%s browser_pid=%s "
+                    "created_at=%s rss_bytes=%s rss_limit_bytes=%s",
+                    process.pid, reason, browser_pid, identity[1], rss_bytes, rss_limit_bytes,
+                )
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             # Renderers exit while pages navigate; losing one during a sample
             # must not stop sampling the other browsers.

@@ -226,7 +226,7 @@ def test_renderer_cpu_lull_resets_sustained_window(pool, renderer_tree):
     assert renderer.killed == 1
 
 
-def test_renderer_rss_limit_is_immediate_and_ignores_nonrenderers(pool, renderer_tree):
+def test_renderer_rss_limit_is_immediate_and_ignores_nonrenderers(pool, renderer_tree, caplog):
     target, renderer = renderer_tree
     renderer.rss = (pool.WATCHDOG.renderer_rss_mb + 1) * 1024 * 1024
     renderer.arguments = ["chromium", "--type=utility"]
@@ -236,6 +236,10 @@ def test_renderer_rss_limit_is_immediate_and_ignores_nonrenderers(pool, renderer
     pool._watch_renderers(target, 1)
     assert renderer.killed == 1
     assert pool.get_pool_snapshot()["renderer_kills"] == {"cpu": 0, "rss": 1}
+    assert (
+        "pid=42 reason=rss browser_pid=1234 created_at=123.0 "
+        f"rss_bytes={renderer.rss} rss_limit_bytes=805306368"
+    ) in caplog.text
 
 
 @pytest.mark.parametrize("field,value", [
