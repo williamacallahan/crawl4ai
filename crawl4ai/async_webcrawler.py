@@ -321,7 +321,20 @@ class AsyncWebCrawler:
                 elif cached_result:
                     cached_result.cache_status = "hit"
 
+                # Discard unusable cache rows before sizing/normalizing their
+                # HTML. In ENABLED mode failed rows heal through a fresh fetch;
+                # READ_ONLY still serves the cached failure by contract.
+                if cached_result and (
+                    (config.screenshot and not cached_result.screenshot)
+                    or (config.pdf and not cached_result.pdf)
+                    or (not cached_result.success and cache_context.cache_mode == CacheMode.ENABLED)
+                ):
+                    cached_result = None
+
                 if cached_result:
+                    oversized = self._html_size_failure(url, cached_result.html, config)
+                    if oversized is not None:
+                        return CrawlResultContainer(oversized)
                     html = sanitize_input_encode(cached_result.html)
                     extracted_content = sanitize_input_encode(
                         cached_result.extracted_content or ""
@@ -331,32 +344,10 @@ class AsyncWebCrawler:
                         if not extracted_content or extracted_content == "[]"
                         else extracted_content
                     )
-                    # If screenshot is requested but its not in cache, then set cache_result to None
                     screenshot_data = cached_result.screenshot
                     pdf_data = cached_result.pdf
-                    if config.screenshot and not screenshot_data:
-                        cached_result = None
 
-                    if config.pdf and not pdf_data:
-                        cached_result = None
-
-                    # Anti-bot cache healing: a cached blocked result carries
-                    # non-empty challenge HTML, so the read short-circuit
-                    # (``if not cached_result or not html``) below would serve
-                    # it forever.  Discard the poisoned row so the fresh-fetch
-                    # branch runs and, on a successful refetch, overwrites the
-                    # poison in the DB (the write gate only fires when
-                    # ``cached_result`` is falsy).  Scoped to ENABLED only:
-                    # READ_ONLY serves cached content verbatim by contract
-                    # (see test_cached_target_refusal_remains_failed).
-                    if (
-                        cached_result
-                        and not cached_result.success
-                        and cache_context.cache_mode == CacheMode.ENABLED
-                    ):
-                        cached_result = None
-
-                    if cached_result is None or not html:
+                    if not html:
                         extracted_content = None
 
                     self.logger.url_status(
@@ -483,6 +474,9 @@ class AsyncWebCrawler:
                                     async_response = await self.crawler_strategy.crawl(
                                         url, config=config)
 
+                                    oversized = self._html_size_failure(url, async_response.html, config)
+                                    if oversized is not None:
+                                        return CrawlResultContainer(oversized)
                                     html = sanitize_input_encode(async_response.html)
                                     screenshot_data = async_response.screenshot
                                     pdf_data = async_response.pdf_data
@@ -609,6 +603,9 @@ class AsyncWebCrawler:
                             try:
                                 _fallback_html = await _fallback_fn(url)
                                 if _fallback_html:
+                                    oversized = self._html_size_failure(url, _fallback_html, config)
+                                    if oversized is not None:
+                                        return CrawlResultContainer(oversized)
                                     _sanitized_html = sanitize_input_encode(_fallback_html)
                                     try:
                                         crawl_result = await self.aprocess_html(
@@ -780,6 +777,22 @@ class AsyncWebCrawler:
                         url=url, html="", success=False, error_message=error_message
                     )
                 )
+
+    @staticmethod
+    def _html_size_failure(url: str, html: str, config: CrawlerRunConfig) -> Optional[CrawlResult]:
+        # Count in chunks: a rejected page must not allocate another page-sized
+        # UTF-8 buffer. Match sanitize_input_encode's handling of lone surrogates.
+        size = sum(
+            len(html[start:start + 65536].encode("utf-8", errors="ignore"))
+            for start in range(0, len(html), 65536)
+        )
+        if size > config.max_html_bytes:
+            return CrawlResult(
+                url=url, html="", success=False,
+                error_message=f"html_too_large: {size} exceeds {config.max_html_bytes}",
+                session_id=config.session_id,
+            )
+        return None
 
     async def _run_content_processing(self, operation, *args, **kwargs):
         # A cancelled request cannot stop a running thread. Keep this crawler's

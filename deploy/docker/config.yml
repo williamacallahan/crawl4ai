@@ -127,6 +127,7 @@ security:
 # Crawler Configuration
 crawler:
   base_config:
+    max_html_bytes: 8388608  # 8 MiB UTF-8 HTML, rejected before scraping/markdown
     # Give JavaScript application shells time to hydrate before validation.
     delay_before_return_html: 1.0
     max_iframes: 20
