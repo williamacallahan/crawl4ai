@@ -222,12 +222,14 @@ AsyncWebCrawler.arun = capped_arun
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     import monitor as monitor_module
+    from api import llm_orphan_scan_settings, reap_llm_tasks
     from crawler_pool import init_permanent
     from egress_proxy import start_pinning_proxy, stop_pinning_proxy
     from monitor import MonitorStats
 
     # Enforce auth posture before serving any traffic.
     _resolve_auth()
+    llm_orphan_scan_settings(config)
 
     app.state.egress_proxy = None
     app.state.readiness_checks_active = False
@@ -262,6 +264,7 @@ async def lifespan(_: FastAPI):
 
         app.state.janitor = asyncio.create_task(janitor())
         app.state.timeline_updater = asyncio.create_task(_timeline_updater())
+        app.state.llm_orphan_reaper = asyncio.create_task(reap_llm_tasks(redis, config))
         app.state.ready_once = False
         app.state.readiness_initializer = asyncio.create_task(_initialize_readiness())
 
@@ -270,7 +273,8 @@ async def lifespan(_: FastAPI):
         app.state.readiness_checks_active = False
         background_tasks = []
         for task_name in (
-            "readiness_initializer", "janitor", "timeline_updater", "artifact_janitor"
+            "readiness_initializer", "janitor", "timeline_updater", "artifact_janitor",
+            "llm_orphan_reaper",
         ):
             task = getattr(app.state, task_name, None)
             if task is not None:

@@ -23,10 +23,15 @@ if DOCKER_DIR not in sys.path:
 
 import api  # noqa: E402
 from utils import TaskStatus, decode_redis_hash  # noqa: E402
+from test_crawl_job_queue_redis import redis_url  # noqa: E402,F401
 
 
 class _Redis:
     """Async Redis stub. HSET merges fields, the way real Redis does."""
+
+    async def time(self):
+        # Redis TIME: (seconds, microseconds) from the server clock.
+        return (int(time.time()), 0)
 
     def __init__(self):
         self._hashes: dict[str, dict[bytes, bytes]] = {}
@@ -121,40 +126,38 @@ def test_inflight_llm_hash_has_no_ttl_until_terminal_write(monkeypatch):
     assert redis.ttl_seconds(key) == 3600
 
 
-def test_processing_read_leaves_the_hash_and_its_ttl_alone():
-    redis = _Redis()
-    key = "task:llm_abc"
-    config = _config(3600)
-    asyncio_run(
-        api.hset_with_ttl(
-            redis,
-            key,
-            {
+def test_processing_read_leaves_the_hash_and_its_ttl_alone(redis_url):
+    """A poll of a live, heartbeating job changes nothing: the recovery script
+    runs on every processing read and must leave a fresh job alone."""
+    async def exercise():
+        from redis import asyncio as aioredis
+
+        redis = aioredis.from_url(redis_url)
+        key = "task:llm_abc"
+        config = _config(3600)
+        try:
+            heartbeat = (await redis.time())[0]
+            await api.hset_with_ttl(redis, key, {
                 "status": TaskStatus.PROCESSING,
-                "heartbeat_at": time.time(),
+                "heartbeat_at": heartbeat,
                 "created_at": "2026-10-22T07:00:00",
                 "url": "https://example.com",
                 "owner": "alice@x.com",
-            },
-            config,
-        )
-    )
+            }, config)
+            response = await api.handle_task_status(
+                redis, "llm_abc", "http://t/", collection="llm/job",
+                requester="alice@x.com", config=config,
+            )
+            return response, await redis.ttl(key), decode_redis_hash(await redis.hgetall(key))
+        finally:
+            await redis.delete(key)
+            await redis.aclose()
 
-    response = asyncio_run(
-        api.handle_task_status(
-            redis,
-            "llm_abc",
-            "http://t/",
-            collection="llm/job",
-            requester="alice@x.com",
-            config=config,
-        )
-    )
-
+    response, ttl, stored = asyncio_run(exercise())
     assert response.status_code == 200
     assert json.loads(response.body)["status"] == TaskStatus.PROCESSING.value
-    assert redis.ttl_seconds(key) is None
-    assert _stored(redis, key)["created_at"] == "2026-10-22T07:00:00"
+    assert ttl == -1
+    assert stored["created_at"] == "2026-10-22T07:00:00"
 
 
 def test_crawl_result_reads_preserve_the_terminal_ttl():
