@@ -167,14 +167,14 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
                 current_attempt,
                 result={"worker": "b"},
             )
-            task = await client.hgetall(queue.task_key(task_id))
-            assert task["status"] == "completed"
-            assert task["owner"] == "alice"
+            assert await client.hmget(queue.task_key(task_id), "status", "owner") == [
+                "completed", "alice"
+            ]
             assert await client.xlen(queue.settings.stream) == 0
 
             with pytest.raises(CrawlJobLeaseLost):
                 await queue.discard_missing_payload(entry, "worker-a")
-            assert (await client.hgetall(queue.task_key(task_id)))["status"] == "completed"
+            assert await client.hget(queue.task_key(task_id), "status") == "completed"
 
             replacement = await queue.enqueue(
                 ["https://replacement.example"],

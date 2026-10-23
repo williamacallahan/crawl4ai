@@ -16,7 +16,7 @@ from redis.exceptions import ResponseError
 from schemas import CrawlRequest
 from utils import (
     DEFAULT_CONFIG,
-    TaskStatus,
+    ResultEncoding, TaskStatus, encode_task_result,
     get_redis_task_ttl,
     validate_url_destination,
 )
@@ -688,7 +688,7 @@ class CrawlJobQueue:
             status,
             payload["created_at"],
             json.dumps(payload["urls"]),
-            json.dumps(result) if result is not None else "",
+            encode_task_result(result, ResultEncoding.IDENTITY) if result is not None else "",
             error or "",
             self._created_at(),
             payload.get("owner") or "",
