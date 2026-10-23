@@ -224,8 +224,16 @@ class MonitorStats:
     async def load_from_redis(self):
         """Load persisted stats; the readiness owner retries failures."""
         data = await self.redis.get("monitor:endpoint_stats")
-        if data:
-            restored = json.loads(data)
+        try:
+            restored = json.loads(data) if data else None
+            if restored is not None and not isinstance(restored, dict):
+                raise ValueError(f"expected an object, got {type(restored).__name__}")
+        except ValueError as error:
+            # Only Redis I/O is worth retrying; a bad blob would block
+            # readiness on every replica, so start from fresh counters.
+            logger.error("Discarding unreadable monitor:endpoint_stats: %s", error)
+            restored = None
+        if restored is not None:
             # Preserve requests collected in memory while startup was degraded.
             for endpoint, counters in self.endpoint_stats.items():
                 baseline = restored.setdefault(endpoint, {})

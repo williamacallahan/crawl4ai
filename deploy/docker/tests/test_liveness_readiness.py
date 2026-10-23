@@ -105,16 +105,37 @@ async def wait_until_ready(client):
         await asyncio.sleep(0.1)
 
 
-def test_liveness_route_is_public_and_reports_identity(lifespan_server):
+def test_liveness_route_is_public_and_starts_dead(lifespan_server):
     server, _ = lifespan_server
-    # Like the auth suites, this client skips startup to isolate routing/auth.
+    # Like the auth suites, this client skips startup to isolate routing/auth:
+    # never ready yet, so a rollout must not promote this replica.
     response = TestClient(server.app).get("/health/live")
-    assert response.status_code == 200
+    assert response.status_code == 503
     assert response.json() == {
-        "status": "alive",
+        "status": "starting",
         "revision": "liveness-test-revision",
         "instance": "liveness-test-instance",
     }
+
+
+def test_redis_outage_is_a_retryable_503_not_a_500(lifespan_server, monkeypatch):
+    server, _ = lifespan_server
+    import job
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))  # Bound but not listening: real ECONNREFUSED.
+    closed = f"redis://127.0.0.1:{listener.getsockname()[1]}/0"
+    monkeypatch.setattr(job, "_redis", aioredis.from_url(closed, socket_connect_timeout=1))
+    try:
+        response = TestClient(server.app, raise_server_exceptions=False).get(
+            "/crawl/job/crawl_00000000000000000000000000000000",
+            headers={"Authorization": "Bearer liveness-test-only-token"},
+        )
+    finally:
+        listener.close()
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "30"
+    assert response.json()["code"] == "redis_unavailable"
 
 
 @pytest.mark.asyncio
@@ -129,8 +150,8 @@ async def test_lifespan_survives_redis_outage_and_recovers(lifespan_server, monk
                     transport=httpx.ASGITransport(app=server.app), base_url="http://test"
                 ) as client:
                     live = await client.get("/health/live")
-                    assert live.status_code == 200
-                    assert live.json()["status"] == "alive"
+                    assert live.status_code == 503
+                    assert live.json()["status"] == "starting"
                     health = await client.get("/health")
                     assert health.status_code == 503
                     assert health.json()["components"] == {"api": "unavailable"}
@@ -140,12 +161,29 @@ async def test_lifespan_survives_redis_outage_and_recovers(lifespan_server, monk
                     assert server.app.state.egress_proxy is not None
                     # Let an actual connection failure reach the retry owner.
                     await asyncio.sleep(1.1)
-                    assert (await client.get("/health/live")).status_code == 200
+                    assert (await client.get("/health/live")).status_code == 503
                     assert (await client.get("/health")).status_code == 503
                     await restore()
                     health = await wait_until_ready(client)
                     assert health.json()["components"] == {"api": "ready", "redis": "ready"}
                     assert len(browser_starts) == 1  # Recovery never restarts Chromium.
+                    # Once ready, losing Redis fails readiness but never liveness.
+                    listener = socket.socket()
+                    listener.bind(("127.0.0.1", 0))
+                    lost = aioredis.from_url(
+                        f"redis://127.0.0.1:{listener.getsockname()[1]}/0",
+                        socket_connect_timeout=1,
+                    )
+                    monkeypatch.setattr(server, "redis", lost)
+                    try:
+                        assert (await client.get("/health")).status_code == 503
+                        live = await client.get("/health/live")
+                        assert live.status_code == 200
+                        assert live.json()["status"] == "alive"
+                    finally:
+                        monkeypatch.setattr(server, "redis", redis)
+                        await lost.aclose()
+                        listener.close()
             assert not server.app.state.readiness_checks_active
             assert server.app.state.readiness_initializer.done()
         finally:
@@ -169,7 +207,7 @@ async def test_readiness_waits_for_monitor_load_and_cancels_retry(
                 transport=httpx.ASGITransport(app=server.app), base_url="http://test"
             ) as client:
                 await asyncio.sleep(0.1)
-                assert (await client.get("/health/live")).status_code == 200
+                assert (await client.get("/health/live")).status_code == 503
                 assert (await client.get("/health")).status_code == 503
                 import monitor
                 stats = monitor.get_monitor()
@@ -195,3 +233,52 @@ async def test_readiness_waits_for_monitor_load_and_cancels_retry(
     finally:
         await redis.delete(key)
         await redis.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_monitor_blob_does_not_block_readiness(lifespan_server, monkeypatch):
+    server, _ = lifespan_server
+    redis = aioredis.from_url(os.environ["REDIS_URL"], **server._REDIS_RESILIENT_KWARGS)
+    monkeypatch.setattr(server, "redis", redis)
+    key = "monitor:endpoint_stats"
+    await redis.set(key, "{not json")
+    try:
+        async with server.app.router.lifespan_context(server.app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=server.app), base_url="http://test"
+            ) as client:
+                assert (await wait_until_ready(client)).status_code == 200
+                assert (await client.get("/health/live")).status_code == 200
+    finally:
+        await redis.delete(key)
+        await redis.aclose()
+
+
+@pytest.mark.asyncio
+async def test_job_worker_waits_for_redis_instead_of_exiting():
+    """A worker started during a Redis outage resumes in-process once it returns."""
+    from crawl_job_worker import CrawlJobWorker
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    outcomes = [RedisConnectionError("Error 111"), RedisConnectionError("Error 111"), None]
+    claimed = asyncio.Event()
+
+    class Queue:
+        async def ensure_group(self):
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        async def claim_stale(self, _consumer):
+            claimed.set()
+            await asyncio.Event().wait()
+
+    worker = CrawlJobWorker(Queue(), {}, "worker-a", crawl=None, webhook_service=object())
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(claimed.wait(), timeout=10)
+        assert not running.done()
+        assert outcomes == []
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
