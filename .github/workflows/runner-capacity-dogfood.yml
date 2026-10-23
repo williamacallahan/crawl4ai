@@ -29,7 +29,8 @@ jobs:
     name: Verify canonical runner capacity
     if: ${{ always() }}
     needs: occupy
-    runs-on: ubuntu-latest
+    # Self-hosted only: this repository runs no job on GitHub-hosted runners.
+    runs-on: [self-hosted, Linux, X64, williamacallahan]
     permissions: { actions: read }
     timeout-minutes: 2
     steps:
