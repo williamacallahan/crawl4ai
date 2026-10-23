@@ -908,6 +908,11 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                     "created_at=%s rss_bytes=%s rss_limit_bytes=%s",
                     process.pid, reason, browser_pid, identity[1], rss_bytes, rss_limit_bytes,
                 )
+                manager.renderer_kill = (
+                    time.monotonic(),
+                    f"renderer exceeded its {reason} limit (pid={process.pid} "
+                    f"rss_bytes={rss_bytes} rss_limit_bytes={rss_limit_bytes})",
+                )
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             # Renderers exit while pages navigate; losing one during a sample
             # must not stop sampling the other browsers.

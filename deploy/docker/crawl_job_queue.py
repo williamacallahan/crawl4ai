@@ -403,6 +403,21 @@ def _field(fields: Mapping[Any, Any] | list[Any], name: str) -> str | None:
     return None
 
 
+def _log_job_terminal(task_id: str, payload: dict, attempt: CrawlJobAttempt, status: str) -> None:
+    """One record per finished job, joinable to the caller's trace like md_terminal."""
+    queued_at = datetime.fromisoformat(payload["created_at"]).replace(tzinfo=timezone.utc)
+    fields = [
+        "event=job_terminal",
+        f"task_id={task_id}",
+        f"status={status}",
+        f"attempt={attempt.number}",
+        f"duration_ms={(datetime.now(timezone.utc) - queued_at).total_seconds() * 1_000:.3f}",
+    ]
+    if payload.get("trace_id"):
+        fields.append(f"trace_id={payload['trace_id']}")
+    logger.info(" ".join(fields))
+
+
 class CrawlJobQueue(CrawlJobOutbox):
     """Owns the persistent request payload and Stream lifecycle for crawl jobs."""
 
@@ -456,7 +471,8 @@ class CrawlJobQueue(CrawlJobOutbox):
         return normalized
 
     def _canonical_payload(self, *, urls: list[str], browser_config: dict, crawler_config: dict,
-        result_fields: list[str] | None, webhook_config: dict | None, created_at: str, owner: str) -> str:
+        result_fields: list[str] | None, webhook_config: dict | None, created_at: str, owner: str,
+        trace_id: str | None = None) -> str:
         try:
             loaded_browser = BrowserConfig.load(browser_config, provenance=Provenance.UNTRUSTED)
             canonical_browser = {"type": "BrowserConfig", "params": {}}
@@ -488,6 +504,7 @@ class CrawlJobQueue(CrawlJobOutbox):
             "webhook_config": webhook_config,
             "created_at": created_at,
             "owner": owner,
+            "trace_id": trace_id,
         }
         try:
             serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -522,7 +539,8 @@ class CrawlJobQueue(CrawlJobOutbox):
                     raise
 
     async def enqueue(self, urls: list[str], browser_config: dict, crawler_config: dict,
-        result_fields: list[str] | None, webhook_config: dict | None, owner: str | None = None) -> str:
+        result_fields: list[str] | None, webhook_config: dict | None, owner: str | None = None,
+        trace_id: str | None = None) -> str:
         """Atomically persist a request and make it visible to worker consumers."""
         task_id = f"crawl_{uuid4().hex}"
         created_at = self._created_at()
@@ -530,6 +548,7 @@ class CrawlJobQueue(CrawlJobOutbox):
         serialized_payload = self._canonical_payload(
             urls=canonical_urls, browser_config=browser_config, crawler_config=crawler_config,
             result_fields=result_fields, webhook_config=webhook_config, created_at=created_at, owner=owner or "",
+            trace_id=trace_id,
         )
         enqueued = await self.redis.eval(
             _ENQUEUE_IF_CAPACITY_SCRIPT, 4, self.settings.stream, self.task_key(task_id),
@@ -640,7 +659,7 @@ class CrawlJobQueue(CrawlJobOutbox):
             raise CrawlJobLeaseLost(
                 f"crawl job {entry.task_id} lease held by {attempt.consumer} was claimed by another worker"
             )
-
+        _log_job_terminal(entry.task_id, payload, attempt, status)
         return status, result, error
 
     async def discard_missing_payload(self, entry: CrawlJobEntry, consumer: str) -> None:

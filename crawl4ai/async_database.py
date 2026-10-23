@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from pathlib import Path
 import aiosqlite
@@ -15,7 +16,7 @@ from .async_logger import AsyncLogger
 
 from .utils import ensure_content_dirs, generate_content_hash
 from .utils import VersionManager
-from .utils import get_error_context, create_box_message
+from .utils import unexpected_error_message
 
 base_directory = DB_PATH = os.path.join(
     os.getenv("CRAWL4_AI_BASE_DIRECTORY", Path.home()), ".crawl4ai"
@@ -154,19 +155,12 @@ class AsyncDatabaseManager:
                     try:
                         await self.initialize()
                         self._initialized = True
-                    except Exception as e:
-                        import sys
-
-                        error_context = get_error_context(sys.exc_info())
+                    except Exception:
                         self.logger.error(
-                            message="Database initialization failed:\n{error}\n\nContext:\n{context}\n\nTraceback:\n{traceback}",
+                            message="Database initialization failed: {error}",
                             tag="ERROR",
                             force_verbose=True,
-                            params={
-                                "error": str(e),
-                                "context": error_context["code_context"],
-                                "traceback": error_context["full_traceback"],
-                            },
+                            params={"error": unexpected_error_message("db initialize", sys.exc_info())},
                         )
                         raise
 
@@ -208,42 +202,21 @@ class AsyncDatabaseManager:
                                 )
 
                         self.connection_pool[task_id] = conn
-                    except Exception as e:
-                        import sys
-
-                        error_context = get_error_context(sys.exc_info())
-                        error_message = (
-                            f"Unexpected error in db get_connection at line {error_context['line_no']} "
-                            f"in {error_context['function']} ({error_context['filename']}):\n"
-                            f"Error: {str(e)}\n\n"
-                            f"Code context:\n{error_context['code_context']}"
-                        )
+                    except Exception:
                         self.logger.error(
                             message="{error}",
                             tag="ERROR",
-                            params={"error": str(error_message)},
-                            boxes=["error"],
+                            params={"error": unexpected_error_message("db get_connection", sys.exc_info())},
                         )
-
                         raise
 
             yield self.connection_pool[task_id]
 
-        except Exception as e:
-            import sys
-
-            error_context = get_error_context(sys.exc_info())
-            error_message = (
-                f"Unexpected error in db get_connection at line {error_context['line_no']} "
-                f"in {error_context['function']} ({error_context['filename']}):\n"
-                f"Error: {str(e)}\n\n"
-                f"Code context:\n{error_context['code_context']}"
-            )
+        except Exception:
             self.logger.error(
                 message="{error}",
                 tag="ERROR",
-                params={"error": str(error_message)},
-                boxes=["error"],
+                params={"error": unexpected_error_message("db get_connection", sys.exc_info())},
             )
             raise
         finally:

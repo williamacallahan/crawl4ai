@@ -96,6 +96,7 @@ from utils import (
     load_config,
     public_crawl_error,
     setup_logging,
+    trace_id_from_traceparent,
     validate_url_destination,
     validate_webhook_url,
     verify_email_domain,
@@ -667,7 +668,6 @@ _HEALTH_PROBE_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-_TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
 _CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
 _CLIENT_REQUEST_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -685,14 +685,7 @@ def _health_probe_id(request: Request) -> str | None:
 
 def _markdown_correlation(request: Request) -> tuple[str | None, str | None]:
     """Retain only bounded correlation values that are safe to emit."""
-    traceparent = _TRACEPARENT.fullmatch(request.headers.get("traceparent", ""))
-    trace_id = None
-    if (
-        traceparent
-        and traceparent.group(1) != "0" * 32
-        and traceparent.group(2) != "0" * 16
-    ):
-        trace_id = traceparent.group(1)
+    trace_id = trace_id_from_traceparent(request.headers.get("traceparent"))
     client_request_id = request.headers.get(_CLIENT_REQUEST_ID_HEADER)
     if client_request_id and _CLIENT_REQUEST_ID.fullmatch(client_request_id):
         client_request_id = str(uuid.UUID(client_request_id))

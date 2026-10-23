@@ -253,6 +253,9 @@ def apply_server_crawler_defaults(loaded_config, request_config, config):
     for key, value in config["crawler"]["base_config"].items():
         if key not in request_params and hasattr(loaded_config, key):
             setattr(loaded_config, key, value)
+    # Per-URL progress lines are console chatter, not records: each crawl would
+    # otherwise switch the shared crawler logger back to verbose.
+    loaded_config.verbose = False
     limits = CrawlResourceSettings.from_config(config)
     loaded_config.max_iframes = min(loaded_config.max_iframes, limits.max_iframes)
     loaded_config.page_termination_timeout = min(
@@ -398,8 +401,7 @@ class CorrelatedCrawlFailure(HTTPException):
 def _raise_for_crawl_failure(result, *, correlate_error: bool = False):
     if not result.success:
         if correlate_error:
-            raw_error = result.error_message
-            detail = public_crawl_error(raw_error)
+            detail = public_crawl_error(result.error_message, result.url)
             raise CorrelatedCrawlFailure(detail, detail.correlation_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -1902,6 +1904,7 @@ async def handle_crawl_job(
     result_fields: Optional[List[str]] = None,
     webhook_config: Optional[Dict] = None,
     owner: Optional[str] = None,
+    trace_id: Optional[str] = None,
 ) -> Dict:
     """Persist a crawl request for the supervised Redis Stream workers.
 
@@ -1917,6 +1920,7 @@ async def handle_crawl_job(
             result_fields=result_fields,
             webhook_config=webhook_config,
             owner=owner,
+            trace_id=trace_id,
         )
     except CrawlJobPayloadRejected as error:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error

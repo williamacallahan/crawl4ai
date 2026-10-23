@@ -814,6 +814,10 @@ class BrowserManager:
         # partially-created page.
         self._pages_served = 0
         self.consecutive_failures = 0
+        # (monotonic time, description) of the last renderer an external
+        # resource watchdog killed in this browser; a page crash after it is a
+        # deliberate resource rejection rather than a renderer fault.
+        self.renderer_kill: tuple[float, str] | None = None
         self._recycle_due = False
         self._recycling = False
         self._closing = False

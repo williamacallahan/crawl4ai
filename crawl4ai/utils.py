@@ -6,6 +6,7 @@ import html
 import lxml
 import re
 import os
+import traceback
 import subprocess
 import platform
 from .prompts import PROMPT_EXTRACT_BLOCKS
@@ -2973,61 +2974,20 @@ def configure_windows_event_loop():
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
-def get_error_context(exc_info, context_lines: int = 5):
+def unexpected_error_message(scope: str, exc_info) -> str:
+    """Report an unexpected exception on one line.
+
+    A log collector stores each line of a multi-line record as its own entry,
+    and Sentry titles an event by its first line, so the report carries the
+    raising frame and the collapsed exception text without a source listing.
     """
-    Extract error context with more reliable line number tracking.
+    frame = traceback.extract_tb(exc_info[2])[-1]
+    detail = " ".join(str(exc_info[1]).split())
+    return (
+        f"Unexpected error in {scope} at line {frame.lineno} in {frame.name} "
+        f"({os.path.basename(frame.filename)}): Error: {detail}"
+    )
 
-    Args:
-        exc_info: The exception info from sys.exc_info()
-        context_lines: Number of lines to show before and after the error
-
-    Returns:
-        dict: Error context information
-    """
-    import traceback
-    import linecache
-    import os
-
-    # Get the full traceback
-    tb = traceback.extract_tb(exc_info[2])
-
-    # Get the last frame (where the error occurred)
-    last_frame = tb[-1]
-    filename = last_frame.filename
-    line_no = last_frame.lineno
-    func_name = last_frame.name
-
-    # Get the source code context using linecache
-    # This is more reliable than inspect.getsourcelines
-    context_start = max(1, line_no - context_lines)
-    context_end = line_no + context_lines + 1
-
-    # Build the context lines with line numbers
-    context_lines = []
-    for i in range(context_start, context_end):
-        line = linecache.getline(filename, i)
-        if line:
-            # Remove any trailing whitespace/newlines and add the pointer for error line
-            line = line.rstrip()
-            pointer = "→" if i == line_no else " "
-            context_lines.append(f"{i:4d} {pointer} {line}")
-
-    # Join the lines with newlines
-    code_context = "\n".join(context_lines)
-
-    # Get relative path for cleaner output
-    try:
-        rel_path = os.path.relpath(filename)
-    except ValueError:
-        # Fallback if relpath fails (can happen on Windows with different drives)
-        rel_path = filename
-
-    return {
-        "filename": rel_path,
-        "line_no": line_no,
-        "function": func_name,
-        "code_context": code_context,
-    }
 
 def truncate(value, threshold):
     if len(value) > threshold:
