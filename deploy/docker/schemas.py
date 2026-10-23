@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, TypeAdapter, field_validator
 from utils import FilterType
 
 
@@ -16,6 +16,18 @@ class CrawlRequest(BaseModel):
             "to match against specific URLs. Takes precedence over crawler_config."
         ),
     )
+    result_fields: list[str] | None = None
+
+    @field_validator("result_fields", mode="before")
+    @classmethod
+    def validate_result_fields(cls, value):
+        # job imports schemas; defer this import until request validation.
+        # Its Literal annotation remains the single owner of allowed fields.
+        from job import CrawlJobPayload
+
+        return TypeAdapter(
+            CrawlJobPayload.model_fields["result_fields"].annotation
+        ).validate_python(value)
 
 
 class HookSpec(BaseModel):
