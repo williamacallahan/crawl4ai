@@ -46,7 +46,7 @@ from .utils import (
     sanitize_input_encode,
     InvalidCSSSelectorError,
     fast_format_html,
-    get_error_context,
+    unexpected_error_message,
     RobotsParser,
     preprocess_html_for_schema,
     compute_head_fingerprint,
@@ -757,14 +757,7 @@ class AsyncWebCrawler:
                     return CrawlResultContainer(cached_result)
 
             except Exception as e:
-                error_context = get_error_context(sys.exc_info())
-
-                error_message = (
-                    f"Unexpected error in _crawl_web at line {error_context['line_no']} "
-                    f"in {error_context['function']} ({error_context['filename']}):\n"
-                    f"Error: {str(e)}\n\n"
-                    f"Code context:\n{error_context['code_context']}"
-                )
+                error_message = unexpected_error_message("_crawl_web", sys.exc_info())
 
                 self.logger.error_status(
                     url=url,

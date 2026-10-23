@@ -432,6 +432,23 @@ _TUNNEL_CONNECTION_FAILED = "net::ERR_TUNNEL_CONNECTION_FAILED"
 # reason as a Chromium code: without it a client cannot tell a page that never
 # answered from an unexplained server fault.
 _NAVIGATION_TIMEOUT = re.compile(r"Page\.goto: (Timeout \d{1,9}ms exceeded)")
+# The whole-page budget the caller set (page_timeout). The target spent it; the
+# withheld private text names the browser step it was spent in.
+_PAGE_TIMEOUT = re.compile(r"Error: (Page timeout after \d{1,9}ms)")
+# The renderer watchdog killed this page's renderer for exceeding its resource
+# limit: a deliberate rejection of the page, not a renderer fault.
+_RESOURCE_REJECTION = re.compile(r"Error: (Target page crashed: renderer exceeded its (?:rss|cpu) limit)")
+
+
+_TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
+
+
+def trace_id_from_traceparent(traceparent: Optional[str]) -> Optional[str]:
+    """The W3C trace id of a valid traceparent header, safe to log."""
+    match = _TRACEPARENT.fullmatch(traceparent or "")
+    if match and match.group(1) != "0" * 32 and match.group(2) != "0" * 16:
+        return match.group(1)
+    return None
 
 
 def public_error_detail(error_message: Optional[str]) -> str:
@@ -468,8 +485,12 @@ def public_error_detail(error_message: Optional[str]) -> str:
         return message[:500]
     navigation = _NAVIGATION_ERROR_CODE.search(message)
     if navigation is None:
-        timeout = _NAVIGATION_TIMEOUT.search(message)
-        return f"Crawl failed: {timeout.group(1)}" if timeout else "Crawl failed"
+        target_outcome = (
+            _NAVIGATION_TIMEOUT.search(message)
+            or _PAGE_TIMEOUT.search(message)
+            or _RESOURCE_REJECTION.search(message)
+        )
+        return f"Crawl failed: {target_outcome.group(1)}" if target_outcome else "Crawl failed"
     code, navigated_url = navigation.groups()
     if code == _TUNNEL_CONNECTION_FAILED and navigated_url:
         # The pinning proxy dials for the browser, so a dead target surfaces as a

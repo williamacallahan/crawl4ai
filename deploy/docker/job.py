@@ -12,9 +12,10 @@ from api import (
     handle_task_status,
 )
 from auth import get_principal
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from schemas import CrawlRequest, WebhookConfig
+from utils import trace_id_from_traceparent
 
 # ------------- dependency placeholders -------------
 _redis: Any = None        # injected from server.py before the router serves requests
@@ -132,6 +133,7 @@ async def crawl_job_enqueue(
         payload: CrawlJobPayload,
         background_tasks: BackgroundTasks,
         _td: Annotated[dict | None, Depends(_principal_dep)],
+        traceparent: Annotated[str | None, Header()] = None,
 ):
     webhook_config = None
     if payload.webhook_config:
@@ -158,6 +160,7 @@ async def crawl_job_enqueue(
         ),
         webhook_config=webhook_config,
         owner=_owner_of(_td),
+        trace_id=trace_id_from_traceparent(traceparent),
     )
 
 

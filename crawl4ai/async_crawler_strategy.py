@@ -7,6 +7,7 @@ import hashlib
 import os
 import random
 import time
+import traceback
 import uuid
 from abc import ABC, abstractmethod
 from functools import partial
@@ -53,6 +54,30 @@ _TARGET_NAVIGATION_REFUSALS: Final = (
 
 class TargetNavigationError(RuntimeError):
     """A direct target origin refused browser navigation."""
+
+
+def _interrupted_step(error: BaseException) -> str:
+    """Name the crawl step an expired page budget interrupted.
+
+    The cancelled task's traceback ends at the await it was suspended in; its
+    innermost crawler frame is the browser phase that spent the budget.
+    """
+    package = os.path.dirname(os.path.abspath(__file__))
+    budget = os.path.join(package, "browser_budget.py")
+    chain = []
+    while error is not None and error not in chain:
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    for exception in reversed(chain):
+        frames = [
+            frame for frame in traceback.extract_tb(exception.__traceback__)
+            if frame.filename.startswith(package) and frame.filename != budget
+            and frame.name != "_crawl_web"
+        ]
+        if frames:
+            frame = frames[-1]
+            return f"{os.path.basename(frame.filename)}:{frame.lineno} ({frame.line})"
+    return "an unknown step"
 
 
 class AsyncCrawlerStrategy(ABC):
@@ -555,9 +580,28 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         try:
             return await asyncio.wait_for(self._crawl_web_impl(url, config), seconds)
         except asyncio.TimeoutError as error:
-            raise asyncio.TimeoutError(f"Page timeout after {config.page_timeout}ms") from error
+            raise asyncio.TimeoutError(
+                f"Page timeout after {config.page_timeout}ms at {_interrupted_step(error)}"
+            ) from error
         finally:
             page_deadline.reset(token)
+
+    @staticmethod
+    async def _settled_content(page: Page) -> str:
+        """Read the document a navigation in progress settles on.
+
+        Site script can navigate after the readiness checks pass; Chromium then
+        refuses the snapshot rather than return a half-replaced document. Wait
+        for the new document and read that, so the HTML and page.url describe
+        the same page.
+        """
+        try:
+            return await within_page_budget(page.content())
+        except Error as error:
+            if "page is navigating" not in str(error):
+                raise
+        await within_page_budget(page.wait_for_load_state("domcontentloaded"))
+        return await within_page_budget(page.content())
 
     async def _terminate_page(self, page: Page, timeout: float, session=None) -> None:
         """Interrupt through a session attached before site JavaScript can wedge it."""
@@ -654,6 +698,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         execution_session = None
         renderer_crashed = False
         crash_cleanup = None
+        crawl_started = time.monotonic()
 
         def on_crash(crashed_page):
             nonlocal renderer_crashed, crash_cleanup
@@ -908,6 +953,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                                 params={"url": url},
                             )
                             response = None
+                        elif "Download is starting" in error_detail:
+                            # Chromium refuses to render an attachment response
+                            # (Content-Disposition: attachment) when downloads
+                            # are off: the target answered with a file, not a page.
+                            raise TargetNavigationError(
+                                f"Target navigation refused: {error_detail.splitlines()[0]}"
+                            ) from e
                         elif config.proxy_config is None and any(
                             refusal in error_detail
                             for refusal in _TARGET_NAVIGATION_REFUSALS
@@ -1246,7 +1298,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         message="Shadow DOM flattening returned no content, falling back to page.content()",
                         tag="SCRAPE",
                     )
-                    html = await within_page_budget(page.content())
+                    html = await self._settled_content(page)
             elif config.css_selector:
                 try:
                     selectors = [s.strip() for s in config.css_selector.split(',')]
@@ -1267,7 +1319,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 except Error as e:
                     raise RuntimeError(f"Failed to extract HTML content: {str(e)}")
             else:
-                html = await within_page_budget(page.content())
+                html = await self._settled_content(page)
 
             await self.execute_hook(
                 "before_return_html", page=page, html=html, context=context, config=config
@@ -1387,6 +1439,9 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             if renderer_crashed or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
                 self.browser_manager.consecutive_failures += 1
             if renderer_crashed:
+                kill = self.browser_manager.renderer_kill
+                if kill is not None and kill[0] >= crawl_started:
+                    raise Error(f"Target page crashed: {kill[1]}") from error
                 raise Error("Target page crashed") from error
             raise
 

@@ -39,3 +39,38 @@ def test_all_failed_crawl_returns_sanitized_bad_gateway(
         assert "/app/private/cache.db" not in response.text
     else:
         assert detail == expected_detail
+
+
+def _library_failure(error: BaseException) -> str:
+    """The error_message arun records for an exception escaping a crawl."""
+    import sys
+
+    from crawl4ai.utils import unexpected_error_message
+
+    try:
+        raise error
+    except type(error):
+        return unexpected_error_message("_crawl_web", sys.exc_info())
+
+
+@pytest.mark.parametrize("error,public,level", [
+    (TimeoutError("Page timeout after 60000ms at async_crawler_strategy.py:1270 "
+                  "(html = await self._settled_content(page))"),
+     "Crawl failed: Page timeout after 60000ms", "WARNING"),
+    (RuntimeError("Target page crashed: renderer exceeded its rss limit "
+                  "(pid=11176 rss_bytes=1053999104 rss_limit_bytes=805306368)"),
+     "Crawl failed: Target page crashed: renderer exceeded its rss limit", "WARNING"),
+    (RuntimeError("Target page crashed"), "Crawl failed", "ERROR"),
+])
+def test_withheld_failures_report_one_line_with_url_and_target_level(error, public, level, caplog):
+    from utils import public_crawl_error
+
+    raw = _library_failure(error)
+    assert "\n" not in raw
+    with caplog.at_level("WARNING", logger="utils"):
+        detail = public_crawl_error(raw, "https://target.example/page")
+    assert detail.startswith(public + " (correlation_id=")
+    [record] = [r for r in caplog.records if r.name == "utils"]
+    assert record.levelname == level
+    assert "url=https://target.example/page" in record.getMessage()
+    assert "\n" not in record.getMessage()
