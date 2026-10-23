@@ -283,7 +283,7 @@ UNTRUSTED_FIELD_ALLOWLIST = {
         "wait_for_images", "delay_before_return_html", "mean_delay", "max_range",
         # scrolling / rendering
         "ignore_body_visibility", "scan_full_page", "scroll_delay",
-        "max_scroll_steps", "process_iframes", "flatten_shadow_dom",
+        "max_scroll_steps", "process_iframes", "max_iframes", "flatten_shadow_dom",
         "remove_overlay_elements", "remove_consent_popups", "virtual_scroll_config",
         # media / capture
         "screenshot", "screenshot_wait_for", "screenshot_height_threshold",
@@ -1036,12 +1036,13 @@ class BrowserConfig:
                                     advanced manipulation. Default: False.
         cdp_url (str): URL for the Chrome DevTools Protocol (CDP) endpoint. Default: "ws://localhost:9222/devtools/browser/".
         browser_context_id (str or None): Pre-existing CDP browser context ID to use. When provided along with
-                                          cdp_url, the crawler will reuse this context instead of creating a new one.
+                                          cdp_url and CrawlerRunConfig.session_id, the crawler reuses this context.
+                                          Non-session crawls always create an isolated context.
                                           Useful for cloud browser services that pre-create isolated contexts.
                                           Default: None.
         target_id (str or None): Pre-existing CDP target ID (page) to use. When provided along with
-                                 browser_context_id, the crawler will reuse this target instead of creating
-                                 a new page. Default: None.
+                                 browser_context_id and CrawlerRunConfig.session_id, reuses this target.
+                                 Non-session crawls always create an isolated page. Default: None.
         cdp_cleanup_on_close (bool): When True and using cdp_url, the close() method will still clean up
                                      the local Playwright client resources. Useful for cloud/server scenarios
                                      where you don't own the remote browser but need to prevent memory leaks
@@ -1818,8 +1819,9 @@ class CrawlerRunConfig():
                               Default: 0.2.
         max_scroll_steps (Optional[int]): Maximum number of scroll steps to perform during full page scan.
                                          If None, scrolls until the entire page is loaded. Default: None.
-        process_iframes (bool): If True, attempts to process and inline iframe content.
-                                Default: False.
+        process_iframes (bool): If True, attempts to process and inline iframe content. Default: False.
+        max_iframes (int): Maximum iframe count to inline within the page deadline. Default: 20.
+        page_termination_timeout (float): Seconds allowed to interrupt timed-out JavaScript. Default: 5.
         flatten_shadow_dom (bool): If True, flatten shadow DOM content into the light DOM
                                     before HTML capture so page.content() includes it.
                                     Also injects an init script to force-open closed shadow roots.
@@ -1994,6 +1996,8 @@ class CrawlerRunConfig():
         scroll_delay: float = 0.2,
         max_scroll_steps: Optional[int] = None,
         process_iframes: bool = False,
+        max_iframes: int = 20,
+        page_termination_timeout: float = 5.0,
         flatten_shadow_dom: bool = False,
         remove_overlay_elements: bool = False,
         remove_consent_popups: bool = False,
@@ -2131,6 +2135,14 @@ class CrawlerRunConfig():
         self.scroll_delay = scroll_delay
         self.max_scroll_steps = max_scroll_steps
         self.process_iframes = process_iframes
+        if not isinstance(max_iframes, int) or isinstance(max_iframes, bool) or max_iframes < 1:
+            raise ValueError("max_iframes must be a positive integer")
+        self.max_iframes = max_iframes
+        if (not isinstance(page_termination_timeout, (int, float))
+                or isinstance(page_termination_timeout, bool)
+                or not math.isfinite(page_termination_timeout) or page_termination_timeout <= 0):
+            raise ValueError("page_termination_timeout must be a positive number")
+        self.page_termination_timeout = page_termination_timeout
         self.flatten_shadow_dom = flatten_shadow_dom
         self.remove_overlay_elements = remove_overlay_elements
         self.remove_consent_popups = remove_consent_popups
@@ -2502,6 +2514,8 @@ class CrawlerRunConfig():
             "scroll_delay": self.scroll_delay,
             "max_scroll_steps": self.max_scroll_steps,
             "process_iframes": self.process_iframes,
+            "max_iframes": self.max_iframes,
+            "page_termination_timeout": self.page_termination_timeout,
             "flatten_shadow_dom": self.flatten_shadow_dom,
             "remove_overlay_elements": self.remove_overlay_elements,
             "remove_consent_popups": self.remove_consent_popups,

@@ -112,7 +112,6 @@ class TestCloneRuntimeStateLocalStorage:
             assert expression == "({name, value}) => localStorage.setItem(name, value)"
             assert isinstance(arg, dict)
             assert set(arg.keys()) == {"name", "value"}
-            # Bug 1: the arg holds the stored values, not the literal key names.
             assert arg["name"] not in (None, "name")
             assert arg["value"] not in (None, "value")
 
@@ -155,18 +154,6 @@ class TestCloneRuntimeStateLocalStorage:
         ]
 
 
-# ---------------------------------------------------------------------------
-# Regression guards for the ``page=`` parameter (cross-crawl hijack fix).
-#
-# These guard against the bug where ``clone_runtime_state`` selected
-# ``dst.pages[0]`` on the shared managed/CDP ``default_context`` to drive the
-# localStorage injection. Concurrent ``get_page`` callers sharing that context
-# could then have one crawl's clone navigate another crawl's in-flight page to
-# the storage origin, aborting its load. The fix takes an explicit ``page=``
-# argument from the caller and only falls back to ``dst.pages[0]`` /
-# ``dst.new_page()`` when no page is supplied (preserving prior callers'
-# behaviour).
-# ---------------------------------------------------------------------------
 
 
 def _make_strict_page() -> "_RecordedPage":
@@ -213,7 +200,6 @@ class TestCloneRuntimeStatePageParameter:
         dst = AsyncMock()
         dst.pages = [other_page]
         dst.add_cookies = AsyncMock()
-        # If a regression re-selects from dst.pages we want a loud failure:
         dst.new_page = AsyncMock(side_effect=AssertionError("must not create new page"))
 
         supplied = _RecordedPage(label="supplied")
@@ -226,7 +212,6 @@ class TestCloneRuntimeStatePageParameter:
         assert supplied.evaluate.await_count == len(entries)
         assert [c.args[1] for c in supplied.evaluate.call_args_list] == entries
 
-        # The other crawl's page on the shared default_context is untouched.
         assert other_page.goto.await_count == 0
         assert other_page.evaluate.await_count == 0
 
@@ -344,13 +329,6 @@ class TestCloneRuntimeStatePageParameter:
         assert dst.add_cookies.await_count == 1
         assert dst.add_cookies.call_args.args[0] == cookies
 
-        # Verify cookies are copied before the page.goto. We order the mock
-        # histories by checking the mock objects are in the right global call
-        # order via their _mock_call_counts; the simplest robust check is that
-        # ``add_cookies`` was awaited at least once before the first
-        # ``page.goto`` await. We approximate this by comparing await counts:
-        # both 1 each, and ``add_cookies`` awaited at all (the clone only has
-        # one of each call here).
         assert dst.add_cookies.await_count == 1
         assert supplied.goto.await_count == 1
 
@@ -380,11 +358,8 @@ class TestCloneRuntimeStatePageParameter:
         assert supplied.goto.call_args.args[0] == "https://auth.example.com"
 
 
-# ---------------------------------------------------------------------------
-# End-to-end regression guard via the real ``BrowserManager.get_page`` flow.
-#
-# This reproduces the bug's exact interleaving: two concurrent ``get_page``
-# callers in the ``storage_state`` branch both append their pages to the shared
+# This reproduces the bug's exact interleaving: two distinct explicit sessions
+# in the ``storage_state`` branch both append their pages to the shared
 # ``default_context.pages`` before either ``clone_runtime_state`` runs (an
 # ``asyncio.Event`` barrier inside ``_new_context`` forces that ordering). With
 # the buggy ``dst.pages[0]`` selection, crawl B's clone navigates crawl A's
@@ -404,10 +379,18 @@ _STORAGE_STATE_E2E = {
 
 
 class _E2EFakePage:
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, context) -> None:
         self.label = label
+        self.context = context
+        self.closed = False
         self.goto = AsyncMock()
         self.evaluate = AsyncMock(return_value=None)
+
+    def is_closed(self):
+        return self.closed
+
+    async def close(self):
+        self.closed = True
 
     def __repr__(self) -> str:
         return f"_E2EFakePage({self.label})"
@@ -427,11 +410,20 @@ class _E2EFakeDefaultContext:
         self.set_extra_http_headers = AsyncMock()
         self.set_geolocation = AsyncMock()
         self.grant_permissions = AsyncMock()
+        self.listeners = {}
+
+    def on(self, event, callback):
+        self.listeners.setdefault(event, []).append(callback)
+
+    def remove_listener(self, event, callback):
+        self.listeners[event].remove(callback)
 
     async def new_page(self) -> _E2EFakePage:
         await asyncio.sleep(0)
-        page = _E2EFakePage(f"page_{len(self.pages)}")
+        page = _E2EFakePage(f"page_{len(self.pages)}", self)
         self.pages.append(page)
+        for callback in self.listeners.get("page", ()):
+            callback(page)
         return page
 
 
@@ -442,6 +434,7 @@ class _E2EFakeSrcContext:
     def __init__(self) -> None:
         self.cookies = AsyncMock(return_value=[])
         self.storage_state = AsyncMock(return_value=_STORAGE_STATE_E2E)
+        self.close = AsyncMock()
 
 
 def _build_e2e_manager() -> BrowserManager:
@@ -453,24 +446,15 @@ def _build_e2e_manager() -> BrowserManager:
     )
     bm = BrowserManager(cfg)
     bm._stealth_adapter = None
-    # ``get_page`` calls these helpers; stub them to no-ops so the test does not
-    # require a real browser, admission lock, stealth setup, or janitor.
-    async def _admit(*a, **kw):
-        return object()
-    bm._admit_page_acquisition = _admit
-    async def _noop(*a, **kw):
-        return None
-    bm._note_page_served = _noop
-    bm._apply_stealth_to_page = _noop
-    bm._cleanup_expired_sessions = lambda: None
-    bm._close_context_quietly = AsyncMock()
-    bm._run_cleanup = AsyncMock(return_value=False)
+    # Real admission and endpoint ownership prevent another session from
+    # claiming the first page while its storage-state clone is in flight.
+    bm._browser_endpoint_key = f"instance:{id(bm)}"
     return bm
 
 
 class TestCloneRuntimeStateGetPageConcurrent:
     """Drive the real ``BrowserManager.get_page`` storage_state branch with two
-    overlapping crawls and verify the clone targets each crawl's own page."""
+    overlapping sessions and verify the clone targets each session's own page."""
 
     @pytest.mark.asyncio
     async def test_concurrent_storage_state_branch_does_not_hijack_other_crawl(self):
@@ -481,8 +465,8 @@ class TestCloneRuntimeStateGetPageConcurrent:
         both_pages_ready = asyncio.Event()
         real_new_page = bm._new_page
 
-        async def _gated_new_page(context):
-            page, cancelled = await real_new_page(context)
+        async def _gated_new_page(context, guard=True):
+            page, cancelled = await real_new_page(context, guard=guard)
             if len(context.pages) >= 2:
                 both_pages_ready.set()
             return page, cancelled
@@ -494,16 +478,29 @@ class TestCloneRuntimeStateGetPageConcurrent:
             # call until BOTH crawls' pages exist on the shared context. This
             # deterministically reproduces the interleaving where the
             # ``_page_lock`` is released between crawls.
-            await both_pages_ready.wait()
+            await asyncio.wait_for(both_pages_ready.wait(), timeout=2)
             return _E2EFakeSrcContext()
 
         bm._new_context = _gated_new_context
 
-        run_conf = CrawlerRunConfig()
-        task_a = asyncio.create_task(bm.get_page(run_conf))
-        task_b = asyncio.create_task(bm.get_page(run_conf))
-        page_a, _ = await task_a
-        page_b, _ = await task_b
+        task_a = asyncio.create_task(bm.get_page(CrawlerRunConfig(session_id="clone-a")))
+        task_b = asyncio.create_task(bm.get_page(CrawlerRunConfig(session_id="clone-b")))
+        try:
+            (page_a, context_a), (page_b, context_b) = await asyncio.wait_for(
+                asyncio.gather(task_a, task_b), timeout=3
+            )
+            assert page_a is not page_b
+            assert context_a is context_b is default
+        finally:
+            for task in (task_a, task_b):
+                task.cancel()
+            await asyncio.gather(task_a, task_b, return_exceptions=True)
+            for session_id in ("clone-a", "clone-b"):
+                await bm.kill_session(session_id)
+            bm._remove_page_guard(default)
+
+        assert not bm._active_acquisitions
+        assert bm._browser_endpoint_key not in BrowserManager._global_pages_in_use
 
         # Each crawl's page receives exactly one storage-origin goto: its own
         # clone_runtime_state. Pre-fix, crawl B's clone picked
@@ -523,10 +520,13 @@ class TestCloneRuntimeStateGetPageConcurrent:
             assert call.args[0] == "https://auth.example.com"
 
         # Each page receives its own localStorage.setItem evaluations.
-        assert page_a.evaluate.await_count == 1
-        assert page_b.evaluate.await_count == 1
         for page in (page_a, page_b):
-            eval_call = page.evaluate.call_args_list[0]
+            storage_calls = [
+                call for call in page.evaluate.call_args_list
+                if call.args[0] != "window.stop()"
+            ]
+            assert len(storage_calls) == 1
+            eval_call = storage_calls[0]
             assert eval_call.args[0] == "({name, value}) => localStorage.setItem(name, value)"
             assert eval_call.args[1] == {"name": "token", "value": "secret"}
 
@@ -579,7 +579,7 @@ class TestCloneRuntimeStateRealBrowser:
         )
         async with AsyncWebCrawler(config=browser_config) as crawler:
             bm = crawler.crawler_strategy.browser_manager
-            page, context = await bm.get_page(CrawlerRunConfig())
+            page, context = await bm.get_page(CrawlerRunConfig(session_id="storage-single"))
             try:
                 # The returned page MUST be on the storage origin: that's the
                 # page ``clone_runtime_state`` navigated. Pre-fix, the clone
@@ -612,7 +612,7 @@ class TestCloneRuntimeStateRealBrowser:
                         f"the wrong page — the cross-crawl hijack."
                     )
             finally:
-                await bm.release_page_with_context(page)
+                await bm.kill_session("storage-single")
 
     @pytest.mark.asyncio
     async def test_real_storage_state_concurrent_crawls_no_hijack(self, local_server):
@@ -648,10 +648,9 @@ class TestCloneRuntimeStateRealBrowser:
         async with AsyncWebCrawler(config=browser_config) as crawler:
             bm = crawler.crawler_strategy.browser_manager
             # Three concurrent get_page calls in the storage_state branch.
-            run_conf = CrawlerRunConfig()
             tasks = [
-                asyncio.ensure_future(bm.get_page(run_conf))
-                for _ in range(3)
+                asyncio.ensure_future(bm.get_page(CrawlerRunConfig(session_id=f"storage-{i}")))
+                for i in range(3)
             ]
             try:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -681,9 +680,9 @@ class TestCloneRuntimeStateRealBrowser:
                         f"page (got {value!r})."
                     )
             finally:
-                for p in pages:
+                for i in range(3):
                     try:
-                        await bm.release_page_with_context(p)
+                        await bm.kill_session(f"storage-{i}")
                     except Exception:
                         pass
                 # Cancel any still-pending tasks defensively.

@@ -212,6 +212,7 @@ RUN uv venv --system-site-packages /tmp/browser-test-env \
     && PYTHONPATH=/app /tmp/browser-test-env/bin/python -m pytest -q -p no:cacheprovider -m "browser and not network" \
         deploy/docker/tests/test_real_browser_recycle_window.py \
         deploy/docker/tests/test_real_admin_recycle_eviction.py \
+        deploy/docker/tests/test_browser_isolation_chromium.py \
         tests/regression/test_adjust_viewport_screenshot_formula.py \
         tests/regression/test_e2e_stale_extraction_fallthrough.py \
         tests/regression/test_create_session_user_agent.py \

@@ -26,6 +26,7 @@ from llm_broker import LLMProviderNotAllowed
 from redis import asyncio as aioredis
 from redis.exceptions import RedisError
 from utils import (
+    CrawlResourceSettings,
     FilterType,
     ResultEncoding,
     TaskStatus,
@@ -229,6 +230,11 @@ def apply_server_crawler_defaults(loaded_config, request_config, config):
     for key, value in config["crawler"]["base_config"].items():
         if key not in request_params and hasattr(loaded_config, key):
             setattr(loaded_config, key, value)
+    limits = CrawlResourceSettings.from_config(config)
+    loaded_config.max_iframes = min(loaded_config.max_iframes, limits.max_iframes)
+    loaded_config.page_termination_timeout = min(
+        loaded_config.page_termination_timeout, limits.page_termination_timeout
+    )
     return loaded_config
 
 

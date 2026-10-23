@@ -4,8 +4,10 @@ import os
 import re
 import uuid
 import zlib
+from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import Enum
+from math import isfinite
 from pathlib import Path
 from typing import Any, Dict, Optional, assert_never
 
@@ -170,6 +172,65 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             merged[key] = value
     return merged
+
+
+@dataclass(frozen=True)
+class BrowserWatchdogSettings:
+    interval_seconds: float = 5.0
+    renderer_cpu_cores: float = 0.9
+    renderer_cpu_seconds: float = 20.0
+    renderer_rss_mb: int = 768
+    browser_probe_timeout_seconds: float = 5.0
+    consecutive_failure_limit: int = 3
+
+    @classmethod
+    def from_config(cls, config: dict) -> "BrowserWatchdogSettings":
+        configured = config.get("crawler", {}).get("pool", {}).get("watchdog", {})
+        values = {}
+        for field in fields(cls):
+            value = configured.get(field.name, field.default)
+            integral = field.name in {"renderer_rss_mb", "consecutive_failure_limit"}
+            expected = int if integral else (int, float)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, expected)
+                or not isfinite(value)
+                or value <= 0
+            ):
+                kind = "integer" if integral else "number"
+                raise ValueError(
+                    f"crawler.pool.watchdog.{field.name} must be a positive {kind}"
+                )
+            values[field.name] = value
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class CrawlResourceSettings:
+    max_iframes: int = 20
+    page_termination_timeout: float = 5.0
+
+    @classmethod
+    def from_config(cls, config: dict) -> "CrawlResourceSettings":
+        configured = config.get("crawler", {}).get("base_config", {})
+        max_iframes = configured.get("max_iframes", cls.max_iframes)
+        if (
+            isinstance(max_iframes, bool)
+            or not isinstance(max_iframes, int)
+            or max_iframes <= 0
+        ):
+            raise ValueError("crawler.base_config.max_iframes must be a positive integer")
+        timeout = configured.get("page_termination_timeout", cls.page_termination_timeout)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError(
+                "crawler.base_config.page_termination_timeout must be a positive number"
+            )
+        return cls(max_iframes=max_iframes, page_termination_timeout=timeout)
 
 
 def load_config() -> Dict:

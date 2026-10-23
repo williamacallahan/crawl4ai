@@ -9,10 +9,11 @@ import sys
 import tempfile
 import time
 import warnings
+import weakref
 from typing import Dict, List, Optional, Tuple
 
 import psutil
-from playwright.async_api import BrowserContext
+from playwright.async_api import BrowserContext, TimeoutError as PlaywrightTimeoutError
 
 from .async_configs import BrowserConfig, CrawlerRunConfig
 from .config import DOWNLOAD_PAGE_TIMEOUT, PAGE_TIMEOUT
@@ -59,6 +60,52 @@ DRIVER_STOP_SECONDS = 5.0
 # attaching to an arbitrary tab.
 TARGET_ID_DISCOVERY_SECONDS = 2.0
 
+# Playwright Python 1.53.0 bundled-driver defaults (chromiumSwitches.js). Chromium uses the
+# last --disable-features switch, so appending ours alone drops these defaults.
+PLAYWRIGHT_DISABLED_FEATURES = (
+    "AcceptCHFrame", "AutoExpandDetailsElement",
+    "AvoidUnnecessaryBeforeUnloadCheckSync",
+    "CertificateTransparencyComponentUpdater", "DestroyProfileOnBrowserClose",
+    "DialMediaRouteProvider", "ExtensionManifestV2Disabled", "GlobalMediaControls",
+    "HttpsUpgrades", "ImprovedCookieControls", "LazyFrameLoading", "LensOverlay",
+    "MediaRouter", "PaintHolding", "ThirdPartyStoragePartitioning", "Translate",
+)
+PATCHRIGHT_DISABLED_FEATURES = (
+    "AcceptCHFrame", "AvoidUnnecessaryBeforeUnloadCheckSync",
+    "DestroyProfileOnBrowserClose", "DialMediaRouteProvider", "GlobalMediaControls",
+    "HttpsUpgrades", "LensOverlay", "MediaRouter", "PaintHolding",
+    "ThirdPartyStoragePartitioning", "Translate", "AutoDeElevate", "RenderDocument",
+)
+
+
+def _merge_disabled_features(args, defaults=()):
+    """Keep one effective feature switch, preserving caller additions."""
+    features = list(defaults)
+    result = []
+    for arg in args:
+        if arg.startswith("--disable-features="):
+            features.extend(arg.split("=", 1)[1].split(","))
+        elif arg != "--disable-ipc-flooding-protection":
+            result.append(arg)
+    if features:
+        result.append("--disable-features=" + ",".join(dict.fromkeys(features)))
+    return list(dict.fromkeys(result))
+
+
+def _chromium_launch_options(args, use_undetected=False):
+    defaults = (
+        PATCHRIGHT_DISABLED_FEATURES if use_undetected
+        else PLAYWRIGHT_DISABLED_FEATURES
+    )
+    return {
+        "args": _merge_disabled_features(args, defaults),
+        "ignore_default_args": [
+            "--disable-features=" + ",".join(defaults),
+            "--disable-ipc-flooding-protection",
+        ],
+    }
+
+
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
     "--disable-background-timer-throttling",
@@ -70,7 +117,6 @@ BROWSER_DISABLE_OPTIONS = [
     "--disable-extensions",
     "--disable-features=TranslateUI",
     "--disable-hang-monitor",
-    "--disable-ipc-flooding-protection",
     "--disable-popup-blocking",
     "--disable-prompt-on-repost",
     "--disable-sync",
@@ -119,7 +165,6 @@ class ManagedBrowser:
             "--disable-blink-features=AutomationControlled",
             "--window-position=400,0",
             "--disable-renderer-backgrounding",
-            "--disable-ipc-flooding-protection",
             "--force-color-profile=srgb",
             "--mute-audio",
             "--disable-background-timer-throttling",
@@ -167,7 +212,7 @@ class ManagedBrowser:
         elif config.proxy_config:
             flags.append(f"--proxy-server={config.proxy_config.server}")
         # dedupe
-        return list(dict.fromkeys(flags))
+        return _merge_disabled_features(flags)
 
     browser_type: str
     user_data_dir: str
@@ -240,6 +285,8 @@ class ManagedBrowser:
         
         if self.browser_config.extra_args:
             args.extend(self.browser_config.extra_args)
+        if self.browser_type == "chromium":
+            args = _merge_disabled_features(args)
             
 
         # ── make sure no old Chromium instance is owning the same port/profile ──
@@ -732,13 +779,14 @@ class BrowserManager:
 
         # Session management
         self.sessions = {}
+        self._session_locks = weakref.WeakValueDictionary()
         self.session_ttl = 1800  # 30 minutes
 
-        # Keep track of contexts by a "config signature," so each unique config reuses a single context
+        # Contexts belong to individual allocations, retained only by sessions.
         self.contexts_by_config = {}
         self._contexts_lock = asyncio.Lock()
 
-        # Context lifecycle tracking for LRU eviction
+        # Allocation lifecycle tracking; a unique key prevents cross-crawl reuse.
         self._context_refcounts = {}    # sig -> int  (active crawls using this context)
         self._context_last_used = {}    # sig -> float (monotonic timestamp for LRU)
         self._page_to_sig = {}          # page -> sig  (for decrement lookup on release)
@@ -764,6 +812,7 @@ class BrowserManager:
         # released (or its session is killed), so a threshold cannot race a
         # partially-created page.
         self._pages_served = 0
+        self.consecutive_failures = 0
         self._recycle_due = False
         self._recycling = False
         self._closing = False
@@ -776,6 +825,12 @@ class BrowserManager:
         self._drain_deadline = None
         self._drain_seconds = RECYCLE_DRAIN_MIN_SECONDS
         self._background_tasks = set()
+        self.pool_recycle_requested = False
+        self.pool_recycle_reason = None
+        self.browser_pid = None
+        self._explicit_pages = {}  # context -> pages created by this manager
+        self._pending_page_creations = {}  # context -> allocation tasks
+        self._page_guard_handlers = {}
 
         # Stealth adapter for stealth mode
         self._stealth_adapter = None
@@ -803,8 +858,50 @@ class BrowserManager:
         """An explicit CDP endpoint is owned by somebody else."""
         return not self.config.cdp_url
 
+    def request_pool_recycle(self, reason: str) -> None:
+        """Quarantine an unhealthy browser; its owning pool disposes of it."""
+        self.pool_recycle_requested = True
+        self.pool_recycle_reason = reason
+        # Wake waiters so the admission check fails promptly.
+        self._recycle_done.set()
+
+    async def _attribute_browser_pid(self) -> None:
+        self.browser_pid = None
+        if not self._owns_browser_process():
+            return
+        process = getattr(self.managed_browser, "browser_process", None)
+        if process is not None:
+            self.browser_pid = process.pid
+            return
+        if self.config.browser_type != "chromium" or self.browser is None:
+            return
+        session = None
+
+        async def query():
+            nonlocal session
+            session = await self.browser.new_browser_cdp_session()
+            info = await session.send("SystemInfo.getProcessInfo")
+            return next(
+                (int(item["id"]) for item in info["processInfo"]
+                 if item["type"] == "browser"),
+                None,
+            )
+
+        try:
+            self.browser_pid = await asyncio.wait_for(query(), DRIVER_STOP_SECONDS)
+        except Exception:
+            pass
+        finally:
+            if session is not None:
+                try:
+                    await asyncio.wait_for(session.detach(), DRIVER_STOP_SECONDS)
+                except Exception:
+                    pass
+
     async def _started_browser(self) -> None:
         """Publish a successful owned-browser start to the recycle barrier."""
+        await self._attribute_browser_pid()
+        self.consecutive_failures = 0
         async with self._recycle_lock:
             if not self._recycling:
                 self._closing = False
@@ -927,12 +1024,15 @@ class BrowserManager:
                 prefix="crawl4ai-persistent-"
             )
 
+            launch_kwargs.update(_chromium_launch_options(cli_args, self.use_undetected))
             self.default_context = (
                 await self.playwright.chromium.launch_persistent_context(
                     user_data_dir, **launch_kwargs
                 )
             )
-            self.browser = None  # persistent context has no separate Browser
+            # New contexts belong to the same browser process; persistent
+            # profile state must not leak into an unrelated crawl.
+            self.browser = self.default_context.browser
             self._launched_persistent = True
 
             await self.setup_context(self.default_context)
@@ -1175,7 +1275,6 @@ class BrowserManager:
             "--disable-blink-features=AutomationControlled",
             "--window-position=400,0",
             "--disable-renderer-backgrounding",
-            "--disable-ipc-flooding-protection",
             "--force-color-profile=srgb",
             "--mute-audio",
             "--disable-background-timer-throttling",
@@ -1223,6 +1322,7 @@ class BrowserManager:
         browser_args = {"headless": self.config.headless, "args": args}
         if self.config.browser_type == "chromium":
             browser_args["chromium_sandbox"] = "--no-sandbox" not in args
+            browser_args.update(_chromium_launch_options(args, self.use_undetected))
 
         # On Windows, passing channel='chromium' (the default) causes Playwright
         # to look for a system Chrome installation instead of using the bundled
@@ -1303,9 +1403,6 @@ class BrowserManager:
 
         if self.config.cookies:
             await context.add_cookies(self.config.cookies)
-
-        if self.config.storage_state:
-            await context.storage_state(path=None)
 
         if self.config.accept_downloads:
             context.set_default_timeout(DOWNLOAD_PAGE_TIMEOUT)
@@ -1499,7 +1596,6 @@ class BrowserManager:
             "viewport": viewport_settings,
             "proxy": proxy_settings,
             "accept_downloads": self.config.accept_downloads,
-            "service_workers": "block",
             "storage_state": self.config.storage_state,
             "ignore_https_errors": self.config.ignore_https_errors,
             "device_scale_factor": self.config.device_scale_factor,
@@ -1540,22 +1636,26 @@ class BrowserManager:
         # Create and return the context with all settings
         context = await self.browser.new_context(**context_settings)
 
-        # Build dynamic blocking list based on config flags
-        to_block = []
-        if self.config.avoid_css:
-            to_block.extend(css_extensions)
-        if self.config.text_mode:
-            to_block.extend(static_extensions)
+        try:
+            # Build dynamic blocking list based on config flags
+            to_block = []
+            if self.config.avoid_css:
+                to_block.extend(css_extensions)
+            if self.config.text_mode:
+                to_block.extend(static_extensions)
 
-        if to_block:
-            for ext in to_block:
-                await context.route(f"**/*.{ext}", lambda route: route.abort())
+            if to_block:
+                for ext in to_block:
+                    await context.route(f"**/*.{ext}", lambda route: route.abort())
 
-        if self.config.avoid_ads:
-            for pattern in ad_tracker_patterns:
-                await context.route(pattern, lambda route: route.abort())
+            if self.config.avoid_ads:
+                for pattern in ad_tracker_patterns:
+                    await context.route(pattern, lambda route: route.abort())
 
-        return context
+            return context
+        except BaseException:
+            await self._run_cleanup(self._close_context_quietly(context))
+            raise
 
     def _make_config_signature(
         self,
@@ -1857,20 +1957,74 @@ class BrowserManager:
 
         task.add_done_callback(_close_late_result)
 
-    async def _close_page_quietly(self, page) -> None:
+    async def _bounded_resource_close(self, resource, reason) -> None:
+        task = asyncio.create_task(resource.close())
         try:
-            is_closed = getattr(page, "is_closed", None)
-            if callable(is_closed) and is_closed():
+            done, _ = await asyncio.wait({task}, timeout=PAGE_CLOSE_SECONDS)
+            if not done:
+                self.request_pool_recycle(reason + "_timeout")
+                task.cancel()
+                self._abandon_hung_task(task, None)
+                task.add_done_callback(self._consume_recycle_result)
                 return
-            await page.close()
+            task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            self._abandon_hung_task(task, None)
+            task.add_done_callback(self._consume_recycle_result)
+            self.request_pool_recycle(reason + "_cancelled")
+            raise
         except Exception:
-            pass
+            self.request_pool_recycle(reason + "_failed")
+
+    async def _close_page_quietly(self, page) -> None:
+        is_closed = getattr(page, "is_closed", None)
+        if callable(is_closed) and is_closed():
+            return
+        await self._bounded_resource_close(page, "page_close")
 
     async def _close_context_quietly(self, context) -> None:
         try:
-            await context.close()
-        except Exception:
-            pass
+            await self._bounded_resource_close(context, "context_close")
+        finally:
+            self._remove_page_guard(context)
+
+    def _remove_page_guard(self, context) -> None:
+        handler = self._page_guard_handlers.pop(context, None)
+        if handler is not None:
+            context.remove_listener("page", handler)
+        self._explicit_pages.pop(context, None)
+        self._pending_page_creations.pop(context, None)
+
+    def _install_page_guard(self, context) -> None:
+        if context in self._explicit_pages:
+            return
+        self._explicit_pages[context] = set()
+        self._pending_page_creations[context] = set()
+
+        def on_page(page):
+            # A Playwright page event precedes new_page's return. Compare the
+            # exact returned Page objects, never a shared "creating" boolean:
+            # a popup can arrive while another crawl allocates its own page.
+            pending = tuple(self._pending_page_creations.get(context, ()))
+            self._track_background_task(asyncio.create_task(
+                self._discard_unexpected_page(context, page, pending)
+            ))
+
+        context.on("page", on_page)
+        self._page_guard_handlers[context] = on_page
+
+    async def _discard_unexpected_page(self, context, page, pending) -> None:
+        if page in self._explicit_pages.get(context, ()):
+            return
+        if pending:
+            done, _ = await asyncio.wait(pending, timeout=PAGE_CLOSE_SECONDS)
+            for task in done:
+                if not task.cancelled() and task.exception() is None:
+                    if task.result() is page:
+                        return
+        if page not in self._explicit_pages.get(context, ()):
+            await self._close_page_quietly(page)
 
     async def _run_cleanup(self, coroutine) -> bool:
         """Keep cleanup alive if its caller receives another cancellation."""
@@ -1881,13 +2035,21 @@ class BrowserManager:
         except BaseException:
             return False
 
-    async def _new_page(self, context):
+    async def _new_page(self, context, guard=True):
         """Create a page without letting cancellation orphan Playwright's result."""
+        if guard:
+            self._install_page_guard(context)
         task = asyncio.create_task(context.new_page())
-        page, cancelled = await self._await_task_despite_cancellation(
-            task, self._close_page_quietly
-        )
-        return page, cancelled
+        pending = self._pending_page_creations.get(context, set())
+        pending.add(task)
+        try:
+            page, cancelled = await self._await_task_despite_cancellation(
+                task, self._close_page_quietly
+            )
+            self._explicit_pages.get(context, set()).add(page)
+            return page, cancelled
+        finally:
+            pending.discard(task)
 
     async def _new_context(
         self,
@@ -1911,10 +2073,11 @@ class BrowserManager:
         if signature is None:
             return
         async with self._contexts_lock:
-            if signature in self._context_refcounts:
-                self._context_refcounts[signature] = max(
-                    0, self._context_refcounts[signature] - 1
-                )
+            context = self.contexts_by_config.pop(signature, None)
+            self._context_refcounts.pop(signature, None)
+            self._context_last_used.pop(signature, None)
+        if context is not None:
+            await self._close_context_quietly(context)
 
     async def _acquire_context(
         self,
@@ -1922,58 +2085,24 @@ class BrowserManager:
         user_agent: Optional[str] = None,
         browser_hint: Optional[str] = None,
     ):
-        """Acquire one context reference, closing partial contexts on failure.
-
-        ``user_agent`` / ``browser_hint`` are the per-crawl overrides threaded
-        from ``_crawl_web``: they flow into the config signature (so distinct
-        UAs get distinct cached contexts) and into context creation / setup
-        (so each context is baked with the crawl's own UA). When ``None``,
-        callers get the existing behavior (fall back to ``self.config``).
-        """
-        signature = self._make_config_signature(crawlerRunConfig, user_agent=user_agent)
-        context = None
-        unregistered_context = None
-        acquired = False
+        """Each allocation owns its context; only session_id retains it."""
+        context = await self._new_context(
+            crawlerRunConfig, user_agent=user_agent, browser_hint=browser_hint
+        )
+        signature = object()
         try:
+            await self.setup_context(
+                context, crawlerRunConfig,
+                user_agent=user_agent, browser_hint=browser_hint,
+            )
             async with self._contexts_lock:
-                context = self.contexts_by_config.get(signature)
-                if context is None:
-                    context = await self._new_context(
-                        crawlerRunConfig,
-                        user_agent=user_agent,
-                        browser_hint=browser_hint,
-                    )
-                    unregistered_context = context
-                    await self.setup_context(
-                        context,
-                        crawlerRunConfig,
-                        user_agent=user_agent,
-                        browser_hint=browser_hint,
-                    )
-                    self.contexts_by_config[signature] = context
-                    self._context_refcounts[signature] = 0
-                    unregistered_context = None
-                    to_close = self._evict_lru_context_locked()
-                else:
-                    to_close = None
-
-                self._context_refcounts[signature] = (
-                    self._context_refcounts.get(signature, 0) + 1
-                )
-                self._context_last_used[signature] = time.monotonic()
-                acquired = True
-
-            if to_close is not None:
-                if await self._run_cleanup(self._close_context_quietly(to_close)):
-                    raise asyncio.CancelledError
+                if self._closing or self.pool_recycle_requested:
+                    raise RuntimeError("Browser manager is unavailable")
+                self.contexts_by_config[signature] = context
+                self._context_refcounts[signature] = 1
             return context, signature
         except BaseException:
-            if acquired:
-                await self._run_cleanup(self._decrement_context_refcount(signature))
-            if unregistered_context is not None:
-                await self._run_cleanup(
-                    self._close_context_quietly(unregistered_context)
-                )
+            await self._run_cleanup(self._close_context_quietly(context))
             raise
 
     async def _admit_page_acquisition(self, page_timeout_ms=PAGE_TIMEOUT):
@@ -2001,8 +2130,8 @@ class BrowserManager:
                     f"{wait_seconds:.0f}s"
                 ) from None
             async with self._recycle_lock:
-                if self._closing:
-                    raise RuntimeError("Browser manager is closed")
+                if self._closing or self.pool_recycle_requested:
+                    raise RuntimeError("Browser manager is unavailable")
                 if self._recycle_done.is_set():
                     token = object()
                     self._active_acquisitions.add(token)
@@ -2014,6 +2143,7 @@ class BrowserManager:
             not self._recycle_due
             or self.sessions
             or self._closing
+            or self.pool_recycle_requested
             or not self._owns_browser_process()
         ):
             return
@@ -2062,15 +2192,15 @@ class BrowserManager:
                 self._active_acquisitions.discard(token)
             self._close_admission_if_recycle_due_locked()
 
-    async def _note_page_served(self) -> None:
+    async def _note_page_served(self, session_id=None) -> None:
         async with self._recycle_lock:
-            if self._closing:
+            if self._closing or self.pool_recycle_requested:
                 raise RuntimeError("Browser manager is closed")
             self._pages_served += 1
             if not self._should_recycle():
                 return
             self._recycle_due = True
-            if self.sessions:
+            if self.sessions or session_id:
                 # Sessions deliberately retain their browser. Keep admission open
                 # until the last one is killed or expires.
                 self._recycle_done.set()
@@ -2134,12 +2264,7 @@ class BrowserManager:
             raise asyncio.CancelledError
 
     async def _rollback_page_acquisition(
-        self,
-        token,
-        page=None,
-        signature=None,
-        page_marked=False,
-        close_page=False,
+        self, token, page=None, signature=None, page_marked=False, close_page=False,
     ) -> None:
         async def cleanup():
             try:
@@ -2148,20 +2273,14 @@ class BrowserManager:
                     self._page_to_admission.pop(page, None)
                 if page_marked and page is not None:
                     await self._release_page_from_use(page)
-                if signature is not None:
-                    await self._decrement_context_refcount(signature)
-            finally:
-                # Before the page close, never after: a close that hangs would
-                # strand this token in _active_acquisitions, and a due recycle
-                # that never sees an empty drain set closes admission for good.
-                await self._finish_admission(token)
-            if close_page and page is not None:
                 try:
-                    await asyncio.wait_for(
-                        self._close_page_quietly(page), PAGE_CLOSE_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                    if close_page and page is not None:
+                        await self._close_page_quietly(page)
+                finally:
+                    if signature is not None:
+                        await self._decrement_context_refcount(signature)
+            finally:
+                await self._finish_admission(token)
 
         await self._run_cleanup(cleanup())
 
@@ -2171,29 +2290,53 @@ class BrowserManager:
         user_agent: Optional[str] = None,
         browser_hint: Optional[str] = None,
     ):
-        """Get a page, retaining every partial allocation until it is cleaned up.
+        """Allocate independently, serializing first creation of the same session."""
+        if crawlerRunConfig.session_id:
+            lock = self._session_locks.setdefault(
+                crawlerRunConfig.session_id, asyncio.Lock()
+            )
+            async with lock:
+                return await self._get_page_impl(
+                    crawlerRunConfig, user_agent=user_agent, browser_hint=browser_hint
+                )
+        return await self._get_page_impl(
+            crawlerRunConfig, user_agent=user_agent, browser_hint=browser_hint
+        )
 
-        ``user_agent`` / ``browser_hint`` are the per-crawl UA / client-hint
-        overrides threaded from ``AsyncPlaywrightCrawlerStrategy._crawl_web``
-        for crawls that change the UA. They flow into the context config
-        signature (so distinct UAs get distinct cached contexts) and into
-        context creation / setup (so each context is baked with the crawl's
-        own UA - the value that actually goes on the wire). When ``None``,
-        callers get the existing behavior (the shared ``BrowserConfig`` UA).
+    async def _get_page_impl(
+        self,
+        crawlerRunConfig: CrawlerRunConfig,
+        user_agent: Optional[str] = None,
+        browser_hint: Optional[str] = None,
+    ):
+        """Retain each allocation until release; reuse only an explicit session.
+
+        Per-crawl UA and client hints are applied to this allocation's context.
         """
         self._cleanup_expired_sessions()
 
         session_id = crawlerRunConfig.session_id
         if session_id and session_id in self.sessions:
             async with self._recycle_lock:
-                if self._closing:
-                    raise RuntimeError("Browser manager is closed")
+                if self._closing or self.pool_recycle_requested:
+                    raise RuntimeError("Browser manager is unavailable")
             context, page, _ = self.sessions[session_id]
             self.sessions[session_id] = (context, page, time.time())
+            await self._note_page_served(session_id=session_id)
             try:
                 await page.evaluate("window.stop()")
+            except (asyncio.CancelledError, asyncio.TimeoutError, PlaywrightTimeoutError):
+                # The caller has not received this retained page yet, so its
+                # timeout cleanup cannot interrupt a busy session renderer.
+                self.request_pool_recycle("session acquisition interrupted")
+                raise
             except Exception:
                 pass
+            async with self._recycle_lock:
+                if self._closing:
+                    raise RuntimeError("Browser manager closed during session acquisition")
+                if self.pool_recycle_requested:
+                    raise RuntimeError("Browser manager is unavailable")
             return page, context
 
         token = await self._admit_page_acquisition(
@@ -2206,11 +2349,55 @@ class BrowserManager:
         close_page = False
         stored_session = False
         try:
-            if (
-                not self.config.use_managed_browser
-                or self.config.create_isolated_context
-                or user_agent is not None
-            ):
+            await self._note_page_served(session_id=session_id)
+            use_session_context = (
+                session_id
+                and self.config.use_managed_browser
+                and not self.config.create_isolated_context
+                and user_agent is None
+            )
+            if use_session_context:
+                # Explicit sessions retain the configured profile / CDP target.
+                # Non-session requests never enter this shared-context path.
+                context = self.default_context
+                guard = self._owns_browser_process()
+                if guard:
+                    self._install_page_guard(context)
+                async with BrowserManager._get_global_lock():
+                    cancelled = False
+                    if self.config.browser_context_id and self.config.target_id:
+                        page = await self._get_page_by_target_id(
+                            context, self.config.target_id
+                        )
+                    else:
+                        pages_in_use = self._get_pages_in_use()
+                        page = next(
+                            (candidate for candidate in context.pages
+                             if candidate not in pages_in_use),
+                            None,
+                        )
+                    if page is None:
+                        page, cancelled = await self._new_page(context, guard=guard)
+                        close_page = True
+                    self._explicit_pages.get(context, set()).add(page)
+                    self._mark_page_in_use_locked(page)
+                    page_marked = True
+                self._page_to_admission[page] = token
+                if cancelled:
+                    raise asyncio.CancelledError
+                if self.config.storage_state:
+                    temporary = await self._new_context(
+                        crawlerRunConfig, user_agent=user_agent,
+                        browser_hint=browser_hint,
+                    )
+                    try:
+                        await clone_runtime_state(
+                            temporary, context, crawlerRunConfig,
+                            self.config, page=page,
+                        )
+                    finally:
+                        await self._run_cleanup(self._close_context_quietly(temporary))
+            else:
                 context, signature = await self._acquire_context(
                     crawlerRunConfig,
                     user_agent=user_agent,
@@ -2222,73 +2409,27 @@ class BrowserManager:
                 self._page_to_admission[page] = token
                 if cancelled:
                     raise asyncio.CancelledError
-                await self._apply_stealth_to_page(page)
-            elif self.config.storage_state:
-                context = self.default_context
-                async with self._page_lock:
-                    page, cancelled = await self._new_page(context)
-                close_page = True
-                self._page_to_admission[page] = token
-                if cancelled:
-                    raise asyncio.CancelledError
-
-                tmp_context = None
-                try:
-                    tmp_context = await self._new_context(
-                        crawlerRunConfig,
-                        user_agent=user_agent,
-                        browser_hint=browser_hint,
-                    )
-                    await clone_runtime_state(
-                        tmp_context,
-                        context,
-                        crawlerRunConfig,
-                        self.config,
-                        page=page,
-                    )
-                finally:
-                    if tmp_context is not None:
-                        await self._run_cleanup(
-                            self._close_context_quietly(tmp_context)
-                        )
-                await self._apply_stealth_to_page(page)
-            else:
-                context = self.default_context
-                async with BrowserManager._get_global_lock():
-                    page_created = False
-                    cancelled = False
-                    if self.config.browser_context_id and self.config.target_id:
-                        page = await self._get_page_by_target_id(
-                            context, self.config.target_id
-                        )
-                    else:
-                        pages_in_use = self._get_pages_in_use()
-                        page = next(
-                            (page for page in context.pages if page not in pages_in_use),
-                            None,
-                        )
-                    if page is None:
-                        page, cancelled = await self._new_page(context)
-                        page_created = True
-                    self._mark_page_in_use_locked(page)
-                    page_marked = True
-                close_page = page_created
-                self._page_to_admission[page] = token
-                if cancelled:
-                    raise asyncio.CancelledError
-                await self._apply_stealth_to_page(page)
+            await self._apply_stealth_to_page(page)
 
             if session_id:
                 self.sessions[session_id] = (context, page, time.time())
                 stored_session = True
+                async with self._recycle_lock:
+                    if self._recycle_due:
+                        self._recycle_done.set()
+                        if self._drain_deadline is not None:
+                            self._drain_deadline.cancel()
+                            self._drain_deadline = None
                 try:
                     await page.evaluate("window.stop()")
                 except Exception:
                     pass
 
-            # This closes admission under the same lock that issues tokens, before
-            # this page is returned to its caller.
-            await self._note_page_served()
+            async with self._recycle_lock:
+                if self._closing or token not in self._active_acquisitions:
+                    raise RuntimeError("Browser manager closed during page acquisition")
+                if self.pool_recycle_requested:
+                    raise RuntimeError("Browser manager is unavailable")
             return page, context
         except BaseException:
             if (
@@ -2309,31 +2450,8 @@ class BrowserManager:
         entry = self.sessions.pop(session_id, None)
         if entry is None:
             return
-        context, page, _ = entry
-        signature = self._page_to_sig.pop(page, None)
-        token = self._page_to_admission.pop(page, None)
-        should_close_context = False
-        try:
-            await self._release_page_from_use(page)
-            if signature is not None:
-                async with self._contexts_lock:
-                    if signature in self._context_refcounts:
-                        self._context_refcounts[signature] = max(
-                            0, self._context_refcounts[signature] - 1
-                        )
-                        if (
-                            not self.config.use_managed_browser
-                            and self._context_refcounts[signature] == 0
-                        ):
-                            self.contexts_by_config.pop(signature, None)
-                            self._context_refcounts.pop(signature, None)
-                            self._context_last_used.pop(signature, None)
-                            should_close_context = True
-            await self._close_page_quietly(page)
-            if should_close_context:
-                await self._close_context_quietly(context)
-        finally:
-            await self._finish_admission(token)
+        _, page, _ = entry
+        await self._release_page_with_context(page)
 
     async def kill_session(self, session_id: str):
         """Kill a session without letting a cancelled caller strand its page."""
@@ -2351,11 +2469,21 @@ class BrowserManager:
         self._release_page_from_use_nowait(page)
 
     async def _release_page_with_context(self, page) -> None:
+        # A session owns its page until kill_session or TTL expiry.
+        if any(entry[1] is page for entry in self.sessions.values()):
+            return
         signature = self._page_to_sig.pop(page, None)
         token = self._page_to_admission.pop(page, None)
-        await self._release_page_from_use(page)
-        await self._decrement_context_refcount(signature)
-        await self._finish_admission(token)
+        try:
+            await self._release_page_from_use(page)
+            if signature is not None or token is not None:
+                try:
+                    await self._close_page_quietly(page)
+                finally:
+                    await self._decrement_context_refcount(signature)
+                    self._explicit_pages.get(page.context, set()).discard(page)
+        finally:
+            await self._finish_admission(token)
 
     async def release_page_with_context(self, page):
         """Release a page and its drain token exactly once."""
@@ -2485,6 +2613,8 @@ class BrowserManager:
                 return
 
             if self.config.cdp_url:
+                await self._close_sessions()
+                await self._close_contexts()
                 # An explicit CDP URL is externally owned. Do not recycle or
                 # terminate it; optional cleanup only disconnects this client.
                 if self.config.cdp_cleanup_on_close:
@@ -2539,6 +2669,8 @@ class BrowserManager:
 
             await self._stop_playwright()
         finally:
+            for context in list(self._page_guard_handlers):
+                self._remove_page_guard(context)
             await self._release_all_pages_from_use()
             self._page_to_sig.clear()
             self._page_to_admission.clear()

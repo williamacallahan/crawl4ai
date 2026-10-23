@@ -109,6 +109,8 @@ class _FakeBrowserConfig:
 
 
 class _FakeCrawlerRunConfig:
+    max_iframes = 20
+    page_termination_timeout = 5.0
     deep_crawl_strategy = None
     scraping_strategy = None
     stream = False

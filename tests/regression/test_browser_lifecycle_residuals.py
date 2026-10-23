@@ -31,19 +31,37 @@ class _Page:
 
 
 class _Context:
-    def __init__(self, *, new_page_started=None, new_page_release=None):
+    def __init__(self, *, new_page_started=None, new_page_release=None, stop_error=None):
         self.pages = []
         self.closed = False
         self.new_page_started = new_page_started
         self.new_page_release = new_page_release
+        self.stop_error = stop_error
+        self.listeners = {}
+
+    def on(self, event, callback):
+        self.listeners.setdefault(event, []).append(callback)
+
+    async def new_cdp_session(self, page):
+        session = MagicMock()
+        session.send = AsyncMock()
+        session.detach = AsyncMock()
+        return session
+
+    def remove_listener(self, event, handler):
+        callbacks = self.listeners.get(event, [])
+        if handler in callbacks:
+            callbacks.remove(handler)
 
     async def new_page(self):
         if self.new_page_started:
             self.new_page_started.set()
         if self.new_page_release:
             await self.new_page_release.wait()
-        page = _Page(self)
+        page = _Page(self, stop_error=self.stop_error)
         self.pages.append(page)
+        for callback in self.listeners.get("page", ()):
+            callback(page)
         return page
 
     async def close(self):
@@ -86,6 +104,11 @@ def _manager(config=None):
     manager = BrowserManager(config or BrowserConfig(headless=True), logger=None)
     manager.managed_browser = None
     manager._browser_endpoint_key = f"instance:{id(manager)}"
+    async def create_context(*_args, **_kwargs):
+        return _Context()
+
+    manager.create_browser_context = create_context
+    manager.setup_context = AsyncMock()
     return manager
 
 
@@ -124,16 +147,22 @@ async def test_page_registry_prunes_on_release_and_close():
 
 
 @pytest.mark.asyncio
-async def test_managed_page_is_reused_after_release():
+async def test_managed_crawls_close_and_replace_their_context_after_release():
     manager = _manager(BrowserConfig(use_managed_browser=True, headless=True))
     manager.default_context = _Context()
 
-    first, _ = await manager.get_page(CrawlerRunConfig())
+    first, first_context = await manager.get_page(CrawlerRunConfig())
     await manager.release_page_with_context(first)
-    second, _ = await manager.get_page(CrawlerRunConfig())
+    assert first.closed
+    assert first_context.closed
+    second, second_context = await manager.get_page(CrawlerRunConfig())
 
-    assert second is first
+    assert second is not first
+    assert second_context is not first_context
+    assert not second.closed
     await manager.release_page_with_context(second)
+    assert second.closed
+    assert second_context.closed
 
 
 @pytest.mark.asyncio
@@ -258,7 +287,7 @@ async def test_close_rejects_an_acquisition_that_was_already_in_flight():
     await manager.close()
     release.set()
 
-    with pytest.raises(RuntimeError, match="closed"):
+    with pytest.raises(RuntimeError, match="closed|unavailable"):
         await acquisition
 
     assert context.pages[0].closed
@@ -267,18 +296,16 @@ async def test_close_rejects_an_acquisition_that_was_already_in_flight():
 
 @pytest.mark.asyncio
 async def test_window_stop_cancellation_kills_only_a_new_session():
-    page = _Page(stop_error=asyncio.CancelledError())
-    context = _Context()
-    context.pages.append(page)
-    page.context = context
+    context = _Context(stop_error=asyncio.CancelledError())
     manager = _manager(BrowserConfig(use_managed_browser=True))
     manager.default_context = context
+    manager.create_browser_context = AsyncMock(return_value=context)
 
     with pytest.raises(asyncio.CancelledError):
         await manager.get_page(CrawlerRunConfig(session_id="session"))
 
     assert "session" not in manager.sessions
-    assert page.closed
+    assert context.pages[0].closed
     assert not manager._active_acquisitions
 
     existing_page = _Page(stop_error=asyncio.CancelledError())
@@ -299,10 +326,13 @@ async def test_repeated_cancellation_during_console_cleanup_still_releases_page(
     )
     page = MagicMock()
     page.goto = AsyncMock(side_effect=asyncio.CancelledError)
+    page.context.new_cdp_session = AsyncMock(
+        return_value=MagicMock(send=AsyncMock(), detach=AsyncMock())
+    )
     page.context.browser.contexts = []
     strategy.browser_manager = MagicMock()
     strategy.browser_manager.get_page = AsyncMock(
-        return_value=(page, MagicMock())
+        return_value=(page, page.context)
     )
     strategy.browser_manager.release_page_with_context = AsyncMock()
 
@@ -330,10 +360,14 @@ async def test_headless_crawl_closes_its_last_page():
     strategy.browser_manager.get_page = AsyncMock(
         return_value=(crawl_page, context)
     )
-    strategy.browser_manager.release_page_with_context = AsyncMock()
+    async def release_page(_page):
+        await context.close()
+
+    strategy.browser_manager.release_page_with_context = AsyncMock(side_effect=release_page)
 
     await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
 
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(crawl_page)
     assert page.is_closed(), "the crawl left its page (and renderer) open"
 
 
@@ -351,8 +385,6 @@ async def test_headless_crawl_delayed_content_survives_page_close():
     crawl_page.context.browser.contexts = [context]
     crawl_page.close = underlying.close
 
-    # `page.content()` raises once the underlying page is closed, mirroring
-    # real Playwright's TargetClosedError on a closed target.
     async def content_after_close(*a, **k):
         if getattr(underlying, "closed", False):
             raise PlaywrightError("Target page, context or browser has been closed")
@@ -367,16 +399,16 @@ async def test_headless_crawl_delayed_content_survives_page_close():
     strategy.browser_manager.get_page = AsyncMock(
         return_value=(crawl_page, context)
     )
-    strategy.browser_manager.release_page_with_context = AsyncMock()
+    async def release_page(_page):
+        await context.close()
+
+    strategy.browser_manager.release_page_with_context = AsyncMock(side_effect=release_page)
 
     result = await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(crawl_page)
 
-    # The finally block closed the only page (the resource-cleanup invariant
-    # from test_headless_crawl_closes_its_last_page still holds).
     assert underlying.is_closed(), "the crawl left its page (and renderer) open"
 
-    # get_delayed_content must still return the crawled HTML after the page
-    # was closed. Pre-fix this raised TargetClosedError.
     html = await result.get_delayed_content(0.0)
     assert "html" in html
 
@@ -397,8 +429,6 @@ async def test_delayed_content_returns_crawled_html_without_live_page():
 
     async def content_tracker(*a, **k):
         calls["count"] += 1
-        # After close, a real page.content() would raise; return a sentinel
-        # that would fail the assertion if the closure re-read the page.
         if getattr(underlying, "closed", False):
             return "<html>STALE</html>"
         return "<html><body>crawl-time</body></html>"
@@ -412,17 +442,18 @@ async def test_delayed_content_returns_crawled_html_without_live_page():
     strategy.browser_manager.get_page = AsyncMock(
         return_value=(crawl_page, context)
     )
-    strategy.browser_manager.release_page_with_context = AsyncMock()
+    async def release_page(_page):
+        await context.close()
+
+    strategy.browser_manager.release_page_with_context = AsyncMock(side_effect=release_page)
 
     result = await strategy._crawl_web("https://example.test/", CrawlerRunConfig())
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(crawl_page)
     assert underlying.is_closed()
 
     delayed_html = await result.get_delayed_content(0.0)
-    # The delayed read returns the crawl-time HTML, not a stale page re-read.
     assert "crawl-time" in delayed_html
     assert "STALE" not in delayed_html
-    # page.content() was called exactly once — during the crawl — and never
-    # again from get_delayed_content.
     assert calls["count"] == 1
 
 
@@ -562,7 +593,7 @@ async def test_failed_recycle_wakes_waiters_with_a_closed_manager_error():
     await manager._recycle_browser()
 
     assert manager._recycle_done.is_set()
-    with pytest.raises(RuntimeError, match="closed"):
+    with pytest.raises(RuntimeError, match="closed|unavailable"):
         await manager.get_page(CrawlerRunConfig())
 
 
@@ -592,11 +623,6 @@ def test_explicit_cdp_never_claims_process_recycling():
     assert not manager._should_recycle()
 
 
-# ---------------------------------------------------------------------------
-# Bounds. Every wait below replaced an unbounded one; without them a single
-# wedged Playwright call takes the whole replica down instead of one request,
-# which is the 2026-09-03 outage shape rather than a fix for it.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -605,8 +631,6 @@ async def test_a_recycle_that_never_finishes_fails_the_request(monkeypatch):
     manager = _manager()
     manager._recycle_done.clear()
 
-    # Not a hang: PERMANENT has no janitor backstop, so a request parked here
-    # would hold its pool permit until the container is restarted.
     with pytest.raises(RuntimeError, match="did not finish"):
         await manager._admit_page_acquisition()
 
@@ -625,8 +649,6 @@ async def test_a_hung_allocation_stops_absorbing_its_caller_cancellation(monkeyp
     await asyncio.sleep(0)
     waiter.cancel()
 
-    # The pool's 60s close cap only SIGKILLs an abandoned Chromium if its
-    # cancellation is actually delivered through here.
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(waiter, timeout=1)
 
@@ -693,12 +715,13 @@ async def test_a_hung_page_close_still_returns_its_admission_token(monkeypatch):
 
     hung = asyncio.Event()
 
-    async def never_closes(_page):
+    async def never_closes():
         await hung.wait()
 
-    manager._close_page_quietly = never_closes
+    page = _Page()
+    page.close = never_closes
     await manager._rollback_page_acquisition(
-        token, page=_Page(), close_page=True
+        token, page=page, close_page=True
     )
 
     for _ in range(100):
@@ -734,8 +757,6 @@ async def test_a_failing_browser_close_still_ends_the_chromium_process():
 
     await manager.close()
 
-    # These two are what actually end the process group; a raising close() used
-    # to skip both and leave the Chromium charged to the container for life.
     assert cleaned.is_set()
     assert stopped.is_set()
 
@@ -757,10 +778,6 @@ async def test_a_wedged_driver_does_not_deadlock_the_restart(monkeypatch):
         await wedged.wait()
 
     async def start():
-        # start() re-enters close() whenever playwright is still set, and that
-        # close awaits the recycle task this restart is running inside. The
-        # timeout branch has to drop the driver reference or the restart
-        # deadlocks against itself and the barrier never reopens.
         assert manager.playwright is None
         started.set()
 
@@ -774,32 +791,22 @@ async def test_a_wedged_driver_does_not_deadlock_the_restart(monkeypatch):
     wedged.set()
 
 
-# ---------------------------------------------------------------------------
-# Console-message capture regression coverage for `_crawl_web`.
-#
-# `UndetectedAdapter` does not push console events into `captured_console`
-# during the crawl; it buffers them in-page and surfaces them only via
-# `retrieve_console_messages`. The response is built with
-# `console_messages=captured_console` and `AsyncCrawlResponse` is a Pydantic
-# v2 model that copies its list at construction. If the in-page messages are
-# only retrieved in the `finally` block (after `return` constructs the
-# response), the response is silently empty. The fakes below model both the
-# buffering adapter (UndetectedAdapter) and the event-based adapter
-# (PlaywrightAdapter/StealthAdapter) without launching a real browser.
-# ---------------------------------------------------------------------------
 
 
 def _mock_crawl_page(url="https://example.test/"):
     """A MagicMock page wired so `AsyncPlaywrightCrawlerStrategy._crawl_web`
     completes a minimal happy path: `goto` returns no response (skipping the
     redirect walk), body visibility succeeds, `page.content()` returns HTML,
-    and the finally-block page-close guard sees an empty context list."""
+    and CDP session attachment supports renderer cancellation."""
     page = MagicMock()
     page.goto = AsyncMock(return_value=None)
     page.url = url
     page.content = AsyncMock(return_value="<html><body></body></html>")
     page.wait_for_selector = AsyncMock(return_value=True)
     page.context.browser.contexts = []
+    page.context.new_cdp_session = AsyncMock(
+        return_value=MagicMock(send=AsyncMock(), detach=AsyncMock())
+    )
     return page
 
 
@@ -809,12 +816,12 @@ def _mock_strategy(adapter):
         browser_adapter=adapter,
     )
     strategy.browser_manager = MagicMock()
+    page = _mock_crawl_page()
     strategy.browser_manager.get_page = AsyncMock(
-        return_value=(_mock_crawl_page(), MagicMock())
+        return_value=(page, page.context)
     )
     strategy.browser_manager.release_page_with_context = AsyncMock()
 
-    # Hand the caller the page that get_page returns so assertions can pin it.
     page = strategy.browser_manager.get_page.return_value[0]
     return strategy, page
 
@@ -831,11 +838,9 @@ class _BufferingConsoleAdapter:
         self.cleanup_calls = 0
 
     async def evaluate(self, page, expression, arg=None):
-        # `csp_compliant_wait` probes body visibility via evaluate; succeed.
         return True
 
     async def setup_console_capture(self, page, captured_console):
-        # No event handler — messages are NOT pushed during the crawl.
         return None
 
     async def setup_error_capture(self, page, captured_console):
@@ -899,15 +904,10 @@ async def test_buffering_adapter_console_messages_reach_response():
         CrawlerRunConfig(capture_console_messages=True),
     )
 
-    # The pre-return retrieval must run before the response is built.
     assert adapter.retrieve_calls == 1
-    # The finally-block teardown still runs exactly once.
     assert adapter.cleanup_calls == 1
-    # The response carries the buffered messages (empty `[]` without the fix).
     assert result.console_messages is not None
     assert [m["text"] for m in result.console_messages] == ["log-1", "error-1"]
-    # Pre-existing straggler-window: messages surfaced only in `finally` run
-    # after Pydantic copied the list, so they do not reach the response.
     assert "straggler" not in [m["text"] for m in result.console_messages]
     # The page is still released exactly once.
     strategy.browser_manager.release_page_with_context.assert_awaited_once_with(page)
@@ -1082,38 +1082,38 @@ def test_get_global_lock_survives_contended_reuse_across_event_loops():
     asyncio.run(acquire_contended_on_new_loop())  # pre-fix: raises here
 
 
-def test_get_page_third_branch_survives_concurrent_reuse_across_event_loops():
-    """End-to-end regression for get_page's third branch (managed browser,
-    default config) — the exact line in the bug's traceback. Two concurrent
-    get_page calls park a waiter on _get_global_lock (binding it to the loop),
-    exactly as arun_many's default 5-wide dispatcher does; a second asyncio.run
-    with a fresh BrowserManager but the same class-level lock must not crash.
+def test_get_page_survives_concurrent_acquisitions_across_event_loops():
+    """Concurrent managed crawls allocate distinct contexts on each event loop.
+
+    Global bookkeeping survives the loop change, while allocation itself no
+    longer serializes behind the historical shared-default-context branch.
     """
 
     async def run_two_concurrent_get_page_calls():
         manager = _manager(BrowserConfig(use_managed_browser=True, headless=True))
         release = asyncio.Event()
         started = asyncio.Event()
-        manager.default_context = _Context(
-            new_page_started=started,
-            new_page_release=release,
-        )
+        async def create_context(*_args, **_kwargs):
+            return _Context(new_page_started=started, new_page_release=release)
+
+        manager.create_browser_context = create_context
 
         first = asyncio.create_task(manager.get_page(CrawlerRunConfig()))
-        await started.wait()  # first is inside _new_page, holding _get_global_lock
+        await asyncio.wait_for(started.wait(), 1)
         second = asyncio.create_task(manager.get_page(CrawlerRunConfig()))
-        # Let second reach _get_global_lock and park on it (or raise pre-fix).
+        # Both pages remain in flight until their allocation is released.
         await asyncio.sleep(0.05)
-        release.set()  # unblock first; it releases the lock; second acquires
-        page_a, _ = await first
-        page_b, _ = await second  # pre-fix: RuntimeError; post-fix: succeeds
+        release.set()
+        page_a, context_a = await first
+        page_b, context_b = await second
         assert page_a is not page_b
+        assert context_a is not context_b
         await manager.release_page_with_context(page_a)
         await manager.release_page_with_context(page_b)
 
-    asyncio.run(run_two_concurrent_get_page_calls())  # loop 1: bind lock
+    asyncio.run(run_two_concurrent_get_page_calls())
     assert BrowserManager._global_pages_lock is not None
-    asyncio.run(run_two_concurrent_get_page_calls())  # loop 2: must not crash
+    asyncio.run(run_two_concurrent_get_page_calls())
 
 
 @pytest.mark.asyncio

@@ -1,21 +1,9 @@
-"""Regression tests for the crawler pool's liveness check during an in-place recycle.
+"""A browser remains live during its own close/start recycle window.
 
-``BrowserManager`` recycles an owned Chromium process in place after
-``max_pages_before_recycle`` pages: it runs ``close(_for_recycle=True)`` (which
-nulls ``self.browser`` and ``self.default_context``) then ``start()`` in a
-fire-and-forget background task. During that close->start window the manager's
-flags read as a *healthy* recycle in progress (``_recycling is True``,
-``_closing is False``) even though ``browser``/``default_context`` are both
-``None``. ``crawler_pool._is_live`` must treat a recycling manager as live so
-the pool blocks on the library's own restart via ``_admit_page_acquisition``
-instead of force-replacing a healthy-but-reloading browser.
-
-These tests drive the real ``BrowserManager.close(_for_recycle=True)`` path
-(the code that nulls the attributes) with a stubbed ``start()`` that parks on
-an ``asyncio.Event`` to expose the mid-recycle state deterministically, then
-call the real ``crawler_pool._is_live`` / ``_discard_if_unavailable`` /
-``get_crawler``. ``test_real_browser_recycle_window.py`` exercises the same
-contract against a real headless Chromium end-to-end.
+These tests drive BrowserManager.close with start parked on an asyncio.Event,
+then exercise pool liveness, discard and acquisition. A recycling manager
+must stay registered while its browser reference is temporarily None.
+The separate test_real_browser_recycle_window.py covers real Chromium.
 """
 
 import asyncio
@@ -60,13 +48,28 @@ class _Context:
     def __init__(self):
         self.pages = []
         self.closed = False
+        self.handlers = {}
+        self.headers = {}
+
+    def on(self, event, handler):
+        self.handlers.setdefault(event, []).append(handler)
+
+    async def set_extra_http_headers(self, headers):
+        self.headers = dict(headers)
 
     def is_closed(self):
         return self.closed
 
+    def remove_listener(self, event, handler):
+        callbacks = self.handlers.get(event, [])
+        if handler in callbacks:
+            callbacks.remove(handler)
+
     async def new_page(self):
         page = _Page(self)
         self.pages.append(page)
+        for handler in self.handlers.get("page", []):
+            handler(page)
         return page
 
     async def close(self):
@@ -81,6 +84,9 @@ class _Browser:
 
     def is_connected(self):
         return self._connected
+
+    async def new_context(self, **_settings):
+        return _Context()
 
     async def close(self):
         self._connected = False
@@ -473,7 +479,7 @@ async def test_failed_recycle_with_a_still_connected_browser_is_replaced(monkeyp
 
     assert manager._closing is True
     assert manager.browser.is_connected()
-    with pytest.raises(RuntimeError, match="closed"):
+    with pytest.raises(RuntimeError, match="unavailable"):
         await manager.get_page(CrawlerRunConfig())
 
     dead = _crawler_with_manager(manager)

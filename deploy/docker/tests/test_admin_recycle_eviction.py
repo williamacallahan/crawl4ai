@@ -1,46 +1,11 @@
-"""Regression tests for the admin browser restart/cleanup paths evicting a
-browser mid-recycle.
+"""Admin restart and cleanup must not detach a browser during its own recycle.
 
-``BrowserManager`` recycles an owned Chromium process in place after
-``max_pages_before_recycle`` pages, running ``close(_for_recycle=True)`` ->
-``start()`` in a shielded, fire-and-forget background task
-(``_recycle_browser``). While that runs, the manager lies fallow at
-``active_requests == 0`` and ``_recycling is True`` with its ``browser``/
-``default_context`` temporarily ``None``.
-
-Commits ``d15fdd6`` and ``881307d`` added an ``_is_recycling`` guard to the
-*automatic* eviction paths (``_janitor_pass`` and ``_make_browser_capacity``)
-so their bounded ``_close_in_background`` 60s close cap cannot cancel the
-shielded recycle and orphan a fresh driver + Chromium on a detached,
-``_closing=True`` manager. Two production-reachable *admin* detach paths -
-``_init_permanent_locked(force=True)`` (reached by ``POST /actions/restart_browser``
-for the permanent browser) and ``retire_pool_crawlers`` (reached by
-``POST /actions/restart_browser`` / ``/actions/kill_browser`` /
-``/actions/cleanup`` for hot/cold browsers) - were never given that guard, so
-an admin action landing on a mid-recycle browser routed it back into the
-exact orphan mechanism the commits closed.
-
-This fix mirrors ``d15fdd6``/``881307d`` literally: both admin paths now skip a
-mid-recycle entry (``_is_recycling`` is True) instead of detaching it.
-
-These tests drive the real ``BrowserManager.close(_for_recycle=True)`` recycle
-machinery with only the Playwright/Chromium transport stubbed (mirroring the
-doubles ``tests/regression/test_browser_lifecycle_residuals.py``,
-``test_is_live_recycle.py`` and the in-tree ``test_janitor_recycle_eviction.py``
-use), then exercise the real ``crawler_pool._init_permanent_locked`` /
-``retire_pool_crawlers``. They assert:
-
-* the new ``_is_recycling`` gate skips a mid-recycle permanent browser on a
-  force-restart (the fix) and the browser stays registered, healthy and
-  closeable after the recycle completes (no orphan),
-* the gate skips a mid-recycle hot/cold entry on retire/cleanup (the fix),
-* plain (non-recycling) idle browsers are still detached and closed (no
-  regression), and
-* the orphan mechanism the admin guard now avoids reproduces directly when the
-  close budget fires during a straddling ``start()`` (the counterfactual the
-  guarded paths already document).
-
-Browser-free: ``-m "not browser"`` picks these up in the CI unit gate.
+These browser-free tests drive BrowserManager's real close/start lifecycle
+with only the Playwright transport stubbed. They exercise permanent-browser
+force restart and hot/cold retirement, verifying that recycling entries stay
+registered, completed entries remain closeable, and ordinary idle entries
+still retire. A counterfactual close-budget test reproduces the orphaned
+Chromium mechanism that the recycling guard prevents.
 """
 
 import asyncio
@@ -95,6 +60,18 @@ class _Context:
     def __init__(self):
         self.pages = []
         self.closed = False
+        self.handlers = {}
+
+    def on(self, event, handler):
+        self.handlers.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event, handler):
+        callbacks = self.handlers.get(event, [])
+        if handler in callbacks:
+            callbacks.remove(handler)
+
+    async def set_extra_http_headers(self, headers):
+        pass
 
     def is_closed(self):
         return self.closed
@@ -102,6 +79,8 @@ class _Context:
     async def new_page(self):
         page = _Page(self)
         self.pages.append(page)
+        for handler in self.handlers.get("page", []):
+            handler(page)
         return page
 
     async def close(self):
@@ -111,6 +90,9 @@ class _Context:
 
 
 class _Browser:
+    async def new_context(self, **kwargs):
+        return _Context()
+
     def __init__(self, connected=True):
         self._connected = connected
         self.closed = False

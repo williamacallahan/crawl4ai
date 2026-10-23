@@ -29,8 +29,6 @@ class FakeResult:
         return {"url": self.url, "success": True, "fit_html": None, "pdf": None}
 
 
-# The library's catch-all shape (crawl4ai/utils.py get_error_context): container
-# path, source snippet and raw exception text.
 INTERNAL_ERROR_MESSAGE = (
     "Unexpected error in _crawl_web at line 806 in _crawl_web "
     "(/app/crawl4ai/async_crawler_strategy.py):\n"
@@ -109,6 +107,8 @@ class FakeBrowserConfig:
 
 
 class FakeCrawlerRunConfig:
+    max_iframes = 20
+    page_termination_timeout = 5.0
     deep_crawl_strategy = None
     scraping_strategy = None
     stream = False

@@ -8,9 +8,14 @@ import logging
 import time
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Dict, Optional
 
-from utils import get_container_memory_percent, load_config
+import psutil
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from prometheus_client import Counter
+from utils import BrowserWatchdogSettings, get_container_memory_percent, load_config
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig
 
@@ -42,6 +47,25 @@ MAX_BROWSER_INSTANCES = CONFIG.get("crawler", {}).get("pool", {}).get(
 ADMISSION_SEM = asyncio.Semaphore(MAX_ACTIVE_REQUESTS)
 DEFAULT_CONFIG_SIG = None  # Cached sig for default config
 _CLOSE_TASKS = set()  # In-flight background closes; close_all() drains them at shutdown
+WATCHDOG = BrowserWatchdogSettings.from_config(CONFIG)
+RENDERER_KILLS = {"cpu": 0, "rss": 0}
+# Preserve the process-wide collector when the pool configuration is reloaded.
+if "RENDERER_KILL_METRIC" not in globals():
+    RENDERER_KILL_METRIC = Counter(
+        "crawl4ai_renderer_kills_total",
+        "Renderer processes terminated by the browser resource watchdog",
+        ["reason"],
+    )
+
+
+@dataclass
+class _RendererSample:
+    cpu_seconds: float
+    sampled_at: float
+    over_cpu_since: Optional[float] = None
+
+
+_RENDERER_SAMPLES: dict[tuple[int, float], _RendererSample] = {}
 
 
 def _pos(v):
@@ -92,6 +116,7 @@ def get_pool_snapshot() -> dict:
         "cold_pool": COLD_POOL.copy(),
         "last_used": LAST_USED.copy(),
         "usage_count": USAGE_COUNT.copy(),
+        "renderer_kills": RENDERER_KILLS.copy(),
     }
 
 
@@ -175,8 +200,13 @@ def _is_live(crawler: AsyncWebCrawler) -> bool:
     """
     try:
         manager = crawler.crawler_strategy.browser_manager
-        if getattr(manager, "_recycling", False):
+        if getattr(manager, "_recycling", False) is True:
             return True
+        if getattr(manager, "pool_recycle_requested", False) is True:
+            return False
+        failures = getattr(manager, "consecutive_failures", 0)
+        if isinstance(failures, int) and failures >= WATCHDOG.consecutive_failure_limit:
+            return False
         # A failed recycle or a close leaves _closing set, and a closed manager
         # refuses every page even while its browser object still reports
         # connected; only a replacement brings this config back.
@@ -703,6 +733,164 @@ async def _recycle_busiest_browser() -> None:
         logger.warning(f"Memory pressure: recycling a browser after {pages_served} pages")
 
 
+def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, float]]:
+    """Sample only renderers descended from this manager's owned browser PID."""
+    manager = crawler.crawler_strategy.browser_manager
+    browser_pid = getattr(manager, "browser_pid", None)
+    if isinstance(browser_pid, bool) or not isinstance(browser_pid, int):
+        return set()
+    try:
+        descendants = psutil.Process(browser_pid).children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return set()
+
+    seen = set()
+    for process in descendants:
+        try:
+            if "--type=renderer" not in process.cmdline():
+                continue
+            identity = (process.pid, process.create_time())
+            seen.add(identity)
+            cpu_times = process.cpu_times()
+            cpu_seconds = cpu_times.user + cpu_times.system
+            previous = _RENDERER_SAMPLES.get(identity)
+            over_cpu_since = None
+            if previous is not None and now > previous.sampled_at:
+                cores = (cpu_seconds - previous.cpu_seconds) / (now - previous.sampled_at)
+                if cores > WATCHDOG.renderer_cpu_cores:
+                    over_cpu_since = (
+                        previous.over_cpu_since
+                        if previous.over_cpu_since is not None
+                        else previous.sampled_at
+                    )
+            _RENDERER_SAMPLES[identity] = _RendererSample(
+                cpu_seconds, now, over_cpu_since
+            )
+            reason = None
+            if process.memory_info().rss > WATCHDOG.renderer_rss_mb * 1024 * 1024:
+                reason = "rss"
+            elif (
+                over_cpu_since is not None
+                and now - over_cpu_since >= WATCHDOG.renderer_cpu_seconds
+            ):
+                reason = "cpu"
+            if reason is not None:
+                process.kill()  # psutil sends SIGKILL on the supported Linux image.
+                RENDERER_KILLS[reason] += 1
+                RENDERER_KILL_METRIC.labels(reason=reason).inc()
+                _RENDERER_SAMPLES.pop(identity, None)
+                logger.warning("Killed browser renderer pid=%s reason=%s", process.pid, reason)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Renderers exit while pages navigate; losing one during a sample
+            # must not stop sampling the other browsers.
+            continue
+    return seen
+
+
+def _probe_failure(error: Exception) -> bool:
+    if isinstance(error, (asyncio.TimeoutError, PlaywrightTimeoutError)):
+        return True
+    if not isinstance(error, PlaywrightError):
+        return False
+    message = str(error).lower()
+    return "target closed" in message or "has been closed" in message
+
+
+async def _probe_browser(crawler: AsyncWebCrawler) -> bool:
+    """Return whether a browser has exhausted its consecutive failure budget."""
+    manager = crawler.crawler_strategy.browser_manager
+    if getattr(manager, "pool_recycle_requested", False) is True:
+        return True
+    failures = getattr(manager, "consecutive_failures", 0)
+    if isinstance(failures, int) and failures >= WATCHDOG.consecutive_failure_limit:
+        return True
+    if _is_recycling(crawler):
+        return False
+    browser = manager.browser
+    if browser is None:
+        return False
+    if getattr(manager, "_docker_health_browser", None) is not browser:
+        manager._docker_health_browser = browser
+        manager._docker_health_failures = 0
+        manager._docker_health_session = None
+
+    async def get_version():
+        # One session belongs to this browser and closes with it. A detach in
+        # timeout cleanup would send another command through the same wedged
+        # connection and hold the janitor past its five-second probe budget.
+        if manager._docker_health_session is None:
+            manager._docker_health_session = await browser.new_browser_cdp_session()
+        await manager._docker_health_session.send("Browser.getVersion")
+
+    try:
+        await asyncio.wait_for(get_version(), WATCHDOG.browser_probe_timeout_seconds)
+    except Exception as error:
+        if manager.browser is not browser or _is_recycling(crawler):
+            return False
+        if not _probe_failure(error):
+            # Browser-level CDP is Chromium-only. Other browser engines retain
+            # their existing lifecycle; a protocol error is not a failed target.
+            manager._docker_health_failures = 0
+            return False
+        manager._docker_health_failures += 1
+        logger.warning(
+            "Browser health probe failed (%s/%s): %s",
+            manager._docker_health_failures, WATCHDOG.consecutive_failure_limit,
+            type(error).__name__,
+        )
+    else:
+        if manager.browser is not browser or _is_recycling(crawler):
+            return False
+        manager._docker_health_failures = 0
+    return manager._docker_health_failures >= WATCHDOG.consecutive_failure_limit
+
+
+async def _dispose_unhealthy(crawler: AsyncWebCrawler, browser) -> None:
+    """Detach the exact failed instance and use the pool's bounded close path."""
+    async with LOCK:
+        manager = crawler.crawler_strategy.browser_manager
+        if _is_recycling(crawler) or manager.browser is not browser:
+            return
+        if PERMANENT is crawler:
+            _close_in_background(_detach_permanent())
+            return
+        for pool in (HOT_POOL, COLD_POOL):
+            for sig, current in list(pool.items()):
+                if current is crawler:
+                    _close_in_background(_detach_pool_crawler(pool, sig))
+                    return
+
+
+async def _watchdog_pass() -> None:
+    """Bound resource and CDP failures for busy and idle browsers alike."""
+    async with LOCK:
+        crawlers = [
+            crawler
+            for crawler in (PERMANENT, *HOT_POOL.values(), *COLD_POOL.values())
+            if crawler is not None
+        ]
+    now = time.monotonic()
+    seen = set()
+    for crawler in crawlers:
+        if not _is_recycling(crawler):
+            seen.update(_watch_renderers(crawler, now))
+    for identity in list(_RENDERER_SAMPLES):
+        if identity not in seen:
+            _RENDERER_SAMPLES.pop(identity, None)
+
+    # A busy target must not hold the pool lock, or one wedged browser prevents
+    # admission and reclamation for all the healthy browsers in this process.
+    browsers = [crawler.crawler_strategy.browser_manager.browser for crawler in crawlers]
+    results = await asyncio.gather(
+        *(_probe_browser(crawler) for crawler in crawlers), return_exceptions=True
+    )
+    for crawler, browser, failed in zip(crawlers, browsers, results):
+        if isinstance(failed, Exception):
+            logger.warning("Browser health probe raised unexpectedly", exc_info=failed)
+        elif failed is True:
+            await _dispose_unhealthy(crawler, browser)
+
+
 async def janitor():
     """Adaptive cleanup based on memory pressure."""
     global LAST_JANITOR_PASS
@@ -732,7 +920,10 @@ async def _janitor_pass():
     else:
         interval, cold_ttl, hot_ttl = 60, BASE_IDLE_TTL, BASE_IDLE_TTL * 2
 
-    await asyncio.sleep(interval)
+    # The resource watchdog needs repeated samples inside its sustained-CPU
+    # window even when low container memory permits a longer idle TTL.
+    await asyncio.sleep(min(interval, WATCHDOG.interval_seconds))
+    await _watchdog_pass()
 
     now = time.time()
     async with LOCK:

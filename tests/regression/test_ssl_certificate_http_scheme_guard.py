@@ -107,6 +107,7 @@ def _build_strategy():
     page.wait_for_selector = AsyncMock(side_effect=RuntimeError("STOP_AFTER_SSL"))
     page.close = AsyncMock()
     context = MagicMock()
+    context.new_cdp_session = AsyncMock(return_value=AsyncMock())
 
     strategy.browser_manager = MagicMock()
     strategy.browser_manager.get_page = AsyncMock(return_value=(page, context))

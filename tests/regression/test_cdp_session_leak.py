@@ -142,6 +142,14 @@ def _patch_new_cdp_session_on_context(crawler, fake_cdp):
     """
 
     async def hook(page, context, config):
+        original = context.new_cdp_session
+
+        async def restore(page, **_kwargs):
+            context.new_cdp_session = original
+            return page
+
+        crawler.crawler_strategy.set_hook("before_return_html", restore)
+
         async def fake_new_cdp_session(_page):
             return fake_cdp
 
