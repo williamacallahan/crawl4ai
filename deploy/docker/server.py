@@ -61,6 +61,8 @@ from monitor_routes import router as monitor_router
 from prometheus_fastapi_instrumentator import Instrumentator
 from rank_bm25 import BM25Okapi
 from redis import asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis_config import (
     build_rate_limit_storage_uri as _build_rate_limit_storage_uri,
 )
@@ -260,6 +262,7 @@ async def lifespan(_: FastAPI):
 
         app.state.janitor = asyncio.create_task(janitor())
         app.state.timeline_updater = asyncio.create_task(_timeline_updater())
+        app.state.ready_once = False
         app.state.readiness_initializer = asyncio.create_task(_initialize_readiness())
 
         yield
@@ -309,6 +312,7 @@ async def _initialize_readiness():
             await asyncio.wait_for(get_monitor().load_from_redis(), timeout=5.0)
             get_monitor().start_persistence_worker()
             app.state.readiness_checks_active = True
+            app.state.ready_once = True
             return
         except Exception as exc:
             logger.warning("Redis readiness initialization failed: %s", type(exc).__name__)
@@ -689,6 +693,18 @@ async def _archive_budget_spent_handler(request: Request, exc: ArchiveBudgetSpen
         },
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         headers={"Retry-After": str(exc.retry_after)},
+    )
+
+
+@app.exception_handler(RedisConnectionError)
+@app.exception_handler(RedisTimeoutError)
+async def _redis_unavailable_handler(request: Request, exc: Exception):
+    """A Redis outage is a retryable dependency failure, not a server bug."""
+    logger.warning("redis unavailable for %s: %r", request.url.path, exc)
+    return JSONResponse(
+        {"detail": "Crawl4AI state store is unavailable", "code": "redis_unavailable"},
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        headers={"Retry-After": "30"},
     )
 
 
@@ -1145,12 +1161,17 @@ async def get_hooks_info():
 
 @app.get(LIVENESS_PATH)
 async def liveness():
-    # Serving a response proves startup finished; dependencies own readiness.
-    return {
+    # Until the first readiness, liveness waits on Redis too: a rollout must
+    # never promote a candidate that cannot reach it. After that, a Redis
+    # outage leaves the replica alive and its in-flight crawls running.
+    body = {
         "status": "alive",
         "revision": os.environ.get("C4AI_GIT_SHA", ""),
         "instance": os.environ.get("HOSTNAME", ""),
     }
+    if not getattr(app.state, "ready_once", False):
+        return JSONResponse({**body, "status": "starting"}, status_code=503)
+    return body
 
 
 @app.get(HEALTH_PATH)

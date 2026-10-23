@@ -20,6 +20,8 @@ from crawler_pool import close_all, janitor
 from egress_proxy import start_pinning_proxy, stop_pinning_proxy
 from fastapi import HTTPException, status
 from redis import asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis_config import RESILIENT_CLIENT_KWARGS, build_redis_url
 from utils import correlated_error, load_config, setup_logging
 from webhook import WebhookDeliveryService
@@ -47,7 +49,18 @@ class CrawlJobWorker:
         self.webhook_service = webhook_service or WebhookDeliveryService(config)
 
     async def run(self) -> None:
-        await self.queue.ensure_group()
+        # A worker started during a Redis outage waits in-process: exiting
+        # would leave supervisord's growing restart delay between it and the
+        # moment Redis returns.
+        delay = 1.0
+        while True:
+            try:
+                await self.queue.ensure_group()
+                break
+            except (RedisConnectionError, RedisTimeoutError) as error:
+                logger.warning("Crawl job worker waiting for Redis: %r", error)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
         while True:
             try:
                 entries = await self.queue.claim_stale(self.consumer)

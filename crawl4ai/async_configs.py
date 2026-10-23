@@ -222,6 +222,24 @@ UNTRUSTED_FORBIDDEN_FIELDS = {
 
 }
 
+# Extraction schemas are free-form dicts, so regex steps are checked by walking
+# the schema rather than by field name. Field types may be scalar or pipelines.
+_SCHEMA_STRATEGIES = {
+    "JsonCssExtractionStrategy", "JsonXPathExtractionStrategy", "JsonLxmlExtractionStrategy",
+}
+
+
+def _has_regex_field(node) -> bool:
+    if isinstance(node, dict):
+        field_type = node.get("type")
+        if field_type == "regex" or (isinstance(field_type, list) and "regex" in field_type):
+            return True
+        return any(_has_regex_field(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_has_regex_field(value) for value in node)
+    return False
+
+
 # Field names that must NEVER be set from an untrusted body on ANY allowed
 # type, checked regardless of per-type allowlist. This is the fail-closed
 # backstop for filesystem and code fields on every allowed strategy.
@@ -589,6 +607,12 @@ def _clamp_untrusted(type_name: str, params: dict) -> dict:
                     type_name, "scroll_by", scroll_by, minimum=0,
                     maximum=100_000, integer=True,
                 )
+    elif type_name in _SCHEMA_STRATEGIES:
+        if _has_regex_field(params.get("schema")):
+            raise UntrustedConfigError(
+                f"schema fields of type 'regex' are not permitted on {type_name} "
+                "from an untrusted request"
+            )
     elif type_name == "PruningContentFilter":
         for field in ("preserve_classes", "preserve_tags"):
             if field in params:
