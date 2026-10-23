@@ -766,13 +766,9 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 async def handle_response_capture(response):
                     try:
                         try:
-                            # body = await response.body()
-                            # json_body = await response.json()
                             text_body = await response.text()
                         except Exception:
                             text_body = None
-                            # json_body = None
-                            # text_body = None
                         captured_requests.append({
                             "event_type": "response",
                             "url": response.url,
@@ -783,8 +779,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             "request_timing": response.request.timing, # Detailed timing info
                             "timestamp": time.time(),
                             "body" : {
-                                # "raw": body,
-                                # "json": json_body,
                                 "text": text_body
                             }
                         })
@@ -1014,48 +1008,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 if not config.ignore_body_visibility:
                     raise Error(f"Body element is hidden: {visibility_info}")
 
-            # try:
-            #     await page.wait_for_selector("body", state="attached", timeout=30000)
-
-            #     await page.wait_for_function(
-            #         """
-            #         () => {
-            #             const body = document.body;
-            #             const style = window.getComputedStyle(body);
-            #             return style.display !== 'none' &&
-            #                 style.visibility !== 'hidden' &&
-            #                 style.opacity !== '0';
-            #         }
-            #     """,
-            #         timeout=30000,
-            #     )
-            # except Error as e:
-            #     visibility_info = await page.evaluate(
-            #         """
-            #         () => {
-            #             const body = document.body;
-            #             const style = window.getComputedStyle(body);
-            #             return {
-            #                 display: style.display,
-            #                 visibility: style.visibility,
-            #                 opacity: style.opacity,
-            #                 hasContent: body.innerHTML.length,
-            #                 classList: Array.from(body.classList)
-            #             }
-            #         }
-            #     """
-            #     )
-
-            #     if self.config.verbose:
-            #         self.logger.debug(
-            #             message="Body visibility info: {info}",
-            #             tag="DEBUG",
-            #             params={"info": visibility_info},
-            #         )
-
-            #     if not config.ignore_body_visibility:
-            #         raise Error(f"Body element is hidden: {visibility_info}")
-
             # Handle content loading and viewport adjustment
             if not self.browser_config.text_mode and (
                 config.wait_for_images or config.adjust_viewport_to_content
@@ -1083,12 +1035,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     dimensions = await self.get_page_dimensions(page)
                     page_height = dimensions["height"]
                     page_width = dimensions["width"]
-                    # page_width = await page.evaluate(
-                    #     "document.documentElement.scrollWidth"
-                    # )
-                    # page_height = await page.evaluate(
-                    #     "document.documentElement.scrollHeight"
-                    # )
 
                     target_width = self.browser_config.viewport_width
                     target_height = max(int(target_width * page_height / page_width), page_height)
@@ -1447,7 +1393,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 if cleanup_cancelled:
                     raise asyncio.CancelledError
 
-    # async def _handle_full_page_scan(self, page: Page, scroll_delay: float = 0.1):
     async def _handle_full_page_scan(self, page: Page, scroll_delay: float = 0.1, max_scroll_steps: Optional[int] = None):
         """
         Helper method to handle full page scanning.
@@ -1483,12 +1428,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             )
             current_position = viewport_height
 
-            # await page.evaluate(f"window.scrollTo(0, {current_position})")
             await self.safe_scroll(page, 0, current_position, delay=scroll_delay)
-            # await self.csp_scroll_to(page, 0, current_position)
-            # await asyncio.sleep(scroll_delay)
 
-            # total_height = await page.evaluate("document.documentElement.scrollHeight")
             dimensions = await self.get_page_dimensions(page)
             total_height = dimensions["height"]
 
@@ -1506,18 +1447,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
                 # Increment the step counter for max_scroll_steps tracking
                 scroll_step_count += 1
-                
-                # await page.evaluate(f"window.scrollTo(0, {current_position})")
-                # await asyncio.sleep(scroll_delay)
 
-                # new_height = await page.evaluate("document.documentElement.scrollHeight")
                 dimensions = await self.get_page_dimensions(page)
                 new_height = dimensions["height"]
 
                 if new_height > total_height:
                     total_height = new_height
 
-            # await page.evaluate("window.scrollTo(0, 0)")
             await self.safe_scroll(page, 0, 0)
 
         except Exception as e:
@@ -1527,7 +1463,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 params={"error": str(e)},
             )
         else:
-            # await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await self.safe_scroll(page, 0, total_height)
 
     async def _handle_virtual_scroll(self, page: Page, config: "VirtualScrollConfig"):
@@ -2031,7 +1966,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             stitched = Image.new("RGB", (segments[0].width, total_height))
             offset = 0
             for img in segments:
-                # stitched.paste(img, (0, offset))
                 stitched.paste(img.convert("RGB"), (0, offset))
                 offset += img.height
 
@@ -2130,24 +2064,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     # then wait for the new page to load before continuing
                     result = None
                     try:
-                        # OLD VERSION:
-                        # result = await page.evaluate(
-                        #     f"""
-                        # (async () => {{
-                        #     try {{
-                        #         const script_result = {script};
-                        #         return {{ success: true, result: script_result }};
-                        #     }} catch (err) {{
-                        #         return {{ success: false, error: err.toString(), stack: err.stack }};
-                        #     }}
-                        # }})();
-                        # """
-                        # )
-                        
-                        # """ NEW VERSION:
-                        # When {script} contains statements (e.g., const link = …; link.click();), 
+                        # When {script} contains statements (e.g., const link = …; link.click();),
                         # this forms invalid JavaScript, causing Playwright execution error: SyntaxError: Unexpected token 'const'.
-                        # """
                         result = await self.adapter.evaluate(page,
                             f"""
                         (async () => {{
@@ -2209,17 +2127,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             tag="JS_EXEC",
                             params={"error": str(e)},
                         )
-
-                    # t1 = time.time()
-                    # try:
-                    #     await page.wait_for_load_state('networkidle', timeout=5000)
-                    #     print("Network idle after script execution in", time.time() - t1)
-                    # except Error as e:
-                    #     self.logger.warning(
-                    #         message="Network idle timeout: {error}",
-                    #         tag="JS_EXEC",
-                    #         params={"error": str(e)}
-                    #     )
 
                     results.append(result if result else {"success": True})
 
