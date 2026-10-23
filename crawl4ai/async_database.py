@@ -30,6 +30,9 @@ class CacheSettings(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     max_bytes: int = Field(default=536_870_912, gt=0)
     max_age_seconds: int = Field(default=604_800, gt=0)
+    # A census reads every row and stats every content file under the shared
+    # writer lock; once per interval per process keeps writes O(1).
+    prune_interval_seconds: int = Field(default=300, ge=0)
 
 
 class AsyncDatabaseManager:
@@ -53,6 +56,7 @@ class AsyncDatabaseManager:
                 config = yaml.safe_load(config_path.read_text()) or {}
                 cache_settings = CacheSettings.model_validate(config.get("cache", {}))
         self.cache_settings = cache_settings or CacheSettings()
+        self._next_prune_at = 0.0
         self.logger = AsyncLogger(
             log_file=(None if os.getenv("PYTHON_ENV") == "production"
                       else os.path.join(base_directory, "crawler_db.log")),
@@ -696,13 +700,19 @@ class AsyncDatabaseManager:
                     cached_at,
                 ),
             )
-            await self._prune_cache(db)
+            prune_due = time.monotonic() >= self._next_prune_at
+            if prune_due:
+                self._next_prune_at = (
+                    time.monotonic() + self.cache_settings.prune_interval_seconds
+                )
+                await self._prune_cache(db)
             # Publish evictions before unlinking: a rollback must never restore
             # rows whose files were already removed. Reacquire the writer lock
             # and read references afresh in case another writer ran at commit.
             await db.commit()
-            await db.execute("BEGIN IMMEDIATE")
-            await self._collect_orphan_content(db)
+            if prune_due:
+                await db.execute("BEGIN IMMEDIATE")
+                await self._collect_orphan_content(db)
 
         try:
             await self.execute_with_retry(_cache)
@@ -713,6 +723,12 @@ class AsyncDatabaseManager:
                 force_verbose=True,
                 params={"error": str(e)},
             )
+
+    _ROW_COLUMNS = (
+        "url", "html", "cleaned_html", "markdown", "extracted_content", "success",
+        "media", "links", "metadata", "screenshot", "response_headers",
+        "downloaded_files", "etag", "last_modified", "head_fingerprint", "cached_at",
+    )
 
     _CONTENT_FIELDS = {
         "html": "html", "cleaned_html": "cleaned", "markdown": "markdown",
@@ -728,26 +744,29 @@ class AsyncDatabaseManager:
 
     async def _prune_cache(self, db):
         """Evict expired rows, then oldest writes until the payload fits."""
-        # ponytail: O(n) census of the bounded store per write; use indexed
-        # reference accounting if cache-write throughput warrants it.
         await db.execute(
             "DELETE FROM crawled_data WHERE cached_at < ? OR cached_at IS NULL",
             (time.time() - self.cache_settings.max_age_seconds,),
         )
         fields = list(self._CONTENT_FIELDS)
-        async with db.execute("SELECT * FROM crawled_data ORDER BY cached_at, url") as cursor:
+        # SQLite measures inline payloads; only hashes and sizes reach Python.
+        row_bytes = " + ".join(
+            f"coalesce(length(CAST({column} AS BLOB)), 0)" for column in self._ROW_COLUMNS
+        )
+        async with db.execute(
+            f"SELECT url, {', '.join(fields)}, {row_bytes} AS row_bytes "
+            "FROM crawled_data ORDER BY cached_at, url"
+        ) as cursor:
             columns = [column[0] for column in cursor.description]
             rows = [dict(zip(columns, row)) for row in await cursor.fetchall()]
         refs = Counter(
             (self._CONTENT_FIELDS[field], row[field])
             for row in rows for field in fields if row[field]
         )
-        files = self._content_files()
-        sizes = {key: path.stat().st_size for key, path in files.items()}
-        row_sizes = [
-            sum(len(str(value).encode("utf-8")) for value in row.values() if value is not None)
-            for row in rows
-        ]
+        sizes = await asyncio.to_thread(
+            lambda: {key: path.stat().st_size for key, path in self._content_files().items()}
+        )
+        row_sizes = [row["row_bytes"] for row in rows]
         total = sum(sizes.get(key, 0) for key in refs) + sum(row_sizes)
         for row, row_size in zip(rows, row_sizes):
             if total <= self.cache_settings.max_bytes:
@@ -770,9 +789,12 @@ class AsyncDatabaseManager:
                 for row in await cursor.fetchall()
                 for field, value in zip(fields, row) if value
             }
-        for key, path in self._content_files().items():
-            if key not in refs:
-                path.unlink(missing_ok=True)
+        def unlink_orphans():
+            for key, path in self._content_files().items():
+                if key not in refs:
+                    path.unlink(missing_ok=True)
+
+        await asyncio.to_thread(unlink_orphans)
 
     async def _store_content(self, content: str, content_type: str) -> str:
         """Store content under acache_url's SQLite writer lock and return hash."""
@@ -782,10 +804,13 @@ class AsyncDatabaseManager:
         content_hash = generate_content_hash(content)
         file_path = os.path.join(self.content_paths[content_type], content_hash)
 
-        # Only write if file doesn't exist
+        # Only write if file doesn't exist. Write aside and rename so a reader
+        # holding an older snapshot never opens a truncated blob.
         if not os.path.exists(file_path):
-            async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+            temp_path = f"{file_path}.tmp-{os.getpid()}"
+            async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
                 await f.write(content)
+            os.replace(temp_path, file_path)
 
         return content_hash
 

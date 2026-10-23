@@ -183,6 +183,7 @@ crawler:
 cache:
   max_bytes: 536870912  # 512 MiB per replica, shared by its server/job workers
   max_age_seconds: 604800  # 7 days; WRITE_ONLY refreshes still replace entries
+  prune_interval_seconds: 300  # one census per process per interval; orphans wait at most this long
 
 # Logging Configuration
 logging:

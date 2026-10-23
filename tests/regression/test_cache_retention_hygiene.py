@@ -18,7 +18,7 @@ async def test_cache_retention_collects_orphans_without_racing_writers(tmp_path)
         mgr = AsyncDatabaseManager()
         mgr.db_path = str(tmp_path / "cache.db")
         mgr.content_paths = ensure_content_dirs(str(tmp_path))
-        mgr.cache_settings = SimpleNamespace(max_bytes=8192, max_age_seconds=60)
+        mgr.cache_settings = SimpleNamespace(max_bytes=8192, max_age_seconds=60, prune_interval_seconds=0)
         await mgr.ainit_db()
         await mgr.update_db_schema()
         mgr._initialized = True
@@ -83,3 +83,24 @@ async def test_cache_retention_collects_orphans_without_racing_writers(tmp_path)
     assert (await mgr.aget_cached_url("https://example.com/size/11")).html == "11" + "x" * 1024
     await mgr.cleanup()
     await peer.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_cache_census_runs_at_most_once_per_interval(tmp_path):
+    """Writes inside the interval skip the census; the next one after it collects."""
+    mgr = AsyncDatabaseManager()
+    mgr.db_path = str(tmp_path / "cache.db")
+    mgr.content_paths = ensure_content_dirs(str(tmp_path))
+    mgr.cache_settings = SimpleNamespace(max_bytes=1 << 30, max_age_seconds=3600, prune_interval_seconds=1)
+    await mgr.ainit_db()
+    await mgr.update_db_schema()
+    mgr._initialized = True
+    old = Path(mgr.content_paths["html"]) / generate_content_hash("old html")
+
+    await mgr.acache_url(CrawlResult(url="https://example.com/a", html="old html", success=True))
+    await mgr.acache_url(CrawlResult(url="https://example.com/a", html="new html", success=True))
+    assert old.is_file()  # Orphaned, but no census ran inside the interval.
+    await asyncio.sleep(1.1)
+    await mgr.acache_url(CrawlResult(url="https://example.com/b", html="other html", success=True))
+    assert not old.exists()
+    assert (await mgr.aget_cached_url("https://example.com/a")).html == "new html"
