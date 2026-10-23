@@ -182,7 +182,7 @@ DEFAULT_CONFIG = {
             "worker_admission_wait_seconds": 300.0,
         },
         "browser": {
-            "kwargs": {"headless": True, "text_mode": True},
+            "kwargs": {"headless": True, "text_mode": True, "avoid_ads": True},
             "extra_args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",

@@ -183,6 +183,7 @@ crawler:
       headless: true
       text_mode: true
       memory_saving_mode: true
+      avoid_ads: true
       # ~330 pages reach one process's browser per 6h at production load, so a
       # 500-page budget never restarted a browser before the replica recycle.
       max_pages_before_recycle: 100
