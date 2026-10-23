@@ -8,7 +8,7 @@ import rollout_http
 import rollout_tasks
 import rollout_dokploy
 import verify_rollout as rollout
-from conftest import BASELINE, CANDIDATE, ELIGIBLE_NODES, REVISION, _deploy_env, application, health, service_spec
+from conftest import BASELINE, CANDIDATE, ELIGIBLE_NODES, INSTANCES, REVISION, _deploy_env, application, health, service_spec, task_proof
 
 
 PRIOR_UPDATE_STARTED = "2026-10-21T10:00:00.123456789Z"
@@ -53,7 +53,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys,
     monkeypatch.setattr(
         rollout_tasks,
         "_verify_tasks",
-        lambda *_args: {"tasks": ["1", "2", "3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["a", "b", "c"]},
+        lambda *_args: task_proof(),
     )
     monkeypatch.setattr(
         rollout_tasks,
@@ -68,7 +68,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys,
     rollout.deploy()
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["publicInstances"] == {
-        url: ["a", "b", "c"] for url in rollout_policy.HEALTH_URLS
+        url: INSTANCES for url in rollout_policy.HEALTH_URLS
     }
     # The Redis proof must precede the first write, not merely happen.
     assert events == ["verify_redis", "application.update", "application.deploy"]
@@ -80,7 +80,7 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys,
     assert posts[0][1]["placementSwarm"] == placement
     assert "expectedDockerImage" not in posts[0][1]
     proof = json.loads(rollout_tasks._task_proof_path().read_text())
-    assert proof["instances"] == ["a", "b", "c"]
+    assert proof["instances"] == INSTANCES
     assert set(proof["publicInstances"]) == set(rollout_policy.HEALTH_URLS)
     assert proof["placement"] == placement
 
@@ -96,11 +96,15 @@ def test_deploy_uses_only_stock_update_and_deploy(monkeypatch, tmp_path, capsys,
     posts.clear()
     events.clear()
     deployments[:] = [{"deploymentId": "old", "status": "done"}]
+    # One slot is rescheduled onto another node between the census reads.
+    rescheduled = task_proof(sorted(ELIGIBLE_NODES)[1:rollout_policy.REPLICAS + 1])
+    rescheduled["tasks"][-1] = "replacement"
+    rescheduled["instances"][-1] = "replacement-instance"
     proofs = iter([
-        {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
-        {"tasks": ["old1", "old2", "old3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["old-a", "old-b", "old-c"]},
-        {"tasks": ["1", "2", "3"], "nodes": ["haiku-5", "haiku-6", "haiku-9"], "instances": ["a", "b", "c"]},
-        {"tasks": ["1", "2", "4"], "nodes": ["haiku-5", "haiku-6", "haiku-18"], "instances": ["a", "b", "d"]},
+        task_proof(tag="old"),
+        task_proof(tag="old"),
+        task_proof(),
+        rescheduled,
     ])
     monkeypatch.setattr(rollout_tasks, "_verify_tasks", lambda *_args: next(proofs))
     monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: ("completed", CURRENT_UPDATE_STARTED if state["dockerImage"] == CANDIDATE else PRIOR_UPDATE_STARTED))
@@ -134,11 +138,7 @@ def test_deploy_proves_an_already_deployed_candidate_without_resubmitting(
     monkeypatch.setattr(
         rollout_tasks,
         "_verify_tasks",
-        lambda *_args: {
-            "tasks": ["1", "2", "3"],
-            "nodes": ["haiku-5", "haiku-6", "haiku-9"],
-            "instances": ["a", "b", "c"],
-        },
+        lambda *_args: task_proof(),
     )
     monkeypatch.setattr(
         rollout_tasks,
@@ -154,7 +154,7 @@ def test_deploy_proves_an_already_deployed_candidate_without_resubmitting(
     assert receipt["image"] == candidate
     assert receipt["revision"] == REVISION
     assert receipt["publicInstances"] == {
-        url: ["a", "b", "c"] for url in rollout_policy.HEALTH_URLS
+        url: INSTANCES for url in rollout_policy.HEALTH_URLS
     }
 
 
@@ -164,14 +164,16 @@ def test_deploy_proves_an_already_deployed_candidate_with_a_non_redis_spare_down
 ):
     # A rerun of a revision that is already live performs no start-first
     # rollout: it submits no update, starts no replacement, and retires no
-    # predecessor, so it needs no spare overlap slot. With exactly REPLICAS
-    # Ready eligible nodes and the absent node a non-Redis spare (so Redis on
-    # haiku-18 still passes), the no-op rerun must prove it in place rather
-    # than abort under the start-first spare gate. Regression for the no-op
-    # rerun path added in f43ef89, whose spare gate ran above the branch.
+    # predecessor, so it needs no spare overlap slot. With a one-per-node cap,
+    # exactly REPLICAS Ready eligible nodes, and the down node a non-Redis
+    # spare (so the Redis node still passes), the no-op rerun must prove it
+    # in place rather than abort under the start-first spare gate. Regression
+    # for the no-op rerun path added in f43ef89, whose spare gate ran above
+    # the branch.
     candidate = "registry.example/crawl4ai@sha256:candidate"
-    state = application(image=candidate, revision=REVISION)
-    ready = frozenset(ELIGIBLE_NODES - {down_node})
+    placement = rollout_policy._CAPPED_PLACEMENT
+    state = application(image=candidate, revision=REVISION, placement=placement)
+    ready = frozenset(sorted(ELIGIBLE_NODES - {down_node})[:rollout_policy.REPLICAS])
     _deploy_env(monkeypatch)
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
     monkeypatch.setattr(rollout_dokploy, "_application", lambda *_args: copy.deepcopy(state))
@@ -184,17 +186,13 @@ def test_deploy_proves_an_already_deployed_candidate_with_a_non_redis_spare_down
     )
     monkeypatch.setattr(rollout_tasks, "_update_state", lambda _name: ("completed", PRIOR_UPDATE_STARTED))
     monkeypatch.setattr(rollout_tasks, "_eligible_nodes", lambda: (ELIGIBLE_NODES, ready))
-    monkeypatch.setattr(rollout_tasks, "_service_spec", lambda _name: service_spec(candidate, REVISION))
+    monkeypatch.setattr(rollout_tasks, "_service_spec", lambda _name: service_spec(candidate, REVISION, placement))
     monkeypatch.setattr(rollout_tasks, "_verify_redis", lambda: None)
     monkeypatch.setattr(rollout_tasks, "verify_route", lambda *_args: None)
     monkeypatch.setattr(
         rollout_tasks,
         "_verify_tasks",
-        lambda *_args: {
-            "tasks": ["1", "2", "3"],
-            "nodes": sorted(ready),
-            "instances": ["a", "b", "c"],
-        },
+        lambda *_args: task_proof(ready),
     )
     monkeypatch.setattr(
         rollout_tasks,
@@ -206,13 +204,16 @@ def test_deploy_proves_an_already_deployed_candidate_with_a_non_redis_spare_down
     rollout.deploy()
 
     assert len(ready) == rollout_policy.REPLICAS
-    assert rollout_policy.REDIS_NODE in ready
+    assert down_node not in ready and rollout_policy.REDIS_NODE in ready
+    assert rollout_policy.placement_capacity(len(ready), placement) < (
+        rollout_policy.REPLICAS + rollout_policy.PARALLELISM
+    )
     receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert receipt["deploymentId"] is None
     assert receipt["image"] == candidate
     assert receipt["revision"] == REVISION
     assert receipt["publicInstances"] == {
-        url: ["a", "b", "c"] for url in rollout_policy.HEALTH_URLS
+        url: INSTANCES for url in rollout_policy.HEALTH_URLS
     }
 
 
@@ -226,11 +227,7 @@ def test_deploy_real_rollout_passes_strict_converged_to_the_candidate_proof(
 
     def spy(_app, image, _revision, _ready, converged=True, placement=rollout_policy.PLACEMENT):
         calls.append((image, converged))
-        return {
-            "tasks": ["1", "2", "3"],
-            "nodes": ["haiku-5", "haiku-6", "haiku-9"],
-            "instances": ["a", "b", "c"],
-        }
+        return task_proof()
 
     state = application()  # baseline running; candidate not yet deployed
     _deploy_env(monkeypatch)
@@ -317,9 +314,8 @@ def test_deploy_does_not_compensate_for_ambiguous_write(monkeypatch, fail_on):
     assert len(calls) == fail_on
 
 
-@pytest.mark.parametrize("placement", rollout_policy.PLACEMENTS)
-@pytest.mark.parametrize("ready_count", [2, 3, 4])
-def test_deploy_capacity_follows_placement(monkeypatch, capsys, placement, ready_count):
+def _deploy_until_capacity_gate(monkeypatch, capsys, placement, ready_count):
+    """Run deploy() with ready_count Ready nodes; return the gate failure or None if it passed."""
     _deploy_env(monkeypatch)
     ready = frozenset(sorted(ELIGIBLE_NODES)[:ready_count])
     monkeypatch.setattr(rollout_dokploy, "_application", lambda *_args: application(placement=placement))
@@ -333,20 +329,70 @@ def test_deploy_capacity_follows_placement(monkeypatch, capsys, placement, ready
         rollout_tasks, "_verify_tasks",
         lambda *_args: (_ for _ in ()).throw(SystemExit("capacity gate passed")),
     )
-    if ready_count < 3:
-        monkeypatch.setattr(rollout.sys, "argv", ["verify_rollout.py", "deploy"])
-        with pytest.raises(RuntimeError, match="not enough Ready eligible nodes"):
-            rollout.main()
+    monkeypatch.setattr(rollout.sys, "argv", ["verify_rollout.py", "deploy"])
+    try:
+        rollout.main()
+    except SystemExit as passed:
+        assert str(passed) == "capacity gate passed"
+        return None
+    except RuntimeError as failure:
         # The message names nodes, so the public line carries only its class.
         assert capsys.readouterr().err == (
             "rollout failure: command=deploy check=_deploy error=RuntimeError\n"
         )
-    elif ready_count == 3 and placement.get("MaxReplicas") == 1:
-        with pytest.raises(RuntimeError, match="start-first needs a spare eligible node"):
-            rollout.deploy()
+        return str(failure)
+    pytest.fail("deploy() must stop at the capacity gate or the baseline proof")
+
+
+@pytest.mark.parametrize("placement", rollout_policy.PLACEMENTS)
+@pytest.mark.parametrize("ready_count", range(len(ELIGIBLE_NODES) + 1))
+def test_deploy_capacity_follows_placement(monkeypatch, capsys, placement, ready_count):
+    failure = _deploy_until_capacity_gate(monkeypatch, capsys, placement, ready_count)
+    capacity = rollout_policy.placement_capacity(ready_count, placement)
+    if capacity < rollout_policy.REPLICAS:
+        assert failure.startswith("not enough Ready eligible nodes to place every replica")
+    elif capacity < rollout_policy.REPLICAS + rollout_policy.PARALLELISM:
+        assert failure.startswith("start-first needs a spare eligible node")
     else:
-        with pytest.raises(SystemExit, match="capacity gate passed"):
-            rollout.deploy()
+        assert failure is None
+
+
+def _spread_capped(max_replicas):
+    return next(
+        placement for placement in rollout_policy.PLACEMENTS
+        if placement.get("MaxReplicas") == max_replicas and placement.get("Preferences")
+    )
+
+
+# Six replicas in start-first batches of two need eight placement slots.
+@pytest.mark.parametrize(("max_replicas", "ready_count", "expected"), [
+    (3, 3, None),
+    (2, 3, "start-first needs a spare eligible node"),
+    (2, 4, None),
+    (3, 1, "not enough Ready eligible nodes to place every replica"),
+    (1, 5, "not enough Ready eligible nodes to place every replica"),
+    (1, 7, "start-first needs a spare eligible node"),
+    (1, 8, None),
+])
+def test_deploy_capped_capacity_counts_slots_per_node(
+    monkeypatch, capsys, max_replicas, ready_count, expected
+):
+    failure = _deploy_until_capacity_gate(
+        monkeypatch, capsys, _spread_capped(max_replicas), ready_count
+    )
+    if expected is None:
+        assert failure is None
+    else:
+        assert failure.startswith(expected)
+
+
+@pytest.mark.parametrize("placement", [rollout_policy.PLACEMENT, rollout_policy._SPREAD_PLACEMENT])
+def test_deploy_uncapped_placement_still_needs_three_ready_nodes(monkeypatch, capsys, placement):
+    # Without a per-node cap Swarm could stack every replica on one node.
+    assert _deploy_until_capacity_gate(monkeypatch, capsys, placement, 2).startswith(
+        "not enough Ready eligible nodes to place every replica"
+    )
+    assert _deploy_until_capacity_gate(monkeypatch, capsys, placement, 3) is None
 
 
 def test_main_keeps_the_original_failure_when_its_summary_fails(monkeypatch, capsys):

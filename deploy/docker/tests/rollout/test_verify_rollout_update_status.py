@@ -8,7 +8,7 @@ import rollout_http
 import rollout_tasks
 import rollout_dokploy
 import verify_rollout as rollout
-from conftest import BASELINE, CANDIDATE, ELIGIBLE_NODES, REVISION, _deploy_env, application, health, service_spec
+from conftest import BASELINE, CANDIDATE, ELIGIBLE_NODES, INSTANCES, REVISION, _deploy_env, application, health, service_spec, task_proof
 
 
 PRIOR_UPDATE_STARTED = "2026-10-21T10:00:00.123456789Z"
@@ -103,7 +103,7 @@ def _wire_update_outcome(monkeypatch, tmp_path, prior_state="completed"):
 
     def verify_tasks(_app, image, *_args):
         events.append(("tasks", image))
-        return {"tasks": ["1", "2", "3"], "nodes": sorted(ELIGIBLE_NODES)[:rollout_policy.REPLICAS], "instances": ["a", "b", "c"]}
+        return task_proof()
 
     monkeypatch.setattr(rollout_tasks, "_verify_tasks", verify_tasks)
     monkeypatch.setattr(
@@ -185,7 +185,7 @@ def test_deploy_waits_past_stale_terminal_until_a_new_completed_update(
     assert receipt["deploymentId"] == "new"
     assert receipt["image"] == CANDIDATE
     assert receipt["publicInstances"] == {
-        url: ["a", "b", "c"] for url in rollout_policy.HEALTH_URLS
+        url: INSTANCES for url in rollout_policy.HEALTH_URLS
     }
     assert events.index("application.deploy") < events.index("waited for current update")
     assert events.index("waited for current update") < events.index(("tasks", CANDIDATE))
@@ -207,7 +207,7 @@ def test_deploy_accepts_a_new_completed_update_when_prior_status_was_absent(
     assert receipt["image"] == CANDIDATE
     assert ("tasks", CANDIDATE) in events
     assert receipt["publicInstances"] == {
-        url: ["a", "b", "c"] for url in rollout_policy.HEALTH_URLS
+        url: INSTANCES for url in rollout_policy.HEALTH_URLS
     }
 
 

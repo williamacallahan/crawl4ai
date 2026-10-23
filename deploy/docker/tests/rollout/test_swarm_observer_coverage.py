@@ -3,16 +3,19 @@ from dataclasses import fields
 
 import pytest
 
+import rollout_policy
 import swarm_observer as observer
 
 
 OBSERVER_MISMATCH = observer.NetworkDbFdbComparison.DESTINATION_MISMATCH
 
 
-OBSERVER_COMPLETE = observer.CoverageSnapshot(3, 3, 3)
+OBSERVER_COMPLETE = observer.CoverageSnapshot(
+    rollout_policy.REPLICAS, rollout_policy.REPLICAS, rollout_policy.REPLICAS, rollout_policy.REPLICAS
+)
 
 
-OBSERVER_INCOMPLETE = observer.CoverageSnapshot(3, 2, 1)
+OBSERVER_INCOMPLETE = observer.CoverageSnapshot(3, 2, 1, 3)
 
 
 def test_initial_incomplete_is_reported_once_until_full_recovery(tmp_path):
@@ -78,7 +81,7 @@ def test_latch_state_survives_a_restart_and_resets_after_recovery(tmp_path):
 
 
 def test_coverage_metrics_are_fixed_unlabeled_and_zero_is_incomplete():
-    snapshot = observer.CoverageSnapshot(3, 2, 1)
+    snapshot = observer.CoverageSnapshot(3, 2, 1, 3)
 
     assert snapshot.complete == 0
     assert snapshot.metrics_text(1789000000.125) == (
@@ -88,13 +91,19 @@ def test_coverage_metrics_are_fixed_unlabeled_and_zero_is_incomplete():
         "crawl4ai_coverage_complete 0\n"
         "crawl4ai_coverage_sample_timestamp_seconds 1789000000.125\n"
     )
-    empty = observer.CoverageSnapshot(0, 0, 0)
+    empty = observer.CoverageSnapshot(0, 0, 0, 0)
     assert empty.complete == 0
     assert "crawl4ai_coverage_complete 0\n" in empty.metrics_text(1789000000.125)
-    two_surviving_tasks = observer.CoverageSnapshot(2, 2, 2)
-    assert two_surviving_tasks.complete == 0
+    assert OBSERVER_COMPLETE.complete == 1
+    one_task_short = rollout_policy.REPLICAS - 1
+    assert observer.CoverageSnapshot(
+        one_task_short, one_task_short, one_task_short, rollout_policy.REPLICAS
+    ).complete == 0
+    # Completeness follows the live service, not the pinned policy count.
+    assert observer.CoverageSnapshot(4, 4, 4, 4).complete == 1
+    assert observer.CoverageSnapshot(3, 3, 3, 6).complete == 0
     with pytest.raises(ValueError, match="exceeds direct_healthy_count"):
-        observer.CoverageSnapshot(3, 1, 2)
+        observer.CoverageSnapshot(3, 1, 2, 3)
 
 
 def test_public_coverage_values_are_redacted_aggregate_counts(tmp_path):
@@ -107,6 +116,7 @@ def test_public_coverage_values_are_redacted_aggregate_counts(tmp_path):
         "authoritative_task_count",
         "direct_healthy_count",
         "public_covered_count",
+        "desired_task_count",
     ]
     assert [field.name for field in fields(observer.CoverageDiagnostic)] == [
         "authoritative_task_count",
@@ -120,7 +130,7 @@ def test_public_coverage_values_are_redacted_aggregate_counts(tmp_path):
         "networkdb_fdb=destination_mismatch"
     )
     with pytest.raises(TypeError, match="integer"):
-        observer.CoverageSnapshot("task-id", 0, 0)
+        observer.CoverageSnapshot("task-id", 0, 0, 3)
     with pytest.raises(TypeError, match="CoverageSnapshot"):
         observer.CoverageEpisodeLatch(tmp_path / "other-state").observe(
             object(), OBSERVER_MISMATCH

@@ -72,6 +72,9 @@ class CoverageSnapshot:
     authoritative_task_count: int
     direct_healthy_count: int
     public_covered_count: int
+    # The service's own replica count, read live: an installed observer release
+    # outlives replica-count changes, so a pinned count would go stale.
+    desired_task_count: int
 
     def __post_init__(self) -> None:
         _validate_counts(
@@ -79,11 +82,16 @@ class CoverageSnapshot:
             self.direct_healthy_count,
             self.public_covered_count,
         )
+        if isinstance(self.desired_task_count, bool) or not isinstance(self.desired_task_count, int):
+            raise TypeError("desired_task_count must be an integer")
+        if self.desired_task_count < 0:
+            raise ValueError("desired_task_count must not be negative")
 
     @property
     def complete(self) -> int:
         return int(
-            self.authoritative_task_count == rollout_policy.REPLICAS
+            self.desired_task_count > 0
+            and self.authoritative_task_count == self.desired_task_count
             and self.authoritative_task_count
             == self.direct_healthy_count
             == self.public_covered_count
@@ -316,6 +324,7 @@ def _verify_ingress_namespace(ingress_pid: int) -> None:
 def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]:
     """Reuse the rollout verifier's task and health owners for one stable sample."""
     deadline = time.monotonic() + SAMPLE_DEADLINE_SECONDS
+    desired_task_count = int(rollout_tasks._service_spec(service_name)["Mode"]["Replicated"]["Replicas"])
     ingress_pid = rollout_tasks._verify_ingress_host()
     _verify_ingress_namespace(ingress_pid)
     before = rollout_tasks._service_tasks(service_name)
@@ -363,6 +372,7 @@ def sample(service_name: str) -> tuple[CoverageSnapshot, NetworkDbFdbComparison]
         authoritative_task_count,
         len(direct_instance),
         _public_coverage(direct_instance, deadline),
+        desired_task_count,
     )
     if snapshot.complete or len(runtime_by_task) != authoritative_task_count:
         comparison = NetworkDbFdbComparison.INCONCLUSIVE
@@ -394,7 +404,7 @@ def write_sample() -> None:
     try:
         snapshot, comparison = sample(os.environ["CRAWL4AI_SWARM_SERVICE"])
     except Exception as error:
-        snapshot = CoverageSnapshot(0, 0, 0)
+        snapshot = CoverageSnapshot(0, 0, 0, 0)
         comparison = NetworkDbFdbComparison.INCONCLUSIVE
         print(f"crawl4ai coverage sampling failed: {type(error).__name__}", flush=True)
     diagnostic = latch.observe(snapshot, comparison)

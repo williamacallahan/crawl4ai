@@ -23,6 +23,27 @@ REVISION = "a" * 40
 
 
 ELIGIBLE_NODES = frozenset({"haiku-5", "haiku-6", "haiku-9", "haiku-18"})
+# Extra nodes let a one-per-node cap hold every replica plus one start-first batch.
+ELIGIBLE_NODES |= {
+    f"node-{n}" for n in range(rollout_policy.REPLICAS + rollout_policy.PARALLELISM - len(ELIGIBLE_NODES))
+}
+
+
+SLOTS = range(1, rollout_policy.REPLICAS + 1)
+
+
+INSTANCES = [f"instance{slot}" for slot in SLOTS]
+
+
+def task_proof(nodes=None, tag=""):
+    """A _verify_tasks result naming REPLICAS tasks and instances; tag sets them apart."""
+    if nodes is None:
+        nodes = sorted(ELIGIBLE_NODES)[:rollout_policy.REPLICAS]
+    return {
+        "tasks": [f"{tag}{slot}" for slot in SLOTS],
+        "nodes": sorted(nodes),
+        "instances": [f"{tag}instance{slot}" for slot in SLOTS],
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -60,12 +81,12 @@ def application(image=BASELINE, revision="baseline", placement=rollout_policy.PL
             f"LLM_BASE_URL={rollout_policy.LLM_BASE_URL}\n"
             "LLM_API_KEY=secret"
         ),
-        "replicas": 3,
+        "replicas": rollout_policy.REPLICAS,
         "healthCheckSwarm": copy.deepcopy(rollout_policy.HEALTHCHECK),
         "placementSwarm": copy.deepcopy(placement),
         "endpointSpecSwarm": {"Mode": "vip", "Ports": []},
         "updateConfigSwarm": {
-            "Parallelism": 1,
+            "Parallelism": rollout_policy.PARALLELISM,
             "Delay": rollout_policy.DELAY_NS,
             "FailureAction": "rollback",
             "Monitor": rollout_policy.DELAY_NS,
@@ -73,7 +94,7 @@ def application(image=BASELINE, revision="baseline", placement=rollout_policy.PL
             "Order": "start-first",
         },
         "rollbackConfigSwarm": {
-            "Parallelism": 1,
+            "Parallelism": rollout_policy.PARALLELISM,
             "Delay": rollout_policy.DELAY_NS,
             "FailureAction": "pause",
             "Monitor": rollout_policy.DELAY_NS,
@@ -105,9 +126,9 @@ def service_spec(image=BASELINE, revision="baseline", placement=rollout_policy.P
             "Placement": copy.deepcopy(placement),
             "Resources": copy.deepcopy(rollout_policy.RESOURCES),
         },
-        "Mode": {"Replicated": {"Replicas": 3}},
+        "Mode": {"Replicated": {"Replicas": rollout_policy.REPLICAS}},
         "UpdateConfig": {
-            "Parallelism": 1,
+            "Parallelism": rollout_policy.PARALLELISM,
             "Delay": rollout_policy.DELAY_NS,
             "FailureAction": "rollback",
             "Monitor": rollout_policy.DELAY_NS,
@@ -115,7 +136,7 @@ def service_spec(image=BASELINE, revision="baseline", placement=rollout_policy.P
             "Order": "start-first",
         },
         "RollbackConfig": {
-            "Parallelism": 1,
+            "Parallelism": rollout_policy.PARALLELISM,
             "Delay": rollout_policy.DELAY_NS,
             "FailureAction": "pause",
             "Monitor": rollout_policy.DELAY_NS,
@@ -145,27 +166,29 @@ def _candidate_runtimes():
             "image": CANDIDATE,
             "addresses": {f"10.0.1.{index}"},
         }
-        for index in range(1, 4)
+        for index in SLOTS
     }
 
 
 def _healed_baseline_rows():
-    # haiku-6 died holding slot 1; Swarm healed the replica onto haiku-18,
+    # A node died holding slot 1; Swarm healed the replica onto the Redis node,
     # and the ghost task on the dead node can never confirm its shutdown.
+    # Every other slot runs on its own Ready node beside its withdrawn
+    # predecessor on the next one, leaving one Ready node spare.
     rows = [
-        {"ID": "task1", "Name": "crawl4ai.1", "Node": "haiku-18",
+        {"ID": "task1", "Name": "crawl4ai.1", "Node": rollout_policy.REDIS_NODE,
          "DesiredState": "Running", "CurrentState": "Running 1m"},
         {"ID": "ghost1", "Name": "crawl4ai.1", "Node": "haiku-6",
          "DesiredState": "Shutdown", "CurrentState": "Running 12 hours ago"},
-        {"ID": "task2", "Name": "crawl4ai.2", "Node": "haiku-5",
-         "DesiredState": "Running", "CurrentState": "Running 1h"},
-        {"ID": "old2", "Name": "crawl4ai.2", "Node": "haiku-9",
-         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
-        {"ID": "task3", "Name": "crawl4ai.3", "Node": "haiku-9",
-         "DesiredState": "Running", "CurrentState": "Running 1h"},
-        {"ID": "old3", "Name": "crawl4ai.3", "Node": "haiku-5",
-         "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
     ]
+    nodes = sorted(ELIGIBLE_NODES - {rows[1]["Node"], rollout_policy.REDIS_NODE})
+    for slot in SLOTS[1:]:
+        rows += [
+            {"ID": f"task{slot}", "Name": f"crawl4ai.{slot}", "Node": nodes[slot - 2],
+             "DesiredState": "Running", "CurrentState": "Running 1h"},
+            {"ID": f"old{slot}", "Name": f"crawl4ai.{slot}", "Node": nodes[slot - 1],
+             "DesiredState": "Shutdown", "CurrentState": "Shutdown 1h"},
+        ]
     runtimes = {
         f"task{index}": {
             "container": f"container{index}",
@@ -173,9 +196,25 @@ def _healed_baseline_rows():
             "image": BASELINE,
             "addresses": {f"10.0.1.{index}"},
         }
-        for index in range(1, 4)
+        for index in SLOTS
     }
     return rows, runtimes
+
+
+# The Ready set after slot 1's node died; the healed baseline runs on it.
+HEALED_READY = ELIGIBLE_NODES - {_healed_baseline_rows()[0][1]["Node"]}
+
+
+def _healed_colocation_rows():
+    # The healed slot 1 doubled up beside slot 2 instead of moving to a
+    # spare; its ghost is stranded on the dead node.
+    rows, runtimes = _healed_baseline_rows()
+    rows[0]["Node"] = rows[2]["Node"]
+    return rows, runtimes
+
+
+def _running_nodes(rows):
+    return sorted({row["Node"] for row in rows if row["DesiredState"] == "Running"})
 
 
 def _wire_verify_tasks(monkeypatch, rows, runtimes, revision="baseline"):

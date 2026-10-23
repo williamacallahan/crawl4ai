@@ -6,7 +6,7 @@ import pytest
 import swarm_observer as observer
 import swarm_observer_server as observer_server
 
-OBSERVER_COMPLETE = observer.CoverageSnapshot(3, 3, 3)
+OBSERVER_COMPLETE = observer.CoverageSnapshot(3, 3, 3, 3)
 
 
 def test_metrics_endpoint_exposes_only_the_fixed_contract(tmp_path):

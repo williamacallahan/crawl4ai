@@ -355,6 +355,13 @@ def test_policy_accepts_only_stock_docker_image_configuration():
         rollout_policy._policy(changed)
 
 
+def test_policy_rejects_the_retired_replica_count():
+    retired = application()
+    retired["replicas"] = 3
+    with pytest.raises(ValueError, match=r"^Crawl4AI must keep 6 replicas$"):
+        rollout_policy._policy(retired)
+
+
 def test_running_spec_rejects_artifact_drift():
     rollout_policy._running_spec(service_spec(), BASELINE, rollout_policy._labels("baseline"))
     changed = service_spec()
