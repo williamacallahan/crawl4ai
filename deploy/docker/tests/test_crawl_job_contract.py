@@ -335,7 +335,7 @@ def test_llm_job_enqueue_returns_accepted_with_canonical_links(monkeypatch):
 
     response = asyncio.run(
         api.create_new_task(
-            SimpleNamespace(hset=AsyncMock(), expire=AsyncMock()),
+            SimpleNamespace(hset=AsyncMock(), expire=AsyncMock(), time=AsyncMock(return_value=(1_700_000_000, 0))),
             BackgroundTasks(),
             "https://example.com",
             "extract",
@@ -357,7 +357,7 @@ def test_llm_job_enqueue_returns_accepted_with_canonical_links(monkeypatch):
 def test_llm_job_task_ids_are_collision_resistant(monkeypatch):
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
     monkeypatch.setattr(api, "_enqueue_job", AsyncMock())
-    redis = SimpleNamespace(hset=AsyncMock(), expire=AsyncMock())
+    redis = SimpleNamespace(hset=AsyncMock(), expire=AsyncMock(), time=AsyncMock(return_value=(1_700_000_000, 0)))
 
     async def create():
         response = await api.create_new_task(

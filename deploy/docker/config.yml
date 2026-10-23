@@ -26,6 +26,9 @@ llm:
   permit_ttl_seconds: 300
   # Three missed heartbeats let polling recover a lost local worker.
   task_heartbeat_seconds: 30
+  # Positive integers: scan interval and Redis SCAN count hint.
+  orphan_scan_seconds: 60
+  orphan_scan_count: 100
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
 # Redis Configuration
