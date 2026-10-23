@@ -177,6 +177,13 @@ crawler:
       # disabled TLS verification for every crawl (MITM / SSRF-to-internal-TLS).
       # Set CRAWL4AI_ALLOW_INSECURE_TLS=true only for trusted internal testing.
 
+# Page-cache payload retention. Positive integer bytes/seconds; validated by
+# AsyncDatabaseManager. Oldest writes are evicted; shared content is retained.
+# SQLite allocation overhead is outside the payload budget (freed pages reuse).
+cache:
+  max_bytes: 536870912  # 512 MiB per replica, shared by its server/job workers
+  max_age_seconds: 604800  # 7 days; WRITE_ONLY refreshes still replace entries
+
 # Logging Configuration
 logging:
   level: "INFO"
