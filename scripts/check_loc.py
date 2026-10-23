@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BASELINE = Path(__file__).with_name("loc-baseline.txt")
 # Upstream 0.9.3 integrated by 16dfdaa376; update with the next upstream merge.
 UPSTREAM_SHA: Final[str] = "862f6bccb9c063f49b9d42701baa0eea17a4993f"
+UPSTREAM_URL: Final[str] = "https://github.com/unclecode/crawl4ai.git"
 SCOPE = ("deploy/*.py", "tests/*.py")
 
 
@@ -35,14 +36,27 @@ def _failure_reason(error: Exception) -> str:
     return str(error)
 
 
+def _pinned_tree() -> set[str]:
+    return set(_git(
+        "ls-tree", "-r", "-z", "--name-only", UPSTREAM_SHA, "--", "deploy", "tests"
+    ))
+
+
 def upstream_paths() -> set[str]:
-    """Read names, never fetch objects or update refs in a validation lane."""
+    """Pinned upstream file names: local objects, then a tree-only fetch, then the API.
+
+    CI's shallow checkout lacks the pinned tree but can fetch it; read-only agent
+    lanes cannot write fetched objects but can read the GitHub trees API.
+    """
     try:
-        return set(_git(
-            "ls-tree", "-r", "-z", "--name-only", UPSTREAM_SHA, "--", "deploy", "tests"
-        ))
+        return _pinned_tree()
     except (OSError, subprocess.CalledProcessError) as error:
         local_reason = _failure_reason(error)
+    try:
+        _git("fetch", "--quiet", "--depth=1", "--filter=blob:none", UPSTREAM_URL, UPSTREAM_SHA)
+        return _pinned_tree()
+    except (OSError, subprocess.CalledProcessError) as error:
+        local_reason += f"; fetch: {_failure_reason(error)}"
     try:
         response = subprocess.run(
             ["gh", "api", f"repos/unclecode/crawl4ai/git/trees/{UPSTREAM_SHA}?recursive=1"],
