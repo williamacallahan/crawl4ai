@@ -12,7 +12,8 @@ import utils
 def test_missing_pool_admission_settings_use_defaults(config):
     settings = utils.PoolAdmissionSettings.from_config(config)
     assert settings.replica_max_pages == 8
-    assert settings.admission_wait_seconds == 2.0
+    assert settings.admission_wait_seconds == 25.0
+    assert settings.worker_admission_wait_seconds == 300.0
 
 
 def test_shipped_and_fallback_pool_admission_settings_match():
@@ -22,7 +23,8 @@ def test_shipped_and_fallback_pool_admission_settings_match():
     for config in (shipped, utils.DEFAULT_CONFIG):
         pool = config["crawler"]["pool"]
         assert pool["replica_max_pages"] == 8
-        assert pool["admission_wait_seconds"] == 2.0
+        assert pool["admission_wait_seconds"] == 25.0
+        assert pool["worker_admission_wait_seconds"] == 300.0
         assert utils.PoolAdmissionSettings.from_config(config) == utils.PoolAdmissionSettings()
 
 

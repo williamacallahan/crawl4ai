@@ -16,7 +16,7 @@ from crawl_job_queue import (
     CrawlJobLeaseLost,
     CrawlJobQueue,
 )
-from crawler_pool import BrowserCapacityError, close_all, janitor
+from crawler_pool import close_all, janitor, use_worker_admission_wait
 from egress_proxy import start_pinning_proxy, stop_pinning_proxy
 from fastapi import HTTPException, status
 from redis import asyncio as aioredis
@@ -282,15 +282,7 @@ class CrawlJobWorker:
         attempt: CrawlJobAttempt,
     ) -> tuple[str, dict | None, str | None] | None:
         try:
-            while True:
-                try:
-                    result = await self.crawl(payload)
-                    break
-                except BrowserCapacityError:
-                    # A full replica is not a failed attempt: wait for a page
-                    # slot inside this attempt's deadline rather than spend
-                    # the job's retry budget on a two-second admission refusal.
-                    await asyncio.sleep(1)
+            result = await self.crawl(payload)
         except asyncio.CancelledError:
             raise
         except ArchiveBudgetSpent as error:
@@ -392,6 +384,7 @@ async def run_worker() -> None:
     )
     queue = CrawlJobQueue(redis, config)
     consumer = f"{socket.gethostname()}-{os.getpid()}"
+    use_worker_admission_wait()
     proxy = None
     # Each worker process owns a private browser pool (the pools in
     # crawler_pool are module globals, and supervisord runs numprocs=2 of

@@ -176,7 +176,8 @@ DEFAULT_CONFIG = {
             "max_pages": 40,
             "idle_ttl_sec": 300,
             "replica_max_pages": 8,
-            "admission_wait_seconds": 2.0,
+            "admission_wait_seconds": 25.0,
+            "worker_admission_wait_seconds": 300.0,
         },
         "browser": {
             "kwargs": {"headless": True, "text_mode": True},
@@ -227,7 +228,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 @dataclass(frozen=True)
 class PoolAdmissionSettings:
     replica_max_pages: int = 8
-    admission_wait_seconds: float = 2.0
+    admission_wait_seconds: float = 25.0
+    worker_admission_wait_seconds: float = 300.0
 
     @classmethod
     def from_config(cls, config: dict) -> "PoolAdmissionSettings":
@@ -235,17 +237,18 @@ class PoolAdmissionSettings:
         budget = configured.get("replica_max_pages", cls.replica_max_pages)
         if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
             raise ValueError("crawler.pool.replica_max_pages must be a positive integer")
-        wait = configured.get("admission_wait_seconds", cls.admission_wait_seconds)
-        if (
-            isinstance(wait, bool)
-            or not isinstance(wait, (int, float))
-            or not isfinite(wait)
-            or wait < 0
-        ):
-            raise ValueError(
-                "crawler.pool.admission_wait_seconds must be a finite nonnegative number"
-            )
-        return cls(replica_max_pages=budget, admission_wait_seconds=float(wait))
+        waits = {}
+        for name in ("admission_wait_seconds", "worker_admission_wait_seconds"):
+            wait = configured.get(name, getattr(cls, name))
+            if (
+                isinstance(wait, bool)
+                or not isinstance(wait, (int, float))
+                or not isfinite(wait)
+                or wait < 0
+            ):
+                raise ValueError(f"crawler.pool.{name} must be a finite nonnegative number")
+            waits[name] = float(wait)
+        return cls(replica_max_pages=budget, **waits)
 
 
 @dataclass(frozen=True)

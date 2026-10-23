@@ -11,7 +11,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable, Dict, Optional
+from typing import BinaryIO, Dict, Optional
 
 import psutil
 from fastapi import HTTPException
@@ -136,14 +136,10 @@ class ReplicaPageBudget:
         self.max_pages = max_pages
         self.directory = Path(directory)
 
-    async def acquire(
-        self, wait_seconds: float, *, before_acquire: Optional[Callable[[], None]] = None,
-    ) -> BinaryIO:
+    async def acquire(self, wait_seconds: float) -> BinaryIO:
         deadline = time.monotonic() + wait_seconds
         self.directory.mkdir(parents=True, exist_ok=True)
         while True:
-            if before_acquire is not None:
-                before_acquire()
             for slot in range(self.max_pages):
                 lease = (self.directory / f"{slot}.lock").open("a+b")
                 try:
@@ -161,27 +157,45 @@ class ReplicaPageBudget:
 
 
 PAGE_BUDGET = ReplicaPageBudget(ADMISSION.replica_max_pages)
+_WORKER_PROCESS = False
+
+
+def _admission_wait_seconds() -> float:
+    if _WORKER_PROCESS:
+        return ADMISSION.worker_admission_wait_seconds
+    return ADMISSION.admission_wait_seconds
+
+
+def use_worker_admission_wait() -> None:
+    """Durable job workers wait out a busy replica inside their attempt.
+
+    An HTTP caller gets a bounded 503; a worker refused after the HTTP bound
+    would spend a retry on contention and repeat its archive prefetch.
+    """
+    global _WORKER_PROCESS
+    _WORKER_PROCESS = True
 
 
 def _check_admission_memory() -> None:
+    # Only a new browser is refused: refusing hits on running browsers would
+    # turn a replica whose heap sits above the limit into a 503 sink.
     mem_pct = get_container_memory_percent()
     if mem_pct >= MEM_LIMIT:
-        raise MemoryCapacityError(f"Memory at {mem_pct:.1f}%, refusing page admission")
+        raise MemoryCapacityError(f"Memory at {mem_pct:.1f}%, refusing a new browser")
 
 
 async def _acquire_admission() -> BinaryIO:
-    deadline = time.monotonic() + ADMISSION.admission_wait_seconds
+    wait_seconds = _admission_wait_seconds()
+    deadline = time.monotonic() + wait_seconds
     try:
         if ADMISSION_SEM.locked():
-            await asyncio.wait_for(ADMISSION_SEM.acquire(), ADMISSION.admission_wait_seconds)
+            await asyncio.wait_for(ADMISSION_SEM.acquire(), wait_seconds)
         else:
             await ADMISSION_SEM.acquire()
     except asyncio.TimeoutError as error:
         raise BrowserCapacityError() from error
     try:
-        return await PAGE_BUDGET.acquire(
-            max(0, deadline - time.monotonic()), before_acquire=_check_admission_memory,
-        )
+        return await PAGE_BUDGET.acquire(max(0, deadline - time.monotonic()))
     except BaseException:
         ADMISSION_SEM.release()
         raise
@@ -434,6 +448,7 @@ async def get_dedicated_crawler(cfg: BrowserConfig, *, crawler_strategy=None) ->
         while True:
             close_task = None
             async with LOCK:
+                _check_admission_memory()
                 close_task = _make_browser_capacity()
                 if close_task is None:
                     crawler = AsyncWebCrawler(
@@ -580,6 +595,7 @@ async def _get_admitted_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
 
             if not replace_permanent and close_task is None:
                 # Create new in cold pool
+                _check_admission_memory()
                 close_task = _make_browser_capacity()
                 if close_task is None:
                     logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]})")

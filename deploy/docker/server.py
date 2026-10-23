@@ -88,7 +88,7 @@ from schemas import (
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.exceptions import HTTPException as _StarletteHTTPException
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.gzip import GZipResponder, IdentityResponder
 from utils import (
     get_browser_extra_args,
@@ -442,15 +442,44 @@ def _setup_security(app_: FastAPI):
 _setup_security(app)
 
 
+_OFF_LOOP_GZIP_BYTES = 256 * 1024
+
+
 class _CrawlGZipResponder(GZipResponder):
+    def __init__(self, app, minimum_size: int, compresslevel: int) -> None:
+        super().__init__(app, minimum_size, compresslevel=compresslevel)
+        self.compresslevel = compresslevel
+
     async def send_with_compression(self, message):
+        if (
+            message["type"] == "http.response.body"
+            and not self.started
+            and not message.get("more_body", False)
+            and not (self.content_encoding_set or self.content_type_is_excluded)
+            and len(message.get("body", b"")) >= _OFF_LOOP_GZIP_BYTES
+        ):
+            # A whole multi-megabyte body (a /crawl or /crawl/job result) is
+            # gzipped in a thread; Starlette would compress it on the loop.
+            self.started = True
+            body = await asyncio.to_thread(gzip.compress, message["body"], self.compresslevel)
+            headers = MutableHeaders(raw=self.initial_message["headers"])
+            headers.add_vary_header("Accept-Encoding")
+            headers["Content-Encoding"] = "gzip"
+            headers["Content-Length"] = str(len(body))
+            await self.send(self.initial_message)
+            await self.send({**message, "body": body})
+            return
         await super().send_with_compression(message)
         if message["type"] == "http.response.start":
             # Starlette 1.3.1 excludes SSE, but buffers NDJSON in GzipFile
             # until its buffer fills. Exclude by media type, including the
-            # /crawl crawler_config.stream alias, before the first body.
-            content_type = Headers(raw=message["headers"]).get("content-type", "")
-            self.content_type_is_excluded |= content_type.startswith("application/x-ndjson")
+            # /crawl crawler_config.stream alias, before the first body. A
+            # 206's Content-Range describes the uncompressed bytes.
+            headers = Headers(raw=message["headers"])
+            self.content_type_is_excluded |= (
+                headers.get("content-type", "").startswith("application/x-ndjson")
+                or "content-range" in headers
+            )
 
 
 class CrawlGZipMiddleware(GZipMiddleware):
@@ -979,6 +1008,19 @@ def _reject_disabled_hooks(hooks) -> None:
     raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
 
 
+async def _arun_before_deadline(crawler, url, cfg):
+    """Bound a single-page endpoint by limits.wall_clock_s, as /crawl and /html are.
+
+    A hostile page that never settles would otherwise hold its admission slot
+    and browser for as long as the client stays connected.
+    """
+    from api import _await_before_deadline
+    from governor import wall_clock_seconds
+    seconds = wall_clock_seconds(config)
+    deadline = asyncio.get_running_loop().time() + seconds if seconds > 0 else None
+    return await _await_before_deadline(crawler.arun(url=url, config=cfg), deadline)
+
+
 @app.post("/screenshot")
 @limiter.limit(config["rate_limiting"]["default_limit"])
 @mcp_tool("screenshot")
@@ -1003,7 +1045,7 @@ async def generate_screenshot(
             wait_for_images=body.wait_for_images,
         )
         crawler = await get_crawler(get_default_browser_config())
-        results = await crawler.arun(url=body.url, config=cfg)
+        results = await _arun_before_deadline(crawler, body.url, cfg)
         _raise_for_crawl_failure(results[0])
         screenshot_data = results[0].screenshot
         art = await asyncio.to_thread(
@@ -1015,6 +1057,8 @@ async def generate_screenshot(
         if legacy_output_path:
             response["warning"] = _OUTPUT_PATH_WARNING
         return response
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
     except HTTPException:
         raise
     except Exception as e:
@@ -1045,7 +1089,7 @@ async def generate_pdf(
     try:
         cfg = server_crawler_config(config, pdf=True)
         crawler = await get_crawler(get_default_browser_config())
-        results = await crawler.arun(url=body.url, config=cfg)
+        results = await _arun_before_deadline(crawler, body.url, cfg)
         _raise_for_crawl_failure(results[0])
         pdf_data = results[0].pdf
         art = await asyncio.to_thread(_store_artifact, "pdf", pdf_data)
@@ -1053,6 +1097,8 @@ async def generate_pdf(
         if legacy_output_path:
             response["warning"] = _OUTPUT_PATH_WARNING
         return response
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
     except HTTPException:
         raise
     except Exception as e:
@@ -1126,12 +1172,14 @@ async def execute_js(
     try:
         cfg = server_crawler_config(config, js_code=body.scripts)
         crawler = await get_crawler(get_default_browser_config())
-        results = await crawler.arun(url=body.url, config=cfg)
+        results = await _arun_before_deadline(crawler, body.url, cfg)
         _raise_for_crawl_failure(results[0])
         data = results[0].model_dump()
         if data.get("error_message"):
             data["error_message"] = public_crawl_error(data["error_message"], data.get("url"))
         return JSONResponse(data)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
     except HTTPException:
         raise
     except Exception as e:
@@ -1330,23 +1378,12 @@ async def crawl(
         if not crawl_request.hooks.hooks:
             hooks_resp["status"] = "ignored"
         hooks_resp["warning"] = _HOOKS_CODE_WARNING
-    accepts_gzip = "gzip" in request.headers.get("accept-encoding", "")
-
-    def encode() -> tuple[bytes, dict[str, str]]:
-        body = json.dumps(
+    encoded = await asyncio.to_thread(
+        lambda: json.dumps(
             results, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")
         ).encode("utf-8")
-        if not accepts_gzip or len(body) < 1024:
-            return body, {}
-        # Compressed here, off the event loop: a multi-megabyte result would
-        # otherwise stall every request while the middleware gzips it inline.
-        # The middleware passes a response that already sets Content-Encoding.
-        return gzip.compress(body, compresslevel=5), {
-            "Content-Encoding": "gzip", "Vary": "Accept-Encoding",
-        }
-
-    encoded, headers = await asyncio.to_thread(encode)
-    return Response(content=encoded, media_type="application/json", headers=headers)
+    )
+    return Response(content=encoded, media_type="application/json")
 
 
 @app.post("/crawl/stream")
