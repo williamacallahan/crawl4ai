@@ -78,7 +78,10 @@ class FakeRedis:
         return 1
 
     async def hget(self, key, field):
-        return self.hashes[key].get(field)
+        return self.hashes.get(key, {}).get(field)
+
+    async def hmget(self, key, *fields):
+        return [self.hashes.get(key, {}).get(field) for field in fields]
 
     async def hdel(self, key, field):
         existed = field in self.hashes[key]
@@ -110,6 +113,10 @@ class FakeRedis:
             for stream_id, fields in self.streams[stream]
             if stream_id == start == end
         ]
+
+    async def xpending_range(self, stream, group, start, end, count, consumername=None):
+        return [{"message_id": stream_id} for stream_id, _fields in self.streams[stream]
+                if self.pending.get(stream_id) == consumername][:count]
 
     def _zset_purge(self, key, cutoff):
         self.zsets[key] = {
@@ -145,6 +152,17 @@ class FakeRedis:
             return await self._eval_complete(keys, args)
         if "crawl4ai:discard-missing-payload" in script:
             return await self._eval_discard_missing_payload(keys, args)
+        if "local pending = redis.call('XPENDING'" in script:
+            group, consumer, stream_id, action, _operation = args[:5]
+            if self.pending.get(stream_id) != consumer:
+                return 0
+            if action == "finish":
+                await self.xack(keys[0], group, stream_id)
+                await self.xdel(keys[0], stream_id)
+                self.hashes[keys[1]].pop(stream_id, None)
+            if action == "reserve":
+                return await self.hincrby(keys[1], stream_id, 1)
+            return 1
         raise AssertionError("unexpected Lua script")
 
     async def _eval_enqueue(self, keys, args):
@@ -162,13 +180,8 @@ class FakeRedis:
             owner,
             protocol_version,
             now,
-        ) = args
-        (
-            stream,
-            task_key,
-            payload_key,
-            principal_lease_key,
-        ) = keys
+        ) = args[:13]
+        stream, task_key, payload_key, principal_lease_key = keys[:4]
         if len(self.streams[stream]) >= int(max_pending_jobs):
             return 0
         if owner and int(per_principal) > 0:
@@ -259,11 +272,17 @@ class FakeRedis:
             or self.hashes[payload_key].get("protocol_version") != str(protocol_version)
         ):
             return [0, 0]
+        if self.hashes[payload_key].get("start_operation") == fence_token:
+            return [1, int(self.hashes[payload_key]["attempt"])]
+        if self.hashes[payload_key].get("attempt_state") == "running":
+            return [0, 0]
         attempt = await self.hincrby(payload_key, "attempt", 1)
         await self.hset(
             payload_key,
             mapping={
                 "attempt": attempt,
+                "attempt_state": "running",
+                "start_operation": fence_token,
                 "lease_owner": consumer,
                 "fence_token": fence_token,
                 "owner": owner,
@@ -363,12 +382,13 @@ class FakeRedis:
         )
         await self.hset(
             payload_key,
-            mapping={"last_error": error, "attempt": attempt, "owner": owner},
+            mapping={"last_error": error, "attempt": attempt, "owner": owner,
+                     "attempt_state": "retry"},
         )
         return 1
 
     async def _eval_complete(self, keys, args):
-        payload_key, task_key, stream, principal_lease_key = keys
+        payload_key, task_key, stream, principal_lease_key = keys[:4]
         (
             fence_token,
             consumer,
@@ -384,7 +404,7 @@ class FakeRedis:
             stream_id,
             task_id,
             result_encoding,
-        ) = args
+        ) = args[:14]
         payload = self.hashes[payload_key]
         if payload.get("fence_token") != fence_token or payload.get("lease_owner") != consumer:
             return 0
@@ -404,6 +424,10 @@ class FakeRedis:
         )
         if int(task_ttl) > 0:
             await self.expire(task_key, int(task_ttl))
+        if len(args) > 15 and args[15]:
+            event_id = await self.xadd(keys[4], {"event": args[15], "result": args[16],
+                                                "result_encoding": result_encoding})
+            self.pending[event_id] = consumer
         self._zset_remove(principal_lease_key, task_id)
         await self.delete(payload_key)
         await self.xack(stream, group, stream_id)
@@ -411,12 +435,7 @@ class FakeRedis:
         return 1
 
     async def _eval_discard_missing_payload(self, keys, args):
-        (
-            task_key,
-            payload_key,
-            stream,
-            principal_lease_key,
-        ) = keys
+        task_key, payload_key, stream, principal_lease_key = keys[:4]
         (
             group,
             consumer,
@@ -429,7 +448,7 @@ class FakeRedis:
             task_id,
             protocol_version,
             stream_owner,
-        ) = args
+        ) = args[:11]
         if self.pending.get(stream_id) != consumer:
             return 0
         if "payload" in self.hashes[payload_key]:
@@ -499,7 +518,7 @@ class FakeRedis:
         return []
 
     async def xack(self, stream, group, stream_id):
-        assert group == "crawl-workers:v3"
+        assert group in {"crawl-workers:v3", "crawl-workers:v3:webhooks"}
         self.pending.pop(stream_id, None)
         self.acks.append((stream, stream_id))
         return 1
@@ -512,7 +531,7 @@ class FakeRedis:
 
 class NoopWebhook:
     async def notify_job_completion(self, **_kwargs):
-        return None
+        return True
 
 
 class TerminalWebhook:
@@ -522,10 +541,12 @@ class TerminalWebhook:
         self.entry = entry
         self.called = False
 
-    async def notify_job_completion(self, *, status, **_kwargs):
+    async def notify_job_completion(self, *, status, before_attempt, **_kwargs):
+        assert await before_attempt() == 1
         assert self.entry.stream_id not in self.redis.pending
         assert self.redis.hashes[self.queue.task_key(self.entry.task_id)]["status"] == status
         self.called = True
+        return True
 
 
 def enqueue(redis, config, *, owner=None):
@@ -546,7 +567,6 @@ def enqueue(redis, config, *, owner=None):
 def test_enqueue_persists_payload_before_stream_visibility():
     redis = FakeRedis()
     queue, task_id = enqueue(redis, queue_config())
-
     payload = json.loads(redis.hashes[queue.payload_key(task_id)]["payload"])
     assert payload["urls"] == ["https://example.com"]
     assert redis.hashes[queue.task_key(task_id)]["status"] == "processing"
@@ -565,11 +585,9 @@ def test_protocol_v3_refuses_startup_while_v2_stream_entries_remain():
     queue = CrawlJobQueue(redis, queue_config())
     # The previous protocol's stream is the versioned :v2 name, not the bare v1 name.
     asyncio.run(redis.xadd("crawl-jobs:v2", {"task_id": "legacy"}))
-
     queue, task_id = enqueue(redis, queue_config())
     with pytest.raises(RuntimeError, match="legacy crawl jobs remain in crawl-jobs:v2"):
         asyncio.run(queue.ensure_group())
-
     assert queue.settings.stream == "crawl-jobs:v3"
     assert queue.settings.group == "crawl-workers:v3"
     assert queue.payload_key(task_id).startswith("crawl-job:v3:")
@@ -584,7 +602,6 @@ def test_protocol_names_are_not_double_suffixed_and_other_versions_are_rejected(
     )
     assert queue.settings.stream == "custom:v3"
     assert queue.settings.group == "workers:v3"
-
     with pytest.raises(ValueError, match="protocol_version"):
         CrawlJobQueue(FakeRedis(), queue_config(protocol_version=1))
 
@@ -602,7 +619,6 @@ def test_untrusted_configs_are_rejected_before_any_redis_write(
 ):
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
-
     with pytest.raises(CrawlJobPayloadRejected):
         asyncio.run(
             queue.enqueue(
@@ -613,7 +629,6 @@ def test_untrusted_configs_are_rejected_before_any_redis_write(
                 webhook_config=None,
             )
         )
-
     assert redis.eval_scripts == []
     assert dict(redis.hashes) == {}
     assert dict(redis.streams) == {}
@@ -641,7 +656,6 @@ def test_enqueue_persists_canonical_untrusted_config_dumps(browser_config):
             webhook_config=None,
         )
     )
-
     payload = json.loads(redis.hashes[queue.payload_key(task_id)]["payload"])
     assert payload["protocol_version"] == 3
     assert payload["browser_config"]["type"] == "BrowserConfig"
@@ -665,7 +679,6 @@ def test_enqueue_persists_canonical_untrusted_config_dumps(browser_config):
 def test_enqueue_preserves_explicit_default_valued_crawler_fields(crawler_config):
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
-
     task_id = asyncio.run(
         queue.enqueue(
             urls=["https://example.com"],
@@ -675,7 +688,6 @@ def test_enqueue_preserves_explicit_default_valued_crawler_fields(crawler_config
             webhook_config=None,
         )
     )
-
     payload = json.loads(redis.hashes[queue.payload_key(task_id)]["payload"])
     assert payload["browser_config"]["params"] == {}
     assert payload["crawler_config"]["params"]["delay_before_return_html"] == 0.1
@@ -684,7 +696,6 @@ def test_enqueue_preserves_explicit_default_valued_crawler_fields(crawler_config
 def test_oversized_canonical_payload_is_rejected_before_any_redis_write():
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config(max_payload_bytes=512))
-
     with pytest.raises(CrawlJobPayloadRejected, match="durable payload limit"):
         asyncio.run(
             queue.enqueue(
@@ -695,7 +706,6 @@ def test_oversized_canonical_payload_is_rejected_before_any_redis_write():
                 webhook_config=None,
             )
         )
-
     assert redis.eval_scripts == []
     assert dict(redis.hashes) == {}
     assert dict(redis.streams) == {}
@@ -710,7 +720,6 @@ def test_seed_is_normalized_and_validated_before_redis_visibility(monkeypatch):
     )
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
-
     task_id = asyncio.run(
         queue.enqueue(
             urls=["example.com/path"],
@@ -720,7 +729,6 @@ def test_seed_is_normalized_and_validated_before_redis_visibility(monkeypatch):
             webhook_config=None,
         )
     )
-
     payload = json.loads(redis.hashes[queue.payload_key(task_id)]["payload"])
     assert validated == ["https://example.com/path"]
     assert payload["urls"] == ["https://example.com/path"]
@@ -729,11 +737,9 @@ def test_seed_is_normalized_and_validated_before_redis_visibility(monkeypatch):
 def test_blocked_seed_is_rejected_before_any_redis_write(monkeypatch):
     def reject(_url):
         raise RuntimeError("blocked")
-
     monkeypatch.setattr(crawl_job_queue_module, "validate_url_destination", reject)
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
-
     with pytest.raises(CrawlJobPayloadRejected, match="crawl job URL"):
         asyncio.run(
             queue.enqueue(
@@ -744,7 +750,6 @@ def test_blocked_seed_is_rejected_before_any_redis_write(monkeypatch):
                 webhook_config=None,
             )
         )
-
     assert redis.eval_scripts == []
     assert dict(redis.hashes) == {}
     assert dict(redis.streams) == {}
@@ -753,7 +758,6 @@ def test_blocked_seed_is_rejected_before_any_redis_write(monkeypatch):
 def test_seed_dns_validation_runs_off_the_event_loop(monkeypatch):
     def slow_validation(_url):
         time.sleep(0.05)
-
     monkeypatch.setattr(
         crawl_job_queue_module,
         "validate_url_destination",
@@ -775,7 +779,6 @@ def test_seed_dns_validation_runs_off_the_event_loop(monkeypatch):
         await asyncio.sleep(0.01)
         assert not enqueue_task.done()
         await enqueue_task
-
     asyncio.run(exercise())
 
 
@@ -784,7 +787,6 @@ def test_full_queue_rejects_atomically_without_creating_task_or_payload():
     config = queue_config(max_pending_jobs=1)
     queue, _task_id = enqueue(redis, config)
     keys_before_rejection = set(redis.hashes)
-
     with pytest.raises(CrawlJobQueueFull):
         asyncio.run(
             queue.enqueue(
@@ -795,7 +797,6 @@ def test_full_queue_rejects_atomically_without_creating_task_or_payload():
                 webhook_config=None,
             )
         )
-
     assert len(redis.streams[queue.settings.stream]) == 1
     assert set(redis.hashes) == keys_before_rejection
 
@@ -803,11 +804,13 @@ def test_full_queue_rejects_atomically_without_creating_task_or_payload():
 def test_consumer_group_creation_is_idempotent_for_two_supervised_workers():
     redis = FakeRedis()
     queue = CrawlJobQueue(redis, queue_config())
-
     asyncio.run(queue.ensure_group())
     asyncio.run(queue.ensure_group())
 
-    assert redis.groups == {(queue.settings.stream, queue.settings.group)}
+    assert redis.groups == {
+        (queue.settings.stream, queue.settings.group),
+        (queue.outbox_stream, queue.outbox_group),
+    }
 
 
 def test_public_crawl_job_submit_contract_has_no_background_task_dependency():
@@ -910,6 +913,7 @@ def test_public_crawl_job_rejects_blocked_seed_without_redis_writes(monkeypatch)
 def test_worker_completes_and_removes_stream_entry_atomically():
     redis = FakeRedis()
     config = queue_config()
+    config["webhooks"] = {"default_url": "https://callback.example/done"}
     queue, task_id = enqueue(redis, config)
     entry = asyncio.run(queue.read_new("worker-a"))[0]
 
@@ -924,10 +928,11 @@ def test_worker_completes_and_removes_stream_entry_atomically():
     assert task["status"] == "completed"
     assert decode_task_result(task, task_id)["success"] is True
     assert queue.payload_key(task_id) not in redis.hashes
-    assert redis.acks == [(queue.settings.stream, entry.stream_id)]
-    assert redis.deleted == [(queue.settings.stream, entry.stream_id)]
+    assert redis.acks == redis.deleted == [
+        (queue.settings.stream, entry.stream_id), (queue.outbox_stream, "2-0")]
     assert redis.expires == [(queue.task_key(task_id), 60)]
     assert webhook.called is True
+    assert redis.streams[queue.outbox_stream] == []
 
 
 def test_worker_retains_pending_entry_until_retry_budget_is_exhausted():
@@ -974,6 +979,7 @@ def test_stale_claim_fences_out_the_previous_workers_heartbeat():
     entry = asyncio.run(queue.read_new("dead-worker"))[0]
     payload = asyncio.run(queue.load_payload(entry.task_id))
     stale_attempt = asyncio.run(queue.start_attempt(entry, payload, "dead-worker"))
+    asyncio.run(queue.mark_retry(entry, payload, "dead-worker", stale_attempt, "clean failure"))
 
     claimed = asyncio.run(queue.claim_stale("worker-a"))
     assert claimed == [entry]
@@ -992,6 +998,7 @@ def test_stale_attempt_cannot_publish_terminal_state_after_takeover():
     entry = asyncio.run(queue.read_new("worker-a"))[0]
     payload = asyncio.run(queue.load_payload(task_id))
     stale_attempt = asyncio.run(queue.start_attempt(entry, payload, "worker-a"))
+    asyncio.run(queue.mark_retry(entry, payload, "worker-a", stale_attempt, "clean failure"))
 
     assert asyncio.run(queue.claim_stale("worker-b")) == [entry]
     current_attempt = asyncio.run(queue.start_attempt(entry, payload, "worker-b"))
@@ -1096,6 +1103,7 @@ def test_stale_missing_payload_cleanup_cannot_overwrite_valid_completion_or_doub
     entry = asyncio.run(queue.read_new("worker-a"))[0]
     payload = asyncio.run(queue.load_payload(task_id))
     stale_attempt = asyncio.run(queue.start_attempt(entry, payload, "worker-a"))
+    asyncio.run(queue.mark_retry(entry, payload, "worker-a", stale_attempt, "clean failure"))
     assert asyncio.run(queue.claim_stale("worker-b")) == [entry]
     current_attempt = asyncio.run(queue.start_attempt(entry, payload, "worker-b"))
     asyncio.run(
@@ -1159,13 +1167,7 @@ def test_worker_heartbeats_during_a_long_crawl():
 
 
 class FlakyHeartbeatRedis(FakeRedis):
-    """FakeRedis that injects failures into the heartbeat eval path.
-
-    ``fail_on_heartbeat_numbers`` raises ``error`` on those heartbeat calls so the
-    heartbeat loop's resilience can be exercised; ``lose_lease_on_heartbeat_number``
-    makes the fence check return 0 so ``CrawlJobQueue.heartbeat`` raises
-    ``CrawlJobLeaseLost`` (genuine lease takeover).
-    """
+    """Inject heartbeat connection failures or a lost ownership fence."""
 
     def __init__(
         self,

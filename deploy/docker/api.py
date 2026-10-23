@@ -32,6 +32,7 @@ from utils import (
     TaskStatus,
     decode_redis_hash,
     decode_task_result,
+    ResultTooLarge,
     encode_task_result,
     get_base_url,
     get_browser_extra_args,
@@ -1151,7 +1152,14 @@ def create_task_response(task: dict, task_id: str, base_url: str, collection: st
 
     # A crawl job whose URLs all failed is terminal-failed but still carries
     # its per-URL diagnostics, so result and error are not exclusive.
-    result = decode_task_result(task, task_id)
+    try:
+        result = decode_task_result(task, task_id)
+    except ResultTooLarge:
+        # Stored before results were bounded: poll it as a terminal failure
+        # instead of inflating it past the read budget into a 500.
+        response["status"] = TaskStatus.FAILED.value
+        response["error"] = "result_too_large"
+        return response
     if task.get("result"):
         response["result"] = result
     if task["status"] == TaskStatus.FAILED:

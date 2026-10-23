@@ -7,6 +7,7 @@ import asyncio
 import logging
 import re
 import socket
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Dict, Optional
 from urllib.parse import urljoin
@@ -59,6 +60,7 @@ _WEBHOOK_DENY_HEADERS = {
 }
 _MAX_WEBHOOK_HEADERS = 20
 _MAX_WEBHOOK_HEADER_VALUE = 2048
+DEFAULT_WEBHOOK_ATTEMPTS = 5
 
 
 def sanitize_webhook_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -91,7 +93,7 @@ class WebhookDeliveryService:
             config: Application configuration dictionary containing webhook settings
         """
         self.config = config.get("webhooks", {})
-        self.max_attempts = self.config.get("retry", {}).get("max_attempts", 5)
+        self.max_attempts = self.config.get("retry", {}).get("max_attempts", DEFAULT_WEBHOOK_ATTEMPTS)
         self.initial_delay = self.config.get("retry", {}).get("initial_delay_ms", 1000) / 1000
         self.max_delay = self.config.get("retry", {}).get("max_delay_ms", 32000) / 1000
         self.timeout = self.config.get("retry", {}).get("timeout_ms", 30000) / 1000
@@ -100,7 +102,9 @@ class WebhookDeliveryService:
         self,
         webhook_url: str,
         payload: Dict,
-        headers: Optional[Dict[str, str]] = None
+        headers: Optional[Dict[str, str]] = None,
+        event_id: Optional[str] = None,
+        before_attempt: Optional[Callable[[], Awaitable[int]]] = None,
     ) -> bool:
         """
         Send webhook with exponential backoff retry logic.
@@ -123,8 +127,18 @@ class WebhookDeliveryService:
             safe_custom = {}
         merged_headers = {**default_headers, **safe_custom}
         merged_headers["Content-Type"] = "application/json"
+        if event_id is not None:
+            payload = {**payload, "event_id": event_id}
+            merged_headers["X-Crawl4AI-Event-ID"] = event_id
 
-        for attempt in range(self.max_attempts):
+        attempt = 0
+        while attempt < self.max_attempts:
+            # The outbox reserves durably before opening a connection. Keep
+            # this outside the delivery catch: losing ownership must stop the
+            # send, and a reservation failure must retain the pending event.
+            attempt = await before_attempt() if before_attempt else attempt + 1
+            if attempt <= 0 or attempt > self.max_attempts:
+                return False
             try:
                 status = await self._deliver(webhook_url, payload, merged_headers)
                 if 200 <= status < 300:
@@ -140,10 +154,10 @@ class WebhookDeliveryService:
                 logger.warning(f"Webhook blocked (SSRF protection): {exc}")
                 return False
             except Exception as exc:
-                logger.error(f"Webhook delivery error (attempt {attempt + 1}): {exc}")
+                logger.error(f"Webhook delivery error (attempt {attempt}): {exc}")
 
-            if attempt < self.max_attempts - 1:
-                delay = min(self.initial_delay * (2 ** attempt), self.max_delay)
+            if attempt < self.max_attempts:
+                delay = min(self.initial_delay * (2 ** (attempt - 1)), self.max_delay)
                 await asyncio.sleep(delay)
         return False
 
@@ -191,8 +205,10 @@ class WebhookDeliveryService:
         urls: list,
         webhook_config: Optional[Dict],
         result: Optional[Dict] = None,
-        error: Optional[str] = None
-    ):
+        error: Optional[str] = None,
+        event_id: Optional[str] = None,
+        before_attempt: Optional[Callable[[], Awaitable[int]]] = None,
+    ) -> bool:
         """
         Notify webhook of job completion.
 
@@ -220,12 +236,12 @@ class WebhookDeliveryService:
 
         if not webhook_url:
             logger.debug("No webhook URL configured, skipping notification")
-            return
+            return event_id is None
 
         # Check if webhooks are enabled
         if not self.config.get("enabled", True):
             logger.debug("Webhooks are disabled, skipping notification")
-            return
+            return event_id is None
 
         # Build payload
         payload = {
@@ -242,5 +258,7 @@ class WebhookDeliveryService:
         if data_in_payload and result:
             payload["data"] = result
 
-        # Send webhook (fire and forget - don't block on completion)
-        await self.send_webhook(webhook_url, payload, custom_headers)
+        return await self.send_webhook(
+            webhook_url, payload, custom_headers,
+            event_id=event_id, before_attempt=before_attempt,
+        )

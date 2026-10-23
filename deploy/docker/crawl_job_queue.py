@@ -13,10 +13,12 @@ from typing import Any
 from uuid import uuid4
 
 from redis.exceptions import ResponseError
+from crawl_job_outbox import APPEND_OUTBOX_LUA, CrawlJobOutbox
 from schemas import CrawlRequest
 from utils import (
     DEFAULT_CONFIG,
-    ResultEncoding, TaskStatus, encode_task_result,
+    ResultEncoding, ResultTooLarge, TaskStatus, encode_task_result,
+    MAX_SERIALIZED_RESULT_BYTES, MAX_STORED_RESULT_BYTES,
     get_redis_task_ttl,
     validate_url_destination,
 )
@@ -24,10 +26,7 @@ from work_queue import principal_lease_key
 
 from crawl4ai import BrowserConfig, CrawlerRunConfig
 from crawl4ai.async_configs import (
-    Provenance,
-    UNTRUSTED_FIELD_ALLOWLIST,
-    UntrustedConfigError,
-    to_serializable_dict,
+    Provenance, UNTRUSTED_FIELD_ALLOWLIST, UntrustedConfigError, to_serializable_dict,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +40,10 @@ CRAWL_JOB_PROTOCOL_VERSION = 3
 
 class CrawlJobLeaseLost(RuntimeError):
     """Raised when another consumer has taken over a pending crawl job."""
+
+
+class CrawlJobWorkerDied(RuntimeError):
+    """A running attempt lost its worker; repeating it can kill another replica."""
 
 
 class CrawlJobQueueFull(RuntimeError):
@@ -66,6 +69,9 @@ _ENQUEUE_IF_CAPACITY_SCRIPT = """
 -- KEYS[4] is the shared per-principal quota lease ZSET (see work_queue.py).
 -- Durable claims carry score +inf: their release is atomic in the terminal
 -- scripts, and a pending backlog job may outlive any finite lease.
+-- A lost reply must not enqueue again, even if capacity is now exhausted.
+if redis.call('HGET', KEYS[2], 'enqueue_operation') == ARGV[14] then return 1 end
+-- Keep admission identical to old replicas throughout a rolling update.
 if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[1]) then
   return 0
 end
@@ -77,13 +83,14 @@ if tonumber(ARGV[2]) > 0 and ARGV[11] ~= '' then
 end
 redis.call('HSET', KEYS[2], 'status', ARGV[3], 'created_at', ARGV[4],
   'url', ARGV[5], 'result', ARGV[6], 'error', ARGV[7],
-  'webhook_config', ARGV[8], 'owner', ARGV[11], 'protocol_version', ARGV[12])
+  'webhook_config', ARGV[8], 'owner', ARGV[11], 'protocol_version', ARGV[12],
+  'enqueue_operation', ARGV[14])
 redis.call('HSET', KEYS[3], 'payload', ARGV[9], 'attempt', '0',
   'owner', ARGV[11], 'lease_owner', '', 'fence_token', '',
   'protocol_version', ARGV[12])
 redis.call(
   'XADD', KEYS[1], '*', 'task_id', ARGV[10],
-  'protocol_version', ARGV[12], 'owner', ARGV[11]
+  'protocol_version', ARGV[12], 'owner', ARGV[11], 'url', ARGV[5], 'webhook_config', ARGV[8]
 )
 if tonumber(ARGV[2]) > 0 and ARGV[11] ~= '' then
   redis.call('ZADD', KEYS[4], '+inf', ARGV[10])
@@ -112,16 +119,25 @@ if #messages > 0 then
   if task_id and protocol_version == ARGV[7] then
     local payload_key = ARGV[6] .. task_id
     if redis.call('HEXISTS', payload_key, 'payload') == 1 then
-    redis.call(
-      'HSET', payload_key,
-      'lease_owner', ARGV[2], 'fence_token', ARGV[5]
-    )
+      local fence = redis.call('HGET', payload_key, 'fence_token')
+      local state = redis.call('HGET', payload_key, 'attempt_state')
+      local owned = redis.call('HGET', payload_key, 'start_operation') == fence
+      -- Old scripts retain unknown fields: a foreign fence invalidates them.
+      if (state == 'running' and owned)
+        or redis.call('HGET', payload_key, 'worker_died') == fence then
+        redis.call('HSET', payload_key, 'worker_died', ARGV[5])
+      else
+        redis.call('HDEL', payload_key, 'worker_died', 'attempt_state', 'start_operation')
+      end
+      redis.call(
+        'HSET', payload_key,
+        'lease_owner', ARGV[2], 'fence_token', ARGV[5]
+      )
     end
   end
 end
 return claimed
 """
-
 
 _START_ATTEMPT_SCRIPT = """
 -- crawl4ai:start-attempt
@@ -133,10 +149,19 @@ if redis.call('HEXISTS', KEYS[2], 'payload') == 0
   or redis.call('HGET', KEYS[2], 'protocol_version') ~= ARGV[10] then
   return {0, 0}
 end
+if redis.call('HGET', KEYS[2], 'start_operation') == ARGV[4]
+  and redis.call('HGET', KEYS[2], 'fence_token') == ARGV[4] then
+  return {1, tonumber(redis.call('HGET', KEYS[2], 'attempt'))}
+end
+local fence = redis.call('HGET', KEYS[2], 'fence_token')
+if redis.call('HGET', KEYS[2], 'worker_died') == fence
+  or (redis.call('HGET', KEYS[2], 'attempt_state') == 'running'
+      and redis.call('HGET', KEYS[2], 'start_operation') == fence) then return {0, 0} end
 local attempt = redis.call('HINCRBY', KEYS[2], 'attempt', 1)
 redis.call(
   'HSET', KEYS[2], 'attempt', attempt, 'lease_owner', ARGV[2],
-  'fence_token', ARGV[4], 'owner', ARGV[8], 'protocol_version', ARGV[10]
+  'fence_token', ARGV[4], 'owner', ARGV[8], 'protocol_version', ARGV[10],
+  'attempt_state', 'running', 'start_operation', ARGV[4]
 )
 redis.call(
   'HSET', KEYS[3], 'status', ARGV[5], 'created_at', ARGV[6],
@@ -146,7 +171,6 @@ redis.call(
 )
 return {1, attempt}
 """
-
 
 _HEARTBEAT_SCRIPT = """
 -- crawl4ai:heartbeat
@@ -170,7 +194,6 @@ redis.call(
 return 1
 """
 
-
 _MARK_RETRY_SCRIPT = """
 -- crawl4ai:mark-retry
 if redis.call('HGET', KEYS[1], 'fence_token') ~= ARGV[1]
@@ -185,14 +208,17 @@ redis.call(
 )
 redis.call(
   'HSET', KEYS[1], 'last_error', ARGV[8], 'attempt', ARGV[7],
-  'owner', ARGV[6]
+  'owner', ARGV[6], 'attempt_state', 'retry'
 )
 return 1
 """
 
-
-_COMPLETE_SCRIPT = """
+_COMPLETE_SCRIPT = APPEND_OUTBOX_LUA + """
 -- crawl4ai:complete
+-- Terminal metadata survives deleting the payload, so a reply replay succeeds.
+if redis.call('HGET', KEYS[2], 'completion_operation') == ARGV[15]
+  and redis.call('HGET', KEYS[2], 'completion_fence') == ARGV[1]
+  and redis.call('HGET', KEYS[2], 'completion_consumer') == ARGV[2] then return 1 end
 if redis.call('HGET', KEYS[1], 'fence_token') ~= ARGV[1]
   or redis.call('HGET', KEYS[1], 'lease_owner') ~= ARGV[2] then
   return 0
@@ -201,11 +227,13 @@ local attempt = redis.call('HGET', KEYS[1], 'attempt') or ''
 redis.call(
   'HSET', KEYS[2], 'status', ARGV[3], 'created_at', ARGV[4],
   'url', ARGV[5], 'result', ARGV[6], 'error', ARGV[7],
-  'completed_at', ARGV[8], 'owner', ARGV[9], 'attempt', attempt, 'result_encoding', ARGV[14]
+  'completed_at', ARGV[8], 'owner', ARGV[9], 'attempt', attempt, 'result_encoding', ARGV[14],
+  'completion_operation', ARGV[15], 'completion_fence', ARGV[1], 'completion_consumer', ARGV[2]
 )
 if tonumber(ARGV[10]) > 0 then
   redis.call('EXPIRE', KEYS[2], ARGV[10])
 end
+append_outbox(ARGV[16], ARGV[17], ARGV[14], ARGV[18], ARGV[11], ARGV[2])
 redis.call('ZREM', KEYS[4], ARGV[13])
 redis.call('DEL', KEYS[1])
 redis.call('XACK', KEYS[3], ARGV[11], ARGV[12])
@@ -214,7 +242,7 @@ return 1
 """
 
 
-_DISCARD_MISSING_PAYLOAD_SCRIPT = """
+_DISCARD_MISSING_PAYLOAD_SCRIPT = APPEND_OUTBOX_LUA + """
 -- crawl4ai:discard-missing-payload
 local pending_entry = redis.call(
   'XPENDING', KEYS[3], ARGV[1], ARGV[3], ARGV[3], 1
@@ -249,6 +277,7 @@ else
     redis.call('EXPIRE', KEYS[1], ARGV[8])
   end
 end
+append_outbox(ARGV[12], '', 'zlib', ARGV[13], ARGV[1], ARGV[2])
 -- XAUTOCLAIM must never leave a lease-only payload hash behind.
 redis.call('DEL', KEYS[2])
 redis.call('ZREM', KEYS[4], ARGV[9])
@@ -290,11 +319,14 @@ class CrawlJobQueueSettings:
     max_payload_bytes: int
     per_principal: int
     protocol_version: int
+    max_serialized_result_bytes: int
+    max_stored_result_bytes: int
 
     @classmethod
     def from_config(cls, config: dict) -> CrawlJobQueueSettings:
         defaults = DEFAULT_CONFIG["crawl_jobs"]
-        configured = {**defaults, **config.get("crawl_jobs", {})}
+        configured = {"max_serialized_result_bytes": MAX_SERIALIZED_RESULT_BYTES, "max_stored_result_bytes": MAX_STORED_RESULT_BYTES,
+                      **defaults, **config.get("crawl_jobs", {})}
 
         def positive_int(name: str) -> int:
             candidate = configured[name]
@@ -302,6 +334,11 @@ class CrawlJobQueueSettings:
                 raise ValueError(f"crawl_jobs.{name} must be a positive integer")
             return candidate
 
+        # Readers share these hard ceilings, including status reads by other replicas.
+        for name, ceiling in (("max_serialized_result_bytes", MAX_SERIALIZED_RESULT_BYTES),
+                              ("max_stored_result_bytes", MAX_STORED_RESULT_BYTES)):
+            if positive_int(name) > ceiling:
+                raise ValueError(f"crawl_jobs.{name} must not exceed {ceiling}")
         lease_seconds = positive_int("lease_seconds")
         heartbeat_seconds = positive_int("heartbeat_seconds")
         if heartbeat_seconds >= lease_seconds:
@@ -336,27 +373,24 @@ class CrawlJobQueueSettings:
             max_payload_bytes=positive_int("max_payload_bytes"),
             per_principal=per_principal,
             protocol_version=protocol_version,
+            max_serialized_result_bytes=positive_int("max_serialized_result_bytes"),
+            max_stored_result_bytes=positive_int("max_stored_result_bytes"),
         )
 
 
 def _as_text(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
-    return str(value)
+    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
 
 def _field(fields: Mapping[Any, Any] | list[Any], name: str) -> str | None:
-    if isinstance(fields, Mapping):
-        items = fields.items()
-    else:
-        items = zip(fields[::2], fields[1::2])
+    items = fields.items() if isinstance(fields, Mapping) else zip(fields[::2], fields[1::2])
     for key, value in items:
         if _as_text(key) == name:
             return _as_text(value)
     return None
 
 
-class CrawlJobQueue:
+class CrawlJobQueue(CrawlJobOutbox):
     """Owns the persistent request payload and Stream lifecycle for crawl jobs."""
 
     def __init__(self, redis: Any, config: dict):
@@ -372,6 +406,14 @@ class CrawlJobQueue:
     @property
     def payload_prefix(self) -> str:
         return f"crawl-job:v{self.settings.protocol_version}:"
+
+    @property
+    def outbox_stream(self) -> str:
+        return f"{self.settings.stream}:webhooks"
+
+    @property
+    def outbox_group(self) -> str:
+        return f"{self.settings.group}:webhooks"
 
     def payload_key(self, task_id: str) -> str:
         return f"{self.payload_prefix}{task_id}"
@@ -400,43 +442,22 @@ class CrawlJobQueue:
                 raise CrawlJobPayloadRejected("Rejected crawl job URL") from error
         return normalized
 
-    def _canonical_payload(
-        self,
-        *,
-        urls: list[str],
-        browser_config: dict,
-        crawler_config: dict,
-        result_fields: list[str] | None,
-        webhook_config: dict | None,
-        created_at: str,
-        owner: str,
-    ) -> str:
+    def _canonical_payload(self, *, urls: list[str], browser_config: dict, crawler_config: dict,
+        result_fields: list[str] | None, webhook_config: dict | None, created_at: str, owner: str) -> str:
         try:
-            loaded_browser = BrowserConfig.load(
-                browser_config,
-                provenance=Provenance.UNTRUSTED,
-            )
+            loaded_browser = BrowserConfig.load(browser_config, provenance=Provenance.UNTRUSTED)
             canonical_browser = {"type": "BrowserConfig", "params": {}}
-            request_browser_params = (
-                browser_config.get("params", {})
-                if browser_config.get("type") == "BrowserConfig"
-                else browser_config
-            )
+            request_browser_params = (browser_config.get("params", {})
+                                      if browser_config.get("type") == "BrowserConfig" else browser_config)
             for field in request_browser_params:
                 if field in UNTRUSTED_FIELD_ALLOWLIST["BrowserConfig"]:
                     canonical_browser["params"][field] = to_serializable_dict(
                         getattr(loaded_browser, field)
                     )
-            loaded_crawler = CrawlerRunConfig.load(
-                crawler_config,
-                provenance=Provenance.UNTRUSTED,
-            )
+            loaded_crawler = CrawlerRunConfig.load(crawler_config, provenance=Provenance.UNTRUSTED)
             canonical_crawler = loaded_crawler.dump()
-            request_params = (
-                crawler_config.get("params", {})
-                if crawler_config.get("type") == "CrawlerRunConfig"
-                else crawler_config
-            )
+            request_params = (crawler_config.get("params", {})
+                              if crawler_config.get("type") == "CrawlerRunConfig" else crawler_config)
             for field in request_params:
                 if field in UNTRUSTED_FIELD_ALLOWLIST["CrawlerRunConfig"]:
                     canonical_crawler["params"][field] = to_serializable_dict(
@@ -479,59 +500,31 @@ class CrawlJobQueue:
                 raise RuntimeError(
                     f"legacy crawl jobs remain in {legacy_stream}; refusing v{self.settings.protocol_version} worker startup"
                 )
-        try:
-            await self.redis.xgroup_create(
-                self.settings.stream,
-                self.settings.group,
-                id="0-0",
-                mkstream=True,
-            )
-        except ResponseError as error:
-            if "BUSYGROUP" not in str(error):
-                raise
+        for stream, group in ((self.settings.stream, self.settings.group),
+                              (self.outbox_stream, self.outbox_group)):
+            try:
+                await self.redis.xgroup_create(stream, group, id="0-0", mkstream=True)
+            except ResponseError as error:
+                if "BUSYGROUP" not in str(error):
+                    raise
 
-    async def enqueue(
-        self,
-        urls: list[str],
-        browser_config: dict,
-        crawler_config: dict,
-        result_fields: list[str] | None,
-        webhook_config: dict | None,
-        owner: str | None = None,
-    ) -> str:
+    async def enqueue(self, urls: list[str], browser_config: dict, crawler_config: dict,
+        result_fields: list[str] | None, webhook_config: dict | None, owner: str | None = None) -> str:
         """Atomically persist a request and make it visible to worker consumers."""
         task_id = f"crawl_{uuid4().hex}"
         created_at = self._created_at()
         canonical_urls = await self._canonical_urls(urls)
         serialized_payload = self._canonical_payload(
-            urls=canonical_urls,
-            browser_config=browser_config,
-            crawler_config=crawler_config,
-            result_fields=result_fields,
-            webhook_config=webhook_config,
-            created_at=created_at,
-            owner=owner or "",
+            urls=canonical_urls, browser_config=browser_config, crawler_config=crawler_config,
+            result_fields=result_fields, webhook_config=webhook_config, created_at=created_at, owner=owner or "",
         )
         enqueued = await self.redis.eval(
-            _ENQUEUE_IF_CAPACITY_SCRIPT,
-            4,
-            self.settings.stream,
-            self.task_key(task_id),
-            self.payload_key(task_id),
-            principal_lease_key(owner or ""),
-            self.settings.max_pending_jobs,
-            self.settings.per_principal,
-            TaskStatus.PROCESSING.value,
-            created_at,
-            json.dumps(canonical_urls),
-            "",
-            "",
-            json.dumps(webhook_config) if webhook_config else "",
-            serialized_payload,
-            task_id,
-            owner or "",
-            self.settings.protocol_version,
-            time.time(),
+            _ENQUEUE_IF_CAPACITY_SCRIPT, 4, self.settings.stream, self.task_key(task_id),
+            self.payload_key(task_id), principal_lease_key(owner or ""),
+            self.settings.max_pending_jobs, self.settings.per_principal, TaskStatus.PROCESSING.value,
+            created_at, json.dumps(canonical_urls), "", "",
+            json.dumps(webhook_config) if webhook_config else "", serialized_payload, task_id, owner or "",
+            self.settings.protocol_version, time.time(), task_id,
         )
         if int(enqueued) == -1:
             raise CrawlJobPrincipalQuotaExceeded(self.settings.per_principal)
@@ -552,16 +545,9 @@ class CrawlJobQueue:
     async def claim_stale(self, consumer: str) -> list[CrawlJobEntry]:
         """Claim one stale pending entry whose lease was not heartbeated."""
         response = await self.redis.eval(
-            _CLAIM_STALE_SCRIPT,
-            1,
-            self.settings.stream,
-            self.settings.group,
-            consumer,
-            self.settings.lease_seconds * 1000,
-            self._claim_cursor,
-            f"claim-{uuid4().hex}",
-            self.payload_prefix,
-            self.settings.protocol_version,
+            _CLAIM_STALE_SCRIPT, 1, self.settings.stream, self.settings.group, consumer,
+            self.settings.lease_seconds * 1000, self._claim_cursor, f"claim-{uuid4().hex}",
+            self.payload_prefix, self.settings.protocol_version,
         )
         if not response:
             self._claim_cursor = "0-0"
@@ -569,7 +555,23 @@ class CrawlJobQueue:
 
         next_start_id, messages, _deleted = response
         self._claim_cursor = _as_text(next_start_id)
-        return self._messages_to_entries(messages)
+        entries = []
+        for entry in self._messages_to_entries(messages):
+            key = self.payload_key(entry.task_id)
+            died, fence = await self.redis.hmget(key, "worker_died", "fence_token")
+            if died and died == fence:
+                payload = await self.load_payload(entry.task_id)
+                if payload is not None:
+                    number, fence = await self.redis.hmget(key, "attempt", "fence_token")
+                    attempt = CrawlJobAttempt(int(number), _as_text(fence), consumer)
+                    try:
+                        await self.complete(entry, payload, attempt,
+                            error=f"worker_died: {CrawlJobWorkerDied('worker died while running this job')}")
+                    except CrawlJobLeaseLost:
+                        pass  # Another reclaim owns the same poison disposition.
+                    continue
+            entries.append(entry)
+        return entries
 
     async def load_payload(self, task_id: str) -> dict | None:
         payload = await self.redis.hget(self.payload_key(task_id), "payload")
@@ -577,159 +579,93 @@ class CrawlJobQueue:
             return None
         return json.loads(_as_text(payload))
 
-    async def start_attempt(
-        self,
-        entry: CrawlJobEntry,
-        payload: dict,
-        consumer: str,
-    ) -> CrawlJobAttempt:
+    async def start_attempt(self, entry: CrawlJobEntry, payload: dict, consumer: str) -> CrawlJobAttempt:
         fence_token = uuid4().hex
         owner = payload.get("owner") or ""
         result = await self.redis.eval(
-            _START_ATTEMPT_SCRIPT,
-            3,
-            self.settings.stream,
-            self.payload_key(entry.task_id),
-            self.task_key(entry.task_id),
-            self.settings.group,
-            consumer,
-            entry.stream_id,
-            fence_token,
-            TaskStatus.PROCESSING.value,
-            payload["created_at"],
-            json.dumps(payload["urls"]),
-            owner,
-            self._created_at(),
-            self.settings.protocol_version,
+            _START_ATTEMPT_SCRIPT, 3, self.settings.stream, self.payload_key(entry.task_id),
+            self.task_key(entry.task_id), self.settings.group, consumer, entry.stream_id, fence_token,
+            TaskStatus.PROCESSING.value, payload["created_at"], json.dumps(payload["urls"]), owner,
+            self._created_at(), self.settings.protocol_version,
         )
         if not result or int(result[0]) != 1:
             raise CrawlJobLeaseLost(f"crawl job {entry.task_id} is no longer owned by {consumer}")
-        return CrawlJobAttempt(
-            number=int(result[1]),
-            fence_token=fence_token,
-            consumer=consumer,
-        )
+        return CrawlJobAttempt(number=int(result[1]), fence_token=fence_token, consumer=consumer)
 
-    async def heartbeat(
-        self,
-        entry: CrawlJobEntry,
-        payload: dict,
-        consumer: str,
-        attempt: CrawlJobAttempt,
+    async def heartbeat(self, entry: CrawlJobEntry, payload: dict, consumer: str, attempt: CrawlJobAttempt,
     ) -> None:
         """Renew both the pending-entry lease and its durable task metadata."""
         renewed = await self.redis.eval(
-            _HEARTBEAT_SCRIPT,
-            3,
-            self.settings.stream,
-            self.payload_key(entry.task_id),
-            self.task_key(entry.task_id),
-            self.settings.group,
-            consumer,
-            entry.stream_id,
-            attempt.fence_token,
-            attempt.number,
-            TaskStatus.PROCESSING.value,
-            payload["created_at"],
-            json.dumps(payload["urls"]),
-            payload.get("owner") or "",
-            self._created_at(),
+            _HEARTBEAT_SCRIPT, 3, self.settings.stream, self.payload_key(entry.task_id),
+            self.task_key(entry.task_id), self.settings.group, consumer, entry.stream_id,
+            attempt.fence_token, attempt.number, TaskStatus.PROCESSING.value, payload["created_at"],
+            json.dumps(payload["urls"]), payload.get("owner") or "", self._created_at(),
         )
         if int(renewed) != 1:
             raise CrawlJobLeaseLost(f"crawl job {entry.task_id} lease was claimed by another worker")
 
-    async def mark_retry(
-        self,
-        entry: CrawlJobEntry,
-        payload: dict,
-        consumer: str,
-        attempt: CrawlJobAttempt,
-        error: str,
-    ) -> None:
+    async def mark_retry(self, entry: CrawlJobEntry, payload: dict, consumer: str, attempt: CrawlJobAttempt,
+        error: str) -> None:
         updated = await self.redis.eval(
-            _MARK_RETRY_SCRIPT,
-            2,
-            self.payload_key(entry.task_id),
-            self.task_key(entry.task_id),
-            attempt.fence_token,
-            consumer,
-            TaskStatus.PROCESSING.value,
-            payload["created_at"],
-            json.dumps(payload["urls"]),
-            payload.get("owner") or "",
-            attempt.number,
-            error,
-            entry.stream_id,
+            _MARK_RETRY_SCRIPT, 2, self.payload_key(entry.task_id), self.task_key(entry.task_id),
+            attempt.fence_token, consumer, TaskStatus.PROCESSING.value, payload["created_at"],
+            json.dumps(payload["urls"]), payload.get("owner") or "", attempt.number, error, entry.stream_id,
             self._created_at(),
         )
         if int(updated) != 1:
             raise CrawlJobLeaseLost(f"crawl job {entry.task_id} lease was claimed by another worker")
 
-    async def complete(
-        self,
-        entry: CrawlJobEntry,
-        payload: dict,
-        attempt: CrawlJobAttempt,
-        *,
-        result: dict | None = None,
-        error: str | None = None,
-    ) -> None:
-        """Atomically publish a terminal task state and remove its Stream entry."""
+    async def complete(self, entry: CrawlJobEntry, payload: dict, attempt: CrawlJobAttempt, *,
+        result: dict | None = None, error: str | None = None) -> tuple[str, dict | None, str | None]:
+        """Commit the bounded result and webhook together, under the attempt fence."""
+        try:
+            encoded = encode_task_result(result, ResultEncoding.ZLIB,
+                max_serialized_bytes=self.settings.max_serialized_result_bytes,
+                max_stored_bytes=self.settings.max_stored_result_bytes) if result is not None else ""
+        except ResultTooLarge as oversized:
+            result, encoded, error = None, "", f"result_too_large: {oversized}"
         status = TaskStatus.COMPLETED.value if error is None else TaskStatus.FAILED.value
+        event, include_result = self._webhook_event(entry.task_id, payload, status, error)
         completed = await self.redis.eval(
-            _COMPLETE_SCRIPT,
-            4,
-            self.payload_key(entry.task_id),
-            self.task_key(entry.task_id),
-            self.settings.stream,
-            principal_lease_key(payload.get("owner") or ""),
-            attempt.fence_token,
-            attempt.consumer,
-            status,
-            payload["created_at"],
-            json.dumps(payload["urls"]),
-            encode_task_result(result, ResultEncoding.ZLIB) if result is not None else "",
-            error or "",
-            self._created_at(),
-            payload.get("owner") or "",
-            get_redis_task_ttl(self.config),
-            self.settings.group,
-            entry.stream_id,
-            entry.task_id, ResultEncoding.ZLIB.value,
+            _COMPLETE_SCRIPT, 5, self.payload_key(entry.task_id), self.task_key(entry.task_id),
+            self.settings.stream, principal_lease_key(payload.get("owner") or ""), self.outbox_stream,
+            attempt.fence_token, attempt.consumer, status, payload["created_at"],
+            json.dumps(payload["urls"]), encoded, error or "", self._created_at(),
+            payload.get("owner") or "", get_redis_task_ttl(self.config), self.settings.group,
+            entry.stream_id, entry.task_id, ResultEncoding.ZLIB.value,
+            uuid4().hex, event, encoded if include_result else "", self.settings.max_pending_jobs,
         )
         if int(completed) != 1:
             raise CrawlJobLeaseLost(
                 f"crawl job {entry.task_id} lease held by {attempt.consumer} was claimed by another worker"
             )
 
+        return status, result, error
+
     async def discard_missing_payload(self, entry: CrawlJobEntry, consumer: str) -> None:
         """Fenced cleanup for an entry whose durable payload is absent."""
         # The quota lease key is per-principal; recover the owner from the
         # Stream entry's immutable 'owner' field before the fenced script runs
         # and thread it through ARGV (the script must not re-read it).
-        stream_owner = ""
+        stream_owner, stream_url, stream_webhook = "", "[]", "null"
         for _stream_id, fields in await self.redis.xrange(
             self.settings.stream, entry.stream_id, entry.stream_id, count=1
         ) or []:
-            stream_owner = _as_text(_field(fields, "owner") or "")
+            stream_owner, stream_url, stream_webhook = (
+                _field(fields, name) or default for name, default in
+                (("owner", ""), ("url", "[]"), ("webhook_config", "null")))
+        url, webhook = await self.redis.hmget(self.task_key(entry.task_id), "url", "webhook_config")
+        url, webhook = _as_text(url or stream_url), _as_text(webhook or stream_webhook)
+        event, _include = self._webhook_event(entry.task_id,
+            {"urls": json.loads(url), "webhook_config": json.loads(webhook)},
+            "failed", "Durable crawl job payload is missing")
         discarded = await self.redis.eval(
-            _DISCARD_MISSING_PAYLOAD_SCRIPT,
-            4,
-            self.task_key(entry.task_id),
-            self.payload_key(entry.task_id),
-            self.settings.stream,
-            principal_lease_key(stream_owner),
-            self.settings.group,
-            consumer,
-            entry.stream_id,
-            TaskStatus.PROCESSING.value,
-            TaskStatus.FAILED.value,
-            "Durable crawl job payload is missing",
-            self._created_at(),
-            get_redis_task_ttl(self.config),
-            entry.task_id,
-            self.settings.protocol_version,
-            stream_owner,
+            _DISCARD_MISSING_PAYLOAD_SCRIPT, 5, self.task_key(entry.task_id),
+            self.payload_key(entry.task_id), self.settings.stream, principal_lease_key(stream_owner),
+            self.outbox_stream, self.settings.group, consumer, entry.stream_id, TaskStatus.PROCESSING.value,
+            TaskStatus.FAILED.value, "Durable crawl job payload is missing", self._created_at(),
+            get_redis_task_ttl(self.config), entry.task_id, self.settings.protocol_version, stream_owner,
+            event, self.settings.max_pending_jobs,
         )
         if int(discarded) != 1:
             raise CrawlJobLeaseLost(
