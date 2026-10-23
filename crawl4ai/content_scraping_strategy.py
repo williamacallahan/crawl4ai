@@ -18,6 +18,7 @@ from .utils import (
     extract_metadata_using_lxml,
     extract_page_context,
     calculate_link_intrinsic_score,
+    unwrap_orphaned_noscript,
 )
 from lxml import etree
 from lxml import html as lhtml
@@ -621,8 +622,14 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                 if parent is not None:
                     # Preserve .tail text before removing the element
                     tail = el.tail
+                    prev = el.getprevious()
+                    has_before = prev is not None or bool((parent.text or "").strip())
+                    has_after = bool((tail or "").strip()) or el.getnext() is not None
+                    if el.text and not text_content and has_before and has_after:
+                        # Keep a separator between words a whitespace-only element
+                        # split; at an edge it would land inside "[ link]" or "##  ".
+                        tail = " " + (tail or "")
                     if tail:
-                        prev = el.getprevious()
                         if prev is not None:
                             prev.tail = (prev.tail or "") + tail
                         else:
@@ -683,7 +690,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
 
         success = True
         try:
-            doc = lhtml.document_fromstring(html)
+            doc = lhtml.document_fromstring(unwrap_orphaned_noscript(html))
             # Match BeautifulSoup's behavior of using body or full doc
             # body = doc.xpath('//body')[0] if doc.xpath('//body') else doc
             body = doc

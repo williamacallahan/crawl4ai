@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 from pathlib import Path
 from typing import Any
 
@@ -140,21 +141,19 @@ def _rollout_policy(failure_action: str) -> dict[str, Any]:
 _SLEEP_UNITS = {"s": 1, "m": 60, "h": 3_600, "d": 86_400}
 
 
-# One GNU sleep interval as a single quoted argument: optional leading
-# whitespace (GNU sleep's strtod skips it), an optionally-signed,
-# optionally-fractional decimal number, and an optional single s/m/h/d suffix.
-# ``re.fullmatch`` (not ``re.match``) keeps multi-component values such as
-# ``1m30s`` or ``1d2h`` from parsing as their first component, and the absence
-# of trailing ``\s*`` rejects trailing whitespace that GNU sleep itself rejects
-# (the container's ``sleep "${VAR:-2}"`` exits 1 on ``"2 "`` or ``"  2  "``,
-# aborting the drain trap before it can SIGTERM supervisord). The leading
-# ``\s*`` mirrors sleep's own leading-whitespace tolerance so the verifier
-# never fails the deploy on a value the container would honor.
-_SLEEP_INTERVAL = re.compile(r"\s*([+]?(?:\d+(?:\.\d*)?|\.\d+))([smhd])?")
+# GNU sleep uses strtod: leading ASCII whitespace, decimal/exponent or hex
+# numbers, optional lower-case unit, but no trailing whitespace. Infinite
+# intervals parse but cannot fit a finite stop grace and are rejected below.
+_SLEEP_INTERVAL = re.compile(
+    r"[ \t\n\r\v\f]*([+-]?(?:"
+    r"0[xX](?:[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)(?:[pP][+-]?[0-9]+)?"
+    r"|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+    r"|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?))([smhd])?"
+)
 
 
-def _parse_sleep_seconds(value: str) -> int:
-    """Parse one GNU sleep time interval to whole seconds.
+def _parse_sleep_seconds(value: str) -> float:
+    """Parse a finite GNU sleep interval, preserving fractional seconds.
 
     entrypoint.sh runs ``sleep "${CRAWL4AI_DRAIN_DELAY_SECONDS:-2}"``, so the
     deployed value reaches ``sleep`` as a single quoted argument. GNU sleep
@@ -167,14 +166,22 @@ def _parse_sleep_seconds(value: str) -> int:
     mid-drain — the exact data-loss class the STOP_GRACE_NS gate exists to
     prevent.
     """
-    match = _SLEEP_INTERVAL.fullmatch(value)
+    # A bare leading '-' is parsed by sleep as an option, even for -0.
+    match = None if value.startswith("-") else _SLEEP_INTERVAL.fullmatch(value)
     if match is None:
         raise ValueError(
             "CRAWL4AI_DRAIN_DELAY_SECONDS must be a number bash sleep accepts"
             f" (a number with an optional s/m/h/d suffix); got {value!r}"
         )
-    seconds = float(match.group(1)) * _SLEEP_UNITS[match.group(2) or "s"]
-    return int(seconds)
+    number = match.group(1)
+    try:
+        seconds = (float.fromhex(number) if "0x" in number.lower() else float(number))
+    except OverflowError as error:
+        raise ValueError("CRAWL4AI_DRAIN_DELAY_SECONDS exceeds a finite drain budget") from error
+    seconds *= _SLEEP_UNITS[match.group(2) or "s"]
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("CRAWL4AI_DRAIN_DELAY_SECONDS must have a finite nonnegative drain budget")
+    return seconds
 
 
 def _drain_budget_ns(environment: Any) -> int:
@@ -204,17 +211,12 @@ def _drain_budget_ns(environment: Any) -> int:
     if not stop_waits or not fallback:
         raise ValueError("container drain budget is no longer readable from its own sources")
     raw = _environment_values(environment).get("CRAWL4AI_DRAIN_DELAY_SECONDS", "")
-    # Only the "is the variable unset?" test may strip: a pure-whitespace value
-    # is treated as unset and falls back to the entrypoint literal. The raw
-    # value is what reaches the container's ``sleep``, so it is what
-    # _parse_sleep_seconds must see — stripping here would re-form ``"2 "`` or
-    # ``"  2  "`` into ``"2"``, slipping a value sleep will reject at drain time
-    # past the loud-reject contract this gate exists to enforce.
-    if not raw.strip():
+    # Bash's ${VAR:-2} falls back only for unset or empty, not whitespace.
+    if raw == "":
         drain = int(fallback.group(1))
     else:
         drain = _parse_sleep_seconds(raw)
-    return (max(int(value) for value in stop_waits) + drain) * 1_000_000_000
+    return max(int(value) for value in stop_waits) * 1_000_000_000 + math.ceil(drain * 1_000_000_000)
 
 
 def _policy(application: dict[str, Any]) -> None:

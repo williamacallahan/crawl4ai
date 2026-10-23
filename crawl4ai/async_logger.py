@@ -2,12 +2,33 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional, Dict, Any, List
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from urllib.parse import unquote
 from rich.console import Console
 from rich.text import Text
 from rich.markup import escape
 from .utils import create_box_message
+
+
+def _write_bounded_record(handler: RotatingFileHandler, message: str):
+    # The stdlib handler permits an oversized single record. Bound UTF-8
+    # bytes too (including the newline), not just the number of backups.
+    record = message.encode("utf-8")[:handler.maxBytes - 1].decode("utf-8", errors="ignore")
+    handler.acquire()
+    try:
+        try:
+            size = os.path.getsize(handler.baseFilename)
+        except FileNotFoundError:
+            size = 0
+        # shouldRollover counts characters; the on-disk budget counts bytes.
+        if size and size + len(record.encode("utf-8")) + 1 > handler.maxBytes:
+            handler.doRollover()
+        handler.emit(logging.makeLogRecord({"msg": record}))
+    finally:
+        handler.close()
+        handler.release()
 
 
 class LogLevel(Enum):
@@ -113,6 +134,8 @@ class AsyncLogger(AsyncLoggerBase):
         colors: Optional[Dict[LogLevel, LogColor]] = None,
         verbose: bool = True,
         console: Optional[Console] = None,
+        max_log_bytes: int = 10 * 1024 * 1024,
+        log_backup_count: int = 2,
     ):
         """
         Initialize the logger.
@@ -128,6 +151,8 @@ class AsyncLogger(AsyncLoggerBase):
                 so that log output does not pollute stdout-based transports
                 such as MCP stdio. Pass ``Console(file=sys.stdout)`` to
                 restore the previous behaviour.
+            max_log_bytes: Maximum UTF-8 bytes per file, including one record.
+            log_backup_count: Number of rotated files retained beside the log.
         """
         self.log_file = log_file
         self.log_level = log_level
@@ -146,6 +171,13 @@ class AsyncLogger(AsyncLoggerBase):
         # Create log file directory if needed
         if log_file:
             os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+            if max_log_bytes <= 0 or log_backup_count < 1:
+                raise ValueError("file logs require a positive size cap and backup count")
+        self._file_handler = (
+            RotatingFileHandler(log_file, maxBytes=max_log_bytes,
+                                backupCount=log_backup_count, encoding="utf-8", delay=True)
+            if log_file else None
+        )
 
     def _format_tag(self, tag: str) -> str:
         """Format a tag with consistent width."""
@@ -179,8 +211,7 @@ class AsyncLogger(AsyncLoggerBase):
                 line for line in text.plain.splitlines() if line.strip()
             ).strip()
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] {plain_text}\n")
+            _write_bounded_record(self._file_handler, f"[{timestamp}] {plain_text}")
 
     def _log(
         self,
@@ -328,7 +359,8 @@ class AsyncFileLogger(AsyncLoggerBase):
     File-only asynchronous logger that writes logs to a specified file.
     """
 
-    def __init__(self, log_file: str):
+    def __init__(self, log_file: str, max_log_bytes: int = 10 * 1024 * 1024,
+                 log_backup_count: int = 2):
         """
         Initialize the file logger.
 
@@ -337,6 +369,12 @@ class AsyncFileLogger(AsyncLoggerBase):
         """
         self.log_file = log_file
         os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        if max_log_bytes <= 0 or log_backup_count < 1:
+            raise ValueError("file logs require a positive size cap and backup count")
+        self._file_handler = RotatingFileHandler(
+            log_file, maxBytes=max_log_bytes, backupCount=log_backup_count,
+            encoding="utf-8", delay=True,
+        )
 
     def _write_to_file(self, level: str, message: str, tag: str):
         """Write a message to the log file.
@@ -352,8 +390,9 @@ class AsyncFileLogger(AsyncLoggerBase):
             line for line in message.splitlines() if line.strip()
         ).strip()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [{level}] [{tag}] {plain_message}\n")
+        _write_bounded_record(
+            self._file_handler, f"[{timestamp}] [{level}] [{tag}] {plain_message}"
+        )
 
     def debug(self, message: str, tag: str = "DEBUG", **kwargs):
         """Log a debug message to file."""

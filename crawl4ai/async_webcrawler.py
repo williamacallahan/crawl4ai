@@ -137,7 +137,8 @@ class AsyncWebCrawler:
 
         # Initialize logger first since other components may need it
         self.logger = logger or AsyncLogger(
-            log_file=os.path.join(base_directory, ".crawl4ai", "crawler.log"),
+            log_file=(None if os.getenv("PYTHON_ENV") == "production"
+                      else os.path.join(base_directory, ".crawl4ai", "crawler.log")),
             verbose=self.browser_config.verbose,
             tag_width=10,
         )

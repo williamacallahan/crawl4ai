@@ -1,5 +1,6 @@
 # monitor.py - Real-time monitoring stats with Redis persistence
 import html
+import hashlib
 import time
 import json
 import asyncio
@@ -46,7 +47,9 @@ class MonitorStats:
             "endpoint": endpoint,
             "url": html.escape(url[:100]),  # Truncate + escape for XSS prevention
             "start_time": time.time(),
-            "config_sig": config.get("sig", "default") if config else "default",
+            # Never retain caller-owned payloads in either request queue. Hash
+            # in chunks so a large UTF-8 signature needs no second full copy.
+            "config_sig": self._config_signature(config),
             "mem_start": psutil.Process().memory_info().rss / (1024 * 1024)
         }
         self.active_requests[request_id] = req_info
@@ -64,6 +67,16 @@ class MonitorStats:
             self._persist_queue.put_nowait(True)
         except asyncio.QueueFull:
             logger.warning("Persistence queue full, skipping")
+
+    @staticmethod
+    def _config_signature(config: Optional[Dict]) -> str:
+        signature = config.get("sig") if isinstance(config, dict) else None
+        if not isinstance(signature, str):
+            return "default"
+        digest = hashlib.sha256()
+        for offset in range(0, len(signature), 65536):
+            digest.update(signature[offset:offset + 65536].encode("utf-8", errors="replace"))
+        return digest.hexdigest()[:16]
 
     async def track_request_end(self, request_id: str, success: bool, error: str = None,
                                pool_hit: bool = True, status_code: int = 200):
@@ -224,8 +237,16 @@ class MonitorStats:
     async def load_from_redis(self):
         """Load persisted stats; the readiness owner retries failures."""
         data = await self.redis.get("monitor:endpoint_stats")
-        if data:
-            restored = json.loads(data)
+        try:
+            restored = json.loads(data) if data else None
+            if restored is not None and not isinstance(restored, dict):
+                raise ValueError(f"expected an object, got {type(restored).__name__}")
+        except ValueError as error:
+            # Only Redis I/O is worth retrying; a bad blob would block
+            # readiness on every replica, so start from fresh counters.
+            logger.error("Discarding unreadable monitor:endpoint_stats: %s", error)
+            restored = None
+        if restored is not None:
             # Preserve requests collected in memory while startup was degraded.
             for endpoint, counters in self.endpoint_stats.items():
                 baseline = restored.setdefault(endpoint, {})

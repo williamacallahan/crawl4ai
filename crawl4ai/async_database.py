@@ -3,12 +3,14 @@ import time
 from pathlib import Path
 import aiosqlite
 import asyncio
+from collections import Counter
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
 import json
 from .models import CrawlResult, MarkdownGenerationResult
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 import aiofiles
+import yaml
 from .async_logger import AsyncLogger
 
 from .utils import ensure_content_dirs, generate_content_hash
@@ -22,8 +24,20 @@ os.makedirs(DB_PATH, exist_ok=True)
 DB_PATH = os.path.join(base_directory, "crawl4ai.db")
 
 
+class CacheSettings(BaseModel):
+    """Content/row payload budget (SQLite allocation overhead is not included)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+    max_bytes: int = Field(default=536_870_912, gt=0)
+    max_age_seconds: int = Field(default=604_800, gt=0)
+    # A census reads every row and stats every content file under the shared
+    # writer lock; once per interval per process keeps writes O(1).
+    prune_interval_seconds: int = Field(default=300, ge=0)
+
+
 class AsyncDatabaseManager:
-    def __init__(self, pool_size: int = 10, max_retries: int = 3):
+    def __init__(self, pool_size: int = 10, max_retries: int = 3,
+                 cache_settings: Optional[CacheSettings] = None):
         self.db_path = DB_PATH
         self.content_paths = ensure_content_dirs(os.path.dirname(DB_PATH))
         self.pool_size = pool_size
@@ -34,9 +48,19 @@ class AsyncDatabaseManager:
         self.connection_semaphore = asyncio.Semaphore(pool_size)
         self._initialized = False
         self.version_manager = VersionManager()
+        # The Docker image sets PYTHON_ENV and installs its configuration here.
+        # SDK users get the same bounded defaults without reading server config.
+        if cache_settings is None and os.getenv("PYTHON_ENV") == "production":
+            config_path = Path(os.getenv("CRAWL4AI_CONFIG_PATH", "/app/config.yml"))
+            if config_path.is_file():
+                config = yaml.safe_load(config_path.read_text()) or {}
+                cache_settings = CacheSettings.model_validate(config.get("cache", {}))
+        self.cache_settings = cache_settings or CacheSettings()
+        self._next_prune_at = 0.0
         self.logger = AsyncLogger(
-            log_file=os.path.join(base_directory, "crawler_db.log"),
-            verbose=False,
+            log_file=(None if os.getenv("PYTHON_ENV") == "production"
+                      else os.path.join(base_directory, "crawler_db.log")),
+            verbose=os.getenv("PYTHON_ENV") == "production",
             tag_width=10,
         )
 
@@ -324,7 +348,8 @@ class AsyncDatabaseManager:
 
         async def _get(db):
             async with db.execute(
-                "SELECT * FROM crawled_data WHERE url = ?", (url,)
+                "SELECT * FROM crawled_data WHERE url = ? AND (cached_at = 0 OR cached_at >= ?)",
+                (url, time.time() - self.cache_settings.max_age_seconds)
             ) as cursor:
                 row = await cursor.fetchone()
                 if not row:
@@ -334,6 +359,14 @@ class AsyncDatabaseManager:
                 columns = [description[0] for description in cursor.description]
                 # Create dict from row data
                 row_dict = dict(zip(columns, row))
+                if row_dict.get("cached_at") == 0:
+                    # Pre-timestamp cache rows get one bounded lease on first
+                    # read; unread legacy rows are evicted by the next write.
+                    row_dict["cached_at"] = time.time()
+                    await db.execute(
+                        "UPDATE crawled_data SET cached_at = ? WHERE url = ? AND cached_at = 0",
+                        (row_dict["cached_at"], url),
+                    )
 
                 # Load content from files using stored hashes
                 content_fields = {
@@ -469,8 +502,8 @@ class AsyncDatabaseManager:
         async def _get_metadata(db):
             async with db.execute(
                 """SELECT url, etag, last_modified, head_fingerprint, cached_at, response_headers
-                   FROM crawled_data WHERE url = ?""",
-                (url,)
+                   FROM crawled_data WHERE url = ? AND (cached_at = 0 OR cached_at >= ?)""",
+                (url, time.time() - self.cache_settings.max_age_seconds)
             ) as cursor:
                 row = await cursor.fetchone()
                 if not row:
@@ -478,6 +511,12 @@ class AsyncDatabaseManager:
 
                 columns = [description[0] for description in cursor.description]
                 row_dict = dict(zip(columns, row))
+                if row_dict["cached_at"] == 0:
+                    row_dict["cached_at"] = time.time()
+                    await db.execute(
+                        "UPDATE crawled_data SET cached_at = ? WHERE url = ? AND cached_at = 0",
+                        (row_dict["cached_at"], url),
+                    )
 
                 # Parse response_headers JSON
                 try:
@@ -600,10 +639,6 @@ class AsyncDatabaseManager:
                 "markdown",
             )
 
-        content_hashes = {}
-        for field, (content, content_type) in content_map.items():
-            content_hashes[field] = await self._store_content(content, content_type)
-
         # Extract cache validation headers from response
         response_headers = result.response_headers or {}
         etag = response_headers.get("etag") or response_headers.get("ETag") or ""
@@ -613,6 +648,13 @@ class AsyncDatabaseManager:
         cached_at = time.time()
 
         async def _cache(db):
+            # SQLite's writer lock spans file creation and row publication, not
+            # just the UPSERT. This also serializes the independent server/job
+            # worker processes sharing this content directory.
+            await db.execute("BEGIN IMMEDIATE")
+            content_hashes = {}
+            for field, (content, content_type) in content_map.items():
+                content_hashes[field] = await self._store_content(content, content_type)
             await db.execute(
                 """
                 INSERT INTO crawled_data (
@@ -658,6 +700,19 @@ class AsyncDatabaseManager:
                     cached_at,
                 ),
             )
+            prune_due = time.monotonic() >= self._next_prune_at
+            if prune_due:
+                self._next_prune_at = (
+                    time.monotonic() + self.cache_settings.prune_interval_seconds
+                )
+                await self._prune_cache(db)
+            # Publish evictions before unlinking: a rollback must never restore
+            # rows whose files were already removed. Reacquire the writer lock
+            # and read references afresh in case another writer ran at commit.
+            await db.commit()
+            if prune_due:
+                await db.execute("BEGIN IMMEDIATE")
+                await self._collect_orphan_content(db)
 
         try:
             await self.execute_with_retry(_cache)
@@ -669,18 +724,93 @@ class AsyncDatabaseManager:
                 params={"error": str(e)},
             )
 
+    _ROW_COLUMNS = (
+        "url", "html", "cleaned_html", "markdown", "extracted_content", "success",
+        "media", "links", "metadata", "screenshot", "response_headers",
+        "downloaded_files", "etag", "last_modified", "head_fingerprint", "cached_at",
+    )
+
+    _CONTENT_FIELDS = {
+        "html": "html", "cleaned_html": "cleaned", "markdown": "markdown",
+        "extracted_content": "extracted", "screenshot": "screenshots",
+    }
+
+    def _content_files(self):
+        return {
+            (kind, entry.name): Path(entry.path)
+            for kind in self._CONTENT_FIELDS.values()
+            for entry in os.scandir(self.content_paths[kind]) if entry.is_file()
+        }
+
+    async def _prune_cache(self, db):
+        """Evict expired rows, then oldest writes until the payload fits."""
+        await db.execute(
+            "DELETE FROM crawled_data WHERE cached_at < ? OR cached_at IS NULL",
+            (time.time() - self.cache_settings.max_age_seconds,),
+        )
+        fields = list(self._CONTENT_FIELDS)
+        # SQLite measures inline payloads; only hashes and sizes reach Python.
+        row_bytes = " + ".join(
+            f"coalesce(length(CAST({column} AS BLOB)), 0)" for column in self._ROW_COLUMNS
+        )
+        async with db.execute(
+            f"SELECT url, {', '.join(fields)}, {row_bytes} AS row_bytes "
+            "FROM crawled_data ORDER BY cached_at, url"
+        ) as cursor:
+            columns = [column[0] for column in cursor.description]
+            rows = [dict(zip(columns, row)) for row in await cursor.fetchall()]
+        refs = Counter(
+            (self._CONTENT_FIELDS[field], row[field])
+            for row in rows for field in fields if row[field]
+        )
+        sizes = await asyncio.to_thread(
+            lambda: {key: path.stat().st_size for key, path in self._content_files().items()}
+        )
+        row_sizes = [row["row_bytes"] for row in rows]
+        total = sum(sizes.get(key, 0) for key in refs) + sum(row_sizes)
+        for row, row_size in zip(rows, row_sizes):
+            if total <= self.cache_settings.max_bytes:
+                break
+            await db.execute("DELETE FROM crawled_data WHERE url = ?", (row["url"],))
+            total -= row_size
+            for field in fields:
+                key = (self._CONTENT_FIELDS[field], row[field])
+                if row[field]:
+                    refs[key] -= 1
+                    if not refs[key]:
+                        total -= sizes.get(key, 0)
+
+    async def _collect_orphan_content(self, db):
+        """Called with the SQLite writer lock, after committed row evictions."""
+        fields = list(self._CONTENT_FIELDS)
+        async with db.execute(f"SELECT {', '.join(fields)} FROM crawled_data") as cursor:
+            refs = {
+                (self._CONTENT_FIELDS[field], value)
+                for row in await cursor.fetchall()
+                for field, value in zip(fields, row) if value
+            }
+        def unlink_orphans():
+            for key, path in self._content_files().items():
+                if key not in refs:
+                    path.unlink(missing_ok=True)
+
+        await asyncio.to_thread(unlink_orphans)
+
     async def _store_content(self, content: str, content_type: str) -> str:
-        """Store content in filesystem and return hash"""
+        """Store content under acache_url's SQLite writer lock and return hash."""
         if not content:
             return ""
 
         content_hash = generate_content_hash(content)
         file_path = os.path.join(self.content_paths[content_type], content_hash)
 
-        # Only write if file doesn't exist
+        # Only write if file doesn't exist. Write aside and rename so a reader
+        # holding an older snapshot never opens a truncated blob.
         if not os.path.exists(file_path):
-            async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+            temp_path = f"{file_path}.tmp-{os.getpid()}"
+            async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
                 await f.write(content)
+            os.replace(temp_path, file_path)
 
         return content_hash
 
