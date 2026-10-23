@@ -182,7 +182,7 @@ RUN mkdir -p /var/lib/crawl4ai/outputs \
     && chmod 700 /var/lib/crawl4ai/outputs
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl --fail --silent --show-error http://127.0.0.1:11235/health || exit 1
+    CMD curl --fail --silent --show-error http://127.0.0.1:11235/health/live || exit 1
 
 # Redis is in-container only (loopback + requirepass); never expose its port.
 # (was: EXPOSE 6379)

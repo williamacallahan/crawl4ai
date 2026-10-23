@@ -18,7 +18,8 @@ HEALTH_URLS = (
     "https://crawl4ai.iocloudhost.net/health",
 )
 HEALTHCHECK = {
-    "Test": ["CMD", "curl", "-f", "http://localhost:11235/health"],
+    # A Redis outage must not restart every app replica and its browsers.
+    "Test": ["CMD", "curl", "-f", "http://localhost:11235/health/live"],
     "Interval": 10_000_000_000,
     "Timeout": 5_000_000_000,
     "StartPeriod": 120_000_000_000,

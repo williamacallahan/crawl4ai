@@ -8,6 +8,13 @@ import rollout_tasks
 from conftest import BASELINE, CANDIDATE, application, service_spec
 
 
+def test_container_healthcheck_uses_liveness_and_public_proof_uses_readiness():
+    assert rollout_policy.HEALTHCHECK["Test"] == [
+        "CMD", "curl", "-f", "http://localhost:11235/health/live"
+    ]
+    assert all(url.endswith("/health") for url in rollout_policy.HEALTH_URLS)
+
+
 def redis_tasks(state="Running 19 hours ago", node=None):
     return [
         {

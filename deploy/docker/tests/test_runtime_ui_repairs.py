@@ -1146,7 +1146,7 @@ def test_ui_error_and_websocket_fallback_paths_are_explicit():
     assert "updateConnectionStatus('disconnected', 'Token required');" in monitor
 
 
-def test_container_contracts_use_app_readiness_and_compose_v5_shape():
+def test_container_contracts_use_process_liveness_and_compose_v5_shape():
     import yaml
 
     compose_text = (REPO_ROOT / "docker-compose.yml").read_text()
@@ -1166,7 +1166,7 @@ def test_container_contracts_use_app_readiness_and_compose_v5_shape():
 
     dockerfile = (REPO_ROOT / "Dockerfile").read_text()
     assert "redis-cli ping" not in dockerfile
-    assert "http://127.0.0.1:11235/health" in dockerfile
+    assert "http://127.0.0.1:11235/health/live || exit 1" in dockerfile
 
     ignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
     assert ".env" in ignore
