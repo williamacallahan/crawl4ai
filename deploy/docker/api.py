@@ -4,7 +4,7 @@ import logging
 import sys
 import time
 from base64 import b64encode
-from contextlib import asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from datetime import datetime
 from functools import partial
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, cast
@@ -266,10 +266,84 @@ def server_crawler_config(config, **kwargs):
     return apply_server_crawler_defaults(CrawlerRunConfig(**kwargs), {}, config)
 
 
+class ReplicaPageDispatcher(MemoryAdaptiveDispatcher):
+    """Charge concurrent pages against the replica, reusing admission once.
+
+    Each factory instance belongs to one admitted request. Its crawler lease
+    covers one running page; that credit is handed on as soon as the page ends.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._first_page = asyncio.Event()
+        self._first_page.set()
+
+    @asynccontextmanager
+    async def _page_slot(self):
+        from crawler_pool import PAGE_BUDGET, BrowserCapacityError, _admission_wait_seconds
+
+        lease = None
+        using_first = False
+        try:
+            while True:
+                # No await between checking and claiming the request's credit.
+                if self._first_page.is_set():
+                    self._first_page.clear()
+                    using_first = True
+                    break
+                acquisition = asyncio.create_task(PAGE_BUDGET.acquire(_admission_wait_seconds()))
+                credit = asyncio.create_task(self._first_page.wait())
+                try:
+                    await asyncio.wait((acquisition, credit), return_when=asyncio.FIRST_COMPLETED)
+                    # Event completion wakes all waiters; only the loop's
+                    # synchronous check-and-clear grants the first-page credit.
+                    if self._first_page.is_set():
+                        continue
+                    if acquisition.done():
+                        try:
+                            lease = acquisition.result()
+                        except BrowserCapacityError:
+                            continue  # Contention must not fail a URL.
+                        break
+                finally:
+                    for task in (acquisition, credit):
+                        if not task.done():
+                            task.cancel()
+                    try:
+                        await asyncio.gather(acquisition, credit, return_exceptions=True)
+                    finally:
+                        # Cancellation may race with successful acquisition.
+                        if acquisition.done() and not acquisition.cancelled() and acquisition.exception() is None:
+                            unused = acquisition.result()
+                            if unused is not lease:
+                                unused.close()
+            yield
+        finally:
+            if using_first:
+                self._first_page.set()
+            if lease is not None:
+                lease.close()
+
+    async def crawl_url(self, url, config, task_id, retry_count=0):
+        async with self._page_slot():
+            return await super().crawl_url(url, config, task_id, retry_count)
+
+    def run_urls_stream(self, urls, crawler, config):
+        # arun_many's result transformer does not close its inner iterator.
+        # Keep it so the request owner can drain tasks before releasing admission.
+        self._stream = super().run_urls_stream(urls, crawler, config)
+        return self._stream
+
+    async def aclose(self):
+        stream = getattr(self, "_stream", None)
+        if stream is not None:
+            await stream.aclose()
+
+
 def _memory_dispatcher(config):
     """Build the shared dispatcher policy for both crawl response modes."""
     rate_config = config["crawler"]["rate_limiter"]
-    return MemoryAdaptiveDispatcher(
+    return ReplicaPageDispatcher(
         max_session_permit=config["crawler"]["pool"]["max_pages"],
         memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
         recovery_threshold_percent=config["crawler"]["recovery_threshold_percent"],
@@ -1279,7 +1353,7 @@ async def _close_aborted_request(request_id: str, pending: Optional[BaseExceptio
 
 
 async def stream_results(
-    crawler: AsyncWebCrawler,
+    crawler: Optional[AsyncWebCrawler],
     results_gen: AsyncGenerator,
     request_id: Optional[str] = None,
 ) -> AsyncGenerator[bytes, None]:
@@ -1333,11 +1407,19 @@ async def stream_results(
     except asyncio.TimeoutError:
         logger.warning("Streaming crawl exceeded its wall-clock deadline")
         terminal_error = "Crawl exceeded the time limit"
-        yield (json.dumps({"status": "failed", "error": terminal_error}) + "\n").encode("utf-8")
+        yield (json.dumps({"status": "failed", "error": terminal_error, "status_code": 504}) + "\n").encode("utf-8")
+    except HTTPException as error:
+        terminal_error = (
+            correlated_error("Streaming crawl failed", error.detail)
+            if error.status_code == 500 else str(error.detail)
+        )
+        yield (json.dumps({
+            "status": "failed", "error": terminal_error, "status_code": error.status_code,
+        }) + "\n").encode("utf-8")
     except Exception:
         logger.exception("Streaming crawl failed")
         terminal_error = "Streaming crawl failed"
-        yield (json.dumps({"status": "failed", "error": terminal_error}) + "\n").encode("utf-8")
+        yield (json.dumps({"status": "failed", "error": terminal_error, "status_code": 500}) + "\n").encode("utf-8")
     except asyncio.CancelledError:
         logger.warning("Client disconnected during streaming")
         terminal_error = "Client disconnected during streaming"
@@ -1479,6 +1561,7 @@ async def handle_crawl_request(
         # Process results to handle PDF bytes
         processed_results = []
         any_url_succeeded = False
+        first_error = None
         for result in results:
             try:
                 result_dict: Dict[str, Any]
@@ -1518,18 +1601,29 @@ async def handle_crawl_request(
                 # omit "success", and the caller-visible aggregate below must
                 # not depend on what the caller asked to see.
                 any_url_succeeded = any_url_succeeded or bool(result_dict.get("success"))
+                if not result_dict.get("success") and first_error is None:
+                    first_error = result_dict.get("error_message") or "Crawl failed"
 
                 if result_fields:
                     result_dict = _project_crawl_result(result_dict, result_fields)
 
                 processed_results.append(result_dict)
             except Exception as e:
+                error = correlated_error("Crawl failed", f"result serialization failed: {e}")
+                if first_error is None:
+                    first_error = error
                 processed_results.append({
                     "url": "unknown",
                     "success": False,
-                    "error_message": correlated_error("Crawl failed", f"result serialization failed: {e}"),
+                    "error_message": error,
                 })
-            
+
+        if not any_url_succeeded and processed_results:
+            # The /crawl route reads this field for its 502 detail. On total
+            # failure it is envelope metadata, even when payload fields are
+            # projected; jobs still receive the same unsuccessful response.
+            processed_results[0]["error_message"] = first_error or "Crawl failed"
+
         response = {
             # Whether the crawl produced anything usable. Callers that project
             # result fields away still get an authoritative verdict here, and
@@ -1550,10 +1644,7 @@ async def handle_crawl_request(
             await get_monitor().track_request_end(
                 request_id,
                 success=any_url_succeeded,
-                error=None if any_url_succeeded else (
-                    (processed_results[0].get("error_message") if processed_results else None)
-                    or "Crawl failed"
-                ),
+                error=None if any_url_succeeded else first_error or "Crawl failed",
                 pool_hit=True,
                 status_code=200 if any_url_succeeded else status.HTTP_502_BAD_GATEWAY,
             )
@@ -1622,10 +1713,9 @@ async def handle_stream_crawl_request(
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
     redis=None,
-) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict], str]:
+) -> Tuple[Optional[AsyncWebCrawler], AsyncGenerator, Optional[Dict], str]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
-    crawler: Optional[AsyncWebCrawler] = None
 
     deadline_seconds = wall_clock_seconds(config)
     deadline_at = (
@@ -1714,66 +1804,64 @@ async def handle_stream_crawl_request(
                 results_gen = _stream_before_deadline(results_gen, deadline_at)
             return None, results_gen, hooks_info, request_id
 
-        from crawler_pool import get_crawler
-
         if hooks_config:
-            crawler = await _await_before_deadline(
-                _new_hook_crawler(loaded_browser_config),
-                deadline_at,
-            )
-            hooks_status = _attach_declarative_hooks(crawler, hooks)
-            logger.info(f"Hooks attachment status for streaming: {hooks_status['status']}")
-            hooks_info = {'status': hooks_status}
-        else:
-            crawler = await _await_before_deadline(
-                get_crawler(loaded_browser_config),
-                deadline_at,
-            )
+            hooks_info = {"status": {"status": "success", "attached": list(hooks)}}
 
+        async def owned_results():
+            from crawler_pool import get_crawler
 
-        # Deep crawl with single URL: use arun() which returns an async generator
-        # mirroring the Python library's streaming behavior
-        if loaded_crawler_config.deep_crawl_strategy is not None and len(urls) == 1:
-            results_gen = await _await_before_deadline(
-                crawler.arun(
-                    urls[0],
-                    config=loaded_crawler_config,
-                ),
-                deadline_at,
-            )
-        else:
-            # Default multi-URL streaming via arun_many
-            results_gen = await _await_before_deadline(
-                crawler.arun_many(
-                    urls=urls,
-                    config=effective_config,
-                    dispatcher=_memory_dispatcher(config),
-                ),
-                deadline_at,
-            )
+            crawler = None
+            dispatcher = _memory_dispatcher(config)
+            try:
+                # Nothing is acquired until the response iterator is started.
+                crawler = await _await_before_deadline(
+                    _new_hook_crawler(loaded_browser_config) if hooks_config
+                    else get_crawler(loaded_browser_config),
+                    deadline_at,
+                )
+                if hooks_config:
+                    _attach_declarative_hooks(crawler, hooks)
 
+                # Deep crawl with a single URL uses arun(), mirroring the
+                # library's streaming behavior; several URLs go through arun_many.
+                if loaded_crawler_config.deep_crawl_strategy is not None and len(urls) == 1:
+                    results = await _await_before_deadline(
+                        crawler.arun(urls[0], config=loaded_crawler_config), deadline_at,
+                    )
+                else:
+                    results = await _await_before_deadline(
+                        crawler.arun_many(
+                            urls=urls, config=effective_config, dispatcher=dispatcher,
+                        ), deadline_at,
+                    )
+                async with aclosing(results):
+                    async for result in results:
+                        yield result
+            except (UntrustedConfigError, HookValidationError) as error:
+                raise HTTPException(400, detail=f"Rejected request: {error}")
+            finally:
+                try:
+                    await dispatcher.aclose()
+                finally:
+                    await _dispose_crawler(crawler)
+
+        results_gen = owned_results()
         if deadline_at is not None:
             results_gen = _stream_before_deadline(results_gen, deadline_at)
-        return crawler, results_gen, hooks_info, request_id
+        return None, results_gen, hooks_info, request_id
 
     except (UntrustedConfigError, HookValidationError) as e:
-        await _dispose_crawler(crawler)
         raise HTTPException(status_code=400, detail=f"Rejected request: {e}")
 
     except asyncio.TimeoutError:
-        await _dispose_crawler(crawler)
         raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
 
     except HTTPException:
         # Deliberate status (e.g. 400 SSRF "URL blocked") must pass through
         # rather than be genericized to 500 by the handler below.
-        await _dispose_crawler(crawler)
         raise
 
     except Exception as e:
-        # Release crawler on setup error (for successful streams,
-        # release happens in stream_results finally block)
-        await _dispose_crawler(crawler)
         logger.error(f"Stream crawl error: {str(e)}", exc_info=True)
         # Raising HTTPException here will prevent streaming response
         raise HTTPException(

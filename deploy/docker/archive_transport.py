@@ -90,16 +90,22 @@ async def grouped_results(urls, browser, run_config, responses, hooks,
             continue
         supplied = responses if group[0] in responses else {}
         async with owned_crawler(browser, supplied, hooks) as crawler:
-            result = await crawler.arun_many(
-                group, config=run_config, dispatcher=dispatcher_factory(),
-            )
-            if hasattr(result, "__aiter__"):
-                async with aclosing(result):
-                    async for item in result:
+            dispatcher = dispatcher_factory()
+            try:
+                result = await crawler.arun_many(
+                    group, config=run_config, dispatcher=dispatcher,
+                )
+                if hasattr(result, "__aiter__"):
+                    async with aclosing(result):
+                        async for item in result:
+                            yield item
+                else:
+                    for item in result:
                         yield item
-            else:
-                for item in result:
-                    yield item
+            finally:
+                close = getattr(dispatcher, "aclose", None)
+                if close:
+                    await close()
 
 
 async def collect_results(results):

@@ -331,14 +331,14 @@ def test_aggregate_verdict_survives_a_caller_field_projection(monkeypatch):
 def test_projected_failure_keeps_its_unsuccessful_aggregate(monkeypatch):
     pooled = FakeCrawler(mode="crawl_failure")
     install_fakes(monkeypatch, pooled)
-
-    response = run(
-        api.handle_crawl_request(
-            ["https://example.com"], {}, {}, crawl_config(), result_fields=["url"]
-        )
-    )
-
-    assert response["results"] == [{"url": "https://example.com/blocked"}]
+    response = run(api.handle_crawl_request(
+        ["https://example.com"], {}, {}, crawl_config(), result_fields=["url"]
+    ))
+    assert len(response["results"]) == 1
+    result = response["results"][0]
+    assert result["url"] == "https://example.com/blocked"
+    assert result["error_message"].startswith("Crawl failed (correlation_id=")
+    assert "async_crawler_strategy.py" not in json.dumps(result)
     assert response["success"] is False
 
 
@@ -444,7 +444,7 @@ def test_streaming_wall_clock_deadline_emits_failure_and_releases(monkeypatch):
         )
         output = api.stream_results(crawler, results)
         body = json.loads((await anext(output)).decode())
-        assert body == {"status": "failed", "error": "Crawl exceeded the time limit"}
+        assert body == {"status": "failed", "error": "Crawl exceeded the time limit", "status_code": 504}
         with pytest.raises(StopAsyncIteration):
             await anext(output)
 
@@ -462,7 +462,7 @@ def test_streaming_generator_failure_emits_terminal_failure_and_releases(monkeyp
         )
         output = api.stream_results(crawler, results)
         body = json.loads((await anext(output)).decode())
-        assert body == {"status": "failed", "error": "Streaming crawl failed"}
+        assert body == {"status": "failed", "error": "Streaming crawl failed", "status_code": 500}
         with pytest.raises(StopAsyncIteration):
             await anext(output)
 

@@ -681,13 +681,11 @@ def test_streaming_uses_server_render_readiness_default(monkeypatch):
     monkeypatch.setattr(crawler_pool, "get_crawler", get_crawler)
     monkeypatch.setattr(egress_broker, "enforce_egress", lambda _config: None)
 
-    asyncio.run(
-        api.handle_stream_crawl_request(
-            ["https://example.com"],
-            {},
-            {},
-            load_config(),
+    async def exercise():
+        _, results, _, _ = await api.handle_stream_crawl_request(
+            ["https://example.com"], {}, {}, load_config(),
         )
-    )
-
+        async for _ in results:
+            pass
+    asyncio.run(exercise())
     assert captured["config"].delay_before_return_html == 1.0

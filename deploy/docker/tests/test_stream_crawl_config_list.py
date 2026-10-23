@@ -85,8 +85,12 @@ def _install_recording_crawler(monkeypatch, recording_crawler):
     async def get_crawler(_browser_config):
         return recording_crawler
 
+    async def release_crawler(crawler):
+        assert crawler is recording_crawler
+
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
     monkeypatch.setattr(crawler_pool, "get_crawler", get_crawler)
+    monkeypatch.setattr(crawler_pool, "release_crawler", release_crawler)
     monkeypatch.setattr(egress_broker, "enforce_egress", lambda _config: None)
     # _track_request_start reaches out to the monitor; the real one swallows
     # exceptions but imports `monitor` lazily. Patching keeps the test
@@ -96,6 +100,11 @@ def _install_recording_crawler(monkeypatch, recording_crawler):
 
 async def _no_op_track(_endpoint, _urls, _browser_config):
     return "req-test"
+
+
+async def _consume_stream(**kwargs):
+    _crawler, results, _hooks, _request = await api.handle_stream_crawl_request(**kwargs)
+    assert [result async for result in results] == []
 
 
 # ─── signature / acceptance ──────────────────────────────────────────────
@@ -174,7 +183,7 @@ def test_stream_multi_url_forwards_crawler_configs_as_list(monkeypatch):
     _install_recording_crawler(monkeypatch, crawler)
 
     asyncio.run(
-        api.handle_stream_crawl_request(
+        _consume_stream(
             urls=["https://site-a.example/x", "https://site-b.example/x"],
             browser_config={},
             crawler_config={"stream": True},
@@ -204,7 +213,7 @@ def test_stream_multi_url_select_config_routes_per_url(monkeypatch):
     _install_recording_crawler(monkeypatch, crawler)
 
     asyncio.run(
-        api.handle_stream_crawl_request(
+        _consume_stream(
             urls=["https://site-a.example/x", "https://site-b.example/x"],
             browser_config={},
             crawler_config={"stream": True},
@@ -273,7 +282,7 @@ def test_stream_multi_url_without_crawler_configs_uses_single_config(monkeypatch
     _install_recording_crawler(monkeypatch, crawler)
 
     asyncio.run(
-        api.handle_stream_crawl_request(
+        _consume_stream(
             urls=["https://site-a.example/x", "https://site-b.example/x"],
             browser_config={},
             crawler_config={"stream": True, "cache_mode": "bypass"},
