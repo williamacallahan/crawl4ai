@@ -58,7 +58,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from governor import BodySizeLimitMiddleware, max_body_bytes_from_config
+from governor import BodySizeLimitMiddleware, CancelOnDisconnectMiddleware, max_body_bytes_from_config
 from job import init_job_router
 from mcp_bridge import attach_mcp, mcp_tool
 from monitor_routes import router as monitor_router
@@ -563,6 +563,14 @@ app.add_middleware(
 # carries the baseline headers. It does not read request bodies; AuthGate is
 # still the first authorization decision and remains outermost for WebSockets.
 app.middleware("http")(add_security_headers)
+
+# Outermost: a disconnect cancels the whole stack, so BaseHTTPMiddleware never
+# waits on a response the cancelled handler will not send. Only routes that
+# hold a browser page are listed; /crawl/job's enqueue must finish once begun.
+app.add_middleware(
+    CancelOnDisconnectMiddleware,
+    paths=frozenset({"/crawl", "/md", "/html", "/screenshot", "/pdf", "/execute_js"}),
+)
 
 
 def _resolve_auth():
