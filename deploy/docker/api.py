@@ -1923,5 +1923,8 @@ async def handle_crawl_job(
     except CrawlJobPrincipalQuotaExceeded as error:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(error)) from error
     except CrawlJobQueueFull as error:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error),
+            headers={"Retry-After": "30"},
+        ) from error
     return {"task_id": task_id}

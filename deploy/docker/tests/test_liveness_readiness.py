@@ -138,6 +138,25 @@ def test_redis_outage_is_a_retryable_503_not_a_500(lifespan_server, monkeypatch)
     assert response.json()["code"] == "redis_unavailable"
 
 
+def test_redis_memory_full_is_a_retryable_503_not_a_500(lifespan_server, monkeypatch, offline_dns):
+    server, _ = lifespan_server
+    import job
+    from test_crawl_job_redis_memory import redis_maxmemory
+
+    url = os.environ["REDIS_URL"]
+    host = urlsplit(url).hostname
+    offline_dns.set(host, host)  # Real Redis; the crawl target resolves offline.
+    monkeypatch.setattr(job, "_redis", aioredis.from_url(url))
+    with redis_maxmemory(url, 1, "noeviction"):
+        response = TestClient(server.app, raise_server_exceptions=False).post(
+            "/llm/job", json={"url": "https://example.com", "q": "extract"},
+            headers={"Authorization": "Bearer liveness-test-only-token"},
+        )
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "30"
+    assert response.json()["code"] == "redis_memory_full"
+
+
 @pytest.mark.asyncio
 async def test_lifespan_survives_redis_outage_and_recovers(lifespan_server, monkeypatch):
     server, browser_starts = lifespan_server

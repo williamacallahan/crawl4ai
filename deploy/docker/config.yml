@@ -75,6 +75,13 @@ crawl_jobs:
   # Bound both expansion and Redis residency; terminal failures release quota.
   max_serialized_result_bytes: 16777216  # 16 MiB UTF-8 JSON
   max_stored_result_bytes: 4194304       # 4 MiB compressed bytes
+  # Enqueue refuses (503) once used_memory + (backlog + 1) x max_stored_result_bytes
+  # + this headroom + the payload would pass Redis maxmemory. The headroom covers
+  # writers that reserve nothing: 6 replicas x 2 crawl-job workers = 12 in-flight
+  # completions, 16 during a start-first batch of 2 (+2 x 2), each with up to a
+  # 4 MiB query buffer = 64 MiB; LLM results, the webhook outbox and stream
+  # metadata take ~32 MiB more. 96 MiB in all.
+  redis_headroom_bytes: 100663296
 
 # Per-Swarm-node archive.org pacing. archive.org rate-limits per client IP,
 # so each node keeps one shared budget in Redis (crawl4ai:archive:next:{node})

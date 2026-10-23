@@ -50,6 +50,14 @@ class CrawlJobQueueFull(RuntimeError):
         super().__init__(f"Crawl job queue is full (max_pending_jobs={max_pending_jobs})")
 
 
+class CrawlJobResultBudgetFull(CrawlJobQueueFull):
+    """Raised when Redis lacks room to store one more backlog job's result.
+
+    Clients keep the queue-full contract: its exact detail is what tells the
+    back-end the job was never enqueued and the submit is safe to retry.
+    """
+
+
 class CrawlJobPrincipalQuotaExceeded(RuntimeError):
     """Raised when one principal has filled its durable pending-job allowance."""
 
@@ -69,8 +77,19 @@ _ENQUEUE_IF_CAPACITY_SCRIPT = """
 -- A lost reply must not enqueue again, even if capacity is now exhausted.
 if redis.call('HGET', KEYS[2], 'enqueue_operation') == ARGV[14] then return 1 end
 -- Keep admission identical to old replicas throughout a rolling update.
-if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[1]) then
+local backlog = redis.call('XLEN', KEYS[1])
+if backlog >= tonumber(ARGV[1]) then
   return 0
+end
+-- Each backlog entry reserves one stored result; the XDEL in the terminal
+-- scripts releases it. This must precede the first write: Redis checks
+-- maxmemory only before a script's first deny-OOM write, and the
+-- ZREMRANGEBYSCORE below is not one, so a later HSET/XADD would bypass it.
+local memory = redis.call('INFO', 'memory')
+local maxmemory = tonumber(string.match(memory, 'maxmemory:(%d+)'))
+if maxmemory > 0 and tonumber(string.match(memory, 'used_memory:(%d+)'))
+    + (backlog + 1) * tonumber(ARGV[15]) + tonumber(ARGV[16]) + #ARGV[9] > maxmemory then
+  return -2
 end
 if tonumber(ARGV[2]) > 0 and ARGV[11] ~= '' then
   redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', ARGV[13])
@@ -311,6 +330,7 @@ class CrawlJobQueueSettings:
     protocol_version: int
     max_serialized_result_bytes: int
     max_stored_result_bytes: int
+    redis_headroom_bytes: int
 
     @classmethod
     def from_config(cls, config: dict) -> CrawlJobQueueSettings:
@@ -365,6 +385,7 @@ class CrawlJobQueueSettings:
             protocol_version=protocol_version,
             max_serialized_result_bytes=positive_int("max_serialized_result_bytes"),
             max_stored_result_bytes=positive_int("max_stored_result_bytes"),
+            redis_headroom_bytes=positive_int("redis_headroom_bytes"),
         )
 
 
@@ -515,7 +536,10 @@ class CrawlJobQueue(CrawlJobOutbox):
             created_at, json.dumps(canonical_urls), "", "",
             json.dumps(webhook_config) if webhook_config else "", serialized_payload, task_id, owner or "",
             self.settings.protocol_version, time.time(), task_id,
+            self.settings.max_stored_result_bytes, self.settings.redis_headroom_bytes,
         )
+        if int(enqueued) == -2:
+            raise CrawlJobResultBudgetFull(self.settings.max_pending_jobs)
         if int(enqueued) == -1:
             raise CrawlJobPrincipalQuotaExceeded(self.settings.per_principal)
         if int(enqueued) != 1:

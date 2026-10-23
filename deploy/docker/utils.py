@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
         "max_pending_jobs": 1000,
         "max_attempt_seconds": 600,
         "max_payload_bytes": 262144,
+        "redis_headroom_bytes": 100663296,
     },
     "rate_limiting": {
         "enabled": True,

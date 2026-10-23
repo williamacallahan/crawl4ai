@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -466,3 +467,33 @@ def test_worker_proxy_lifecycle_wraps_execution_and_cleanup(monkeypatch, worker_
         "proxy-stop",
         "redis-close",
     ]
+
+
+@pytest.mark.parametrize("squeeze", ["backlog", "memory"])
+def test_crawl_job_backpressure_is_a_retryable_503(redis_url, squeeze):
+    from test_crawl_job_redis_memory import MIB, redis_maxmemory, used_memory
+
+    stream = f"crawl-jobs-contract-{uuid4().hex}"
+    config = {"crawl_jobs": {"stream": stream, "max_pending_jobs": 1,
+                             "redis_headroom_bytes": 2**50 if squeeze == "memory" else 1}}
+
+    async def submit():
+        client = aioredis.from_url(redis_url)
+        keys = [f"{stream}:v3"]
+        try:
+            if squeeze == "backlog":
+                task_id = (await api.handle_crawl_job(client, ["raw:<p>a</p>"], {}, {}, config))["task_id"]
+                keys += [f"task:{task_id}", f"crawl-job:v3:{task_id}"]
+            with pytest.raises(HTTPException) as refused:
+                await api.handle_crawl_job(client, ["raw:<p>b</p>"], {}, {}, config)
+            return refused.value
+        finally:
+            await client.delete(*keys)
+            await client.aclose()
+
+    with redis_maxmemory(redis_url, used_memory(redis_url) + 64 * MIB):
+        refused = asyncio.run(submit())
+    assert refused.status_code == 503
+    assert refused.headers == {"Retry-After": "30"}
+    # The back-end retries a submit only on this exact queue-full detail.
+    assert re.fullmatch(r"Crawl job queue is full \(max_pending_jobs=[1-9]\d*\)", refused.detail)

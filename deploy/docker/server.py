@@ -66,6 +66,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from rank_bm25 import BM25Okapi
 from redis import asyncio as aioredis
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import OutOfMemoryError as RedisOutOfMemoryError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis_config import (
     build_rate_limit_storage_uri as _build_rate_limit_storage_uri,
@@ -769,6 +770,17 @@ async def _redis_unavailable_handler(request: Request, exc: Exception):
     logger.warning("redis unavailable for %s: %r", request.url.path, exc)
     return JSONResponse(
         {"detail": "Crawl4AI state store is unavailable", "code": "redis_unavailable"},
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        headers={"Retry-After": "30"},
+    )
+
+
+@app.exception_handler(RedisOutOfMemoryError)
+async def _redis_memory_full_handler(request: Request, exc: RedisOutOfMemoryError):
+    """Under noeviction a full Redis refuses writes; callers retry once it drains."""
+    logger.warning("redis memory full for %s: %r", request.url.path, exc)
+    return JSONResponse(
+        {"detail": "Crawl4AI state store is out of memory", "code": "redis_memory_full"},
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         headers={"Retry-After": "30"},
     )
