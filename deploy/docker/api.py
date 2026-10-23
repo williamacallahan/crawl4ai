@@ -398,10 +398,10 @@ class CorrelatedCrawlFailure(HTTPException):
         self.correlation_id = correlation_id
 
 
-def _raise_for_crawl_failure(result, *, correlate_error: bool = False):
+def _raise_for_crawl_failure(result, *, url: Optional[str] = None, correlate_error: bool = False):
     if not result.success:
         if correlate_error:
-            detail = public_crawl_error(result.error_message, result.url)
+            detail = public_crawl_error(result.error_message, url)
             raise CorrelatedCrawlFailure(detail, detail.correlation_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -958,7 +958,7 @@ async def handle_markdown_request(
             config=crawler_config,
         ), deadline)
 
-        _raise_for_crawl_failure(result, correlate_error=True)
+        _raise_for_crawl_failure(result, url=decoded_url, correlate_error=True)
 
         if filter_type == FilterType.LLM:
             prompt = PROMPT_FILTER_CONTENT.replace(

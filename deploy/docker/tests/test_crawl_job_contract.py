@@ -53,6 +53,7 @@ def test_public_submit_accepts_every_supported_result_field(monkeypatch):
         result_fields,
         webhook_config,
         owner=None,
+        trace_id=None,
     ):
         submitted["result_fields"] = result_fields
         submitted["owner"] = owner
