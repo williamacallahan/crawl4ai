@@ -201,7 +201,7 @@ local attempt = redis.call('HGET', KEYS[1], 'attempt') or ''
 redis.call(
   'HSET', KEYS[2], 'status', ARGV[3], 'created_at', ARGV[4],
   'url', ARGV[5], 'result', ARGV[6], 'error', ARGV[7],
-  'completed_at', ARGV[8], 'owner', ARGV[9], 'attempt', attempt
+  'completed_at', ARGV[8], 'owner', ARGV[9], 'attempt', attempt, 'result_encoding', ARGV[14]
 )
 if tonumber(ARGV[10]) > 0 then
   redis.call('EXPIRE', KEYS[2], ARGV[10])
@@ -688,14 +688,14 @@ class CrawlJobQueue:
             status,
             payload["created_at"],
             json.dumps(payload["urls"]),
-            encode_task_result(result, ResultEncoding.IDENTITY) if result is not None else "",
+            encode_task_result(result, ResultEncoding.ZLIB) if result is not None else "",
             error or "",
             self._created_at(),
             payload.get("owner") or "",
             get_redis_task_ttl(self.config),
             self.settings.group,
             entry.stream_id,
-            entry.task_id,
+            entry.task_id, ResultEncoding.ZLIB.value,
         )
         if int(completed) != 1:
             raise CrawlJobLeaseLost(

@@ -90,3 +90,62 @@ def test_unknown_result_encoding_raises_with_task_context(redis_url, result):
             await client.aclose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_completed_crawl_stores_compressed_bytes_and_returns_original_result(redis_url, monkeypatch, failed):
+    from crawl_job_queue import CrawlJobQueue
+    from test_crawl_job_queue_redis import queue_config
+
+    monkeypatch.setattr("crawl_job_queue.validate_url_destination", lambda _url: None)
+
+    async def exercise():
+        # Match the worker's text client for writes and the API's bytes client for reads.
+        writer = aioredis.from_url(redis_url, decode_responses=True)
+        reader = aioredis.from_url(redis_url)
+        config = queue_config()
+        config["crawl_jobs"]["stream"] = f"compression-{uuid4().hex}"
+        config["limits"]["queue"]["per_principal"] = 0
+        queue = CrawlJobQueue(writer, config)
+        task_id = ""
+        result = {"success": not failed, "results": [{
+            "url": "https://example.com", "success": not failed,
+            "html": "".join(f'<p id="{i}">Crawl result content {i}: {i * 7919:08x}</p>\n'
+                            for i in range(5500)),
+        }]}
+        serialized = json.dumps(result).encode("utf-8")
+        assert 300_000 <= len(serialized) < 350_000
+        try:
+            await queue.ensure_group()
+            task_id = await queue.enqueue(["https://example.com"], {}, {}, None, None, owner="alice")
+            entry = (await queue.read_new("compression-worker"))[0]
+            payload = await queue.load_payload(task_id)
+            attempt = await queue.start_attempt(entry, payload, "compression-worker")
+            await queue.complete(entry, payload, attempt, result=result,
+                                 error="Every crawled URL failed" if failed else None)
+            stored = await reader.hgetall(queue.task_key(task_id))
+            assert stored[b"result_encoding"] == b"zlib"
+            assert len(stored[b"result"]) < len(serialized)
+            assert zlib.decompress(stored[b"result"]) == serialized
+            expiry = await reader.pexpiretime(queue.task_key(task_id))
+            assert expiry > 0
+            response = await api.handle_task_status(
+                reader, task_id, "https://crawl.example/", collection="crawl/job", requester="alice"
+            )
+            body = json.loads(response.body)
+            assert response.status_code == 200
+            assert body["status"] == ("failed" if failed else "completed")
+            assert body["result"] == result
+            assert "result_encoding" not in body
+            if failed:
+                assert body["error"] == "Every crawled URL failed"
+            assert await reader.pexpiretime(queue.task_key(task_id)) == expiry
+            print(f"stored result: {len(serialized)} -> {len(stored[b'result'])} bytes")
+        finally:
+            await reader.delete(queue.settings.stream)
+            if task_id:
+                await reader.delete(queue.task_key(task_id), queue.payload_key(task_id))
+            await writer.aclose()
+            await reader.aclose()
+
+    asyncio.run(exercise())

@@ -37,6 +37,7 @@ if DOCKER_DIR not in sys.path:
 import crawl_job_queue as crawl_job_queue_module  # noqa: E402
 from crawl_job_queue import CrawlJobLeaseLost, CrawlJobQueue  # noqa: E402
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
+from utils import decode_task_result  # noqa: E402
 
 # Re-use the battle-tested fakes from the contract suite, including the
 # FakeRedis script dispatcher and the queue_config / enqueue helpers.
@@ -128,7 +129,7 @@ def test_terminal_case_complete_fences_out_a_later_complete():
     asyncio.run(queue.complete(entry, payload, attempt, result={"success": True}))
     task = redis.hashes[queue.task_key(task_id)]
     assert task["status"] == "completed"
-    assert "success" in task["result"]
+    assert decode_task_result(task, task_id)["success"] is True
 
     # The release's failure-complete lands second and is fenced out.
     with pytest.raises(CrawlJobLeaseLost):
