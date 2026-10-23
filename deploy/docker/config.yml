@@ -149,7 +149,7 @@ crawler:
     watchdog:
       interval_seconds: 5.0
       renderer_cpu_cores: 0.9
-      renderer_cpu_seconds: 20.0
+      renderer_cpu_seconds: 65.0  # page_timeout (60 s) + termination (5 s): only renderers termination missed
       renderer_rss_mb: 768
       browser_probe_timeout_seconds: 5.0
       consecutive_failure_limit: 3

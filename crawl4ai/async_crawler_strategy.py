@@ -1373,7 +1373,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                              and asyncio.get_running_loop().time() >= deadline))
             if page is not None and not renderer_crashed and (timed_out or cancelled):
                 await self._terminate_page(page, config.page_termination_timeout, execution_session)
-            if renderer_crashed or timed_out or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
+            # Only faults of the browser itself count toward replacing it: a
+            # batch of slow or dead target sites times out together, and
+            # counting those recycled healthy browsers under live crawls.
+            if renderer_crashed or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
                 self.browser_manager.consecutive_failures += 1
             if renderer_crashed:
                 raise Error("Target page crashed") from error

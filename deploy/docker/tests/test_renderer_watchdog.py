@@ -187,25 +187,28 @@ def renderer_tree(pool, monkeypatch):
 
 def test_renderer_cpu_requires_sustained_window(pool, renderer_tree):
     target, renderer = renderer_tree
+    window = pool.WATCHDOG.renderer_cpu_seconds
     pool._watch_renderers(target, 0)
-    for second in (5, 10, 15):
+    for second in (window / 4, window / 2, window * 3 / 4):
         renderer.cpu = float(second)
         pool._watch_renderers(target, second)
         assert renderer.killed == 0
-    renderer.cpu = 20.0
-    pool._watch_renderers(target, 20)
+    renderer.cpu = float(window)
+    pool._watch_renderers(target, window)
     assert renderer.killed == 1
     assert pool.RENDERER_KILLS == {"cpu": 1, "rss": 0}
 
 
 def test_renderer_cpu_lull_resets_sustained_window(pool, renderer_tree):
     target, renderer = renderer_tree
-    for second, cpu in ((0, 0), (5, 5), (10, 10), (15, 10), (20, 15), (25, 20), (30, 25)):
-        renderer.cpu = cpu
-        pool._watch_renderers(target, second)
+    step = pool.WATCHDOG.renderer_cpu_seconds / 4
+    # Busy for three steps, idle for one (the lull), then busy for four more.
+    for tick, cpu_steps in ((0, 0), (1, 1), (2, 2), (3, 2), (4, 3), (5, 4), (6, 5)):
+        renderer.cpu = cpu_steps * step
+        pool._watch_renderers(target, tick * step)
     assert renderer.killed == 0
-    renderer.cpu = 30
-    pool._watch_renderers(target, 35)
+    renderer.cpu = 6 * step
+    pool._watch_renderers(target, 7 * step)
     assert renderer.killed == 1
 
 
