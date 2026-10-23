@@ -69,6 +69,9 @@ crawl_jobs:
   max_attempt_seconds: 600
   # Canonicalized request persisted per durable job (bounds Redis backlog size).
   max_payload_bytes: 262144
+  # Bound both expansion and Redis residency; terminal failures release quota.
+  max_serialized_result_bytes: 16777216  # 16 MiB UTF-8 JSON
+  max_stored_result_bytes: 4194304       # 4 MiB compressed bytes
 
 # Per-Swarm-node archive.org pacing. archive.org rate-limits per client IP,
 # so each node keeps one shared budget in Redis (crawl4ai:archive:next:{node})

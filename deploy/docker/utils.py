@@ -31,20 +31,55 @@ class ResultEncoding(str, Enum):
     ZLIB = "zlib"
 
 
-def encode_task_result(result: Any, encoding: ResultEncoding) -> str | bytes:
+MAX_SERIALIZED_RESULT_BYTES = 16 * 1024 * 1024
+MAX_STORED_RESULT_BYTES = 4 * 1024 * 1024
+
+
+class ResultTooLarge(ValueError):
+    """A result exceeded its serialized or stored byte budget."""
+
+    def __init__(self, dimension: str, actual: int, limit: int):
+        self.dimension = dimension
+        self.actual = actual
+        self.limit = limit
+        super().__init__(f"result {dimension} {actual} exceeds limit {limit}")
+
+
+def encode_task_result(
+    result: Any,
+    encoding: ResultEncoding,
+    *,
+    max_serialized_bytes: int = MAX_SERIALIZED_RESULT_BYTES,
+    max_stored_bytes: int = MAX_STORED_RESULT_BYTES,
+) -> str | bytes:
     """Serialize task results at the hash-format owner."""
     serialized = json.dumps(result)
+    serialized_bytes = serialized.encode("utf-8")
+    if len(serialized_bytes) > max_serialized_bytes:
+        raise ResultTooLarge("serialized_bytes", len(serialized_bytes), max_serialized_bytes)
     match encoding:
         case ResultEncoding.IDENTITY:
-            return serialized
+            stored = serialized
+            stored_size = len(serialized_bytes)
         case ResultEncoding.ZLIB:
-            return zlib.compress(serialized.encode("utf-8"), level=6)
+            stored = zlib.compress(serialized_bytes, level=6)
+            stored_size = len(stored)
         case _:
             assert_never(encoding)
+    if stored_size > max_stored_bytes:
+        raise ResultTooLarge("stored_bytes", stored_size, max_stored_bytes)
+    return stored
 
 
-def decode_task_result(task: dict, task_id: str) -> Any:
+def decode_task_result(
+    task: dict,
+    task_id: str,
+    *,
+    max_serialized_bytes: int = MAX_SERIALIZED_RESULT_BYTES,
+) -> Any:
     """Missing markers are legacy JSON; unknown markers must never be guessed."""
+    if max_serialized_bytes < 0:
+        raise ValueError("max_serialized_bytes must be nonnegative")
     marker = task.get("result_encoding", ResultEncoding.IDENTITY.value)
     try:
         if isinstance(marker, bytes):
@@ -57,9 +92,19 @@ def decode_task_result(task: dict, task_id: str) -> Any:
         return None
     match encoding:
         case ResultEncoding.IDENTITY:
+            serialized_size = len(result.encode("utf-8") if isinstance(result, str) else result)
+            if serialized_size > max_serialized_bytes:
+                raise ResultTooLarge("serialized_bytes", serialized_size, max_serialized_bytes)
             return json.loads(result)
         case ResultEncoding.ZLIB:
-            return json.loads(zlib.decompress(result).decode("utf-8"))
+            decompressor = zlib.decompressobj()
+            # The extra byte detects overflow without expanding the entire result.
+            serialized = decompressor.decompress(result, max_serialized_bytes + 1)
+            if len(serialized) > max_serialized_bytes:
+                raise ResultTooLarge("serialized_bytes", len(serialized), max_serialized_bytes)
+            if not decompressor.eof:
+                raise zlib.error("incomplete or truncated result stream")
+            return json.loads(serialized.decode("utf-8"))
         case _:
             assert_never(encoding)
 

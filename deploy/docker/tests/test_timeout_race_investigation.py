@@ -63,8 +63,10 @@ class RecordingWebhook:
     def __init__(self):
         self.calls = []
 
-    async def notify_job_completion(self, *, task_id, status, result=None, error=None, **_kwargs):
+    async def notify_job_completion(self, *, task_id, status, before_attempt, result=None, error=None, **_kwargs):
+        assert await before_attempt() == 1
         self.calls.append({"task_id": task_id, "status": status, "result": result, "error": error})
+        return True
 
 
 # ────────────────────── tier 1: timing-free fence behaviour ──────────────────
@@ -253,6 +255,7 @@ def test_race_terminal_case_crawl_completes_during_release_complete():
     the job ``completed`` with the real result.
     """
     config = queue_config(max_attempt_seconds=1, max_attempts=1, heartbeat_seconds=60, lease_seconds=120)
+    config["webhooks"] = {"default_url": "https://callback.example/done"}
 
     async def crawl(_payload):
         return {"success": True, "results": [{"url": "https://example.com"}]}
@@ -269,10 +272,9 @@ def test_race_terminal_case_crawl_completes_during_release_complete():
     # entry is acked and deleted from the stream.
     assert task["status"] == "failed"
     assert "attempt budget" in task["error"]
-    assert redis.acks == [(queue.settings.stream, entry.stream_id)]
-    assert redis.deleted == [(queue.settings.stream, entry.stream_id)]
+    assert redis.acks == redis.deleted == [
+        (queue.settings.stream, entry.stream_id), (queue.outbox_stream, "2-0")]
     assert queue.payload_key(task_id) not in redis.hashes
-    # The webhook is delivered — NOT dropped.
-    assert len(webhook.calls) == 1
-    assert webhook.calls[0]["status"] == "failed"
-    assert "attempt budget" in webhook.calls[0]["error"]
+    assert webhook.calls == [{"task_id": task_id, "status": "failed", "result": None,
+                              "error": task["error"]}]
+    assert redis.streams[queue.outbox_stream] == []

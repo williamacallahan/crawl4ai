@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from uuid import uuid4
 
 import pytest
 import redis
@@ -16,19 +17,45 @@ DOCKER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if DOCKER_DIR not in sys.path:
     sys.path.insert(0, DOCKER_DIR)
 
-
 @pytest.fixture(autouse=True)
-def public_seed_validation(monkeypatch):
+def public_seed_validation(monkeypatch, redis_url):
     import crawl_job_queue
-
+    import work_queue
     monkeypatch.setattr(crawl_job_queue, "validate_url_destination", lambda _url: None)
+    # A configured Redis can be shared by independent test processes. Track only
+    # this test's resources rather than clearing the entire database.
+    namespace = uuid4().hex
+    cleanup = set()
+    original_key = work_queue.principal_lease_key
+    original_enqueue = crawl_job_queue.CrawlJobQueue.enqueue
 
+    def quota_key(owner):
+        key = original_key(f"{namespace}:{owner}")
+        cleanup.add(key)
+        return key
+
+    async def enqueue(queue, *args, **kwargs):
+        cleanup.update([queue.settings.stream, queue.outbox_stream,
+                        f"{queue.outbox_stream}:attempts"])
+        task_id = await original_enqueue(queue, *args, **kwargs)
+        cleanup.update([queue.task_key(task_id), queue.payload_key(task_id)])
+        return task_id
+    monkeypatch.setattr(work_queue, "principal_lease_key", quota_key)
+    monkeypatch.setattr(crawl_job_queue, "principal_lease_key", quota_key)
+    monkeypatch.setattr(crawl_job_queue.CrawlJobQueue, "enqueue", enqueue)
+    yield
+    client = redis.from_url(redis_url)
+    try:
+        if cleanup:
+            client.delete(*cleanup)
+    finally:
+        client.close()
 
 def queue_config():
     return {
         "redis": {"task_ttl_seconds": 60},
         "crawl_jobs": {
-            "stream": "crawl-jobs-integration",
+            "stream": f"crawl-jobs-integration-{uuid4().hex}",
             "group": "crawl-workers",
             "lease_seconds": 2,
             "heartbeat_seconds": 1,
@@ -39,7 +66,6 @@ def queue_config():
         },
         "limits": {"queue": {"per_principal": 1}},
     }
-
 
 @pytest.fixture
 def redis_url():
@@ -60,11 +86,9 @@ def redis_url():
     executable = shutil.which("redis-server")
     if executable is None:
         pytest.skip("redis-server is not installed")
-
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-
     with tempfile.TemporaryDirectory(prefix="crawl-job-redis-") as data_dir:
         process = subprocess.Popen(
             [
@@ -104,7 +128,6 @@ def redis_url():
                 process.kill()
                 process.wait(timeout=5)
 
-
 def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
     from crawl_job_queue import (
         CrawlJobLeaseLost,
@@ -134,11 +157,12 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
                     None,
                     owner="alice",
                 )
-
             entry = (await queue.read_new("worker-a"))[0]
             payload = await queue.load_payload(task_id)
             assert payload is not None
             stale_attempt = await queue.start_attempt(entry, payload, "worker-a")
+            # A known-clean failure can retry; a killed running worker cannot.
+            await queue.mark_retry(entry, payload, "worker-a", stale_attempt, "clean failure")
             await client.xclaim(
                 queue.settings.stream,
                 queue.settings.group,
@@ -148,10 +172,8 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
                 idle=3_000,
             )
             assert await queue.claim_stale("worker-b") == [entry]
-
             with pytest.raises(CrawlJobLeaseLost):
                 await queue.heartbeat(entry, payload, "worker-a", stale_attempt)
-
             current_attempt = await queue.start_attempt(entry, payload, "worker-b")
             with pytest.raises(CrawlJobLeaseLost):
                 await queue.complete(
@@ -160,7 +182,6 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
                     stale_attempt,
                     result={"worker": "a"},
                 )
-
             await queue.complete(
                 entry,
                 payload,
@@ -171,11 +192,9 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
                 "completed", "alice"
             ]
             assert await client.xlen(queue.settings.stream) == 0
-
             with pytest.raises(CrawlJobLeaseLost):
                 await queue.discard_missing_payload(entry, "worker-a")
             assert await client.hget(queue.task_key(task_id), "status") == "completed"
-
             replacement = await queue.enqueue(
                 ["https://replacement.example"],
                 {},
@@ -185,7 +204,6 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
                 owner="alice",
             )
             assert replacement != task_id
-
             replacement_entry = (await queue.read_new("worker-c"))[0]
             await client.delete(queue.payload_key(replacement))
             await client.xclaim(
@@ -204,7 +222,6 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
             missing_payload_task = await client.hgetall(queue.task_key(replacement))
             assert missing_payload_task["status"] == "failed"
             assert missing_payload_task["owner"] == "alice"
-
             after_recovery = await queue.enqueue(
                 ["https://after-recovery.example"],
                 {},
@@ -225,9 +242,7 @@ def test_real_redis_fences_takeover_and_releases_owner_quota(redis_url):
                 )
         finally:
             await client.aclose()
-
     asyncio.run(exercise())
-
 
 def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url):
     from crawl_job_queue import CrawlJobPrincipalQuotaExceeded, CrawlJobQueue
@@ -235,7 +250,6 @@ def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url
 
     async def exercise():
         client = aioredis.from_url(redis_url, decode_responses=True)
-        await client.flushdb()
         work_queue = WorkQueue(
             maxsize=4,
             workers=1,
@@ -250,10 +264,8 @@ def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url
             async def held_llm_job():
                 llm_started.set()
                 await release_llm.wait()
-
             await work_queue.submit(held_llm_job, principal="alice")
             await asyncio.wait_for(llm_started.wait(), timeout=1)
-
             durable = CrawlJobQueue(client, queue_config())
             await durable.ensure_group()
             with pytest.raises(CrawlJobPrincipalQuotaExceeded):
@@ -265,7 +277,6 @@ def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url
                     None,
                     owner="alice",
                 )
-
             release_llm.set()
             assert work_queue._q is not None
             await asyncio.wait_for(work_queue._q.join(), timeout=1)
@@ -280,10 +291,8 @@ def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url
 
             async def noop():
                 return None
-
             with pytest.raises(QuotaExceeded):
                 await work_queue.submit(noop, principal="alice")
-
             entry = (await durable.read_new("worker-a"))[0]
             payload = await durable.load_payload(task_id)
             assert payload is not None
@@ -291,7 +300,6 @@ def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url
             await durable.complete(entry, payload, attempt, result={"ok": True})
             await work_queue.submit(noop, principal="alice")
             await asyncio.wait_for(work_queue._q.join(), timeout=1)
-
             bounded = WorkQueue(
                 maxsize=1,
                 workers=1,
@@ -325,16 +333,12 @@ def test_real_redis_principal_quota_is_shared_by_llm_and_durable_crawl(redis_url
             release_llm.set()
             await work_queue.stop()
             await client.aclose()
-
     asyncio.run(exercise())
-
 
 def test_accepted_llm_task_is_failed_when_shutdown_drains_queue(redis_url, monkeypatch):
     from fastapi import BackgroundTasks
-
     import api
     from work_queue import WorkQueue, get_job_queue, set_job_queue
-
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
 
     async def exercise():
@@ -342,16 +346,15 @@ def test_accepted_llm_task_is_failed_when_shutdown_drains_queue(redis_url, monke
         queue = WorkQueue(maxsize=1, workers=1, redis=client)
         previous_queue = get_job_queue()
         worker_started = asyncio.Event()
+        task_id = None
         try:
             async def block_worker():
                 worker_started.set()
                 await asyncio.Event().wait()
-
             await queue.start()
             set_job_queue(queue)
             await queue.submit(block_worker)
             await asyncio.wait_for(worker_started.wait(), timeout=1)
-
             response = await api.create_new_task(
                 client,
                 BackgroundTasks(),
@@ -365,17 +368,16 @@ def test_accepted_llm_task_is_failed_when_shutdown_drains_queue(redis_url, monke
             task_id = json.loads(response.body)["task_id"]
             assert response.status_code == 202
             assert (await client.hgetall(f"task:{task_id}"))["status"] == "processing"
-
             await queue.stop()
-
             task = await client.hgetall(f"task:{task_id}")
             assert task["status"] == "failed"
             assert task["error"] == "LLM extraction interrupted by server shutdown"
         finally:
             await queue.stop()
             set_job_queue(previous_queue)
+            if task_id:
+                await client.delete(f"task:{task_id}")
             await client.aclose()
-
     asyncio.run(exercise())
 
 
@@ -415,7 +417,7 @@ def test_durable_quota_lease_never_expires(redis_url):
     async def exercise():
         client = aioredis.from_url(redis_url, decode_responses=True)
         config = queue_config()
-        config["crawl_jobs"]["stream"] = "crawl-jobs-lease-ttl"
+        config["crawl_jobs"]["stream"] = f"crawl-jobs-lease-ttl-{uuid4().hex}"
         queue = CrawlJobQueue(client, config)
         task_id = ""
         try:

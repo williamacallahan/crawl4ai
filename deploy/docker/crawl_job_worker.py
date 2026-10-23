@@ -61,9 +61,20 @@ class CrawlJobWorker:
                 logger.warning("Crawl job worker waiting for Redis: %r", error)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
+        crawl_loop = asyncio.create_task(self._crawl_loop())
+        outbox_loop = asyncio.create_task(self._outbox_loop())
+        try:
+            await asyncio.gather(crawl_loop, outbox_loop)
+        finally:
+            for task in (crawl_loop, outbox_loop):
+                task.cancel()
+            await asyncio.gather(crawl_loop, outbox_loop, return_exceptions=True)
+
+    async def _crawl_loop(self) -> None:
         while True:
             try:
                 entries = await self.queue.claim_stale(self.consumer)
+                await self._deliver_pending_webhooks()
                 if not entries:
                     entries = await self.queue.read_new(self.consumer)
                 for entry in entries:
@@ -74,7 +85,92 @@ class CrawlJobWorker:
                 logger.exception("Crawl job worker loop failed; retaining pending work for retry")
                 await asyncio.sleep(1)
 
+    async def _outbox_loop(self) -> None:
+        while True:
+            try:
+                entries = await self.queue.read_outbox(f"{self.consumer}:outbox")
+                for stream_id, event in entries:
+                    await self.process_outbox(stream_id, event, consumer=f"{self.consumer}:outbox")
+                if not entries:
+                    await asyncio.sleep(max(self.queue.settings.read_block_ms / 1000, 0.01))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Webhook outbox loop failed; retaining pending delivery for retry")
+                await asyncio.sleep(1)
+
+    async def process_outbox(self, stream_id: str, event: dict, *, consumer: str | None = None) -> None:
+        """Deliver a committed terminal event while renewing its fenced lease."""
+        consumer = consumer or self.consumer
+        async def reserve_attempt() -> int:
+            attempt = await self.queue.reserve_outbox_attempt(stream_id, consumer)
+            if not attempt:
+                raise CrawlJobLeaseLost(f"lost webhook lease for {stream_id}")
+            return attempt
+
+        async def heartbeat() -> None:
+            loop = asyncio.get_running_loop()
+            last_renewal = loop.time()
+            while True:
+                await asyncio.sleep(self.queue.settings.heartbeat_seconds)
+                try:
+                    await self.queue.heartbeat_outbox(stream_id, consumer)
+                    last_renewal = loop.time()
+                except CrawlJobLeaseLost:
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # An outage must not let a sender run indefinitely after
+                    # its last confirmed renewal; another worker can reclaim.
+                    if loop.time() - last_renewal >= self.queue.settings.lease_seconds:
+                        raise CrawlJobLeaseLost(f"webhook lease renewal expired for {stream_id}")
+                    logger.warning("Webhook heartbeat failed for %s", stream_id, exc_info=True)
+
+        delivery = asyncio.create_task(self.webhook_service.notify_job_completion(
+            task_id=event["task_id"],
+            task_type="crawl",
+            status=event["status"],
+            urls=event["urls"],
+            webhook_config=event.get("webhook_config"),
+            result=event.get("result"),
+            error=event.get("error"),
+            event_id=event["event_id"],
+            before_attempt=reserve_attempt,
+        ))
+        renewal = asyncio.create_task(heartbeat())
+        try:
+            done, _ = await asyncio.wait({delivery, renewal}, return_when=asyncio.FIRST_COMPLETED)
+            if renewal in done:
+                renewal.result()
+                raise CrawlJobLeaseLost(f"webhook heartbeat stopped for {stream_id}")
+            outcome = delivery.result()
+            if not isinstance(outcome, bool):
+                raise TypeError("webhook delivery did not return a terminal outcome")
+            if outcome:
+                await self.queue.finish_outbox(stream_id, consumer)
+            else:
+                await self.queue.fail_outbox(stream_id, consumer)
+                logger.warning("Webhook %s remains undelivered within outbox retention", stream_id)
+        except CrawlJobLeaseLost:
+            logger.warning("Webhook worker lost lease for %s; leaving it pending", stream_id)
+        finally:
+            for task in (delivery, renewal):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(delivery, renewal, return_exceptions=True)
+
+    async def _deliver_pending_webhooks(self) -> None:
+        for stream_id, event in await self.queue.pending_outbox(self.consumer):
+            await self.process_outbox(stream_id, event)
+
     async def process(self, entry: CrawlJobEntry) -> None:
+        await self._process_entry(entry)
+        # Completion and outbox reservation are atomic. This path also handles
+        # missing payloads and exhausted retries before a possible rollback.
+        await self._deliver_pending_webhooks()
+
+    async def _process_entry(self, entry: CrawlJobEntry) -> None:
         payload = await self.queue.load_payload(entry.task_id)
         if payload is None:
             logger.error("Discarding crawl job %s because its durable payload is absent", entry.task_id)
@@ -99,16 +195,10 @@ class CrawlJobWorker:
                 attempt,
                 error="Crawl job exhausted its retry budget before execution",
             )
-            await self._notify(
-                entry,
-                payload,
-                "failed",
-                error="Crawl job exhausted its retry budget before execution",
-            )
             return
 
         try:
-            completion = await self._run_with_lease(entry, payload, attempt)
+            await self._run_with_lease(entry, payload, attempt)
         except asyncio.CancelledError:
             logger.info("Crawl worker cancelled while processing %s; leaving Stream entry pending", entry.task_id)
             raise
@@ -118,10 +208,6 @@ class CrawlJobWorker:
         except Exception:
             logger.exception("Crawl job %s failed outside its retry transaction", entry.task_id)
             return
-
-        if completion:
-            status, result, error = completion
-            await self._notify(entry, payload, status, result=result, error=error)
 
     async def _run_with_lease(
         self,
@@ -183,8 +269,7 @@ class CrawlJobWorker:
             self.queue.settings.max_attempts,
         )
         if attempt.number >= self.queue.settings.max_attempts:
-            await self.queue.complete(entry, payload, attempt, error=error_message)
-            return "failed", None, error_message
+            return await self.queue.complete(entry, payload, attempt, error=error_message)
         # Leave the entry pending: cancelling the heartbeat lets its idle time pass
         # lease_seconds so another worker reclaims it through claim_stale.
         await self.queue.mark_retry(entry, payload, self.consumer, attempt, error_message)
@@ -207,8 +292,7 @@ class CrawlJobWorker:
             error_message = (
                 f"archive_budget_spent: {error.detail}; retry after {error.retry_after}s"
             )
-            await self.queue.complete(entry, payload, attempt, error=error_message)
-            return "failed", None, error_message
+            return await self.queue.complete(entry, payload, attempt, error=error_message)
         except (HTTPException, OSError, RuntimeError, TypeError, ValueError) as error:
             # This worker is a separate process: the API's central 500 handler
             # never sees these, so nothing else genericizes them before they
@@ -237,8 +321,7 @@ class CrawlJobWorker:
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
             }
             if terminal_input or attempt.number >= self.queue.settings.max_attempts:
-                await self.queue.complete(entry, payload, attempt, error=error_message)
-                return "failed", None, error_message
+                return await self.queue.complete(entry, payload, attempt, error=error_message)
             else:
                 logger.warning(
                     "Crawl job %s attempt %s/%s failed; retaining it for lease-based retry: %s",
@@ -255,11 +338,9 @@ class CrawlJobWorker:
             # rather than retryable, but the per-URL diagnostics still ship:
             # complete() writes result and error independently.
             error_message = "Every crawled URL failed"
-            await self.queue.complete(entry, payload, attempt, result=result, error=error_message)
-            return "failed", result, error_message
+            return await self.queue.complete(entry, payload, attempt, result=result, error=error_message)
 
-        await self.queue.complete(entry, payload, attempt, result=result)
-        return "completed", result, None
+        return await self.queue.complete(entry, payload, attempt, result=result)
 
     async def _crawl(self, payload: dict) -> dict:
         """Load the existing synchronous crawl owner lazily inside the worker."""
@@ -295,36 +376,11 @@ class CrawlJobWorker:
                     exc_info=True,
                 )
 
-    async def _notify(
-        self,
-        entry: CrawlJobEntry,
-        payload: dict,
-        status: str,
-        *,
-        result: dict | None = None,
-        error: str | None = None,
-    ) -> None:
-        try:
-            await self.webhook_service.notify_job_completion(
-                task_id=entry.task_id,
-                task_type="crawl",
-                status=status,
-                urls=payload["urls"],
-                webhook_config=payload.get("webhook_config"),
-                result=result,
-                error=error,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Webhook notification failed for crawl job %s", entry.task_id)
-
-
 async def run_worker() -> None:
     config = load_config()
     setup_logging(config)
     redis = aioredis.from_url(
-        build_redis_url(config), decode_responses=True, **RESILIENT_CLIENT_KWARGS
+        build_redis_url(config), decode_responses=False, **RESILIENT_CLIENT_KWARGS
     )
     queue = CrawlJobQueue(redis, config)
     consumer = f"{socket.gethostname()}-{os.getpid()}"

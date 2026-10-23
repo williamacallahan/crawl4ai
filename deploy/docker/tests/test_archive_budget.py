@@ -430,6 +430,7 @@ async def test_job_worker_marks_budget_spent_terminal(monkeypatch):
 
     async def complete(entry, payload, attempt, result=None, error=None):
         calls["complete"] = {"result": result, "error": error}
+        return ("failed" if error else "completed"), result, error
 
     async def mark_retry(*args, **kwargs):
         calls["mark_retry"] = True

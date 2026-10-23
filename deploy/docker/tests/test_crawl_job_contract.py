@@ -24,6 +24,11 @@ from crawl_job_worker import CrawlJobWorker  # noqa: E402
 from test_crawl_job_queue_redis import redis_url  # noqa: E402,F401
 
 
+def committed_result(_entry, _payload, _attempt, *, result=None, error=None):
+    """Match the queue's committed outcome, including generated public errors."""
+    return ("failed" if error else "completed", result, error)
+
+
 def test_public_submit_accepts_every_supported_result_field(monkeypatch):
     result_fields = [
         "url",
@@ -94,7 +99,7 @@ def test_crawl_job_reuses_canonical_url_count_bounds():
 def test_worker_terminalizes_deterministic_input_failure_without_retry():
     queue = SimpleNamespace(
         settings=SimpleNamespace(max_attempts=3),
-        complete=AsyncMock(),
+        complete=AsyncMock(side_effect=committed_result),
         mark_retry=AsyncMock(),
     )
 
@@ -122,7 +127,7 @@ def test_worker_terminalizes_an_all_failed_crawl_and_keeps_its_results():
     than retryable, but the per-URL diagnostics must still reach the poller."""
     queue = SimpleNamespace(
         settings=SimpleNamespace(max_attempts=3),
-        complete=AsyncMock(),
+        complete=AsyncMock(side_effect=committed_result),
         mark_retry=AsyncMock(),
     )
     crawl_result = {
@@ -153,7 +158,7 @@ def test_worker_terminalizes_an_all_failed_crawl_and_keeps_its_results():
 def test_worker_completes_when_any_url_succeeded():
     queue = SimpleNamespace(
         settings=SimpleNamespace(max_attempts=3),
-        complete=AsyncMock(),
+        complete=AsyncMock(side_effect=committed_result),
         mark_retry=AsyncMock(),
     )
     crawl_result = {
@@ -219,7 +224,7 @@ def test_worker_does_not_publish_internal_detail_to_the_job_client(failure):
     genericizes what lands in the task hash /crawl/job/{id} returns."""
     queue = SimpleNamespace(
         settings=SimpleNamespace(max_attempts=1),
-        complete=AsyncMock(),
+        complete=AsyncMock(side_effect=committed_result),
         mark_retry=AsyncMock(),
     )
 
@@ -280,7 +285,7 @@ def test_llm_job_failure_does_not_publish_internal_detail(monkeypatch, redis_url
 def test_worker_retries_request_timeout():
     queue = SimpleNamespace(
         settings=SimpleNamespace(max_attempts=3),
-        complete=AsyncMock(),
+        complete=AsyncMock(side_effect=committed_result),
         mark_retry=AsyncMock(),
     )
 
