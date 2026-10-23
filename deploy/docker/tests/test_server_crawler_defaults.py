@@ -10,6 +10,8 @@ import egress_broker
 import llm_broker
 import pytest
 import utils
+from redis import asyncio as aioredis
+from test_crawl_job_queue_redis import redis_url  # noqa: F401
 
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.async_logger import AsyncLogger
@@ -236,7 +238,7 @@ def test_quick_llm_uses_server_render_readiness_default(monkeypatch):
     assert api.aperform_completion_with_backoff.await_args.kwargs["max_attempts"] == 1
 
 
-def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch):
+def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch, redis_url):
     captured = {}
 
     class FakeCrawler:
@@ -258,7 +260,6 @@ def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch):
             )
 
     config = load_config()
-    redis = PermitRedis()
     webhook = SimpleNamespace(notify_job_completion=AsyncMock())
 
     monkeypatch.setattr(api, "AsyncWebCrawler", FakeCrawler)
@@ -283,16 +284,17 @@ def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch):
         },
     )
 
-    asyncio.run(
-        api.process_llm_extraction(
-            redis,
-            config,
-            "llm_test",
-            "https://example.com",
-            "extract",
-        )
-    )
+    async def exercise():
+        redis = aioredis.from_url(redis_url, decode_responses=True)
+        try:
+            await redis.hset("task:llm_test", mapping={"status": "processing"})
+            await api.process_llm_extraction(redis, config, "llm_test", "https://example.com", "extract")
+            return await redis.hgetall("task:llm_test")
+        finally:
+            await redis.delete("task:llm_test")
+            await redis.aclose()
 
+    stored = asyncio.run(exercise())
     assert captured["extra_args"] == {
         "timeout": 300,
         "num_retries": 0,
@@ -300,11 +302,7 @@ def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch):
         "max_tokens": 12288,
     }
     assert captured["apply_chunking"] is False
-    final_mapping = redis.hset.await_args_list[-1].kwargs["mapping"]
-    assert final_mapping == {
-        "status": api.TaskStatus.FAILED,
-        "error": "provider timeout",
-    }
+    assert (stored["status"], stored["error"]) == (api.TaskStatus.FAILED, "provider timeout")
     webhook.notify_job_completion.assert_awaited_once_with(
         task_id="llm_test",
         task_type="llm_extraction",
