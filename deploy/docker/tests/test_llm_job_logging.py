@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from types import SimpleNamespace
+from uuid import uuid4
 from unittest.mock import AsyncMock
 
 import api
@@ -10,6 +11,8 @@ import egress_broker
 import llm_broker
 import pytest
 import utils
+from redis import asyncio as aioredis
+from test_crawl_job_queue_redis import redis_url  # noqa: F401
 
 
 @pytest.mark.parametrize(
@@ -22,14 +25,9 @@ import utils
     ids=["permit-busy", "unrelated-503", "unexpected-error"],
 )
 def test_llm_job_classifies_permit_backpressure_without_hiding_defects(
-    monkeypatch, caplog, failure, expected_level
+    monkeypatch, caplog, failure, expected_level, redis_url
 ):
     config = utils.load_config()
-    redis = SimpleNamespace(
-        set=AsyncMock(return_value=False, side_effect=failure),
-        hset=AsyncMock(),
-        expire=AsyncMock(),
-    )
     webhook = SimpleNamespace(notify_job_completion=AsyncMock())
     monkeypatch.setattr(api, "validate_llm_provider", lambda *_args: (True, None))
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
@@ -48,14 +46,23 @@ def test_llm_job_classifies_permit_backpressure_without_hiding_defects(
         },
     )
 
-    with caplog.at_level(logging.WARNING):
-        asyncio.run(
-            api.process_llm_extraction(
-                redis, config, "llm_logging", "https://example.com", "extract"
+    async def exercise():
+        redis = aioredis.from_url(redis_url)
+        task_id = f"llm_{uuid4().hex}"
+        key = f"task:{task_id}"
+        try:
+            await redis.hset(key, mapping={"status": api.TaskStatus.PROCESSING.value})
+            monkeypatch.setattr(redis, "set", AsyncMock(return_value=False, side_effect=failure))
+            await api.process_llm_extraction(
+                redis, config, task_id, "https://example.com", "extract"
             )
-        )
+            return utils.decode_redis_hash(await redis.hgetall(key))
+        finally:
+            await redis.delete(key)
+            await redis.aclose()
 
-    mapping = redis.hset.await_args_list[-1].kwargs["mapping"]
+    with caplog.at_level(logging.WARNING):
+        mapping = asyncio.run(exercise())
     assert mapping["status"] == api.TaskStatus.FAILED
     assert mapping["error"].startswith("LLM extraction failed (correlation_id=")
     assert "/app/" not in mapping["error"]

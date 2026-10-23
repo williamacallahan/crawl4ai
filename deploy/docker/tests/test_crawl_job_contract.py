@@ -4,10 +4,12 @@ import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from redis import asyncio as aioredis
 
 DOCKER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if DOCKER_DIR not in sys.path:
@@ -19,6 +21,7 @@ import job  # noqa: E402
 import llm_broker  # noqa: E402
 from crawl_job_queue import CrawlJobAttempt, CrawlJobEntry  # noqa: E402
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
+from test_crawl_job_queue_redis import redis_url  # noqa: E402,F401
 
 
 def test_public_submit_accepts_every_supported_result_field(monkeypatch):
@@ -235,14 +238,10 @@ def test_worker_does_not_publish_internal_detail_to_the_job_client(failure):
     queue.complete.assert_awaited_once_with(entry, {}, attempt, error=message)
 
 
-def test_llm_job_failure_does_not_publish_internal_detail(monkeypatch):
+def test_llm_job_failure_does_not_publish_internal_detail(monkeypatch, redis_url):
     """process_llm_extraction runs as a background task: its catch-all wrote
     str(e) straight into the hash /llm/job/{id} returns and into the webhook."""
-    stored = {}
     sent = {}
-
-    async def record_hset(_redis, key, mapping, _config):
-        stored[key] = mapping
 
     class FakeWebhook:
         def __init__(self, _config):
@@ -256,16 +255,22 @@ def test_llm_job_failure_does_not_publish_internal_detail(monkeypatch):
 
     monkeypatch.setattr(api, "validate_llm_provider", lambda *_a, **_k: (True, None))
     monkeypatch.setattr(llm_broker, "resolve_llm", blow_up)
-    monkeypatch.setattr(api, "hset_with_ttl", record_hset)
     monkeypatch.setattr(api, "WebhookDeliveryService", FakeWebhook)
 
-    asyncio.run(
-        api.process_llm_extraction(
-            object(), {"llm": {}}, "llm_leak", "https://example.com", "extract"
-        )
-    )
+    async def exercise():
+        redis = aioredis.from_url(redis_url, decode_responses=True)
+        key = f"task:llm_{uuid4().hex}"
+        try:
+            await redis.hset(key, mapping={"status": api.TaskStatus.PROCESSING.value})
+            await api.process_llm_extraction(
+                redis, {"llm": {}}, key.removeprefix("task:"), "https://example.com", "extract"
+            )
+            return await redis.hgetall(key)
+        finally:
+            await redis.delete(key)
+            await redis.aclose()
 
-    message = stored["task:llm_leak"]["error"]
+    message = asyncio.run(exercise())["error"]
     assert message.startswith("LLM extraction failed (correlation_id=")
     assert "/app/" not in message
     assert sent["error"] == message

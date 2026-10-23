@@ -11,6 +11,7 @@ on a processing hash is the property that keeps a live task out of eviction.
 import json
 import os
 import sys
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -130,6 +131,7 @@ def test_processing_read_leaves_the_hash_and_its_ttl_alone():
             key,
             {
                 "status": TaskStatus.PROCESSING,
+                "heartbeat_at": time.time(),
                 "created_at": "2026-10-22T07:00:00",
                 "url": "https://example.com",
                 "owner": "alice@x.com",

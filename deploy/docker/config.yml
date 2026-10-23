@@ -24,6 +24,8 @@ llm:
   job_max_output_tokens: 12288
   backoff_max_attempts: 1
   permit_ttl_seconds: 300
+  # Three missed heartbeats let polling recover a lost local worker.
+  task_heartbeat_seconds: 30
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
 # Redis Configuration
