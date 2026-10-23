@@ -8,7 +8,81 @@ import hashlib
 from typing import Dict, Any, Optional, List, Tuple
 from urllib.parse import unquote, urlparse
 import OpenSSL.crypto
+from cryptography import x509 as crypto_x509
+from cryptography.x509.oid import ExtensionOID
 from pathlib import Path
+
+_EXTENSION_NAMES = {
+    ExtensionOID.SUBJECT_DIRECTORY_ATTRIBUTES: "subjectDirectoryAttributes",
+    ExtensionOID.SUBJECT_KEY_IDENTIFIER: "subjectKeyIdentifier",
+    ExtensionOID.KEY_USAGE: "keyUsage",
+    ExtensionOID.PRIVATE_KEY_USAGE_PERIOD: "privateKeyUsagePeriod",
+    ExtensionOID.SUBJECT_ALTERNATIVE_NAME: "subjectAltName",
+    ExtensionOID.ISSUER_ALTERNATIVE_NAME: "issuerAltName",
+    ExtensionOID.BASIC_CONSTRAINTS: "basicConstraints",
+    ExtensionOID.NAME_CONSTRAINTS: "nameConstraints",
+    ExtensionOID.CRL_DISTRIBUTION_POINTS: "crlDistributionPoints",
+    ExtensionOID.CERTIFICATE_POLICIES: "certificatePolicies",
+    ExtensionOID.POLICY_MAPPINGS: "policyMappings",
+    ExtensionOID.AUTHORITY_KEY_IDENTIFIER: "authorityKeyIdentifier",
+    ExtensionOID.POLICY_CONSTRAINTS: "policyConstraints",
+    ExtensionOID.EXTENDED_KEY_USAGE: "extendedKeyUsage",
+    ExtensionOID.FRESHEST_CRL: "freshestCRL",
+    ExtensionOID.INHIBIT_ANY_POLICY: "inhibitAnyPolicy",
+    ExtensionOID.ISSUING_DISTRIBUTION_POINT: "issuingDistributionPoint",
+    ExtensionOID.AUTHORITY_INFORMATION_ACCESS: "authorityInfoAccess",
+    ExtensionOID.SUBJECT_INFORMATION_ACCESS: "subjectInfoAccess",
+    ExtensionOID.OCSP_NO_CHECK: "noCheck",
+    ExtensionOID.TLS_FEATURE: "tlsfeature",
+    ExtensionOID.CRL_NUMBER: "crlNumber",
+    ExtensionOID.DELTA_CRL_INDICATOR: "deltaCRL",
+    ExtensionOID.PRECERT_SIGNED_CERTIFICATE_TIMESTAMPS: "ct_precert_scts",
+    ExtensionOID.PRECERT_POISON: "ct_precert_poison",
+    ExtensionOID.SIGNED_CERTIFICATE_TIMESTAMPS: "ct_cert_scts",
+    ExtensionOID.MS_CERTIFICATE_TEMPLATE: "msCertTemplate",
+    ExtensionOID.ADMISSIONS: "x509ExtAdmission",
+}
+
+
+def _extension_value(value: crypto_x509.ExtensionType) -> str:
+    """Render common values without depending on removed OpenSSL APIs."""
+    if isinstance(value, crypto_x509.UnrecognizedExtension):
+        return value.public_bytes().hex()
+    if isinstance(value, crypto_x509.BasicConstraints):
+        return "CA:" + str(value.ca).upper() + (
+            f", pathlen:{value.path_length}" if value.path_length is not None else ""
+        )
+    if isinstance(value, crypto_x509.KeyUsage):
+        usages = [
+            ("digital_signature", "Digital Signature"),
+            ("content_commitment", "Non Repudiation"),
+            ("key_encipherment", "Key Encipherment"),
+            ("data_encipherment", "Data Encipherment"),
+            ("key_agreement", "Key Agreement"),
+            ("key_cert_sign", "Certificate Sign"),
+            ("crl_sign", "CRL Sign"),
+        ]
+        if value.key_agreement:
+            usages += [("encipher_only", "Encipher Only"), ("decipher_only", "Decipher Only")]
+        return ", ".join(label for attribute, label in usages if getattr(value, attribute))
+    if isinstance(value, (crypto_x509.SubjectAlternativeName, crypto_x509.IssuerAlternativeName)):
+        labels = {
+            crypto_x509.DNSName: "DNS", crypto_x509.RFC822Name: "email",
+            crypto_x509.UniformResourceIdentifier: "URI", crypto_x509.IPAddress: "IP Address",
+            crypto_x509.RegisteredID: "Registered ID",
+        }
+        return ", ".join(f"{labels.get(type(name), type(name).__name__)}:{name.value}" for name in value)
+    if isinstance(value, crypto_x509.SubjectKeyIdentifier):
+        return value.digest.hex(":").upper()
+    if isinstance(value, crypto_x509.AuthorityKeyIdentifier) and (
+        value.key_identifier is not None
+        and value.authority_cert_issuer is None
+        and value.authority_cert_serial_number is None
+    ):
+        return value.key_identifier.hex(":").upper()
+    # Other recognized types retain their public, readable representation.
+    return str(value)
+
 
 # === Inherit from dict ===
 class SSLCertificate(dict):
@@ -237,14 +311,11 @@ class SSLCertificate(dict):
             }
 
             extensions = []
-            for i in range(x509.get_extension_count()):
-                ext = x509.get_extension(i)
-                try:
-                    value = str(ext)
-                except OpenSSL.crypto.Error:
-                    # OpenSSL cannot render unknown extension OIDs as text.
-                    value = ext.get_data().hex()
-                extensions.append({"name": ext.get_short_name(), "value": value})
+            for ext in x509.to_cryptography().extensions:
+                extensions.append({
+                    "name": _EXTENSION_NAMES.get(ext.oid, "UNDEF"),
+                    "value": _extension_value(ext.value),
+                })
             cert_info_raw["extensions"] = extensions
 
             return SSLCertificate(cert_info_raw)
