@@ -1124,6 +1124,14 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # Handle full page scanning
             if config.scan_full_page:
                 scan_timeout = (config.page_timeout or 30000) / 1000  # ms to seconds
+                deadline = page_deadline.get()
+                if deadline is not None:
+                    # Keep a reserve for content capture: a scan that runs out
+                    # of the crawl's budget continues with a partial scroll
+                    # instead of failing a crawl that already has its HTML.
+                    reserve = max(2.0, scan_timeout * 0.1)
+                    remaining = deadline - asyncio.get_running_loop().time() - reserve
+                    scan_timeout = max(0.0, min(scan_timeout, remaining))
                 try:
                     await asyncio.wait_for(
                         self._handle_full_page_scan(page, config.scroll_delay, config.max_scroll_steps),
@@ -1390,7 +1398,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 try:
                     page.remove_listener("crash", on_crash)
                     if crash_cleanup is not None:
-                        await crash_cleanup
+                        await asyncio.shield(crash_cleanup)
                     if config.capture_network_requests:
                         page.remove_listener("request", handle_request_capture)
                         page.remove_listener("response", handle_response_capture)

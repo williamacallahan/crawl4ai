@@ -204,20 +204,26 @@ def _is_live(crawler: AsyncWebCrawler) -> bool:
             return True
         if getattr(manager, "pool_recycle_requested", False) is True:
             return False
-        failures = getattr(manager, "consecutive_failures", 0)
-        if isinstance(failures, int) and failures >= WATCHDOG.consecutive_failure_limit:
-            return False
         # A failed recycle or a close leaves _closing set, and a closed manager
         # refuses every page even while its browser object still reports
         # connected; only a replacement brings this config back.
         if getattr(manager, "_closing", False) is True:
             return False
         if manager.browser is not None:
-            return manager.browser.is_connected()
-        return (
-            manager.default_context is not None
-            and not manager.default_context.is_closed()
-        )
+            live = manager.browser.is_connected()
+        else:
+            live = (
+                manager.default_context is not None
+                and not manager.default_context.is_closed()
+            )
+        if not live:
+            return False
+        failures = getattr(manager, "consecutive_failures", 0)
+        if isinstance(failures, int) and failures >= WATCHDOG.consecutive_failure_limit:
+            # Drain, then restart: closing now would fail its in-flight crawls.
+            manager.consecutive_failures = 0
+            manager.request_pool_recycle("consecutive browser faults")
+        return True
     except Exception:
         return False
 
@@ -797,13 +803,21 @@ def _probe_failure(error: Exception) -> bool:
 
 
 async def _probe_browser(crawler: AsyncWebCrawler) -> bool:
-    """Return whether a browser has exhausted its consecutive failure budget."""
+    """Return whether the manager is closed or its CDP failure budget is spent."""
     manager = crawler.crawler_strategy.browser_manager
-    if getattr(manager, "pool_recycle_requested", False) is True:
+    if _is_recycling(crawler):
+        return False
+    if (
+        getattr(manager, "_closing", False) is True
+        or getattr(manager, "pool_recycle_requested", False) is True
+    ):
         return True
     failures = getattr(manager, "consecutive_failures", 0)
     if isinstance(failures, int) and failures >= WATCHDOG.consecutive_failure_limit:
-        return True
+        # Keep probing while pages drain: an unresponsive browser can exhaust
+        # its CDP failure budget even after ordinary faults request a restart.
+        manager.consecutive_failures = 0
+        manager.request_pool_recycle("consecutive browser faults")
     if _is_recycling(crawler):
         return False
     browser = manager.browser

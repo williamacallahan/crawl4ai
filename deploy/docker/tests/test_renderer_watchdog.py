@@ -5,7 +5,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -46,6 +46,12 @@ def crawler(*, send=None, active=1):
         pool_recycle_requested=False,
         consecutive_failures=0,
     )
+
+    def request_pool_recycle(reason):
+        manager._recycle_due = True
+        manager.pool_recycle_reason = reason
+
+    manager.request_pool_recycle = Mock(side_effect=request_pool_recycle)
     return SimpleNamespace(
         crawler_strategy=SimpleNamespace(browser_manager=manager),
         active_requests=active,
@@ -114,21 +120,29 @@ async def test_wedged_probe_is_bounded_and_does_not_hold_pool_lock(pool, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["requested", "consecutive"])
-async def test_manager_failure_signal_retires_permanent_without_probe(pool, failure):
+async def test_manager_failure_signal_drains_permanent_and_still_probes(pool, failure):
     failed = crawler(active=2)
     manager = failed.crawler_strategy.browser_manager
     if failure == "requested":
-        manager.pool_recycle_requested = True
+        manager.request_pool_recycle("cleanup failed")
     else:
-        manager.consecutive_failures = 3
+        manager.consecutive_failures = pool.WATCHDOG.consecutive_failure_limit
     pool.PERMANENT = failed
     pool.DEFAULT_CONFIG_SIG = "default"
-    assert not pool._is_live(failed)
+    assert pool._is_live(failed)
     await pool._watchdog_pass()
     await drain_closes(pool)
-    assert pool.PERMANENT is None
-    assert pool.ADMISSION_SEM._value == 2
-    manager.browser.new_browser_cdp_session.assert_not_awaited()
+    assert pool.PERMANENT is failed
+    assert failed.active_requests == 2
+    assert pool.ADMISSION_SEM._value == 0
+    assert manager.consecutive_failures == 0
+    assert manager._recycle_due
+    assert not manager.pool_recycle_requested
+    failed.close.assert_not_awaited()
+    manager.request_pool_recycle.assert_called_once_with(
+        "cleanup failed" if failure == "requested" else "consecutive browser faults"
+    )
+    manager.browser.new_browser_cdp_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio

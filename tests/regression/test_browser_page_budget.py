@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from crawl4ai.async_configs import CrawlerRunConfig
+from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
+from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.browser_budget import page_deadline, within_page_budget
 
 
@@ -127,6 +129,176 @@ async def test_operation_without_a_deadline_can_complete():
         assert await within_page_budget(asyncio.sleep(0, result="content")) == "content"
     finally:
         page_deadline.reset(token)
+
+
+def _scan_strategy(*, navigation_delay=0):
+    """Keep the real scan/adapter pipeline; fake only Playwright page calls."""
+    page = MagicMock()
+    page.url = "https://example.test/"
+    page.viewport_size = {"width": 800, "height": 600}
+    page.scroll_count = 0
+    page.scan_cancelled = asyncio.Event()
+    page.capture_remaining = None
+    page.wait_for_selector = AsyncMock(return_value=True)
+    page.context.browser.contexts = []
+    page.context.new_cdp_session = AsyncMock(
+        return_value=MagicMock(send=AsyncMock(), detach=AsyncMock())
+    )
+
+    async def navigate(*_args, **_kwargs):
+        if navigation_delay:
+            await asyncio.sleep(navigation_delay)
+        return None
+
+    async def evaluate(expression):
+        if "window.scrollTo(" in expression:
+            page.scroll_count += 1
+            return {"success": True}
+        if "const {scrollWidth, scrollHeight}" in expression:
+            return {"width": 800, "height": 2400}
+        return True  # The body visibility check succeeds.
+
+    async def render_delay(milliseconds):
+        try:
+            await asyncio.sleep(milliseconds / 1000)
+        except asyncio.CancelledError:
+            page.scan_cancelled.set()
+            raise
+
+    async def content():
+        deadline = page_deadline.get()
+        if deadline is not None:
+            page.capture_remaining = deadline - asyncio.get_running_loop().time()
+        body = "partial scroll" if page.scroll_count else "initial content"
+        return f"<html><body>{body}</body></html>"
+
+    page.goto = AsyncMock(side_effect=navigate)
+    page.evaluate = AsyncMock(side_effect=evaluate)
+    page.wait_for_timeout = AsyncMock(side_effect=render_delay)
+    page.content = AsyncMock(side_effect=content)
+    strategy = AsyncPlaywrightCrawlerStrategy(
+        browser_config=BrowserConfig(headless=True, text_mode=True),
+        logger=MagicMock(),
+    )
+    strategy.browser_manager = MagicMock()
+    strategy.browser_manager.get_page = AsyncMock(return_value=(page, page.context))
+    strategy.browser_manager.release_page_with_context = AsyncMock()
+    return strategy, page
+
+
+def _scan_warnings(strategy):
+    return [
+        call.kwargs
+        for call in strategy.logger.warning.call_args_list
+        if call.kwargs.get("tag") == "PAGE_SCAN"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_slow_full_page_scan_returns_partial_html_before_page_deadline():
+    strategy, page = _scan_strategy()
+    previous_deadline = page_deadline.get()
+
+    result = await strategy._crawl_web(
+        page.url,
+        CrawlerRunConfig(
+            page_timeout=2250,
+            scan_full_page=True,
+            scroll_delay=10,
+            delay_before_return_html=0,
+        ),
+    )
+
+    assert result.status_code == 200
+    assert result.html == "<html><body>partial scroll</body></html>"
+    assert page.scan_cancelled.is_set()
+    assert page.scroll_count == 1
+    assert page.capture_remaining >= 1.9
+    assert len(_scan_warnings(strategy)) == 1
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(page)
+    assert page_deadline.get() == previous_deadline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page_timeout", "remaining", "reserve"),
+    [(10_000, 2.15, 2.0), (30_000, 3.15, 3.0)],
+)
+async def test_full_page_scan_uses_remaining_absolute_budget(
+    page_timeout, remaining, reserve
+):
+    strategy, page = _scan_strategy()
+    config = CrawlerRunConfig(
+        page_timeout=page_timeout,
+        scan_full_page=True,
+        scroll_delay=10,
+        delay_before_return_html=0,
+    )
+    # Model admission/navigation already spending most of a longer crawl's
+    # budget, without waiting tens of seconds before reaching the scan.
+    token = page_deadline.set(asyncio.get_running_loop().time() + remaining)
+    try:
+        result = await within_page_budget(strategy._crawl_web_impl(page.url, config))
+    finally:
+        page_deadline.reset(token)
+
+    assert result.status_code == 200
+    assert result.html == "<html><body>partial scroll</body></html>"
+    assert page.scan_cancelled.is_set()
+    assert page.capture_remaining >= reserve - 0.1
+    warnings = _scan_warnings(strategy)
+    assert len(warnings) == 1
+    assert 0 < warnings[0]["params"]["timeout"] <= 0.15
+
+
+@pytest.mark.asyncio
+async def test_navigation_spending_most_deadline_skips_scan_and_returns_html():
+    strategy, page = _scan_strategy(navigation_delay=0.4)
+
+    result = await strategy._crawl_web(
+        page.url,
+        CrawlerRunConfig(
+            page_timeout=600,
+            scan_full_page=True,
+            scroll_delay=10,
+            delay_before_return_html=0,
+        ),
+    )
+
+    assert result.status_code == 200
+    assert result.html == "<html><body>initial content</body></html>"
+    assert page.capture_remaining > 0
+    assert page.scroll_count == 0
+    page.wait_for_timeout.assert_not_awaited()
+    assert _scan_warnings(strategy)[0]["params"]["timeout"] == 0
+    strategy.browser_manager.release_page_with_context.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_full_page_scan_without_deadline_keeps_configured_timeout():
+    strategy, page = _scan_strategy()
+    token = page_deadline.set(None)
+    try:
+        result = await asyncio.wait_for(
+            strategy._crawl_web_impl(
+                page.url,
+                CrawlerRunConfig(
+                    page_timeout=50,
+                    scan_full_page=True,
+                    scroll_delay=10,
+                    delay_before_return_html=0,
+                ),
+            ),
+            timeout=1,
+        )
+    finally:
+        page_deadline.reset(token)
+
+    assert result.status_code == 200
+    assert result.html == "<html><body>partial scroll</body></html>"
+    assert page.scan_cancelled.is_set()
+    assert page.capture_remaining is None
+    assert _scan_warnings(strategy)[0]["params"]["timeout"] == 0.05
 
 
 def test_page_limits_survive_serialization_and_clone():

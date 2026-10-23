@@ -34,23 +34,22 @@ RECYCLE_START_SECONDS = 120.0
 # production replica, failing every request on that browser after 235s.
 RECYCLE_DRAIN_MIN_SECONDS = PAGE_TIMEOUT / 1000
 RECYCLE_DRAIN_MAX_SECONDS = 5 * RECYCLE_DRAIN_MIN_SECONDS
+# Stopping the driver transport is the last resort for a wedged close; its exit
+# handler ends the whole Chromium process group. Capped because it can wedge too.
+DRIVER_STOP_SECONDS = 5.0
 # The whole worst-case legitimate recycle: a close that runs its cap, one
-# absorbed cancellation inside it, the driver-stop fallback, a launch, and
-# margin. Derived rather than picked, so a waiter cannot start failing while a
-# healthy recycle is still running.
+# absorbed cancellation inside it, driver-stop fallback, a launch and its
+# bounded failure rollback, and margin.
 RECYCLE_WAIT_SECONDS = (
-    RECYCLE_CLOSE_SECONDS
+    2 * RECYCLE_CLOSE_SECONDS
     + CANCELLATION_GRACE_SECONDS
-    + 5.0
+    + 2 * DRIVER_STOP_SECONDS
     + RECYCLE_START_SECONDS
     + 30.0
 )
 # Discarding one page must not outlast Playwright's own close, and must never
 # hold the request that is already rolling its allocation back.
 PAGE_CLOSE_SECONDS = 30.0
-# Stopping the driver transport is the last resort for a wedged close; its exit
-# handler ends the whole Chromium group. Capped because it can wedge too.
-DRIVER_STOP_SECONDS = 5.0
 # Window during which _get_page_by_target_id keeps polling Playwright for the
 # page identified by target_id. Targets created via raw CDP commands (as a
 # cloud browser service does before handing off context_id + target_id) can
@@ -827,6 +826,8 @@ class BrowserManager:
         self._background_tasks = set()
         self.pool_recycle_requested = False
         self.pool_recycle_reason = None
+        self._pool_recycle_task = None
+        self._pool_recycle_pending = False
         self.browser_pid = None
         self._explicit_pages = {}  # context -> pages created by this manager
         self._pending_page_creations = {}  # context -> allocation tasks
@@ -859,11 +860,32 @@ class BrowserManager:
         return not self.config.cdp_url
 
     def request_pool_recycle(self, reason: str) -> None:
-        """Quarantine an unhealthy browser; its owning pool disposes of it."""
-        self.pool_recycle_requested = True
+        """Drain and restart an unhealthy browser.
+
+        Closing it at once failed every other crawl still running on it (up to
+        12), so it takes the same drain-then-restart path as a page-count
+        recycle: admission closes, in-flight pages finish within the drain
+        bound, then the browser restarts.
+        """
+        if self._closing or self._recycling or self.pool_recycle_requested:
+            return
         self.pool_recycle_reason = reason
-        # Wake waiters so the admission check fails promptly.
-        self._recycle_done.set()
+        self._pool_recycle_pending = True
+        # This API is synchronous: close the barrier before its scheduled task
+        # runs, including for retained sessions that otherwise bypass admission.
+        self._recycle_done.clear()
+        if self._pool_recycle_task is None or self._pool_recycle_task.done():
+            self._pool_recycle_task = asyncio.get_running_loop().create_task(
+                self._drain_recycle()
+            )
+            self._pool_recycle_task.add_done_callback(self._consume_recycle_result)
+
+    async def _drain_recycle(self) -> None:
+        async with self._recycle_lock:
+            if self._closing or self._recycling:
+                return
+            self._recycle_due = True
+            self._close_admission_if_recycle_due_locked()
 
     async def _attribute_browser_pid(self) -> None:
         self.browser_pid = None
@@ -902,6 +924,7 @@ class BrowserManager:
         """Publish a successful owned-browser start to the recycle barrier."""
         await self._attribute_browser_pid()
         self.consecutive_failures = 0
+        self.pool_recycle_requested = False
         async with self._recycle_lock:
             if not self._recycling:
                 self._closing = False
@@ -924,7 +947,11 @@ class BrowserManager:
         except BaseException:
             # Roll back partial startup (e.g. Playwright driver) since a failed __aenter__ never triggers __aexit__
             try:
-                await self.close()
+                # A failed restart is already inside the recycle task. Its
+                # rollback must not join the parent waiting for this start.
+                await asyncio.wait_for(
+                    self.close(_for_recycle=self._recycling), RECYCLE_CLOSE_SECONDS
+                )
             except BaseException:
                 pass
             if self._using_cached_cdp:
@@ -938,7 +965,7 @@ class BrowserManager:
             elif self.playwright is not None:
                 # A failed external-CDP startup still owns its local driver.
                 try:
-                    await self.playwright.stop()
+                    await asyncio.wait_for(self.playwright.stop(), DRIVER_STOP_SECONDS)
                 except BaseException:
                     pass
                 self.playwright = None
@@ -2105,7 +2132,7 @@ class BrowserManager:
             await self._run_cleanup(self._close_context_quietly(context))
             raise
 
-    async def _admit_page_acquisition(self, page_timeout_ms=PAGE_TIMEOUT):
+    async def _admit_page_acquisition(self, page_timeout_ms=PAGE_TIMEOUT, *, session_id=None):
         """Issue a drain token only while the browser admits new pages."""
         self._drain_seconds = max(
             self._drain_seconds,
@@ -2133,6 +2160,10 @@ class BrowserManager:
                 if self._closing or self.pool_recycle_requested:
                     raise RuntimeError("Browser manager is unavailable")
                 if self._recycle_done.is_set():
+                    if session_id and session_id in self.sessions:
+                        # This session already owns a token, but its next crawl
+                        # must still wait for an unhealthy browser to restart.
+                        return None
                     token = object()
                     self._active_acquisitions.add(token)
                     return token
@@ -2141,10 +2172,10 @@ class BrowserManager:
         """Close admission before a due recycle can observe an empty drain set."""
         if (
             not self._recycle_due
-            or self.sessions
+            or (self.sessions and not self._pool_recycle_pending)
             or self._closing
             or self.pool_recycle_requested
-            or not self._owns_browser_process()
+            or (not self._owns_browser_process() and not self._pool_recycle_pending)
         ):
             return
         self._recycle_done.clear()
@@ -2157,6 +2188,14 @@ class BrowserManager:
         if self._drain_deadline is not None:
             self._drain_deadline.cancel()
             self._drain_deadline = None
+        if not self._owns_browser_process():
+            # Only its owner may restart an external CDP process. Once this
+            # client's pages drain, let the pool replace its connection.
+            self.pool_recycle_requested = True
+            self._recycle_due = False
+            self._pool_recycle_pending = False
+            self._recycle_done.set()
+            return
         self._recycling = True
         self._recycle_task = asyncio.create_task(self._recycle_browser())
         self._recycle_task.add_done_callback(self._consume_recycle_result)
@@ -2174,7 +2213,7 @@ class BrowserManager:
                 not self._recycle_due
                 or self._recycling
                 or self._closing
-                or self.sessions
+                or (self.sessions and not self._pool_recycle_pending)
             ):
                 return
             self._active_acquisitions.clear()
@@ -2200,7 +2239,7 @@ class BrowserManager:
             if not self._should_recycle():
                 return
             self._recycle_due = True
-            if self.sessions or session_id:
+            if (self.sessions or session_id) and not self._pool_recycle_pending:
                 # Sessions deliberately retain their browser. Keep admission open
                 # until the last one is killed or expires.
                 self._recycle_done.set()
@@ -2259,6 +2298,7 @@ class BrowserManager:
                 else:
                     self._closing = True
                 self._recycle_due = False
+                self._pool_recycle_pending = False
                 self._recycle_done.set()
         if cancelled:
             raise asyncio.CancelledError
@@ -2316,6 +2356,9 @@ class BrowserManager:
         self._cleanup_expired_sessions()
 
         session_id = crawlerRunConfig.session_id
+        token = await self._admit_page_acquisition(
+            crawlerRunConfig.page_timeout or PAGE_TIMEOUT, session_id=session_id
+        )
         if session_id and session_id in self.sessions:
             async with self._recycle_lock:
                 if self._closing or self.pool_recycle_requested:
@@ -2325,7 +2368,10 @@ class BrowserManager:
             await self._note_page_served(session_id=session_id)
             try:
                 await page.evaluate("window.stop()")
-            except (asyncio.CancelledError, asyncio.TimeoutError, PlaywrightTimeoutError):
+            except asyncio.CancelledError:
+                # A client disconnect says nothing about the browser.
+                raise
+            except (asyncio.TimeoutError, PlaywrightTimeoutError):
                 # The caller has not received this retained page yet, so its
                 # timeout cleanup cannot interrupt a busy session renderer.
                 self.request_pool_recycle("session acquisition interrupted")
@@ -2335,13 +2381,12 @@ class BrowserManager:
             async with self._recycle_lock:
                 if self._closing:
                     raise RuntimeError("Browser manager closed during session acquisition")
+                if self.sessions.get(session_id, (None, None, None))[1] is not page:
+                    raise RuntimeError("Browser manager restarted during session acquisition")
                 if self.pool_recycle_requested:
                     raise RuntimeError("Browser manager is unavailable")
             return page, context
 
-        token = await self._admit_page_acquisition(
-            crawlerRunConfig.page_timeout or PAGE_TIMEOUT
-        )
         context = None
         page = None
         signature = None
@@ -2415,7 +2460,7 @@ class BrowserManager:
                 self.sessions[session_id] = (context, page, time.time())
                 stored_session = True
                 async with self._recycle_lock:
-                    if self._recycle_due:
+                    if self._recycle_due and not self._pool_recycle_pending:
                         self._recycle_done.set()
                         if self._drain_deadline is not None:
                             self._drain_deadline.cancel()
@@ -2682,6 +2727,7 @@ class BrowserManager:
                         self._drain_deadline = None
                     self._active_acquisitions.clear()
                     self._recycle_due = False
+                    self._pool_recycle_pending = False
                     self._recycling = False
                     self._recycle_done.set()
                 await self._drain_background_tasks()
