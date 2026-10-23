@@ -403,16 +403,24 @@ def _field(fields: Mapping[Any, Any] | list[Any], name: str) -> str | None:
     return None
 
 
-def _log_job_terminal(task_id: str, payload: dict, attempt: CrawlJobAttempt, status: str) -> None:
-    """One record per finished job, joinable to the caller's trace like md_terminal."""
-    queued_at = datetime.fromisoformat(payload["created_at"]).replace(tzinfo=timezone.utc)
+def _log_job_terminal(task_id: str, payload: dict | None, attempt_number: int, status: str) -> None:
+    """One record per finished job, joinable to the caller's trace like md_terminal.
+
+    A job whose durable payload is missing has no queue time or trace to report.
+    """
     fields = [
         "event=job_terminal",
         f"task_id={task_id}",
         f"status={status}",
-        f"attempt={attempt.number}",
-        f"duration_ms={(datetime.now(timezone.utc) - queued_at).total_seconds() * 1_000:.3f}",
+        f"attempt={attempt_number}",
     ]
+    if payload is None:
+        logger.info(" ".join(fields))
+        return
+    queued_at = datetime.fromisoformat(payload["created_at"]).replace(tzinfo=timezone.utc)
+    fields.append(
+        f"duration_ms={(datetime.now(timezone.utc) - queued_at).total_seconds() * 1_000:.3f}"
+    )
     if payload.get("trace_id"):
         fields.append(f"trace_id={payload['trace_id']}")
     logger.info(" ".join(fields))
@@ -659,7 +667,7 @@ class CrawlJobQueue(CrawlJobOutbox):
             raise CrawlJobLeaseLost(
                 f"crawl job {entry.task_id} lease held by {attempt.consumer} was claimed by another worker"
             )
-        _log_job_terminal(entry.task_id, payload, attempt, status)
+        _log_job_terminal(entry.task_id, payload, attempt.number, status)
         return status, result, error
 
     async def discard_missing_payload(self, entry: CrawlJobEntry, consumer: str) -> None:
@@ -691,6 +699,7 @@ class CrawlJobQueue(CrawlJobOutbox):
             raise CrawlJobLeaseLost(
                 f"crawl job {entry.task_id} missing-payload cleanup lost its lease"
             )
+        _log_job_terminal(entry.task_id, None, 0, TaskStatus.FAILED.value)
 
     @staticmethod
     def _stream_entries(response: Any) -> list[CrawlJobEntry]:

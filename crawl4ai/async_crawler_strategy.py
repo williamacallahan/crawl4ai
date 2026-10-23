@@ -56,6 +56,10 @@ class TargetNavigationError(RuntimeError):
     """A direct target origin refused browser navigation."""
 
 
+# Chromium reports a killed renderer's crash within this window of the kill.
+RENDERER_KILL_CRASH_WINDOW_SECONDS = 5.0
+
+
 def _interrupted_step(error: BaseException) -> str:
     """Name the crawl step an expired page budget interrupted.
 
@@ -68,7 +72,9 @@ def _interrupted_step(error: BaseException) -> str:
     while error is not None and error not in chain:
         chain.append(error)
         error = error.__cause__ or error.__context__
-    for exception in reversed(chain):
+    # The cancellation is what the expired budget delivered into the step.
+    cancellations = [e for e in chain if isinstance(e, asyncio.CancelledError)]
+    for exception in cancellations[:1] + list(reversed(chain)):
         frames = [
             frame for frame in traceback.extract_tb(exception.__traceback__)
             if frame.filename.startswith(package) and frame.filename != budget
@@ -580,8 +586,15 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         try:
             return await asyncio.wait_for(self._crawl_web_impl(url, config), seconds)
         except asyncio.TimeoutError as error:
+            # The step names source text, so it stays in the server log; the
+            # message reaches clients through crawl_stats and error_message.
+            self.logger.warning(
+                message="Page timeout after {timeout}ms at {step}: {url}",
+                tag="TIMEOUT",
+                params={"timeout": config.page_timeout, "step": _interrupted_step(error), "url": url},
+            )
             raise asyncio.TimeoutError(
-                f"Page timeout after {config.page_timeout}ms at {_interrupted_step(error)}"
+                f"Page timeout after {config.page_timeout}ms"
             ) from error
         finally:
             page_deadline.reset(token)
@@ -697,12 +710,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         context = None
         execution_session = None
         renderer_crashed = False
+        crashed_at = None
         crash_cleanup = None
-        crawl_started = time.monotonic()
 
         def on_crash(crashed_page):
-            nonlocal renderer_crashed, crash_cleanup
+            nonlocal renderer_crashed, crashed_at, crash_cleanup
             renderer_crashed = True
+            crashed_at = time.monotonic()
             # Closing the crashed target rejects its pending Playwright calls;
             # cancelling only the Python waiter leaves protocol promises alive.
             crash_cleanup = asyncio.create_task(
@@ -955,8 +969,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             response = None
                         elif "Download is starting" in error_detail:
                             # Chromium refuses to render an attachment response
-                            # (Content-Disposition: attachment) when downloads
-                            # are off: the target answered with a file, not a page.
+                            # (Content-Disposition: attachment) as a page: the
+                            # target answered with a file.
                             raise TargetNavigationError(
                                 f"Target navigation refused: {error_detail.splitlines()[0]}"
                             ) from e
@@ -1439,9 +1453,17 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             if renderer_crashed or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
                 self.browser_manager.consecutive_failures += 1
             if renderer_crashed:
-                kill = self.browser_manager.renderer_kill
-                if kill is not None and kill[0] >= crawl_started:
-                    raise Error(f"Target page crashed: {kill[1]}") from error
+                # Up to a dozen pages share one browser, so only a kill just
+                # before this page's crash explains it, and only when every
+                # such kill names the same limit.
+                reasons = {
+                    reason for killed_at, reason in self.browser_manager.renderer_kills
+                    if 0 <= crashed_at - killed_at <= RENDERER_KILL_CRASH_WINDOW_SECONDS
+                }
+                if len(reasons) == 1:
+                    raise Error(
+                        f"Target page crashed: renderer exceeded its {reasons.pop()} limit"
+                    ) from error
                 raise Error("Target page crashed") from error
             raise
 

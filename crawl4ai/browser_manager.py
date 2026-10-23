@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import hashlib
 import os
 import shlex
@@ -814,10 +815,10 @@ class BrowserManager:
         # partially-created page.
         self._pages_served = 0
         self.consecutive_failures = 0
-        # (monotonic time, description) of the last renderer an external
-        # resource watchdog killed in this browser; a page crash after it is a
-        # deliberate resource rejection rather than a renderer fault.
-        self.renderer_kill: tuple[float, str] | None = None
+        # (monotonic time, exceeded limit) of the renderers an external
+        # resource watchdog recently killed in this browser; a page crash right
+        # after one is a deliberate resource rejection, not a renderer fault.
+        self.renderer_kills: deque[tuple[float, str]] = deque(maxlen=12)
         self._recycle_due = False
         self._recycling = False
         self._closing = False
