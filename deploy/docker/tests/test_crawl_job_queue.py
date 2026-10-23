@@ -25,6 +25,7 @@ from crawl_job_queue import (  # noqa: E402
 )
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
 from work_queue import principal_lease_key  # noqa: E402
+from utils import decode_task_result  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +70,7 @@ class FakeRedis:
     async def hset(self, key, key_name=None, value=None, mapping=None, **_kwargs):
         if mapping:
             self.hashes[key].update({
-                str(name): str(field.value if hasattr(field, "value") else field)
+                str(name): field if isinstance(field, bytes) else str(field.value if hasattr(field, "value") else field)
                 for name, field in mapping.items()
             })
         elif key_name is not None:
@@ -367,12 +368,7 @@ class FakeRedis:
         return 1
 
     async def _eval_complete(self, keys, args):
-        (
-            payload_key,
-            task_key,
-            stream,
-            principal_lease_key,
-        ) = keys
+        payload_key, task_key, stream, principal_lease_key = keys
         (
             fence_token,
             consumer,
@@ -387,6 +383,7 @@ class FakeRedis:
             group,
             stream_id,
             task_id,
+            result_encoding,
         ) = args
         payload = self.hashes[payload_key]
         if payload.get("fence_token") != fence_token or payload.get("lease_owner") != consumer:
@@ -398,6 +395,7 @@ class FakeRedis:
                 "created_at": created_at,
                 "url": url,
                 "result": result,
+                "result_encoding": result_encoding,
                 "error": error,
                 "completed_at": completed_at,
                 "owner": owner,
@@ -924,7 +922,7 @@ def test_worker_completes_and_removes_stream_entry_atomically():
 
     task = redis.hashes[queue.task_key(task_id)]
     assert task["status"] == "completed"
-    assert json.loads(task["result"])["success"] is True
+    assert decode_task_result(task, task_id)["success"] is True
     assert queue.payload_key(task_id) not in redis.hashes
     assert redis.acks == [(queue.settings.stream, entry.stream_id)]
     assert redis.deleted == [(queue.settings.stream, entry.stream_id)]
@@ -1011,7 +1009,7 @@ def test_stale_attempt_cannot_publish_terminal_state_after_takeover():
     )
     task = redis.hashes[queue.task_key(task_id)]
     assert task["status"] == "completed"
-    assert json.loads(task["result"]) == {"worker": "b"}
+    assert decode_task_result(task, task_id) == {"worker": "b"}
     assert task["owner"] == "alice"
 
 
@@ -1109,7 +1107,7 @@ def test_stale_missing_payload_cleanup_cannot_overwrite_valid_completion_or_doub
 
     task = redis.hashes[queue.task_key(task_id)]
     assert task["status"] == "completed"
-    assert json.loads(task["result"]) == {"worker": "b"}
+    assert decode_task_result(task, task_id) == {"worker": "b"}
     assert task_id not in redis.zsets[principal_lease_key("alice")]
 
     _queue, replacement = enqueue(redis, config, owner="alice")
