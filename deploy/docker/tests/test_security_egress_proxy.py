@@ -163,6 +163,86 @@ class TestPinningProxy:
         finally:
             up.close()
 
+    async def test_tunnel_ends_when_client_finishes_to_non_reading_upstream(
+        self, monkeypatch
+    ):
+        # The upstream never reads, so bytes the client sends beyond the
+        # kernel's small buffers stay queued on the proxy's upstream writer.
+        # Closing that writer then never runs connection_lost, so a splice
+        # that waits for both directions keeps reading the silent upstream
+        # forever after the client's direction ends.
+        # The kernel completes the handshake into the backlog; nothing accepts
+        # or reads, and the accepted socket inherits the small receive buffer.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        up_port = listener.getsockname()[1]
+        monkeypatch.setattr(
+            egress_proxy,
+            "resolve_and_pin",
+            lambda url: PinnedTarget("https", "stuck.example", up_port, "127.0.0.1"),
+        )
+        real_open_connection = asyncio.open_connection
+
+        async def small_send_buffer(*args, **kwargs):
+            reader, writer = await real_open_connection(*args, **kwargs)
+            writer.get_extra_info("socket").setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, 4096
+            )
+            return reader, writer
+
+        monkeypatch.setattr(egress_proxy.asyncio, "open_connection", small_send_buffer)
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await real_open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT stuck.example:{up_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            assert b"200" in await asyncio.wait_for(r.readline(), timeout=5)
+            await r.readline()
+            # Above the kernel buffers, below the transport's 64 KiB
+            # high-water mark, so the client direction reaches EOF.
+            w.write(b"x" * (40 * 1024))
+            w.write_eof()
+            assert await asyncio.wait_for(r.read(), timeout=5) == b""
+            w.close()
+        finally:
+            listener.close()
+            await proxy.stop()
+
+    async def test_stop_aborts_client_holding_unsent_bytes(self, monkeypatch):
+        # A client that stops reading leaves the proxy's client writer holding
+        # unsent bytes; closing it never runs connection_lost, so
+        # Server.wait_closed() hung unless stop() aborts the transport.
+        async def flooding_upstream(reader, writer):
+            writer.write(b"x" * (8 * 1024 * 1024))
+            await reader.read()
+        up = await asyncio.start_server(flooding_upstream, "127.0.0.1", 0)
+        up_port = up.sockets[0].getsockname()[1]
+        monkeypatch.setattr(
+            egress_proxy,
+            "resolve_and_pin",
+            lambda url: PinnedTarget("https", "flood.example", up_port, "127.0.0.1"),
+        )
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            w.write(f"CONNECT flood.example:{up_port} HTTP/1.1\r\n\r\n".encode())
+            await w.drain()
+            assert b"200" in await asyncio.wait_for(r.readline(), timeout=5)
+            await r.readline()
+            # Proves the flood is flowing; the client reads nothing more.
+            await asyncio.wait_for(r.readexactly(1), timeout=5)
+            await asyncio.sleep(0.5)
+            await asyncio.wait_for(proxy.stop(), timeout=5)
+            w.close()
+        finally:
+            up.close()
+
     async def test_malformed_connect_400(self):
         proxy = PinningProxy()
         await proxy.start()
