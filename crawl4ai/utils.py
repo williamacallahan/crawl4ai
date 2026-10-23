@@ -3120,6 +3120,34 @@ class HeadPeekr:
         title_match = re.search(r'<title>(.*?)</title>', head_content, re.IGNORECASE | re.DOTALL)
         return title_match.group(1) if title_match else None
 
+NOSCRIPT_OPEN_REGEX = re.compile(r"<noscript\b[^>]*>", re.IGNORECASE)
+NOSCRIPT_CLOSE_REGEX = re.compile(r"</noscript\s*>", re.IGNORECASE)
+RAW_TEXT_REGEX = re.compile(
+    r"<script\b.*?(?:</script\s*>|\Z)|<style\b.*?(?:</style\s*>|\Z)|<!--.*?(?:-->|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def unwrap_orphaned_noscript(html: str) -> str:
+    """Drop unbalanced <noscript> tags while keeping their contents.
+
+    A scripting-enabled browser can discard a nested noscript's closing tag
+    when serializing a page. lxml then nests the rest of the document inside
+    the unclosed element, so removing noscript would delete the page body.
+
+    Balanced documents are returned untouched. Tags inside script, style and
+    comments are text and are excluded from the count. Unclosed raw-text
+    regions run to the end of the document, keeping the scan linear even
+    when a page contains many unclosed openers.
+    """
+    markup = RAW_TEXT_REGEX.sub("", html)
+    opens = len(NOSCRIPT_OPEN_REGEX.findall(markup))
+    closes = len(NOSCRIPT_CLOSE_REGEX.findall(markup))
+    if opens <= closes:
+        return html
+    return NOSCRIPT_CLOSE_REGEX.sub("", NOSCRIPT_OPEN_REGEX.sub("", html))
+
+
 def preprocess_html_for_schema(html_content, text_threshold=100, attr_value_threshold=200, max_size=100000):
     """
     Preprocess HTML to reduce size while preserving structure for schema generation.
@@ -3136,7 +3164,7 @@ def preprocess_html_for_schema(html_content, text_threshold=100, attr_value_thre
     try:
         # Parse HTML with error recovery
         parser = etree.HTMLParser(remove_comments=True, remove_blank_text=True)
-        tree = lhtml.fromstring(html_content, parser=parser)
+        tree = lhtml.fromstring(unwrap_orphaned_noscript(html_content), parser=parser)
         
         # 1. Remove HEAD section (keep only BODY)
         head_elements = tree.xpath('//head')
