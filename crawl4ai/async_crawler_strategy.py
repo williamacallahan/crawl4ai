@@ -2843,7 +2843,11 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
             except asyncio.exceptions.TimeoutError as e:
                 await self.hooks['on_error'](e)
                 raise ConnectionTimeoutError(f"Request timed out: {str(e)}")
-            
+
+            except HTTPStatusError as e:
+                await self.hooks['on_error'](e)
+                raise
+
             except Exception as e:
                 await self.hooks['on_error'](e)
                 raise HTTPCrawlerError(f"HTTP request failed: {str(e)}")
