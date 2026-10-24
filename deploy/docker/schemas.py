@@ -97,7 +97,7 @@ class HTMLRequest(BaseModel):
     
 class ScreenshotRequest(BaseModel):
     url: str
-    screenshot_wait_for: float | None = 2
+    screenshot_wait_for: float | None = Field(default=2, ge=0, le=5)
     wait_for_images: bool | None = False
     # Deprecated no-op: results are written only to the server artifact store.
     output_path: str | None = Field(
