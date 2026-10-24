@@ -6,6 +6,7 @@ from crawl4ai.async_logger import AsyncLogger
 from crawl4ai.async_crawler_strategy import AsyncCrawlerStrategy
 from crawl4ai.models import AsyncCrawlResponse, ScrapingResult 
 from crawl4ai.content_scraping_strategy import ContentScrapingStrategy
+from crawl4ai.utils import is_external_url, get_base_domain
 from .processor import NaivePDFProcessorStrategy  # Assuming your current PDF code is in pdf_processor.py
 
 # Default resource bounds for remote PDF fetches. These cap what an untrusted
@@ -184,7 +185,8 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
             
             # Accumulate media and links with page numbers
             media = {"images": []}
-            links = {"urls": []}
+            links = {"internal": [], "external": []}
+            base_domain = get_base_domain(url)
             
             for page in result.pages:
                 # Add page number to each image
@@ -194,10 +196,15 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
                 
                 # Add page number to each link
                 for link in page.links:
-                    links["urls"].append({
-                        "url": link,
-                        "page": page.page_number
-                    })
+                    entry = {
+                        "href": link,
+                        "text": "",
+                        "page": page.page_number,
+                    }
+                    if is_external_url(link, base_domain):
+                        links["external"].append(entry)
+                    else:
+                        links["internal"].append(entry)
 
             return ScrapingResult(
                 cleaned_html=cleaned_html,
