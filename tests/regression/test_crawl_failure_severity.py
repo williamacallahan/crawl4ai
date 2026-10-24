@@ -1,3 +1,4 @@
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -92,6 +93,32 @@ async def test_unproven_navigation_failures_remain_platform_errors(error_detail)
 
     with pytest.raises(RuntimeError, match="Failed on navigating ACS-GOTO"):
         await strategy.crawl("https://example.invalid", CrawlerRunConfig())
+
+
+@pytest.mark.asyncio
+async def test_page_crash_ignores_manager_wide_renderer_kill_history():
+    # The watchdog's kill history is per browser, not per page. Even when a
+    # recent kill is visible on the manager, this page's crash has no causal
+    # attribution and must stay a browser fault.
+    strategy = _navigation_strategy("ignored")
+    page, _ = strategy.browser_manager.get_page.return_value
+    crash_handlers = {}
+    page.on = lambda event, handler: crash_handlers.__setitem__(event, handler)
+    strategy.browser_manager._close_page_quietly = AsyncMock()
+    strategy.browser_manager.consecutive_failures = 0
+    strategy.browser_manager.renderer_kills = [(time.monotonic(), "rss")]
+
+    async def crash_then_fail(*args, **kwargs):
+        crash_handlers["crash"](page)
+        raise Error("Page crashed")
+
+    page.goto = AsyncMock(side_effect=crash_then_fail)
+
+    with pytest.raises(Error) as raised:
+        await strategy.crawl("https://example.invalid", CrawlerRunConfig())
+
+    assert str(raised.value) == "Target page crashed"
+    assert strategy.browser_manager.consecutive_failures == 1
 
 
 @pytest.mark.asyncio

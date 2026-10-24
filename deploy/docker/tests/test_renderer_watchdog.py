@@ -4,7 +4,6 @@ import asyncio
 import sys
 from dataclasses import replace
 from pathlib import Path
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -46,7 +45,6 @@ def crawler(*, send=None, active=1):
         _closing=False,
         pool_recycle_requested=False,
         consecutive_failures=0,
-        renderer_kills=deque(maxlen=12),
     )
 
     def request_pool_recycle(reason):

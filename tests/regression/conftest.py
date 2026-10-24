@@ -542,6 +542,39 @@ IFRAME_CHILD_HTML = """\
 </body>
 </html>"""
 
+# A page whose script navigates to a different document shortly after load,
+# plus that target document, served with a non-200 status and marker headers.
+# Used to verify the landed-document metadata follows a post-goto navigation.
+JS_NAV_SOURCE_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+    <title>JS Navigation Source</title>
+    <script>
+        setTimeout(function () {
+            window.location.replace("/js-nav-target");
+        }, 400);
+    </script>
+</head>
+<body>
+    <h1>Source page that navigates away</h1>
+    <p>This page replaces itself with the /js-nav-target document shortly
+    after load, so the captured HTML describes the target, not this source.</p>
+</body>
+</html>"""
+
+JS_NAV_TARGET_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><title>JS Navigation Target</title></head>
+<body>
+    <h1>JS navigation target reached</h1>
+    <p>This document is served with status 404 so the landed status code is
+    distinguishable from the source page's 200, and it carries enough visible
+    text for the crawl to pass its empty-content checks.</p>
+</body>
+</html>"""
+
 
 # ---------------------------------------------------------------------------
 # Server Handlers
@@ -592,6 +625,20 @@ async def _iframe_http_handler(request):
 
 async def _iframe_child_handler(request):
     return await _serve_html(IFRAME_CHILD_HTML)
+
+async def _js_nav_source_handler(request):
+    return web.Response(
+        text=JS_NAV_SOURCE_HTML,
+        content_type="text/html",
+        headers={"X-Source-Page": "source"},
+    )
+
+async def _js_nav_target_handler(request):
+    return web.Response(
+        text=JS_NAV_TARGET_HTML,
+        content_type="text/html",
+        status=404,
+    )
 
 async def _redirect_handler(request):
     raise web.HTTPFound("/")
@@ -683,6 +730,9 @@ def _create_app():
     app.router.add_get("/iframe-page", _iframe_handler)
     app.router.add_get("/iframe-http-page", _iframe_http_handler)
     app.router.add_get("/iframe-child", _iframe_child_handler)
+    app.router.add_get("/js-nav-source", _js_nav_source_handler)
+    app.router.add_get("/js-nav-target", _js_nav_target_handler)
+    app.router.add_get("/folder;a/page", _js_nav_target_handler)
     app.router.add_get("/redirect", _redirect_handler)
     app.router.add_get("/not-found", _not_found_handler)
     app.router.add_get("/slow", _slow_handler)

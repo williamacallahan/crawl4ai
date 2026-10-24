@@ -56,10 +56,6 @@ class TargetNavigationError(RuntimeError):
     """A direct target origin refused browser navigation."""
 
 
-# Chromium reports a killed renderer's crash within this window of the kill.
-RENDERER_KILL_CRASH_WINDOW_SECONDS = 5.0
-
-
 def _interrupted_step(error: BaseException) -> str:
     """Name the crawl step an expired page budget interrupted.
 
@@ -651,6 +647,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         status_code = None
         redirected_url = url
         redirected_status_code = None
+        document_response = None
 
         # Reset downloaded files list for new crawl
         self._downloaded_files = []
@@ -710,13 +707,16 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         context = None
         execution_session = None
         renderer_crashed = False
-        crashed_at = None
         crash_cleanup = None
 
+        def on_document_response(response):
+            nonlocal document_response
+            if response.request.is_navigation_request() and response.frame == page.main_frame:
+                document_response = response
+
         def on_crash(crashed_page):
-            nonlocal renderer_crashed, crashed_at, crash_cleanup
+            nonlocal renderer_crashed, crash_cleanup
             renderer_crashed = True
-            crashed_at = time.monotonic()
             # Closing the crashed target rejects its pending Playwright calls;
             # cancelling only the Python waiter leaves protocol promises alive.
             crash_cleanup = asyncio.create_task(
@@ -744,6 +744,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # Playwright evaluate promises can remain pending after SIGKILL.
             # The page crash event is the renderer's terminal signal.
             page.on("crash", on_crash)
+            page.on("response", on_document_response)
             # Attaching CDP to an already-busy renderer can itself hang. Attach
             # while this page is still blank, before hooks/navigation run JS.
             if getattr(self.browser_config, "browser_type", None) == "chromium":
@@ -1335,6 +1336,14 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             else:
                 html = await self._settled_content(page)
 
+            # Original-request status/headers keep their first-hop contract.
+            # Snapshot the landed pair with the HTML, before export/hooks can
+            # navigate again; site script may have replaced goto's document.
+            if not url.startswith(("file://", "raw://", "raw:")):
+                redirected_url = page.url
+                if document_response is not None:
+                    redirected_status_code = document_response.status
+
             await self.execute_hook(
                 "before_return_html", page=page, html=html, context=context, config=config
             )
@@ -1391,16 +1400,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         raise
                 return html
 
-            ###
-            # This ensures we capture the current page URL at the time we return the response,
-            # which correctly reflects any JavaScript navigation that occurred.
-            # For raw:/file:// URLs, preserve the earlier redirected_url (config.base_url or None)
-            # instead of using page.url which would be "about:blank".
-            ###
-            is_local_content = url.startswith("file://") or url.startswith("raw://") or url.startswith("raw:")
-            if not is_local_content:
-                redirected_url = page.url  # Use current page URL to capture JS redirects
-
             # For adapters that buffer console messages in-page (e.g.
             # UndetectedAdapter), surface them BEFORE building the response.
             # AsyncCrawlResponse is a Pydantic v2 model that copies its
@@ -1453,17 +1452,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             if renderer_crashed or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
                 self.browser_manager.consecutive_failures += 1
             if renderer_crashed:
-                # Up to a dozen pages share one browser, so only a kill just
-                # before this page's crash explains it, and only when every
-                # such kill names the same limit.
-                reasons = {
-                    reason for killed_at, reason in self.browser_manager.renderer_kills
-                    if 0 <= crashed_at - killed_at <= RENDERER_KILL_CRASH_WINDOW_SECONDS
-                }
-                if len(reasons) == 1:
-                    raise Error(
-                        f"Target page crashed: renderer exceeded its {reasons.pop()} limit"
-                    ) from error
+                # A page crash names no renderer, and the watchdog records its
+                # kills for the whole browser, not for the page whose renderer
+                # it killed. Only a crash with page attribution may name a
+                # resource limit; an unattributed one stays a browser fault.
                 raise Error("Target page crashed") from error
             raise
 
@@ -1474,6 +1466,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 # reuses (even for session pages).
                 try:
                     page.remove_listener("crash", on_crash)
+                    page.remove_listener("response", on_document_response)
                     if crash_cleanup is not None:
                         await asyncio.shield(crash_cleanup)
                     if config.capture_network_requests:

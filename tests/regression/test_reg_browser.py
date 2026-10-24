@@ -22,6 +22,51 @@ from crawl4ai.cache_context import CacheMode
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_js_navigation_updates_landed_status(local_server):
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        result = await crawler.arun(
+            local_server + "/js-nav-source",
+            config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS, delay_before_return_html=1.5),
+        )
+
+    assert result.success, result.error_message
+    assert "JS navigation target reached" in result.html
+    assert result.redirected_url.endswith("/js-nav-target")
+    assert result.redirected_status_code == 404
+    # The original-request fields deliberately retain first-response semantics.
+    assert result.status_code == 200
+    assert result.response_headers.get("x-source-page") == "source"
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_http_redirect_keeps_first_and_landed_status(local_server):
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        result = await crawler.arun(
+            local_server + "/redirect", config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS),
+        )
+
+    assert result.success, result.error_message
+    assert result.status_code == 302
+    assert result.redirected_status_code == 200
+    assert result.redirected_url == local_server + "/"
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_default_cookie_accepts_semicolon_document_path(local_server):
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        result = await crawler.arun(
+            local_server + "/folder;a/page", config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS),
+        )
+
+    # The test server's 404 still reaches navigation; cookie setup used to fail first.
+    assert result.success, result.error_message
+    assert result.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_browser_lifecycle(local_server):
     """Create crawler, start, crawl, and close explicitly without context manager."""

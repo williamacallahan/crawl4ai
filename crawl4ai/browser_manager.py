@@ -1,5 +1,4 @@
 import asyncio
-from collections import deque
 import hashlib
 import os
 import re
@@ -13,6 +12,7 @@ import time
 import warnings
 import weakref
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import psutil
 from playwright.async_api import BrowserContext, TimeoutError as PlaywrightTimeoutError
@@ -816,10 +816,6 @@ class BrowserManager:
         # partially-created page.
         self._pages_served = 0
         self.consecutive_failures = 0
-        # (monotonic time, exceeded limit) of the renderers an external
-        # resource watchdog recently killed in this browser; a page crash right
-        # after one is a deliberate resource rejection, not a renderer fault.
-        self.renderer_kills: deque[tuple[float, str]] = deque(maxlen=12)
         self._recycle_due = False
         self._recycling = False
         self._closing = False
@@ -1481,6 +1477,9 @@ class BrowserManager:
                 cookie_url = crawlerRunConfig.base_url
 
         if cookie_url:
+            # Playwright derives a cookie path from the URL. Document paths
+            # containing semicolons are valid URLs but invalid cookie paths.
+            cookie_url = urlsplit(cookie_url)._replace(path="/", query="", fragment="").geturl()
             await context.add_cookies(
                 [
                     {
