@@ -224,3 +224,95 @@ def test_unreadable_collector_logs_keep_the_guard_failure(monkeypatch, tmp_path)
     monkeypatch.setattr(withdrawals.subprocess, "run", slow_logs)
     detail = guard_detail(collector)
     assert detail["state"] == "failed" and "timed out after 30 seconds" in detail["output"]
+
+
+def test_collect_seconds_defaults_to_seconds_for_back_compat(monkeypatch, tmp_path):
+    # Pre-2e49c6e7 callers (and those that budget one window rather than one
+    # per phase) still work: omitting ``collect_seconds`` falls back to
+    # ``seconds`` for both the runner deadline and the collector program.
+    monkeypatch.setattr(withdrawals, "ready_nodes", lambda: {"node1": "worker"})
+    collector = withdrawals.Withdrawals("crawl4ai", "image", tmp_path / "lifecycle.json", 30)
+    assert collector.seconds == 30
+    assert collector.collect_seconds == 30
+
+
+def test_collect_seconds_drives_the_collector_program_window(monkeypatch, tmp_path):
+    # The collector program runs on its own immutable clock inside the image;
+    # its journal window is the separate ``collect_seconds`` budget sized to
+    # outlive the legitimate sum of every caller phase the runner deadline
+    # spans (regression for the 2e49c6e7 stale-deadline bug).
+    monkeypatch.setattr(withdrawals, "ready_nodes", lambda: {"node1": "worker"})
+    monkeypatch.setattr(withdrawals, "census", lambda _app: [])
+    collector = withdrawals.Withdrawals(
+        "crawl4ai", "image", tmp_path / "lifecycle.json", 30, collect_seconds=120)
+    captured = []
+
+    def create(name, node, program, *_args, **_kwargs):
+        captured.append((name, program))
+        return "service"
+
+    monkeypatch.setattr(collector, "_create", create)
+    running = {"ID": "task1", "NodeID": "node1", "Status": {
+        "State": "running", "ContainerStatus": {"ContainerID": "container1", "ExitCode": 0}}}
+    monkeypatch.setattr(collector, "_task", lambda *_args, **_kwargs: running)
+    monkeypatch.setattr(collector, "_logs", lambda *_args: [{"ready": True}, {"armed": True}])
+    monkeypatch.setattr(collector, "_marker", lambda *_args: None)
+    collector.start()
+    # Exactly one collector create (the marker create carries ``"pass"``).
+    assert [name for name, _ in captured if not name.endswith("-arm")]
+    # The collector program embeds ``_collect(...)`` with ``collect_seconds``.
+    collector_program = next(program for name, program in captured if not name.endswith("-arm"))
+    assert "_collect('crawl4ai', " in collector_program
+    assert ", 120)" in collector_program
+    assert ", 30)" not in collector_program
+
+
+def test_refresh_resets_the_per_phase_runner_deadline(monkeypatch, tmp_path):
+    # Before refresh, a wall clock past the single __init__ deadline is the
+    # 2e49c6e7 stale-deadline failure: a healthy runner reports ``"expired"``.
+    # After refresh, the per-phase deadline starts over at the current clock,
+    # so a phase within its own fresh bound never fails an earlier phase's
+    # collector.
+    clock = [0]
+    monkeypatch.setattr(withdrawals.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(withdrawals, "ready_nodes", lambda: {"node1": "worker"})
+    collector = withdrawals.Withdrawals("crawl4ai", "image", tmp_path / "lifecycle.json", 30)
+    collector.collectors["node1"] = ("collector", "task1", "container1")
+    healthy = {"ID": "task1", "NodeID": "node1", "Status": {
+        "State": "running", "Err": None, "ContainerStatus": {
+            "ContainerID": "container1", "ExitCode": 0}}}
+    monkeypatch.setattr(collector, "_task", lambda _service: healthy)
+    clock[0] = 31  # Past the __init__ deadline of 30.
+    detail = guard_detail(collector)
+    assert detail["state"] == "running" and detail["expired"] is True
+    collector.refresh()  # New per-phase deadline: 31 + 30 = 61.
+    collector._guard("node1")  # Must not raise.
+    clock[0] = 60
+    collector._guard("node1")  # Still inside the fresh window.
+    clock[0] = 62
+    detail = guard_detail(collector)
+    assert detail["state"] == "running" and detail["expired"] is True
+
+
+def test_check_surfaces_a_dead_collector_in_the_phase_that_owned_the_wait(
+    monkeypatch, tmp_path
+):
+    # ``check()`` polls every collector through ``_guard`` so a collector that
+    # died (or whose internal journal expired) in an earlier phase surfaces in
+    # the wait that owns the slow step — not at the finish barrier after a
+    # successful rollout, misleadingly reported as ``"expired"``.
+    monkeypatch.setattr(withdrawals, "ready_nodes", lambda: {"node1": "worker", "node2": "other"})
+    collector = withdrawals.Withdrawals("crawl4ai", "image", tmp_path / "lifecycle.json", 30)
+    collector.collectors["node1"] = ("collector1", "task1", "container1")
+    collector.collectors["node2"] = ("collector2", "task2", "container2")
+    healthy = {"ID": "task1", "NodeID": "node1", "Status": {
+        "State": "running", "Err": None, "ContainerStatus": {"ContainerID": "container1", "ExitCode": 0}}}
+    failed = {"ID": "task2", "NodeID": "node2", "Status": {
+        "State": "failed", "Err": "task: non-zero exit (137)",
+        "ContainerStatus": {"ContainerID": "container2", "ExitCode": 137}}}
+    tasks = {"collector1": healthy, "collector2": failed}
+    monkeypatch.setattr(collector, "_task", lambda service: tasks[service])
+    monkeypatch.setattr(withdrawals.subprocess, "run",
+                        lambda *_args, **_kwargs: type("Logs", (), {"stdout": "", "stderr": ""})())
+    with pytest.raises(withdrawals.StateError, match="withdrawal collector failed"):
+        collector.check()

@@ -63,6 +63,12 @@ def deploy_event_boundary(monkeypatch, tmp_path, request):
         def finish(self, _candidate):
             return None
 
+        def refresh(self):
+            pass
+
+        def check(self):
+            pass
+
     monkeypatch.setenv("ROLLOUT_MONITOR_PATH", str(tmp_path / "monitor.jsonl"))
     monkeypatch.setattr(rollout.withdrawals, "Withdrawals", Collector)
     monkeypatch.setattr(rollout.withdrawals, "census", lambda _app: [])
