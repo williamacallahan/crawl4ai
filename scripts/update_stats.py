@@ -150,34 +150,6 @@ def fetch_github_traffic() -> dict:
     return result
 
 
-def fetch_pypi_downloads() -> dict:
-    """Fetch PyPI download stats from pypistats.org API."""
-    print("Fetching PyPI download stats...")
-    url = f"https://pypistats.org/api/packages/{PYPI_PACKAGE}/overall?mirrors=true"
-    data = fetch_url_json(url)
-    if not data or "data" not in data:
-        return {"monthly": {}, "daily": [], "total": 0}
-
-    # Aggregate by month and collect daily data
-    monthly = defaultdict(int)
-    daily = []
-    total = 0
-    for entry in data["data"]:
-        if entry.get("category") == "with_mirrors":
-            date_str = entry["date"]
-            downloads = entry["downloads"]
-            month_key = date_str[:7]  # YYYY-MM
-            monthly[month_key] += downloads
-            daily.append({"date": date_str, "downloads": downloads})
-            total += downloads
-
-    # Sort
-    monthly_sorted = dict(sorted(monthly.items()))
-    daily.sort(key=lambda x: x["date"])
-
-    return {"monthly": monthly_sorted, "daily": daily, "total": total}
-
-
 def fetch_pypi_live() -> dict:
     """Fetch recent PyPI download stats (~180 days) from pypistats.org API."""
     print("Fetching PyPI download stats (live)...")
