@@ -158,6 +158,24 @@ def test_redis_memory_full_is_a_retryable_503_not_a_500(lifespan_server, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_resilient_client_rides_out_a_redis_replacement(server_module):
+    # A redeployed Redis refuses connections for seconds; a command issued then
+    # must complete once Redis is back instead of failing on the first refusal.
+    async with redis_forwarder() as (url, restore):
+        redis = aioredis.from_url(url, **server_module._REDIS_RESILIENT_KWARGS)
+        try:
+            pending = asyncio.create_task(redis.set("replacement-probe", "kept"))
+            await asyncio.sleep(1.5)
+            assert not pending.done()
+            await restore()
+            assert await asyncio.wait_for(pending, timeout=5) is True
+            assert await redis.get("replacement-probe") == b"kept"
+        finally:
+            await redis.delete("replacement-probe")
+            await redis.aclose()
+
+
+@pytest.mark.asyncio
 async def test_lifespan_survives_redis_outage_and_recovers(lifespan_server, monkeypatch):
     server, browser_starts = lifespan_server
     async with redis_forwarder() as (url, restore):

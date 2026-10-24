@@ -8,6 +8,9 @@ the same authenticated URL shape.
 import os
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from redis.asyncio.retry import Retry
+from redis.backoff import EqualJitterBackoff
+
 
 def redis_auth_from_config(config: dict) -> tuple[str, str]:
     """Return Redis ACL username/password from config and environment."""
@@ -45,11 +48,17 @@ def build_redis_url(config: dict) -> str:
 # on first reuse, which turns /health into a transient 503. health_check_interval
 # makes redis-py PING a connection idle longer than this before reusing it, and
 # keepalive stops middleboxes from idling the socket out in the first place.
+#
+# Replacing the singleton Redis task (a redeploy, or Swarm re-placing it after
+# its node drops) leaves its VIP refusing, then unresolvable, for about 8.4s
+# (2026-10-24). `retry_on_timeout` made redis-py build Retry(retries=1), so
+# # every client failed at once; 22 jittered retries wait at least 9.75s and at
+# most 19.5s, and /health and startup still bound PING with their own wait_for.
 RESILIENT_CLIENT_KWARGS = {
     "health_check_interval": 30,
     "socket_keepalive": True,
     "socket_connect_timeout": 2.0,
-    "retry_on_timeout": True,
+    "retry": Retry(EqualJitterBackoff(cap=1.0, base=0.05), retries=22),
 }
 
 
