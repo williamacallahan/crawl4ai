@@ -82,6 +82,9 @@ crawl_jobs:
   # 4 MiB query buffer = 64 MiB; LLM results, the webhook outbox and stream
   # metadata take ~32 MiB more. 96 MiB in all.
   redis_headroom_bytes: 100663296
+  # Exited workers' empty consumers each idle worker deletes per group per
+  # lease_seconds (crawl_job_consumers.py); bounds one XINFO-driven script.
+  consumer_reap_batch: 100
 
 # Per-Swarm-node archive.org pacing. archive.org rate-limits per client IP,
 # so each node keeps one shared budget in Redis (crawl4ai:archive:next:{node})
@@ -169,6 +172,12 @@ crawler:
       renderer_cpu_cores: 0.9     # CPU use, or the busiest thread's on-CPU plus run-queue time, so host load cannot hide a spinner
       renderer_cpu_seconds: 65.0  # page_timeout (60 s) + termination (5 s): only renderers termination missed
       renderer_rss_mb: 768
+      # Summed RSS of one browser's non-renderer processes (browser, GPU,
+      # utility, zygote); renderers have renderer_rss_mb. Idle production
+      # browsers measure ~330-390 MiB (browser ~101-112, gpu ~44-51, audio
+      # ~52-60, network ~73-87, zygote ~57-87), so this leaves ~210 MiB of
+      # growth before the browser drains and restarts, permanent included.
+      browser_rss_mb: 600
       browser_probe_timeout_seconds: 5.0
       consecutive_failure_limit: 3
   browser:
@@ -176,6 +185,7 @@ crawler:
       headless: true
       text_mode: true
       memory_saving_mode: true
+      avoid_ads: true
       # ~330 pages reach one process's browser per 6h at production load, so a
       # 500-page budget never restarted a browser before the replica recycle.
       max_pages_before_recycle: 100

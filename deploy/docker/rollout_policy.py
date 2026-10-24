@@ -68,9 +68,12 @@ REDIS_NODE = "haiku-18"
 # everysec, never always: appendfsync=always was half of the 2026-08-28 fleet
 # kill, stalling every crawl behind Redis. Pinned so a console edit cannot
 # reintroduce it silently.
-# Bound below the 1GiB limit; volatile-lru excludes the no-TTL queue and in-flight
-# task hashes. Terminal results and the TTL-bearing LLM permit remain evictable;
-# periodic permit renewal does not guarantee protection from eviction.
+# noeviction: nothing Crawl4AI stores may disappear early (unpolled results,
+# the LLM permit, archive.org pacing). Enqueue admission refuses work before
+# maxmemory, and a write past it answers 503. 700mb sits inside the 2 GiB
+# container limit with room for an AOF-rewrite fork to copy every page. The
+# normal-client output buffer cap stops a stalled reader of 4 MiB results from
+# growing memory without bound.
 REDIS_COMMAND = [
     "redis-server",
     "--dir", "/data",
@@ -78,7 +81,8 @@ REDIS_COMMAND = [
     "--appendfsync", "everysec",
     "--loglevel", "notice",
     "--maxmemory", "700mb",
-    "--maxmemory-policy", "volatile-lru",
+    "--maxmemory-policy", "noeviction",
+    "--client-output-buffer-limit", "normal", "64mb", "32mb", "60",
 ]
 REDIS_MOUNTS = [{"Type": "volume", "Source": "crawl4ai-redis-data", "Target": "/data"}]
 REDIS_HEALTHCHECK_TEST = ["CMD", "redis-cli", "ping"]

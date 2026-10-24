@@ -196,7 +196,8 @@ def renderer_tree(pool, monkeypatch):
 
     def process(pid):
         assert pid == 1234
-        return SimpleNamespace(children=lambda recursive: [renderer])
+        return SimpleNamespace(children=lambda recursive: [renderer],
+                               memory_info=lambda: SimpleNamespace(rss=0))
 
     monkeypatch.setattr(pool.psutil, "Process", process)
     monkeypatch.setattr(
@@ -293,6 +294,36 @@ def test_renderer_rss_limit_is_immediate_and_ignores_nonrenderers(pool, renderer
         "pid=42 reason=rss browser_pid=1234 created_at=123.0 "
         f"rss_bytes={renderer.rss} rss_limit_bytes=805306368"
     ) in caplog.text
+
+
+@pytest.mark.parametrize("process_type,recycle_due,drain_pending,recycled", [
+    ("--type=gpu-process", False, False, True),   # non-renderer growth
+    ("--type=renderer", False, False, False),     # one heavy page, under renderer_rss_mb
+    ("--type=gpu-process", True, False, True),    # session-deferred page-count recycle
+    ("--type=gpu-process", True, True, False),    # its drain already runs
+])
+def test_non_renderer_rss_over_cap_drains_and_restarts(
+    pool, renderer_tree, process_type, recycle_due, drain_pending, recycled
+):
+    from prometheus_client import REGISTRY
+
+    target, child = renderer_tree
+    manager = target.crawler_strategy.browser_manager
+    manager._pages_served, manager._recycle_due = 1, recycle_due
+    manager._pool_recycle_pending = drain_pending
+    child.arguments = ["chromium", process_type]
+    child.rss = (pool.WATCHDOG.browser_rss_mb + 100) * 1024 * 1024
+    assert child.rss < pool.WATCHDOG.renderer_rss_mb * 1024 * 1024
+
+    def recycles():
+        return REGISTRY.get_sample_value(
+            "crawl4ai_browser_recycles_total", {"reason": "browser_tree_rss"}) or 0
+
+    before = recycles()
+    pool._watch_renderers(target, 0)
+    assert child.killed == 0
+    assert (getattr(manager, "pool_recycle_reason", None) == "browser process tree rss") is recycled
+    assert recycles() - before == (1 if recycled else 0)
 
 
 @pytest.mark.parametrize("field,value", [

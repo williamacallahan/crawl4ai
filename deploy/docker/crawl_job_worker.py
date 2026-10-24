@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from archive_budget import ArchiveBudgetSpent
+from crawl_job_consumers import reap_idle_consumers
 from crawl_job_queue import (
     CrawlJobAttempt,
     CrawlJobEntry,
@@ -47,6 +48,7 @@ class CrawlJobWorker:
         self.consumer = consumer
         self.crawl = crawl or self._crawl
         self.webhook_service = webhook_service or WebhookDeliveryService(config)
+        self._next_consumer_reap = 0.0
 
     async def run(self) -> None:
         # A worker started during a Redis outage waits in-process: exiting
@@ -76,6 +78,7 @@ class CrawlJobWorker:
                 entries = await self.queue.claim_stale(self.consumer)
                 await self._deliver_pending_webhooks()
                 if not entries:
+                    await self._reap_idle_consumers()
                     entries = await self.queue.read_new(self.consumer)
                 for entry in entries:
                     await self.process(entry)
@@ -84,6 +87,14 @@ class CrawlJobWorker:
             except Exception:
                 logger.exception("Crawl job worker loop failed; retaining pending work for retry")
                 await asyncio.sleep(1)
+
+    async def _reap_idle_consumers(self) -> None:
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._next_consumer_reap:
+            return
+        # Set first: a failing pass then costs one loop iteration per lease.
+        self._next_consumer_reap = loop.time() + self.queue.settings.lease_seconds
+        await reap_idle_consumers(self.queue)
 
     async def _outbox_loop(self) -> None:
         while True:

@@ -148,6 +148,7 @@ DEFAULT_CONFIG = {
         "max_attempt_seconds": 600,
         "max_payload_bytes": 262144,
         "redis_headroom_bytes": 100663296,
+        "consumer_reap_batch": 100,
     },
     "rate_limiting": {
         "enabled": True,
@@ -182,7 +183,7 @@ DEFAULT_CONFIG = {
             "worker_admission_wait_seconds": 300.0,
         },
         "browser": {
-            "kwargs": {"headless": True, "text_mode": True},
+            "kwargs": {"headless": True, "text_mode": True, "avoid_ads": True},
             "extra_args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -263,6 +264,7 @@ class BrowserWatchdogSettings:
     renderer_cpu_cores: float = 0.9
     renderer_cpu_seconds: float = 65.0
     renderer_rss_mb: int = 768
+    browser_rss_mb: int = 600
     browser_probe_timeout_seconds: float = 5.0
     consecutive_failure_limit: int = 3
 
@@ -272,15 +274,14 @@ class BrowserWatchdogSettings:
         values = {}
         for field in fields(cls):
             value = configured.get(field.name, field.default)
-            integral = field.name in {"renderer_rss_mb", "consecutive_failure_limit"}
-            expected = int if integral else (int, float)
+            expected = int if field.type is int else (int, float)
             if (
                 isinstance(value, bool)
                 or not isinstance(value, expected)
                 or not isfinite(value)
                 or value <= 0
             ):
-                kind = "integer" if integral else "number"
+                kind = "integer" if expected is int else "number"
                 raise ValueError(
                     f"crawler.pool.watchdog.{field.name} must be a positive {kind}"
                 )

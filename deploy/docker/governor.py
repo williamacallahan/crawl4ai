@@ -18,13 +18,17 @@ integration-tested pass; gunicorn --limit-request-* covers the transport layer.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import math
 
 DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 DEFAULT_MAX_PAGES = 100
 DEFAULT_MAX_DEPTH = 5
 DEFAULT_PER_PRINCIPAL_JOBS = 100
+
+logger = logging.getLogger(__name__)
 
 
 class BodySizeLimitMiddleware:
@@ -97,6 +101,69 @@ class BodySizeLimitMiddleware:
             ],
         })
         await send({"type": "http.response.body", "body": body})
+
+
+class CancelOnDisconnectMiddleware:
+    """Cancel a browser-bound handler whose client hangs up before its response.
+
+    Uvicorn only marks the request cycle disconnected and answers the next
+    ``receive()`` with ``http.disconnect``; it never cancels the handler, and a
+    non-stream handler stops reading once its body is parsed. Without this, a
+    caller that gives up keeps its browser page, admission permit and replica
+    page-budget slot until the crawl ends or hits limits.wall_clock_s. This
+    waits on ``receive()`` exactly as Starlette's StreamingResponse does
+    (listen_for_disconnect), once the body is consumed so it never takes body
+    bytes from the handler. A started response is left to finish: a stream
+    handles its own disconnect, and nothing remains to free.
+    """
+
+    def __init__(self, app, paths: frozenset[str]):
+        self.app = app
+        self.paths = paths
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] not in self.paths:
+            await self.app(scope, receive, send)
+            return
+        body_consumed = asyncio.Event()
+        response_started = False
+        disconnected = False
+
+        async def handler_receive():
+            message = await receive()
+            if message["type"] == "http.disconnect" or not message.get("more_body", False):
+                body_consumed.set()
+            return message
+
+        async def handler_send(message):
+            nonlocal response_started
+            response_started |= message["type"] == "http.response.start"
+            await send(message)
+
+        handler = asyncio.create_task(self.app(scope, handler_receive, handler_send))
+
+        async def cancel_on_disconnect():
+            nonlocal disconnected
+            await body_consumed.wait()
+            while (await receive())["type"] != "http.disconnect":
+                pass
+            if not response_started:
+                disconnected = True
+                handler.cancel()
+
+        watcher = asyncio.create_task(cancel_on_disconnect())
+        try:
+            await handler
+        except asyncio.CancelledError:
+            # Only the cancellation this middleware caused ends here; a server
+            # shutdown cancelling this task still propagates.
+            if not disconnected or asyncio.current_task().cancelling():
+                raise
+            logger.info("Client disconnected before the %s response; cancelled its work",
+                        scope["path"])
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
 
 
 def clamp_deep_crawl(crawler_config, *, max_pages: int = DEFAULT_MAX_PAGES,

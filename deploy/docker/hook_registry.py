@@ -96,14 +96,17 @@ def _factory_block_resources(p: BlockResourcesParams):
         context = kwargs.get("context")
 
         async def _route(route):
+            # fallback, not continue_: this route is registered after the
+            # context's own abort routes (avoid_ads, text_mode, avoid_css), so
+            # continue_ would send their requests to the network.
             try:
                 if route.request.resource_type in types:
                     await route.abort()
                 else:
-                    await route.continue_()
+                    await route.fallback()
             except Exception:
                 # never let a routing decision crash the crawl
-                await route.continue_()
+                await route.fallback()
 
         if context is not None:
             await context.route("**/*", _route)

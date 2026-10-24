@@ -2,6 +2,7 @@ import asyncio
 from collections import deque
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -1601,28 +1602,21 @@ class BrowserManager:
             "xml", "swf", "wasm",
         ]
 
-        # Ad and tracker domain patterns (curated from uBlock/EasyList sources)
-        ad_tracker_patterns = [
-            "**/google-analytics.com/**",
-            "**/googletagmanager.com/**",
-            "**/googlesyndication.com/**",
-            "**/doubleclick.net/**",
-            "**/adservice.google.com/**",
-            "**/adsystem.com/**",
-            "**/adzerk.net/**",
-            "**/adnxs.com/**",
-            "**/ads.linkedin.com/**",
-            "**/facebook.net/**",
-            "**/analytics.twitter.com/**",
-            "**/ads-twitter.com/**",
-            "**/hotjar.com/**",
-            "**/clarity.ms/**",
-            "**/scorecardresearch.com/**",
-            "**/pixel.wp.com/**",
-            "**/amazon-adsystem.com/**",
-            "**/mixpanel.com/**",
-            "**/segment.com/**",
-        ]
+        # Ad and tracker hosts (curated from uBlock/EasyList sources) and their
+        # subdomains. A "**/host/**" glob compiles to the bare host only, so
+        # www.googletagmanager.com or securepubads.g.doubleclick.net passed it.
+        ad_tracker_hosts = (
+            "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
+            "doubleclick.net", "adservice.google.com", "adsystem.com", "adzerk.net",
+            "adnxs.com", "ads.linkedin.com", "facebook.net", "analytics.twitter.com",
+            "ads-twitter.com", "hotjar.com", "clarity.ms", "scorecardresearch.com",
+            "pixel.wp.com", "amazon-adsystem.com", "mixpanel.com", "segment.com",
+        )
+        ad_tracker_url = re.compile(
+            r"^[a-z][a-z0-9+.-]*://([^/?#]*\.)?("
+            + "|".join(map(re.escape, ad_tracker_hosts)) + r")(:\d+)?/",
+            re.IGNORECASE,
+        )
 
         # Common context settings
         context_settings = {
@@ -1683,8 +1677,7 @@ class BrowserManager:
                     await context.route(f"**/*.{ext}", lambda route: route.abort())
 
             if self.config.avoid_ads:
-                for pattern in ad_tracker_patterns:
-                    await context.route(pattern, lambda route: route.abort())
+                await context.route(ad_tracker_url, lambda route: route.abort())
 
             return context
         except BaseException:

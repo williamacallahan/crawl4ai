@@ -58,7 +58,8 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from governor import BodySizeLimitMiddleware, max_body_bytes_from_config
+from governor import BodySizeLimitMiddleware, CancelOnDisconnectMiddleware, max_body_bytes_from_config
+from security_headers import UI_PREFIXES, SecurityHeadersMiddleware
 from job import init_job_router
 from mcp_bridge import attach_mcp, mcp_tool
 from monitor_routes import router as monitor_router
@@ -506,40 +507,6 @@ if config["observability"]["prometheus"]["enabled"]:
 
 token_dep = get_token_dependency(config)
 
-# ── security response headers (unconditional, strict-by-default) ──────
-SECURITY_BASELINE_HEADERS = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
-    "Cross-Origin-Opener-Policy": "same-origin",
-    "Cross-Origin-Resource-Policy": "same-origin",
-}
-# Strict CSP for the API / error surface (the injection-reflection paths).
-STRICT_CSP = (
-    "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; "
-    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
-    "base-uri 'none'; form-action 'none'"
-)
-# The dashboard/playground still ship inline scripts/styles; until they are
-# externalized (CSP-compat refactor) they must not receive the strict CSP or
-# they break. They still get the baseline headers (nosniff, frame DENY).
-_UI_PREFIXES = ("/dashboard", "/playground", "/static")
-
-
-async def add_security_headers(request: Request, call_next):
-    resp = await call_next(request)
-    for k, v in SECURITY_BASELINE_HEADERS.items():
-        resp.headers.setdefault(k, v)
-    path = request.url.path
-    if not any(path.startswith(p) for p in _UI_PREFIXES):
-        resp.headers.setdefault("Content-Security-Policy", STRICT_CSP)
-    if config["security"].get("https_redirect"):
-        resp.headers.setdefault(
-            "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
-        )
-    return resp
-
-
 # ── authentication gate (outermost ASGI layer, fails closed) ──────────
 # The single place auth is decided: covers every route, static mount, the MCP
 # transports and the metrics endpoint, for HTTP and WebSocket alike. Only the
@@ -557,13 +524,21 @@ app.add_middleware(
     AuthGateMiddleware,
     token_provider=_current_api_tokens,
     public_paths={HEALTH_PATH, LIVENESS_PATH, "/token", "/", "/monitor"},
-    public_prefixes=_UI_PREFIXES,
+    public_prefixes=UI_PREFIXES,
 )
 
 # Response decoration sits outside the auth boundary so even an early 401/413
 # carries the baseline headers. It does not read request bodies; AuthGate is
 # still the first authorization decision and remains outermost for WebSockets.
-app.middleware("http")(add_security_headers)
+app.add_middleware(SecurityHeadersMiddleware, hsts=bool(config["security"].get("https_redirect")))
+
+# Outermost, so one cancel unwinds every layer; every layer is pure ASGI, as a
+# BaseHTTPMiddleware task group would re-cancel the handler's cleanup. Only
+# routes that hold a browser page are listed; /crawl/job's enqueue must finish.
+app.add_middleware(
+    CancelOnDisconnectMiddleware,
+    paths=frozenset({"/crawl", "/md", "/html", "/screenshot", "/pdf", "/execute_js"}),
+)
 
 
 def _resolve_auth():

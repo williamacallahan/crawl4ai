@@ -91,6 +91,8 @@ if "RENDERER_KILL_METRIC" not in globals():
         "Renderer processes terminated by the browser resource watchdog",
         ["reason"],
     )
+    BROWSER_RECYCLE_METRIC = Counter(
+        "crawl4ai_browser_recycles_total", "Browsers drained by the watchdog", ["reason"])
 
 
 @dataclass
@@ -823,13 +825,7 @@ async def retire_pool_crawlers(
                 signatures = signatures[:1]
             for sig in signatures:
                 if _is_recycling(pool[sig]):
-                    # Mirroring d15fdd6/881307d: detaching a mid-recycle entry
-                    # lets the 60s close cap cancel its shielded start() and
-                    # orphan the fresh driver + Chromium on a detached,
-                    # _closing=True manager. Skip it; the recycle clears within
-                    # the bounded close/start caps and the janitor's next pass
-                    # re-evaluates and evicts normally.
-                    continue
+                    continue  # Detaching it mid-recycle leaks a Chromium; see _is_recycling.
                 crawler = _detach_pool_crawler(pool, sig)
                 close_tasks.append(_close_in_background(crawler))
                 retired.append((sig, pool_type))
@@ -920,20 +916,24 @@ def _busiest_thread_cores(
 
 
 def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, float]]:
-    """Sample only renderers descended from this manager's owned browser PID."""
+    """Sample renderers, and non-renderer RSS, under this manager's owned browser PID."""
     manager = crawler.crawler_strategy.browser_manager
     browser_pid = getattr(manager, "browser_pid", None)
     if isinstance(browser_pid, bool) or not isinstance(browser_pid, int):
         return set()
     try:
-        descendants = psutil.Process(browser_pid).children(recursive=True)
+        browser_process = psutil.Process(browser_pid)
+        descendants = browser_process.children(recursive=True)
+        tree_rss_bytes = browser_process.memory_info().rss
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return set()
 
     seen = set()
     for process in descendants:
         try:
+            rss_bytes = process.memory_info().rss
             if "--type=renderer" not in process.cmdline():
+                tree_rss_bytes += rss_bytes
                 continue
             identity = (process.pid, process.create_time())
             seen.add(identity)
@@ -963,7 +963,6 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                 over_cpu_since=over_cpu_since,
             )
             reason = None
-            rss_bytes = process.memory_info().rss
             rss_limit_bytes = WATCHDOG.renderer_rss_mb * 1024 * 1024
             if rss_bytes > rss_limit_bytes:
                 reason = "rss"
@@ -987,6 +986,14 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
             # Renderers exit while pages navigate; losing one during a sample
             # must not stop sampling the other browsers.
             continue
+    # Only a restart returns browser/GPU/utility/zygote growth (the permanent browser has
+    # no idle TTL). Renderers are left out, or one heavy page would drain a fresh browser.
+    tree_limit_bytes = WATCHDOG.browser_rss_mb * 1024 * 1024
+    if tree_rss_bytes > tree_limit_bytes and not getattr(manager, "_pool_recycle_pending", False):
+        logger.warning("Recycling browser pid=%s: non-renderer rss_bytes=%s > %s",
+                       browser_pid, tree_rss_bytes, tree_limit_bytes)
+        BROWSER_RECYCLE_METRIC.labels(reason="browser_tree_rss").inc()
+        manager.request_pool_recycle("browser process tree rss")
     return seen
 
 
@@ -1147,16 +1154,7 @@ async def _janitor_pass():
                 idle_time = now - LAST_USED[sig]
                 active = getattr(crawler, 'active_requests', 0)
 
-                # Mirror the admission path (_is_live): a browser mid-recycle
-                # lies fallow at active_requests==0 while close(_for_recycle=True)
-                # -> start() runs in a shielded background task. Evicting it now
-                # cancels close() at the shielded recycle await, but the recycle
-                # keeps running and start() finishes a fresh driver+Chromium on
-                # an already-detached manager with _closing=True stuck - nothing
-                # will close it again (a monotonic process leak, the exact class
-                # bdccf62/d0f57c0 were written to stop). _recycle_browser's
-                # finally clears _recycling within the close/start wait caps
-                # (<= 180s), so the next pass re-evaluates and evicts normally.
+                # Evicting a mid-recycle browser leaks a Chromium; see _is_recycling.
                 if _is_recycling(crawler):
                     LAST_USED[sig] = now
                     continue

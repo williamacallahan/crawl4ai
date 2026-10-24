@@ -216,16 +216,16 @@ async def _crawler_arun(crawler: AsyncWebCrawler, *args, **kwargs):
 def _apply_server_browser_policy(browser_config, config):
     """Apply server-owned launch flags and limits to caller browser config.
 
-    Kept from the fork alongside upstream's egress_broker/governor guards, which
-    cover SSRF and deep-crawl budgets but NOT Chromium's own memory growth. The
-    proxy-safety helper this used to sit beside is gone: enforce_egress()
-    supersedes it. Guarded by tests/test_resource_policy.py.
+    Upstream's egress_broker/governor guards cover SSRF and deep-crawl budgets,
+    not Chromium's own memory growth or its ad and tracker traffic.
     """
     browser_defaults = config["crawler"]["browser"].get("kwargs", {})
     browser_config.extra_args = get_browser_extra_args(config)
 
-    if browser_defaults.get("memory_saving_mode", False):
-        browser_config.memory_saving_mode = True
+    # Not text_mode: it changes the image scores back-end reads; server-built configs keep it.
+    for flag in ("memory_saving_mode", "avoid_ads"):
+        if browser_defaults.get(flag, False):
+            setattr(browser_config, flag, True)
 
     recycle_limit = browser_defaults.get("max_pages_before_recycle", 0)
     requested_recycle_limit = browser_config.max_pages_before_recycle
@@ -429,8 +429,8 @@ async def hset_with_ttl(redis, key: str, mapping: dict, config: dict):
     """Write a task hash, expiring it only once the write is terminal.
 
     In-flight writes leave the key with no TTL, matching the crawl-job queue
-    until its completion script. ``volatile-lru`` evicts only keys that have a
-    TTL, so a live task hash is not an eviction candidate. A ``completed`` or
+    until its completion script. Redis runs ``noeviction``, so no task hash is
+    ever evicted; a write past maxmemory fails instead. A ``completed`` or
     ``failed`` status applies ``redis.task_ttl_seconds``. A TTL of 0 still
     disables that expiry.
 
@@ -572,7 +572,6 @@ async def reap_llm_tasks(redis, config: dict) -> None:
 
 async def _heartbeat_llm_task(redis, task_id: str, config: dict) -> None:
     interval = llm_task_heartbeat_seconds(config)
-    # The non-expiring task hash cannot be evicted by volatile-lru.
     delay = interval
     while True:
         await asyncio.sleep(delay)
