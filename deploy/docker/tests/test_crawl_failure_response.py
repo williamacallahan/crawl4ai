@@ -74,3 +74,20 @@ def test_withheld_failures_report_one_line_with_url_and_target_level(error, publ
     assert record.levelname == level
     assert "url=https://target.example/page" in record.getMessage()
     assert "\n" not in record.getMessage()
+
+
+@pytest.mark.parametrize("raw,public", [
+    ("All proxies failed: Page timeout after 1ms at x.py:1 (y)",
+     "Crawl failed: Page timeout after 1ms"),
+    ("All proxies failed: Target page crashed: renderer exceeded its rss limit at x.py:1 (y)",
+     "Crawl failed: Target page crashed: renderer exceeded its rss limit"),
+])
+def test_retried_target_failures_keep_their_reason_and_target_level(raw, public, caplog):
+    # max_retries >= 1 reports a crawl's failure as "All proxies failed: <reason>".
+    from utils import public_crawl_error
+
+    with caplog.at_level("WARNING", logger="utils"):
+        detail = public_crawl_error(raw, "https://target.example/page")
+    assert detail.startswith(public + " (correlation_id=")
+    [record] = [r for r in caplog.records if r.name == "utils"]
+    assert record.levelname == "WARNING"

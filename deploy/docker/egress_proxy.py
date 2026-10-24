@@ -41,6 +41,10 @@ _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _BLOCKED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
 _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
 _MAX_HEADER_BYTES = 64 * 1024
+# How long stop() keeps ending client connections before it reports failure.
+_STOP_DEADLINE_S = 5.0
+# How long one stop() pass waits for Server.wait_closed() before sweeping again.
+_STOP_SWEEP_S = 0.1
 
 # Chromium turns every CONNECT answer other than 200/407 into
 # net::ERR_TUNNEL_CONNECTION_FAILED (net/http/http_proxy_client_socket.cc,
@@ -241,6 +245,10 @@ class PinningProxy:
         self._host = host
         self._port = port
         self._server: asyncio.AbstractServer | None = None
+        # asyncio.start_server drops its reference to a connection's handler
+        # task once the client socket is lost, so the proxy owns each handler,
+        # keyed to its client writer, until it finishes; stop() ends survivors.
+        self._connections: dict[asyncio.Task, asyncio.StreamWriter] = {}
         self.bound_host: str | None = None
         self.bound_port: int | None = None
 
@@ -268,15 +276,42 @@ class PinningProxy:
         return url
 
     async def stop(self) -> None:
-        if self._server is not None:
-            self._server.close()
+        if self._server is None:
+            return
+        self._server.close()
+        # Server.wait_closed() waits for every client connection. Cancelling a
+        # handler ends its tunnel, but closing a client transport that holds
+        # unsent bytes for a peer that stopped reading never runs
+        # connection_lost, so each client transport is also aborted. A
+        # connection accepted just before close() registers its handler only on
+        # a later loop pass, so sweeps repeat until the server reports closed.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STOP_DEADLINE_S
+        while True:
+            handlers = dict(self._connections)
+            for handler, client_writer in handlers.items():
+                handler.cancel()
+                client_writer.transport.abort()
+            if handlers:
+                await asyncio.wait(handlers, timeout=max(0.0, deadline - loop.time()))
             try:
-                await self._server.wait_closed()
-            except OSError as error:
-                logger.debug("proxy server close error: %s", error)
+                await asyncio.wait_for(
+                    self._server.wait_closed(),
+                    timeout=max(0.0, min(_STOP_SWEEP_S, deadline - loop.time())),
+                )
+                return
+            except TimeoutError:
+                if loop.time() >= deadline:
+                    raise TimeoutError(
+                        f"pinning proxy server did not close within "
+                        f"{_STOP_DEADLINE_S}s of stop() "
+                        f"({len(self._connections)} tunnel handler(s) still registered)"
+                    ) from None
 
     # ─────────────────────────── connection handling ───────────────────────────
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        connection = asyncio.current_task()
+        self._connections[connection] = writer
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=30)
             if not request_line:
@@ -296,6 +331,8 @@ class PinningProxy:
             await self._reply(writer, _BAD)
         except (OSError, ValueError, UnicodeError) as e:
             logger.debug("proxy connection error: %s", e)
+        finally:
+            self._connections.pop(connection, None)
             await self._safe_close(writer)
 
     async def _handle_connect(self, target, client_reader, client_writer):
@@ -324,9 +361,13 @@ class PinningProxy:
             return
         _record_dial_outcome(host, port, None)
 
-        client_writer.write(_CONNECT_OK)
-        await client_writer.drain()
-        await self._splice(client_reader, client_writer, up_reader, up_writer)
+        # A cancel or error before the splice owns the upstream still closes it.
+        try:
+            client_writer.write(_CONNECT_OK)
+            await client_writer.drain()
+            await self._splice(client_reader, client_writer, up_reader, up_writer)
+        finally:
+            await self._safe_close(up_writer)
 
     async def _handle_absolute(self, method, target, request_line, client_reader, client_writer):
         # Plain HTTP proxying: target is an absolute URI "http://host/path".
@@ -347,16 +388,6 @@ class PinningProxy:
         if sp.query:
             path += "?" + sp.query
         upstream = _use_upstream(pin)
-        destination = (upstream[0], upstream[1]) if upstream else (pin.ip, port)
-        try:
-            up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(*destination), timeout=30
-            )
-        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
-            _record_dial_outcome(sp.hostname, port, error if upstream is None else None)
-            await self._reply(client_writer, _BLOCKED)
-            return
-        _record_dial_outcome(sp.hostname, port, None)
         # Direct dials use origin form.  An upstream proxy gets absolute form
         # containing only the pinned IP, never a hostname it could re-resolve.
         if upstream is None:
@@ -379,9 +410,24 @@ class PinningProxy:
         if sp.port:
             out += f":{sp.port}".encode("latin-1")
         out += b"\r\n" + headers + b"\r\n"
-        up_writer.write(out)
-        await up_writer.drain()
-        await self._splice(client_reader, client_writer, up_reader, up_writer)
+
+        destination = (upstream[0], upstream[1]) if upstream else (pin.ip, port)
+        try:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(*destination), timeout=30
+            )
+        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
+            _record_dial_outcome(sp.hostname, port, error if upstream is None else None)
+            await self._reply(client_writer, _BLOCKED)
+            return
+        _record_dial_outcome(sp.hostname, port, None)
+        # A cancel or error before the splice owns the upstream still closes it.
+        try:
+            up_writer.write(out)
+            await up_writer.drain()
+            await self._splice(client_reader, client_writer, up_reader, up_writer)
+        finally:
+            await self._safe_close(up_writer)
 
     # ─────────────────────────── helpers ───────────────────────────
     async def _dial(self, pin, port: int):
@@ -412,7 +458,8 @@ class PinningProxy:
                 logger.warning("upstream proxy refused CONNECT: %r", status[:64])
                 raise ConnectionError("upstream proxy refused CONNECT")
             await self._drain_headers(reader)
-        except Exception:
+        except BaseException:
+            # A cancel during the upstream handshake must close it too.
             await self._safe_close(writer)
             raise
         return reader, writer
@@ -457,13 +504,30 @@ class PinningProxy:
                     await dst.drain()
             except (OSError, ConnectionError) as error:
                 logger.debug("proxy splice closed: %s", error)
-            finally:
-                await self._safe_close(dst)
 
-        await asyncio.gather(
-            pipe(c_reader, u_writer),
-            pipe(u_reader, c_writer),
-        )
+        # The tunnel ends when either direction ends. Closing a transport that
+        # still holds unsent bytes never wakes a read waiting on that same
+        # transport, so the surviving direction is cancelled, not left waiting.
+        pipes = {
+            asyncio.create_task(pipe(c_reader, u_writer)),
+            asyncio.create_task(pipe(u_reader, c_writer)),
+        }
+        try:
+            await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for direction in pipes:
+                direction.cancel()
+            # The wait lets each transport read what is already in flight, so
+            # close sends FIN rather than RST; a second cancel during the wait
+            # must still close both writers.
+            try:
+                await asyncio.wait(pipes)
+            finally:
+                await self._safe_close(u_writer)
+                await self._safe_close(c_writer)
+        for direction in pipes:
+            if not direction.cancelled():
+                direction.result()
 
     async def _reply(self, writer, payload: bytes):
         try:

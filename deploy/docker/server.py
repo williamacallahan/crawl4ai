@@ -297,7 +297,7 @@ async def lifespan(_: FastAPI):
             try:
                 await job_queue.stop()
             except Exception:
-                pass
+                logger.exception("Job queue stop failed during shutdown")
 
         # An aborted startup never created the monitor; its failure is already logged.
         if monitor_module.monitor_stats is not None:
@@ -310,7 +310,7 @@ async def lifespan(_: FastAPI):
         try:
             await stop_pinning_proxy(app.state.egress_proxy)
         except Exception:
-            pass
+            logger.exception("Egress pinning proxy stop failed during shutdown")
 
 async def _initialize_readiness():
     """Recover Redis readiness without restarting browsers or the process."""

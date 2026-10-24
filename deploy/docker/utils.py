@@ -410,7 +410,7 @@ def is_task_id(value: str) -> bool:
 logger = logging.getLogger(__name__)
 
 _INTERNAL_ERROR_MARKERS = ("Unexpected error in", "Code context", "Traceback", 'File "', ".py")
-# The markers above only recognize the library's get_error_context shape. Its
+# The markers above only recognize the library's unexpected_error_message shape. Its
 # dispatcher reports a bare str(e) instead (crawl4ai/async_dispatcher.py:357
 # and :769), so a path-bearing OSError carries no marker at all. Match any
 # absolute container path directly, after removing the crawled URL — a URL
@@ -434,10 +434,13 @@ _TUNNEL_CONNECTION_FAILED = "net::ERR_TUNNEL_CONNECTION_FAILED"
 _NAVIGATION_TIMEOUT = re.compile(r"Page\.goto: (Timeout \d{1,9}ms exceeded)")
 # The whole-page budget the caller set (page_timeout). The target spent it; the
 # withheld private text names the browser step it was spent in.
-_PAGE_TIMEOUT = re.compile(r"Error: (Page timeout after \d{1,9}ms)")
+# "All proxies failed: " is the same failure reported by the max_retries path.
+_PAGE_TIMEOUT = re.compile(r"(?:Error|All proxies failed): (Page timeout after \d{1,9}ms)")
 # The renderer watchdog killed this page's renderer for exceeding its resource
 # limit: a deliberate rejection of the page, not a renderer fault.
-_RESOURCE_REJECTION = re.compile(r"Error: (Target page crashed: renderer exceeded its (?:rss|cpu) limit)")
+_RESOURCE_REJECTION = re.compile(
+    r"(?:Error|All proxies failed): (Target page crashed: renderer exceeded its (?:rss|cpu) limit)"
+)
 
 
 _TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
@@ -454,7 +457,7 @@ def trace_id_from_traceparent(traceparent: Optional[str]) -> Optional[str]:
 def public_error_detail(error_message: Optional[str]) -> str:
     """Client-safe form of a failed CrawlResult's error_message.
 
-    The library's catch-all error_message (get_error_context) embeds container
+    The library's catch-all error_message (unexpected_error_message) embeds container
     file paths, source snippets and raw exception text; those must never reach
     a client, so only its bare Chromium `net::ERR_*` code or Playwright goto
     timeout survives. Upstream-failure messages (anti-bot, navigation refusal,

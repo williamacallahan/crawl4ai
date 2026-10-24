@@ -4,6 +4,7 @@ import asyncio
 import sys
 from dataclasses import replace
 from pathlib import Path
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -45,6 +46,7 @@ def crawler(*, send=None, active=1):
         _closing=False,
         pool_recycle_requested=False,
         consecutive_failures=0,
+        renderer_kills=deque(maxlen=12),
     )
 
     def request_pool_recycle(reason):
@@ -165,6 +167,7 @@ class Renderer:
 
     def __init__(self):
         self.cpu = 0.0
+        self.runnable_ns_by_tid = {}
         self.rss = 10 * 1024 * 1024
         self.killed = 0
         self.arguments = ["chromium", "--type=renderer"]
@@ -197,6 +200,9 @@ def renderer_tree(pool, monkeypatch):
                                memory_info=lambda: SimpleNamespace(rss=0))
 
     monkeypatch.setattr(pool.psutil, "Process", process)
+    monkeypatch.setattr(
+        pool, "_runnable_ns_by_tid", lambda pid: dict(renderer.runnable_ns_by_tid)
+    )
     return target, renderer
 
 
@@ -212,6 +218,53 @@ def test_renderer_cpu_requires_sustained_window(pool, renderer_tree):
     pool._watch_renderers(target, window)
     assert renderer.killed == 1
     assert pool.RENDERER_KILLS == {"cpu": 1, "rss": 0}
+
+
+SECOND_NS = 1_000_000_000
+
+
+def test_renderer_starved_by_host_load_still_counts_its_cpu_demand(pool, renderer_tree):
+    # On a loaded host a spinning thread runs a quarter of the time and waits
+    # in the run queue for the rest; process usage alone never crosses 0.9.
+    target, renderer = renderer_tree
+    window = pool.WATCHDOG.renderer_cpu_seconds
+    pool._watch_renderers(target, 0)
+    for second in (window / 2, window):
+        renderer.cpu = second / 4
+        renderer.runnable_ns_by_tid = {7: int(second * SECOND_NS)}
+        pool._watch_renderers(target, second)
+    assert renderer.killed == 1
+    assert pool.RENDERER_KILLS == {"cpu": 1, "rss": 0}
+
+
+def test_exited_thread_does_not_reset_a_spinning_threads_window(pool, renderer_tree):
+    # The process's runnable total falls when a long-lived helper thread
+    # exits; the spinning thread's own growth must still count.
+    target, renderer = renderer_tree
+    window = pool.WATCHDOG.renderer_cpu_seconds
+    renderer.runnable_ns_by_tid = {7: 0, 8: int(window * 10 * SECOND_NS)}
+    pool._watch_renderers(target, 0)
+    for second in (window / 2, window):
+        renderer.cpu = second / 4
+        renderer.runnable_ns_by_tid = {7: int(second * SECOND_NS)}
+        pool._watch_renderers(target, second)
+    assert renderer.killed == 1
+
+
+def test_many_briefly_runnable_threads_are_not_a_spin(pool, renderer_tree):
+    # Twenty threads each runnable a tenth of the time on a saturated host
+    # sum to two cores of runnable time, but no thread is spinning.
+    target, renderer = renderer_tree
+    window = pool.WATCHDOG.renderer_cpu_seconds
+    pool._watch_renderers(target, 0)
+    for tick in range(1, 9):
+        second = tick * window / 4
+        renderer.cpu = second * 0.1
+        renderer.runnable_ns_by_tid = {
+            tid: int(second * 0.1 * SECOND_NS) for tid in range(100, 120)
+        }
+        pool._watch_renderers(target, second)
+    assert renderer.killed == 0
 
 
 def test_renderer_cpu_lull_resets_sustained_window(pool, renderer_tree):
