@@ -29,6 +29,7 @@ _CF_INTERSTITIAL_TITLE_RE = re.compile(r"<title>\s*Just\s+a\s+moment", re.IGNORE
 # ---------------------------------------------------------------------------
 # Tier 1: High-confidence structural markers (single signal sufficient)
 # These are unique to block pages and virtually never appear in real content.
+# Searched unconditionally against every response, regardless of status code.
 # ---------------------------------------------------------------------------
 _TIER1_PATTERNS = [
     # Akamai — full reference pattern: Reference #18.2d351ab8.1557333295.a4e16ab
@@ -46,15 +47,10 @@ _TIER1_PATTERNS = [
     # Cloudflare — IUAM challenge script
     (re.compile(r'/cdn-cgi/challenge-platform/\S+orchestrate', re.IGNORECASE),
      "Cloudflare JS challenge"),
-    # PerimeterX / HUMAN — block page with app ID assignment (not prose mentions)
-    (re.compile(r"window\._pxAppId\s*=", re.IGNORECASE),
-     "PerimeterX block"),
-    # PerimeterX — captcha CDN
+    # PerimeterX — captcha CDN (block-page-only: only the block page loads the
+    # captcha widget from px-cdn.net; legitimate tagged pages never do)
     (re.compile(r"captcha\.px-cdn\.net", re.IGNORECASE),
      "PerimeterX captcha"),
-    # DataDome — captcha delivery domain (structural, not the word "datadome")
-    (re.compile(r"captcha-delivery\.com", re.IGNORECASE),
-     "DataDome captcha"),
     # Imperva/Incapsula — resource iframe
     (re.compile(r"_Incapsula_Resource", re.IGNORECASE),
      "Imperva/Incapsula block"),
@@ -64,13 +60,41 @@ _TIER1_PATTERNS = [
     # Sucuri firewall
     (re.compile(r"Sucuri\s+WebSite\s+Firewall", re.IGNORECASE),
      "Sucuri firewall block"),
-    # Kasada
-    (re.compile(r"KPSDK\.scriptStart\s*=\s*KPSDK\.now\(\)", re.IGNORECASE),
-     "Kasada challenge"),
     # Network security block — Reddit and other platforms serve large SPA shells
     # with this message buried under 100KB+ of CSS/JS
     (re.compile(r"blocked\s+by\s+network\s+security", re.IGNORECASE),
      "Network security block"),
+]
+
+# ---------------------------------------------------------------------------
+# Tier 1 site-wide sensors — markers that appear on EVERY page of a protected
+# site, not only on block/challenge pages. The PerimeterX first-party tag
+# assigns ``window._pxAppId`` inside a ``<head>`` ``<script>`` on every page of
+# a PX-protected site; the DataDome and Kasada bootstrap tags load the same way.
+# A bare match on a legitimate 200 response therefore indicates "this site is
+# protected", not "this page is a block page" — so the raw-snippet Tier 1 pass
+# must NOT fire on these unconditionally (it would flag every page of the site
+# as blocked: see the regression where adding the head sensor to a successful
+# 200 crawl flipped ``is_blocked`` from ``(False, '')`` to ``(True, ...)``).
+#
+# Detection requires corroboration: a bare sensor counts as a block only when
+# ``status_code >= 400`` (matching the FP guard the large-page deep scan
+# already applies — commit b4d03c2a). A genuine silent-200 block page that
+# carries only a sensor and no real content is still caught by the 200 +
+# near-empty path and the Tier 3 structural-integrity check below.
+# ---------------------------------------------------------------------------
+_TIER1_SENSOR_PATTERNS = [
+    # PerimeterX / HUMAN — site-wide first-party sensor in <head> (not prose
+    # mentions — the regex requires the ``=`` assignment, not the bare name)
+    (re.compile(r"window\._pxAppId\s*=", re.IGNORECASE),
+     "PerimeterX block"),
+    # DataDome — site-wide tag delivery domain (appears on every page that
+    # loads the DataDome sensor, not only on captcha-challenge responses)
+    (re.compile(r"captcha-delivery\.com", re.IGNORECASE),
+     "DataDome captcha"),
+    # Kasada — site-wide sensor set in the ips.js bootstrap on every page
+    (re.compile(r"KPSDK\.scriptStart\s*=\s*KPSDK\.now\(\)", re.IGNORECASE),
+     "Kasada challenge"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -348,6 +372,21 @@ def is_blocked(
         for pattern, reason in _TIER1_PATTERNS:
             if pattern.search(snippet):
                 return True, reason
+        # Site-wide sensor markers (window._pxAppId, captcha-delivery.com,
+        # KPSDK.scriptStart) live in <script> tags on EVERY page of a
+        # PerimeterX/DataDome/Kasada-protected site — not just on block pages.
+        # A bare match on a legitimate 200 response is a false positive that
+        # flags every page of a protected site as blocked, so the unconditional
+        # scan above deliberately excludes them. Require an HTTP error status
+        # (>= 400) to corroborate the sensor before treating it as a block —
+        # the same FP guard the large-page deep scan below already applies
+        # (commit b4d03c2a). A genuine silent-200 block page that carries only
+        # a sensor and no real content is still caught by the 200 + near-empty
+        # path and the Tier 3 structural-integrity check.
+        if status_code is not None and status_code >= 400:
+            for pattern, reason in _TIER1_SENSOR_PATTERNS:
+                if pattern.search(snippet):
+                    return True, reason
 
     # Large-page deep scan: strip scripts/styles and re-check tier 1
     if html_len > 15000:
