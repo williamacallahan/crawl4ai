@@ -41,6 +41,9 @@ _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _BLOCKED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
 _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
 _MAX_HEADER_BYTES = 64 * 1024
+_HEX_DIGITS = b"0123456789abcdefABCDEF"
+# Hop-by-hop fields the proxy replaces with its own Connection: close.
+_CONNECTION_FIELDS = (b"connection", b"proxy-connection", b"keep-alive")
 # How long stop() keeps ending client connections before it reports failure.
 _STOP_DEADLINE_S = 5.0
 # How long one stop() pass waits for Server.wait_closed() before sweeping again.
@@ -96,6 +99,33 @@ def tunnel_failure_code(url: str) -> str | None:
     if recorded is None or time.monotonic() - recorded[1] > _DIAL_FAILURE_TTL_S:
         return None
     return recorded[0]
+
+
+def _request_body_length(headers: bytes) -> int | None:
+    """The request body's Content-Length, or None for a chunked body.
+
+    Raises ValueError for framing that two HTTP parsers could read differently,
+    since the bytes after the body decide where the next request starts.
+    """
+    lengths: set[bytes] = set()
+    codings: list[bytes] = []
+    for line in headers.split(b"\r\n"):
+        name, _, field = line.partition(b":")
+        name = name.strip().lower()
+        if name == b"content-length":
+            lengths.add(field.strip())
+        elif name == b"transfer-encoding":
+            codings.append(field.strip().lower())
+    if codings:
+        if lengths or codings[-1].rsplit(b",", 1)[-1].strip() != b"chunked":
+            raise ValueError("ambiguous request body framing")
+        return None
+    if not lengths:
+        return 0
+    length = lengths.pop()
+    if lengths or not length.isdigit():
+        raise ValueError("invalid Content-Length")
+    return int(length)
 
 
 def upstream_proxy(scheme: str = "https"):
@@ -365,7 +395,12 @@ class PinningProxy:
         try:
             client_writer.write(_CONNECT_OK)
             await client_writer.drain()
-            await self._splice(client_reader, client_writer, up_reader, up_writer)
+            await self._splice(
+                client_writer,
+                up_writer,
+                self._pipe(client_reader, up_writer),
+                self._pipe(up_reader, client_writer),
+            )
         finally:
             await self._safe_close(up_writer)
 
@@ -384,6 +419,11 @@ class PinningProxy:
             return
 
         headers = await self._read_headers(client_reader)
+        try:
+            body_length = _request_body_length(headers)
+        except ValueError:
+            await self._reply(client_writer, _BAD)
+            return
         path = sp.path or "/"
         if sp.query:
             path += "?" + sp.query
@@ -398,14 +438,13 @@ class PinningProxy:
             ).encode("latin-1")
             if upstream[2]:
                 out += upstream[2]
-            # Only the first request on this connection was validated and
-            # rewritten.  Force close so a keep-alive client cannot smuggle a
-            # second unvalidated request through the same upstream socket.
-            headers = b"".join(
-                line + b"\r\n"
-                for line in headers.split(b"\r\n")
-                if line and not line.lower().startswith(b"connection:")
-            ) + b"Connection: close\r\n"
+        # Only this request was validated and pinned, so the connection carries
+        # exactly one exchange in each direction (see _forward_request_body).
+        headers = b"".join(
+            line + b"\r\n"
+            for line in headers.split(b"\r\n")
+            if line and not line.lower().startswith(b"connection:")
+        ) + b"Connection: close\r\n"
         out += b"Host: " + _bracket(sp.hostname).encode("latin-1")
         if sp.port:
             out += f":{sp.port}".encode("latin-1")
@@ -425,7 +464,12 @@ class PinningProxy:
         try:
             up_writer.write(out)
             await up_writer.drain()
-            await self._splice(client_reader, client_writer, up_reader, up_writer)
+            await self._splice(
+                client_writer,
+                up_writer,
+                self._forward_request_body(client_reader, up_writer, body_length),
+                self._relay_response(up_reader, client_writer),
+            )
         finally:
             await self._safe_close(up_writer)
 
@@ -493,25 +537,86 @@ class PinningProxy:
                 kept.append(ln)
         return (b"\r\n".join(kept) + b"\r\n") if kept else b""
 
-    async def _splice(self, c_reader, c_writer, u_reader, u_writer):
-        async def pipe(src, dst):
+    @staticmethod
+    async def _pipe(src, dst):
+        while True:
+            data = await src.read(65536)
+            if not data:
+                return
+            dst.write(data)
+            await dst.drain()
+
+    async def _forward_request_body(self, c_reader, u_writer, length: int | None):
+        """Forward the validated request's body, then end at the client's next byte.
+
+        The upstream socket is dialed to this request's pinned IP, so any later
+        request on the client connection never passed resolve_and_pin.
+        """
+        if length is None:
+            while True:
+                size_line = await c_reader.readline()
+                size = size_line.split(b";", 1)[0].strip()
+                if not size or size.translate(None, _HEX_DIGITS):
+                    raise ValueError("invalid chunk size")
+                u_writer.write(size_line)
+                chunk_length = int(size, 16)
+                if not chunk_length:
+                    break
+                u_writer.write(await c_reader.readexactly(chunk_length + 2))
+                await u_writer.drain()
+            while (line := await c_reader.readline()) not in (b"\r\n", b"\n", b""):
+                u_writer.write(line)
+            u_writer.write(b"\r\n")
+        while length:
+            data = await c_reader.read(min(length, 65536))
+            if not data:
+                return
+            u_writer.write(data)
+            length -= len(data)
+        await u_writer.drain()
+        await c_reader.read(1)
+
+    async def _relay_response(self, u_reader, c_writer):
+        """Relay one response whose final head says Connection: close.
+
+        A keep-alive response would let the browser send its next plain-HTTP
+        request, for any origin, down this socket to the first request's pin.
+        """
+        while True:
+            fields = [await u_reader.readline()]
+            if not fields[0].startswith(b"HTTP/"):
+                raise ValueError("upstream sent no HTTP status line")
+            while (line := await u_reader.readline()) not in (b"\r\n", b"\n", b""):
+                fields.append(line)
+                if sum(map(len, fields)) > _MAX_HEADER_BYTES:
+                    raise ValueError("upstream response head too large")
+            code = fields[0].split()[1:2]
+            # 1xx heads precede the final response; 101 switches protocols.
+            if code and code[0].startswith(b"1") and code[0] != b"101":
+                c_writer.write(b"".join(fields) + b"\r\n")
+                continue
+            c_writer.write(
+                b"".join(
+                    line for line in fields
+                    if line.split(b":", 1)[0].strip().lower() not in _CONNECTION_FIELDS
+                )
+                + b"Connection: close\r\n\r\n"
+            )
+            await c_writer.drain()
+            break
+        await self._pipe(u_reader, c_writer)
+
+    async def _splice(self, c_writer, u_writer, *directions):
+        async def run(direction):
             try:
-                while True:
-                    data = await src.read(65536)
-                    if not data:
-                        break
-                    dst.write(data)
-                    await dst.drain()
-            except (OSError, ConnectionError) as error:
+                await direction
+            except (OSError, ValueError, asyncio.IncompleteReadError) as error:
                 logger.debug("proxy splice closed: %s", error)
 
-        # The tunnel ends when either direction ends. Closing a transport that
+        # The exchange ends when either direction ends. Closing a transport that
         # still holds unsent bytes never wakes a read waiting on that same
         # transport, so the surviving direction is cancelled, not left waiting.
-        pipes = {
-            asyncio.create_task(pipe(c_reader, u_writer)),
-            asyncio.create_task(pipe(u_reader, c_writer)),
-        }
+        pipes = {asyncio.create_task(run(direction)) for direction in directions}
         try:
             await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
         finally:

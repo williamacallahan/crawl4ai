@@ -256,6 +256,50 @@ class TestPinningProxy:
         finally:
             await proxy.stop()
 
+    async def test_direct_plain_http_keep_alive_origin_cannot_take_next_request(
+        self, monkeypatch
+    ):
+        """A keep-alive origin dialed directly never receives a second request
+        on the same client connection: that request was never resolved or
+        pinned, and the origin could answer it as another site (issue #483)."""
+        seen = []
+
+        async def keep_alive_origin(reader, writer):
+            while request := await reader.read(65536):
+                seen.append(request)
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                             b"Connection: keep-alive\r\n\r\nevil")
+                await writer.drain()
+            writer.close()
+        origin = await asyncio.start_server(keep_alive_origin, "127.0.0.1", 0)
+        origin_port = origin.sockets[0].getsockname()[1]
+        monkeypatch.setattr(
+            egress_proxy, "resolve_and_pin",
+            lambda url: PinnedTarget("http", "attacker.example", origin_port, "127.0.0.1"),
+        )
+
+        proxy = PinningProxy()
+        await proxy.start()
+        try:
+            r, w = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            # The proxy dials the pinned IP at the requested URL's port.
+            w.write(f"GET http://attacker.example:{origin_port}/ HTTP/1.1\r\n"
+                    "Host: attacker.example\r\nConnection: keep-alive\r\n\r\n".encode())
+            await w.drain()
+            head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), timeout=5)
+            assert await asyncio.wait_for(r.readexactly(4), timeout=5) == b"evil"
+            w.write(b"GET http://victim.example/ HTTP/1.1\r\nHost: victim.example\r\n\r\n")
+            await w.drain()
+            leftover = await asyncio.wait_for(r.read(200), timeout=5)
+            w.close()
+        finally:
+            await proxy.stop()
+            origin.close()
+        assert len(seen) == 1 and b"victim.example" not in seen[0]
+        assert leftover == b""
+        assert head.startswith(b"HTTP/1.1 200")
+        assert b"Connection: close\r\n" in head and b"keep-alive" not in head
+
     @pytest.mark.parametrize(
         ("host", "expected"),
         [
