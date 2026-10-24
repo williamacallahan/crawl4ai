@@ -14,7 +14,7 @@ from functools import partial
 from io import BytesIO
 from types import MappingProxyType
 from typing import Any, AsyncGenerator, Callable, Dict, Final, List, Optional, Union
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urlparse
 
 import aiofiles
 import aiohttp
@@ -648,6 +648,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         redirected_url = url
         redirected_status_code = None
         document_response = None
+        navigation_response = None
 
         # Reset downloaded files list for new crawl
         self._downloaded_files = []
@@ -710,9 +711,20 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         crash_cleanup = None
 
         def on_document_response(response):
-            nonlocal document_response
+            nonlocal navigation_response
             if response.request.is_navigation_request() and response.frame == page.main_frame:
-                document_response = response
+                navigation_response = response
+
+        def on_document_commit(frame):
+            nonlocal document_response, navigation_response
+            if frame == page.main_frame and navigation_response is not None:
+                # Receiving headers alone does not replace the document (204,
+                # 205 and downloads can leave the previous page in place).
+                if navigation_response.status not in (204, 205) and (
+                    urldefrag(navigation_response.url)[0] == urldefrag(frame.url)[0]
+                ):
+                    document_response = navigation_response
+                navigation_response = None
 
         def on_crash(crashed_page):
             nonlocal renderer_crashed, crash_cleanup
@@ -745,6 +757,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # The page crash event is the renderer's terminal signal.
             page.on("crash", on_crash)
             page.on("response", on_document_response)
+            page.on("framenavigated", on_document_commit)
             # Attaching CDP to an already-busy renderer can itself hang. Attach
             # while this page is still blank, before hooks/navigation run JS.
             if getattr(self.browser_config, "browser_type", None) == "chromium":
@@ -1467,6 +1480,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 try:
                     page.remove_listener("crash", on_crash)
                     page.remove_listener("response", on_document_response)
+                    page.remove_listener("framenavigated", on_document_commit)
                     if crash_cleanup is not None:
                         await asyncio.shield(crash_cleanup)
                     if config.capture_network_requests:

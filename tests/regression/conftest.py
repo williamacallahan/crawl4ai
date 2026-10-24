@@ -640,6 +640,15 @@ async def _js_nav_target_handler(request):
         status=404,
     )
 
+async def _js_nav_no_content_handler(request):
+    return web.Response(
+        text=JS_NAV_SOURCE_HTML.replace("/js-nav-target", "/no-content/" + request.match_info["status"]),
+        content_type="text/html",
+    )
+
+async def _no_content_handler(request):
+    return web.Response(status=int(request.match_info["status"]))
+
 async def _redirect_handler(request):
     raise web.HTTPFound("/")
 
@@ -732,6 +741,8 @@ def _create_app():
     app.router.add_get("/iframe-child", _iframe_child_handler)
     app.router.add_get("/js-nav-source", _js_nav_source_handler)
     app.router.add_get("/js-nav-target", _js_nav_target_handler)
+    app.router.add_get("/js-nav-no-content/{status}", _js_nav_no_content_handler)
+    app.router.add_get("/no-content/{status}", _no_content_handler)
     app.router.add_get("/folder;a/page", _js_nav_target_handler)
     app.router.add_get("/redirect", _redirect_handler)
     app.router.add_get("/not-found", _not_found_handler)
