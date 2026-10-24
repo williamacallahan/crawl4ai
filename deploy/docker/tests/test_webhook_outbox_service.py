@@ -140,6 +140,35 @@ def test_outbox_heartbeat_loss_cancels_active_send():
     asyncio.run(scenario())
 
 
+def test_outbox_send_stops_at_lease_expiry_while_renewal_hangs():
+    # A renewal stuck in the Redis client's retry loop must not let the send
+    # outlive the lease another worker can now reclaim.
+    async def scenario():
+        pending = queue()
+        pending.settings.lease_seconds = 0.2
+
+        async def hung_renewal(*_args):
+            await asyncio.Event().wait()
+
+        pending.heartbeat_outbox.side_effect = hung_renewal
+        cancelled = asyncio.Event()
+        sender = service()
+
+        async def blocked_send(*_args):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        sender._deliver = blocked_send
+        worker = CrawlJobWorker(pending, {}, "worker", webhook_service=sender)
+        await asyncio.wait_for(worker.process_outbox("1-0", event()), 1)
+        assert cancelled.is_set()
+        pending.finish_outbox.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
 def test_reservation_error_keeps_outbox_pending_without_sending():
     async def scenario():
         pending = queue()

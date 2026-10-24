@@ -53,7 +53,10 @@ def build_redis_url(config: dict) -> str:
 # its node drops) leaves its VIP refusing, then unresolvable, for about 8.4s
 # (2026-10-24). `retry_on_timeout` made redis-py build Retry(retries=1), so
 # # every client failed at once; 22 jittered retries wait at least 9.75s and at
-# most 19.5s, and /health and startup still bound PING with their own wait_for.
+# most 19.5s. On a connection idle past health_check_interval redis-py nests
+# the health PING's own retry inside each attempt, so a command can take ~39s
+# to fail: a caller with a tighter deadline (/health, startup, leases) bounds
+# its call with wait_for.
 RESILIENT_CLIENT_KWARGS = {
     "health_check_interval": 30,
     "socket_keepalive": True,

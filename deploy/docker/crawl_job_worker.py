@@ -124,8 +124,13 @@ class CrawlJobWorker:
             last_renewal = loop.time()
             while True:
                 await asyncio.sleep(self.queue.settings.heartbeat_seconds)
+                # The Redis client retries for up to ~39s, longer than the
+                # lease, so bound the renewal by what is left of the lease.
+                remaining = self.queue.settings.lease_seconds - (loop.time() - last_renewal)
                 try:
-                    await self.queue.heartbeat_outbox(stream_id, consumer)
+                    await asyncio.wait_for(
+                        self.queue.heartbeat_outbox(stream_id, consumer), timeout=max(remaining, 0)
+                    )
                     last_renewal = loop.time()
                 except CrawlJobLeaseLost:
                     raise
