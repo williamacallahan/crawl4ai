@@ -572,6 +572,7 @@ class PinningProxy:
             if not data:
                 return
             u_writer.write(data)
+            await u_writer.drain()
             length -= len(data)
         await u_writer.drain()
         await c_reader.read(1)
@@ -586,9 +587,11 @@ class PinningProxy:
             fields = [await u_reader.readline()]
             if not fields[0].startswith(b"HTTP/"):
                 raise ValueError("upstream sent no HTTP status line")
+            head_bytes = len(fields[0])
             while (line := await u_reader.readline()) not in (b"\r\n", b"\n", b""):
                 fields.append(line)
-                if sum(map(len, fields)) > _MAX_HEADER_BYTES:
+                head_bytes += len(line)
+                if head_bytes > _MAX_HEADER_BYTES:
                     raise ValueError("upstream response head too large")
             code = fields[0].split()[1:2]
             # 1xx heads precede the final response; 101 switches protocols.
