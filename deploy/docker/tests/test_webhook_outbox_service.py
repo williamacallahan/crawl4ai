@@ -185,6 +185,42 @@ def test_reservation_error_keeps_outbox_pending_without_sending():
     asyncio.run(scenario())
 
 
+def test_outbox_retry_sleep_cannot_outlive_last_confirmed_lease():
+    async def scenario():
+        pending = queue()
+        pending.settings.lease_seconds = 0.4
+        pending.settings.heartbeat_seconds = 0.25
+
+        async def failed_renewal(*_args):
+            await asyncio.sleep(0.05)
+            raise ConnectionError("Redis connection retries exhausted")
+
+        pending.heartbeat_outbox.side_effect = failed_renewal
+        cancelled = asyncio.Event()
+        sender = service()
+
+        async def blocked_send(*_args):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        sender._deliver = blocked_send
+        worker = CrawlJobWorker(pending, {}, "worker", webhook_service=sender)
+        task = asyncio.create_task(worker.process_outbox("1-0", event()))
+        try:
+            # Expiry is at 0.4s, before the next full heartbeat sleep at 0.55s.
+            await asyncio.wait_for(cancelled.wait(), 0.5)
+            await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        pending.finish_outbox.assert_not_awaited()
+        pending.fail_outbox.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
 def test_outbox_reservation_fence_loss_keeps_event_pending():
     async def scenario():
         pending = queue()
