@@ -60,6 +60,29 @@ ADMISSION = PoolAdmissionSettings.from_config(CONFIG)
 DEFAULT_CONFIG_SIG = None  # Cached sig for default config
 _CLOSE_TASKS = set()  # In-flight background closes; close_all() drains them at shutdown
 WATCHDOG = BrowserWatchdogSettings.from_config(CONFIG)
+
+
+def _require_schedstat() -> None:
+    """Refuse to start where the renderer CPU watchdog cannot read thread load.
+
+    A kernel without CONFIG_SCHED_INFO has no schedstat file or reports
+    "0 0 0", which would hide every runaway renderer from the watchdog.
+    """
+    try:
+        on_cpu_ns = int(Path("/proc/self/schedstat").read_text().split()[0])
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "/proc/self/schedstat is missing; the renderer CPU watchdog needs Linux "
+            "with CONFIG_SCHED_INFO"
+        ) from error
+    if on_cpu_ns == 0:
+        raise RuntimeError(
+            "/proc/self/schedstat reports no CPU time; the renderer CPU watchdog "
+            "needs a kernel with CONFIG_SCHED_INFO"
+        )
+
+
+_require_schedstat()
 RENDERER_KILLS = {"cpu": 0, "rss": 0}
 # Preserve the process-wide collector when the pool configuration is reloaded.
 if "RENDERER_KILL_METRIC" not in globals():
@@ -73,7 +96,7 @@ if "RENDERER_KILL_METRIC" not in globals():
 @dataclass
 class _RendererSample:
     cpu_seconds: float
-    run_queue_seconds: float
+    runnable_ns_by_tid: dict[int, int]
     sampled_at: float
     over_cpu_since: Optional[float] = None
 
@@ -857,32 +880,43 @@ async def _recycle_busiest_browser() -> None:
         logger.warning(f"Memory pressure: recycling a browser after {pages_served} pages")
 
 
-def _run_queue_seconds(pid: int) -> float:
-    """Seconds the process's live threads spent runnable but waiting for a CPU.
+def _runnable_ns_by_tid(pid: int) -> dict[int, int]:
+    """Nanoseconds each live thread spent on a CPU or waiting in its run queue.
 
     CPU usage alone understates a spinning renderer on a loaded host, where it
     gets only its share of the CPUs; a spinning thread is runnable the whole
-    time, so usage plus run-queue wait is its CPU demand whatever the load.
-    The second field of /proc/<pid>/task/<tid>/schedstat is that wait in ns.
+    time whatever the load. Fields one and two of
+    /proc/<pid>/task/<tid>/schedstat are those two times.
     """
     task_dir = f"/proc/{pid}/task"
     try:
-        tasks = os.listdir(task_dir)
+        tids = os.listdir(task_dir)
     except FileNotFoundError as error:
         raise psutil.NoSuchProcess(pid) from error
-    waited_ns = 0
-    for tid in tasks:
+    runnable_ns_by_tid = {}
+    for tid in tids:
         try:
             with open(f"{task_dir}/{tid}/schedstat") as schedstat:
-                waited_ns += int(schedstat.read().split()[1])
+                on_cpu_ns, run_queue_ns, _ = schedstat.read().split()
         except FileNotFoundError:
-            if os.path.isdir(f"{task_dir}/{tid}"):
-                raise RuntimeError(
-                    f"{task_dir}/{tid}/schedstat is missing; the renderer CPU "
-                    "watchdog needs a kernel built with CONFIG_SCHED_INFO"
-                ) from None
-            # The thread exited between listing and reading.
-    return waited_ns / 1e9
+            continue  # The thread exited between listing and reading.
+        runnable_ns_by_tid[int(tid)] = int(on_cpu_ns) + int(run_queue_ns)
+    return runnable_ns_by_tid
+
+
+def _busiest_thread_cores(
+    previous: dict[int, int], current: dict[int, int], elapsed_seconds: float
+) -> float:
+    """The largest share of the interval any one live thread was runnable.
+
+    Per-thread increases keep an exited thread's lifetime from cancelling the
+    others' growth, and taking the busiest thread rather than the sum keeps
+    many briefly waking threads on a saturated host from adding up to a spin.
+    """
+    increases = (
+        runnable_ns - previous.get(tid, 0) for tid, runnable_ns in current.items()
+    )
+    return max(increases, default=0) / 1e9 / elapsed_seconds
 
 
 def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, float]]:
@@ -905,14 +939,17 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
             seen.add(identity)
             cpu_times = process.cpu_times()
             cpu_seconds = cpu_times.user + cpu_times.system
-            run_queue_seconds = _run_queue_seconds(process.pid)
+            runnable_ns_by_tid = _runnable_ns_by_tid(process.pid)
             previous = _RENDERER_SAMPLES.get(identity)
             over_cpu_since = None
             if previous is not None and now > previous.sampled_at:
-                demanded_seconds = (cpu_seconds - previous.cpu_seconds) + (
-                    run_queue_seconds - previous.run_queue_seconds
+                elapsed_seconds = now - previous.sampled_at
+                cores = max(
+                    (cpu_seconds - previous.cpu_seconds) / elapsed_seconds,
+                    _busiest_thread_cores(
+                        previous.runnable_ns_by_tid, runnable_ns_by_tid, elapsed_seconds
+                    ),
                 )
-                cores = demanded_seconds / (now - previous.sampled_at)
                 if cores > WATCHDOG.renderer_cpu_cores:
                     over_cpu_since = (
                         previous.over_cpu_since
@@ -921,7 +958,7 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                     )
             _RENDERER_SAMPLES[identity] = _RendererSample(
                 cpu_seconds=cpu_seconds,
-                run_queue_seconds=run_queue_seconds,
+                runnable_ns_by_tid=runnable_ns_by_tid,
                 sampled_at=now,
                 over_cpu_since=over_cpu_since,
             )
