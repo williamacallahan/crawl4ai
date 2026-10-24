@@ -592,6 +592,11 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             "td",
             "th",
         }
+        inline_tags = {
+            "b", "strong", "i", "em", "u", "s", "small", "mark",
+            "sub", "sup", "abbr", "cite", "q", "kbd", "samp",
+            "var", "time", "span", "label",
+        }
 
         for el in reversed(list(root.iterdescendants())):
             if not isinstance(el, lhtml.HtmlElement):
@@ -610,13 +615,24 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                     break
                 ancestor = ancestor.getparent()
 
-            if is_in_code_block:
+            if el.tag in ("pre", "code") or is_in_code_block:
                 continue
 
             text_content = (el.text_content() or "").strip()
             if (
-                len(text_content.split()) < word_count_threshold
-                and not el.getchildren()
+                len(text_content.split())
+                < (1 if el.tag in inline_tags else word_count_threshold)
+                and (
+                    not el.getchildren()
+                    or (
+                        el.tag not in inline_tags
+                        and not any(
+                            descendant.tag in bypass_tags
+                            or descendant.tag in ("pre", "code")
+                            for descendant in el.iterdescendants()
+                        )
+                    )
+                )
             ):
                 parent = el.getparent()
                 if parent is not None:
@@ -936,7 +952,7 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                     img.set("src", self.BASE64_PATTERN.sub("", src))
 
             # Remove empty elements
-            self.remove_empty_elements_fast(content_element, 1)
+            self.remove_empty_elements_fast(content_element, word_count_threshold)
 
             # Remove unneeded attributes
             self.remove_unwanted_attributes_fast(
