@@ -10,7 +10,6 @@ import base64
 import tempfile
 from .utils import *
 from .utils import (
-    apply_png_predictor,
     clean_pdf_text,
     clean_pdf_text_to_html,
 )
@@ -299,19 +298,65 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                                     
                                     if '/FlateDecode' in filters:
                                         try:
-                                            decode_parms = xobj.get('/DecodeParms', {})
-                                            if isinstance(decode_parms, IndirectObject):
-                                                decode_parms = decode_parms.get_object()
-                                            
-                                            predictor = decode_parms.get('/Predictor', 1)
-                                            bits = xobj.get('/BitsPerComponent', 8)
-                                            colors = 3 if color_space == '/DeviceRGB' else 1
-
-                                            if predictor >= 10:
-                                                data = apply_png_predictor(data, width, bits, colors)
-
-                                            # Create PIL Image
+                                            # ``xobj.get_data()`` already
+                                            # applied any PNG predictor
+                                            # (pypdf: ``FlateDecode.decode``
+                                            # -> ``_decode_png_prediction``);
+                                            # calling ``apply_png_predictor``
+                                            # again would double-decode.
                                             from PIL import Image
+                                            # ``Image.frombytes`` with mode ``L``
+                                            # or ``RGB`` requires 8-bit samples;
+                                            # unpack 1-, 2-, and 4-bit predictor
+                                            # output and scale to 8-bit.
+                                            bits = xobj.get('/BitsPerComponent', 8)
+                                            # ``Image.frombytes`` with mode ``L``
+                                            # or ``RGB`` consumes one byte per
+                                            # sample; for 16-bit samples it
+                                            # silently ignores the extra byte
+                                            # and emits a wrong-pixel PNG.
+                                            # Retain the raw ``bin`` fallback
+                                            # until 16-bit conversion is
+                                            # supported.
+                                            if bits == 16:
+                                                raise ValueError(
+                                                    "16-bit samples unsupported by "
+                                                    "PIL L/RGB conversion; using "
+                                                    "raw bin fallback"
+                                                )
+                                            # ``/Indexed`` color spaces map each
+                                            # sample to a palette entry; the
+                                            # ``L``/``RGB`` paths below would
+                                            # treat palette indices as
+                                            # luminance and emit a wrong-color
+                                            # PNG. Retain the raw ``bin``
+                                            # fallback until indexed conversion
+                                            # is supported.
+                                            if (
+                                                isinstance(color_space, (list, tuple))
+                                                and color_space
+                                                and color_space[0] == '/Indexed'
+                                            ) or color_space == '/Indexed':
+                                                raise ValueError(
+                                                    "Indexed ColorSpace: palette "
+                                                    "conversion unsupported, using "
+                                                    "raw bin fallback"
+                                                )
+                                            if bits in (1, 2, 4):
+                                                channels = 3 if color_space == '/DeviceRGB' else 1
+                                                row_bytes = (width * bits * channels + 7) // 8
+                                                sample_max = (1 << bits) - 1
+                                                unpacked = bytearray()
+                                                for row_start in range(0, height * row_bytes, row_bytes):
+                                                    row = data[row_start:row_start + row_bytes]
+                                                    for sample_index in range(width * channels):
+                                                        bit_offset = sample_index * bits
+                                                        sample = (
+                                                            row[bit_offset // 8]
+                                                            >> (8 - bits - (bit_offset % 8))
+                                                        ) & sample_max
+                                                        unpacked.append(sample * 255 // sample_max)
+                                                data = bytes(unpacked)
                                             mode = 'RGB' if color_space == '/DeviceRGB' else 'L'
                                             img = Image.frombytes(mode, (width, height), data)
                                             
