@@ -712,6 +712,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         context = None
         execution_session = None
         renderer_crashed = False
+        # Playwright's crash event and CDP TargetInfo expose no renderer OS
+        # PID. SystemInfo lists processes without target ownership, and
+        # navigation can swap renderers, so this page's PID remains unknown.
+        renderer_pid = None
         crashed_at = None
         crash_cleanup = None
 
@@ -1472,12 +1476,12 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             if renderer_crashed or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
                 self.browser_manager.consecutive_failures += 1
             if renderer_crashed:
-                # A page crash names no renderer, so it claims a watchdog kill
-                # of this browser only while crashes in the window stay within
-                # the kill count; an unattributed crash stays a browser fault.
+                # Attribute only a proven PID match; an unknown renderer must
+                # remain a reported browser fault despite nearby kills.
                 kill_reason = self.browser_manager.attribute_renderer_kill(
                     crashed_at or time.monotonic(),
                     RENDERER_KILL_CRASH_WINDOW_SECONDS,
+                    renderer_pid=renderer_pid,
                 )
                 if kill_reason is not None:
                     raise Error(

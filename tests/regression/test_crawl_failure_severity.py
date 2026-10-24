@@ -1,6 +1,5 @@
 import time
 from collections import deque
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -48,7 +47,7 @@ class _ResponseStrategy:
         return self.response
 
 
-def _navigation_strategy(error_detail):
+def _navigation_strategy(error_detail, *, browser_manager=None):
     strategy = AsyncPlaywrightCrawlerStrategy(
         browser_config=BrowserConfig(headless=True),
         logger=AsyncLogger(verbose=False),
@@ -56,10 +55,12 @@ def _navigation_strategy(error_detail):
     page = MagicMock()
     page.goto = AsyncMock(side_effect=Error(error_detail))
     page.context.browser.contexts = []
-    strategy.browser_manager = MagicMock()
-    strategy.browser_manager.tearing_down = False
-    strategy.browser_manager.page_crashes = deque()
-    strategy.browser_manager.attribute_renderer_kill = Mock(return_value=None)
+    if browser_manager is None:
+        browser_manager = MagicMock()
+        browser_manager.tearing_down = False
+        browser_manager.page_crashes = deque()
+        browser_manager.attribute_renderer_kill = Mock(return_value=None)
+    strategy.browser_manager = browser_manager
     context = MagicMock()
     context.new_cdp_session = AsyncMock(return_value=AsyncMock())
     strategy.browser_manager.get_page = AsyncMock(
@@ -102,24 +103,16 @@ async def test_unproven_navigation_failures_remain_platform_errors(error_detail)
 
 
 @pytest.mark.asyncio
-async def test_page_crash_claims_unambiguous_renderer_kill():
-    # A page crash is reported only on the page whose renderer died, so a
-    # crash inside the kill window claims a watchdog kill while every crash
-    # can be matched to a distinct kill — the designed rejection the API
-    # reports instead of a Sentry-producing server fault.
-    strategy = _navigation_strategy("ignored")
+async def test_page_crash_without_renderer_pid_stays_a_fault_despite_recent_kill():
+    # A nearby kill can belong to another page. Playwright's crash event
+    # supplies no renderer PID, so timing alone cannot explain this crash.
+    manager = BrowserManager(BrowserConfig(headless=True))
+    strategy = _navigation_strategy("ignored", browser_manager=manager)
     page, _ = strategy.browser_manager.get_page.return_value
     crash_handlers = {}
     page.on = lambda event, handler: crash_handlers.__setitem__(event, handler)
     strategy.browser_manager._close_page_quietly = AsyncMock()
-    strategy.browser_manager.consecutive_failures = 0
-    ledger = SimpleNamespace(
-        renderer_kills=deque([(time.monotonic(), "rss")]),
-        page_crashes=strategy.browser_manager.page_crashes,
-    )
-    strategy.browser_manager.attribute_renderer_kill = (
-        lambda at, window: BrowserManager.attribute_renderer_kill(ledger, at, window)
-    )
+    manager.renderer_kills.append((time.monotonic(), "rss", 12345))
 
     async def crash_then_fail(*args, **kwargs):
         crash_handlers["crash"](page)
@@ -130,28 +123,21 @@ async def test_page_crash_claims_unambiguous_renderer_kill():
     with pytest.raises(Error) as raised:
         await strategy.crawl("https://example.invalid", CrawlerRunConfig())
 
-    assert str(raised.value) == "Target page crashed: renderer exceeded its rss limit"
-    assert strategy.browser_manager.consecutive_failures == 1
+    assert str(raised.value) == "Target page crashed"
+    assert manager.consecutive_failures == 1
 
 
 @pytest.mark.asyncio
 async def test_page_crash_stays_a_fault_when_crashes_outnumber_kills():
-    # A second page crashing inside the same window cannot claim the only
-    # recorded kill; the ambiguous crash stays a browser fault and reports.
-    strategy = _navigation_strategy("ignored")
+    # Multiple unknown renderers crashing near a kill remain browser faults.
+    manager = BrowserManager(BrowserConfig(headless=True))
+    strategy = _navigation_strategy("ignored", browser_manager=manager)
     page, _ = strategy.browser_manager.get_page.return_value
     crash_handlers = {}
     page.on = lambda event, handler: crash_handlers.__setitem__(event, handler)
     strategy.browser_manager._close_page_quietly = AsyncMock()
-    strategy.browser_manager.consecutive_failures = 0
-    strategy.browser_manager.page_crashes.append(time.monotonic())
-    ledger = SimpleNamespace(
-        renderer_kills=deque([(time.monotonic(), "rss")]),
-        page_crashes=strategy.browser_manager.page_crashes,
-    )
-    strategy.browser_manager.attribute_renderer_kill = (
-        lambda at, window: BrowserManager.attribute_renderer_kill(ledger, at, window)
-    )
+    manager.page_crashes.append(time.monotonic())
+    manager.renderer_kills.append((time.monotonic(), "rss", 12345))
 
     async def crash_then_fail(*args, **kwargs):
         crash_handlers["crash"](page)
@@ -166,13 +152,65 @@ async def test_page_crash_stays_a_fault_when_crashes_outnumber_kills():
 
 
 @pytest.mark.asyncio
-async def test_closed_call_during_browser_drain_is_a_watchdog_rejection():
+async def test_started_browser_clears_previous_renderer_failure_ledgers(monkeypatch):
+    manager = BrowserManager(BrowserConfig(headless=True))
+    manager.renderer_kills.append((time.monotonic(), "rss", 12345))
+    manager.page_crashes.append(time.monotonic())
+    monkeypatch.setattr(manager, "_attribute_browser_pid", AsyncMock())
+
+    await manager._started_browser()
+
+    assert not manager.renderer_kills
+    assert not manager.page_crashes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recycle_trigger", ("page_count", "request_recycle"))
+async def test_closed_call_during_session_deferred_recycle_stays_unexpected(
+    recycle_trigger,
+):
+    manager = BrowserManager(
+        BrowserConfig(
+            headless=True,
+            max_pages_before_recycle=1 if recycle_trigger == "page_count" else 0,
+        )
+    )
+    strategy = _navigation_strategy(
+        "Target page, context or browser has been closed",
+        browser_manager=manager,
+    )
+    page, context = manager.get_page.return_value
+    retained_session = (context, page, time.time())
+    manager.sessions["retained"] = retained_session
+    await manager._note_page_served(session_id="retained")
+    if recycle_trigger == "request_recycle":
+        assert not await manager.request_recycle()
+
+    assert manager._recycle_due
+    assert manager._recycle_done.is_set()
+    assert not manager.tearing_down
+    with pytest.raises(RuntimeError, match="Failed on navigating ACS-GOTO"):
+        await strategy.crawl(
+            "https://example.invalid", CrawlerRunConfig(session_id="retained")
+        )
+
+    assert manager.sessions["retained"] is retained_session
+    assert manager._recycle_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recycling", (False, True))
+async def test_closed_call_during_browser_drain_is_a_watchdog_rejection(recycling):
     # A page/context/protocol call closed while the pool deliberately drains
     # this browser is a designed rejection, not an unexpected fault.
+    manager = BrowserManager(BrowserConfig(headless=True))
     strategy = _navigation_strategy(
-        "Target page, context or browser has been closed"
+        "Target page, context or browser has been closed",
+        browser_manager=manager,
     )
-    strategy.browser_manager.tearing_down = True
+    manager._recycle_due = True
+    manager._recycle_done.clear()
+    manager._recycling = recycling
 
     with pytest.raises(Error, match="browser drained by the resource watchdog"):
         await strategy.crawl("https://example.invalid", CrawlerRunConfig())

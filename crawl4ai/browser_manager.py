@@ -817,12 +817,10 @@ class BrowserManager:
         # partially-created page.
         self._pages_served = 0
         self.consecutive_failures = 0
-        # (monotonic, exceeded limit) of renderers an external resource
-        # watchdog recently killed in this browser, and (monotonic) page
-        # crashes. A crash claims a kill only while crashes in the window stay
-        # within the kill count, so an unrelated crash cannot borrow the
-        # resource rejection belonging to the killed page.
-        self.renderer_kills: deque[tuple[float, str]] = deque(maxlen=12)
+        # (monotonic, exceeded limit, renderer pid) of watchdog kills, and
+        # (monotonic) page crashes. Only a proven renderer PID match can
+        # attribute a page crash to one of these kills.
+        self.renderer_kills: deque[tuple[float, str, int]] = deque(maxlen=12)
         self.page_crashes: deque[float] = deque(maxlen=12)
         self._recycle_due = False
         self._recycling = False
@@ -877,33 +875,25 @@ class BrowserManager:
         return bool(
             self._closing
             or self._recycling
-            or self._recycle_due
+            or (self._recycle_due and not self._recycle_done.is_set())
             or self.pool_recycle_requested
             or self._pool_recycle_pending
         )
 
     def attribute_renderer_kill(
-        self, crashed_at: float, window: float
+        self, crashed_at: float, window: float, *, renderer_pid: Optional[int] = None
     ) -> Optional[str]:
         """Name the resource limit a watchdog kill explains for this page's crash.
 
-        Playwright reports a crash only on the page whose renderer died, but
-        names no renderer, so a crash claims a kill of this browser only while
-        every crash inside the window can be matched to a distinct kill. When
-        crashes outnumber kills the attribution is ambiguous and nothing is
-        claimed, leaving the surplus crashes to report as browser faults.
+        A kill of another renderer never explains this page's crash, even
+        when it is the only recent kill. Unknown page PIDs stay unattributed.
         """
-        kills = [
-            kill
-            for kill in self.renderer_kills
-            if 0 <= crashed_at - kill[0] <= window
-        ]
-        crashes = [
-            at for at in self.page_crashes if 0 <= crashed_at - at <= window
-        ]
-        if not kills or len(crashes) > len(kills):
+        if renderer_pid is None:
             return None
-        return kills[-1][1]
+        for killed_at, reason, killed_pid in reversed(self.renderer_kills):
+            if killed_pid == renderer_pid and 0 <= crashed_at - killed_at <= window:
+                return reason
+        return None
 
     def request_pool_recycle(self, reason: str) -> None:
         """Drain and restart an unhealthy browser.
@@ -968,6 +958,8 @@ class BrowserManager:
 
     async def _started_browser(self) -> None:
         """Publish a successful owned-browser start to the recycle barrier."""
+        self.renderer_kills.clear()
+        self.page_crashes.clear()
         await self._attribute_browser_pid()
         self.consecutive_failures = 0
         self.pool_recycle_requested = False
