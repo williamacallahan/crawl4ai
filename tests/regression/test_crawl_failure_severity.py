@@ -1,5 +1,7 @@
 import time
-from unittest.mock import AsyncMock, MagicMock
+from collections import deque
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from playwright.async_api import Error
@@ -12,6 +14,7 @@ from crawl4ai.async_crawler_strategy import (
 from crawl4ai.async_logger import AsyncLogger
 from crawl4ai.async_webcrawler import AsyncWebCrawler
 from crawl4ai.async_webcrawler import async_db_manager
+from crawl4ai.browser_manager import BrowserManager
 from crawl4ai.cache_context import CacheMode
 from crawl4ai.models import AsyncCrawlResponse, CrawlResult
 
@@ -54,6 +57,9 @@ def _navigation_strategy(error_detail):
     page.goto = AsyncMock(side_effect=Error(error_detail))
     page.context.browser.contexts = []
     strategy.browser_manager = MagicMock()
+    strategy.browser_manager.tearing_down = False
+    strategy.browser_manager.page_crashes = deque()
+    strategy.browser_manager.attribute_renderer_kill = Mock(return_value=None)
     context = MagicMock()
     context.new_cdp_session = AsyncMock(return_value=AsyncMock())
     strategy.browser_manager.get_page = AsyncMock(
@@ -96,17 +102,56 @@ async def test_unproven_navigation_failures_remain_platform_errors(error_detail)
 
 
 @pytest.mark.asyncio
-async def test_page_crash_ignores_manager_wide_renderer_kill_history():
-    # The watchdog's kill history is per browser, not per page. Even when a
-    # recent kill is visible on the manager, this page's crash has no causal
-    # attribution and must stay a browser fault.
+async def test_page_crash_claims_unambiguous_renderer_kill():
+    # A page crash is reported only on the page whose renderer died, so a
+    # crash inside the kill window claims a watchdog kill while every crash
+    # can be matched to a distinct kill — the designed rejection the API
+    # reports instead of a Sentry-producing server fault.
     strategy = _navigation_strategy("ignored")
     page, _ = strategy.browser_manager.get_page.return_value
     crash_handlers = {}
     page.on = lambda event, handler: crash_handlers.__setitem__(event, handler)
     strategy.browser_manager._close_page_quietly = AsyncMock()
     strategy.browser_manager.consecutive_failures = 0
-    strategy.browser_manager.renderer_kills = [(time.monotonic(), "rss")]
+    ledger = SimpleNamespace(
+        renderer_kills=deque([(time.monotonic(), "rss")]),
+        page_crashes=strategy.browser_manager.page_crashes,
+    )
+    strategy.browser_manager.attribute_renderer_kill = (
+        lambda at, window: BrowserManager.attribute_renderer_kill(ledger, at, window)
+    )
+
+    async def crash_then_fail(*args, **kwargs):
+        crash_handlers["crash"](page)
+        raise Error("Page crashed")
+
+    page.goto = AsyncMock(side_effect=crash_then_fail)
+
+    with pytest.raises(Error) as raised:
+        await strategy.crawl("https://example.invalid", CrawlerRunConfig())
+
+    assert str(raised.value) == "Target page crashed: renderer exceeded its rss limit"
+    assert strategy.browser_manager.consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_page_crash_stays_a_fault_when_crashes_outnumber_kills():
+    # A second page crashing inside the same window cannot claim the only
+    # recorded kill; the ambiguous crash stays a browser fault and reports.
+    strategy = _navigation_strategy("ignored")
+    page, _ = strategy.browser_manager.get_page.return_value
+    crash_handlers = {}
+    page.on = lambda event, handler: crash_handlers.__setitem__(event, handler)
+    strategy.browser_manager._close_page_quietly = AsyncMock()
+    strategy.browser_manager.consecutive_failures = 0
+    strategy.browser_manager.page_crashes.append(time.monotonic())
+    ledger = SimpleNamespace(
+        renderer_kills=deque([(time.monotonic(), "rss")]),
+        page_crashes=strategy.browser_manager.page_crashes,
+    )
+    strategy.browser_manager.attribute_renderer_kill = (
+        lambda at, window: BrowserManager.attribute_renderer_kill(ledger, at, window)
+    )
 
     async def crash_then_fail(*args, **kwargs):
         crash_handlers["crash"](page)
@@ -118,7 +163,29 @@ async def test_page_crash_ignores_manager_wide_renderer_kill_history():
         await strategy.crawl("https://example.invalid", CrawlerRunConfig())
 
     assert str(raised.value) == "Target page crashed"
-    assert strategy.browser_manager.consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_closed_call_during_browser_drain_is_a_watchdog_rejection():
+    # A page/context/protocol call closed while the pool deliberately drains
+    # this browser is a designed rejection, not an unexpected fault.
+    strategy = _navigation_strategy(
+        "Target page, context or browser has been closed"
+    )
+    strategy.browser_manager.tearing_down = True
+
+    with pytest.raises(Error, match="browser drained by the resource watchdog"):
+        await strategy.crawl("https://example.invalid", CrawlerRunConfig())
+
+
+@pytest.mark.asyncio
+async def test_closed_call_without_drain_stays_unexpected():
+    strategy = _navigation_strategy(
+        "Target page, context or browser has been closed"
+    )
+
+    with pytest.raises(RuntimeError, match="Failed on navigating ACS-GOTO"):
+        await strategy.crawl("https://example.invalid", CrawlerRunConfig())
 
 
 @pytest.mark.asyncio

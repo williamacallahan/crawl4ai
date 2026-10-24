@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import hashlib
 import os
 import re
@@ -816,6 +817,13 @@ class BrowserManager:
         # partially-created page.
         self._pages_served = 0
         self.consecutive_failures = 0
+        # (monotonic, exceeded limit) of renderers an external resource
+        # watchdog recently killed in this browser, and (monotonic) page
+        # crashes. A crash claims a kill only while crashes in the window stay
+        # within the kill count, so an unrelated crash cannot borrow the
+        # resource rejection belonging to the killed page.
+        self.renderer_kills: deque[tuple[float, str]] = deque(maxlen=12)
+        self.page_crashes: deque[float] = deque(maxlen=12)
         self._recycle_due = False
         self._recycling = False
         self._closing = False
@@ -862,6 +870,40 @@ class BrowserManager:
     def _owns_browser_process(self) -> bool:
         """An explicit CDP endpoint is owned by somebody else."""
         return not self.config.cdp_url
+
+    @property
+    def tearing_down(self) -> bool:
+        """The pool or this manager is deliberately closing or recycling the browser."""
+        return bool(
+            self._closing
+            or self._recycling
+            or self._recycle_due
+            or self.pool_recycle_requested
+            or self._pool_recycle_pending
+        )
+
+    def attribute_renderer_kill(
+        self, crashed_at: float, window: float
+    ) -> Optional[str]:
+        """Name the resource limit a watchdog kill explains for this page's crash.
+
+        Playwright reports a crash only on the page whose renderer died, but
+        names no renderer, so a crash claims a kill of this browser only while
+        every crash inside the window can be matched to a distinct kill. When
+        crashes outnumber kills the attribution is ambiguous and nothing is
+        claimed, leaving the surplus crashes to report as browser faults.
+        """
+        kills = [
+            kill
+            for kill in self.renderer_kills
+            if 0 <= crashed_at - kill[0] <= window
+        ]
+        crashes = [
+            at for at in self.page_crashes if 0 <= crashed_at - at <= window
+        ]
+        if not kills or len(crashes) > len(kills):
+            return None
+        return kills[-1][1]
 
     def request_pool_recycle(self, reason: str) -> None:
         """Drain and restart an unhealthy browser.

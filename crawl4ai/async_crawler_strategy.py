@@ -56,6 +56,10 @@ class TargetNavigationError(RuntimeError):
     """A direct target origin refused browser navigation."""
 
 
+# Chromium reports a killed renderer's crash within this window of the kill.
+RENDERER_KILL_CRASH_WINDOW_SECONDS = 10.0
+
+
 def _interrupted_step(error: BaseException) -> str:
     """Name the crawl step an expired page budget interrupted.
 
@@ -708,6 +712,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         context = None
         execution_session = None
         renderer_crashed = False
+        crashed_at = None
         crash_cleanup = None
 
         def on_document_response(response):
@@ -727,8 +732,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 navigation_response = None
 
         def on_crash(crashed_page):
-            nonlocal renderer_crashed, crash_cleanup
+            nonlocal renderer_crashed, crashed_at, crash_cleanup
             renderer_crashed = True
+            crashed_at = time.monotonic()
+            self.browser_manager.page_crashes.append(crashed_at)
             # Closing the crashed target rejects its pending Playwright calls;
             # cancelling only the Python waiter leaves protocol promises alive.
             crash_cleanup = asyncio.create_task(
@@ -1465,11 +1472,31 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             if renderer_crashed or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
                 self.browser_manager.consecutive_failures += 1
             if renderer_crashed:
-                # A page crash names no renderer, and the watchdog records its
-                # kills for the whole browser, not for the page whose renderer
-                # it killed. Only a crash with page attribution may name a
-                # resource limit; an unattributed one stays a browser fault.
+                # A page crash names no renderer, so it claims a watchdog kill
+                # of this browser only while crashes in the window stay within
+                # the kill count; an unattributed crash stays a browser fault.
+                kill_reason = self.browser_manager.attribute_renderer_kill(
+                    crashed_at or time.monotonic(),
+                    RENDERER_KILL_CRASH_WINDOW_SECONDS,
+                )
+                if kill_reason is not None:
+                    raise Error(
+                        f"Target page crashed: renderer exceeded its {kill_reason} limit"
+                    ) from error
                 raise Error("Target page crashed") from error
+            closed = (
+                "target closed" in failure
+                or "targetclosed" in failure
+                or "has been closed" in failure
+            )
+            if closed and self.browser_manager.tearing_down:
+                # The pool is deliberately draining this browser (a renderer
+                # kill, a resource-driven recycle, or teardown), so a page,
+                # context or protocol call closed by that drain is a designed
+                # rejection, not an unexpected fault.
+                raise Error(
+                    "Target closed: browser drained by the resource watchdog"
+                ) from error
             raise
 
         finally:
