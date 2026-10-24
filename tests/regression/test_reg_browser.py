@@ -25,7 +25,7 @@ from crawl4ai.cache_context import CacheMode
 @pytest.mark.browser
 @pytest.mark.asyncio
 async def test_js_navigation_updates_landed_status(local_server):
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(
             local_server + "/js-nav-source",
             config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS, delay_before_return_html=1.5),
@@ -45,7 +45,7 @@ async def test_js_navigation_updates_landed_status(local_server):
 @pytest.mark.parametrize("status", [204, 205])
 async def test_no_content_navigation_keeps_committed_document_status(local_server, status):
     path = "/js-nav-no-content/" + str(status)
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(
             local_server + path,
             config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS, delay_before_return_html=1.5),
@@ -60,7 +60,7 @@ async def test_no_content_navigation_keeps_committed_document_status(local_serve
 @pytest.mark.browser
 @pytest.mark.asyncio
 async def test_http_redirect_keeps_first_and_landed_status(local_server):
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(
             local_server + "/redirect", config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS),
         )
@@ -74,7 +74,7 @@ async def test_http_redirect_keeps_first_and_landed_status(local_server):
 @pytest.mark.browser
 @pytest.mark.asyncio
 async def test_default_cookie_accepts_semicolon_document_path(local_server):
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(
             local_server + "/folder;a/page", config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS),
         )
