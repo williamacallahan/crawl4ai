@@ -214,6 +214,96 @@ class TestURLPatternFilter:
         assert must_contain in compiled
         assert must_not_contain not in compiled
 
+    # Regression guard for the single-star brace-glob bug: patterns with
+    # exactly one `*` AND a `{a,b}` alternation that shape as a SUFFIX
+    # (`*.{jpg,png}`) or PREFIX (`/blog/{2023,2024}/*`) glob were short-circuited
+    # by `_categorize_pattern` into the brace-unaware SUFFIX/PREFIX fast paths,
+    # which store the literal unexpanded string (`{jpg,png}` / `/blog/{2023,2024}`)
+    # and can therefore never match a real URL. The fix routes such patterns to
+    # the PATH branch, where the existing `{a,b}` -> `(a|b)` post-processing
+    # turns them into a real regex. Without this guard the include filter
+    # silently crawls nothing and the reverse filter silently filters nothing.
+    @pytest.mark.parametrize(
+        "pattern, url, expected",
+        [
+            # Bug-report shapes: PREFIX `/blog/{2023,2024}/*` and SUFFIX `*.{jpg,png}`.
+            ("/blog/{2023,2024}/*", "https://x.com/blog/2023/p1", True),
+            ("/blog/{2023,2024}/*", "https://x.com/blog/2025/p1", False),
+            ("*.{jpg,png}", "https://x.com/img.jpg", True),
+            ("*.{jpg,png}", "https://x.com/img.gif", False),
+            # >2 alternatives and brace-in-the-middle both shape-into SUFFIX/PREFIX
+            # and must also reach the PATH branch.
+            ("*.{jpg,png,bmp}", "https://x.com/img.bmp", True),
+            ("/v{1,2}/*", "https://x.com/v1/anything", True),
+        ],
+    )
+    def test_single_star_brace_glob_matches(self, pattern, url, expected):
+        # apply() is @lru_cache'd; use a fresh instance per case.
+        f = URLPatternFilter(patterns=[pattern])
+        assert f.apply(url) is expected
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "/blog/{2023,2024}/*",  # PREFIX shape
+            "*.{jpg,png}",         # SUFFIX shape
+        ],
+    )
+    def test_single_star_brace_glob_routed_to_path_branch(self, pattern):
+        # The bug was that these shaped as SUFFIX/PREFIX and got stored as the
+        # literal (unexpanded) string in `_simple_suffixes`/`_simple_prefixes`,
+        # which never understand braces. Pin that they now land in
+        # `_path_patterns` (where `{a,b}` -> `(a|b)` post-processing runs) and
+        # do NOT leak into the brace-unaware fast-path sets. The compiled-regex
+        # assertion catches a regression even if apply() coincidentally returned
+        # the right answer for the wrong reason.
+        f = URLPatternFilter(patterns=[pattern])
+        assert len(f._path_patterns) == 1
+        assert not f._simple_suffixes
+        assert not f._simple_prefixes
+        compiled = f._path_patterns[0].pattern
+        assert "\\{" not in compiled, (
+            f"{pattern!r} compiled to {compiled!r} still has the literal "
+            f"escaped brace form `\\{{` -- brace expansion did not run"
+        )
+
+    @pytest.mark.parametrize(
+        "pattern, url, expected",
+        [
+            # reverse=True inverts the result. With the bug, every URL matched
+            # (the unexpanded prefix never matched, so the include filter
+            # returned False for every URL, and reverse flipped it to True),
+            # so the filter "excluded nothing".
+            ("/blog/{2023,2024}/*", "https://x.com/blog/2023/p1", False),
+            ("/blog/{2023,2024}/*", "https://x.com/blog/2025/p1", True),
+            ("*.{jpg,png}", "https://x.com/img.jpg", False),
+            ("*.{jpg,png}", "https://x.com/img.gif", True),
+        ],
+    )
+    def test_single_star_brace_glob_reverse(self, pattern, url, expected):
+        # apply() is @lru_cache'd; use a fresh instance per case.
+        f = URLPatternFilter(patterns=[pattern], reverse=True)
+        assert f.apply(url) is expected
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "*.tar.gz",  # non-brace SUFFIX (multi-part) must keep the fast path
+            "/api/*",    # non-brace PREFIX must keep the fast path
+        ],
+    )
+    def test_non_brace_single_star_keeps_fast_path(self, pattern):
+        # Guards against over-fixing: the fix only diverts brace-containing
+        # patterns to PATH; non-brace single-star globs must still use the
+        # SUFFIX/PREFIX fast paths (or the performance/behavior contract
+        # regresses).
+        f = URLPatternFilter(patterns=[pattern])
+        assert not f._path_patterns
+        if pattern.startswith("*."):
+            assert f._simple_suffixes
+        elif pattern.endswith("/*"):
+            assert f._simple_prefixes
+
 
 class TestDomainFilter:
     # Regression guard for the port/userinfo/IPv6 stripping bug: a previous

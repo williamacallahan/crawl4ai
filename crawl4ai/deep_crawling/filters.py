@@ -204,7 +204,15 @@ class URLPatternFilter(URLFilter):
         if pattern.startswith("^") or pattern.endswith("$") or "\\d" in pattern:
             return self.PATTERN_TYPES["REGEX"]
 
-        if pattern.count("*") == 1:
+        # Guard the SUFFIX/PREFIX fast paths against brace-alternation
+        # globs (`{a,b}`). Those fast paths store the literal (unexpanded)
+        # string in `_simple_suffixes`/`_simple_prefixes`, where no brace
+        # expansion happens, so a pattern like `*.{jpg,png}` or
+        # `/blog/{2023,2024}/*` would never match a real URL. Routing such
+        # patterns to the PATH branch lets the existing brace-expansion
+        # post-processing (`{a,b}` -> `(a|b)`) translate them into a real
+        # regex. See `_add_pattern`'s PATH branch.
+        if pattern.count("*") == 1 and "{" not in pattern:
             if pattern.startswith("*."):
                 return self.PATTERN_TYPES["SUFFIX"]
             if pattern.endswith("/*"):
