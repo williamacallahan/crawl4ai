@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from pydantic import BaseModel, HttpUrl, PrivateAttr, Field, ConfigDict, BeforeValidator, model_serializer
 from typing import Annotated
 from typing import List, Dict, Optional, Callable, Awaitable, Union, Any
@@ -247,23 +248,29 @@ class CrawlResult(BaseModel):
         result = handler(self)
         if self._markdown is not None:
             def _nested(spec, key):
-                # Forward the sub-field spec only when the value is a dict
+                # Forward the sub-field spec only when the value is a Mapping
                 # (nested form: {'markdown': {'fit_markdown'}}). The set-valued
                 # flat form ({'markdown'}) means whole-field control and there
                 # is nothing to forward to the inner model_dump.
-                if spec is None or not isinstance(spec, dict) or key not in spec:
+                if spec is None or not isinstance(spec, Mapping) or key not in spec:
                     return None
                 value = spec[key]
-                return value if isinstance(value, (dict, set)) else None
+                return value if isinstance(value, (Mapping, set)) else None
 
             def _whole(spec, key):
                 # True only when the spec names the whole field (set form).
-                # A dict form ('markdown' in spec with a dict value) means
-                # nested sub-field selection, NOT whole-field suppression.
+                # A Mapping form ('markdown' in spec with a Mapping value)
+                # means nested sub-field selection, NOT whole-field suppression.
                 if spec is None:
                     return False
                 if isinstance(spec, set):
                     return key in spec
+                if isinstance(spec, (list, tuple)):
+                    # list/tuple: membership means whole-field control
+                    # (pydantic honors sequence excludes/includes at runtime).
+                    return key in spec
+                if not isinstance(spec, Mapping):
+                    return False
                 if key not in spec:
                     return False
                 value = spec[key]
