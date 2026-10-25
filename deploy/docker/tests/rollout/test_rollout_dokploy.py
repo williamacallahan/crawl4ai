@@ -59,6 +59,78 @@ def test_wait_deployment_accepts_one_exact_new_row(monkeypatch):
     assert result["deploymentId"] == "new"
 
 
+def test_wait_deployment_refreshes_and_checks_the_collector(monkeypatch):
+    # The runner deadline tracks the caller's per-phase resets so a slow queue
+    # wait within its own fresh TIMEOUT_SECONDS bound never fails a healthy
+    # collector whose runner deadline the earlier arming consumed (regression
+    # for the 2e49c6e7 stale-deadline bug). The collector check fires before
+    # the entry refresh so an expired arming phase is reported at this boundary
+    # instead of being masked, then refresh hits at entry (queue admission) and
+    # on admission itself (the processing reset), and the check polls every
+    # polling iteration that does not return.
+    matching = {
+        "deploymentId": "new",
+        "title": "title",
+        "description": "description",
+    }
+    deployments = iter(
+        [
+            [{**matching, "status": "running"}],
+            [{**matching, "status": "running"}],
+            [{**matching, "status": "done"}],
+        ]
+    )
+    clock = [0]
+    refresh_calls = []
+    check_calls = []
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    class Collector:
+        def refresh(self):
+            refresh_calls.append(clock[0])
+
+        def check(self):
+            check_calls.append(clock[0])
+
+    monkeypatch.setattr(rollout_policy, "TIMEOUT_SECONDS", 20)
+    monkeypatch.setattr(rollout_dokploy, "_deployments", lambda *_args: next(deployments))
+    monkeypatch.setattr(rollout.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(rollout.time, "sleep", advance)
+
+    result = rollout_dokploy._wait_deployment(
+        "https://dokploy", "key", "app", {"old"}, "title", "description", Collector()
+    )
+    assert result["status"] == "done"
+    # Refresh at entry (clock=0, queue admission) and on admission (clock=0,
+    # processing reset): both happen before the first time.sleep.
+    assert refresh_calls == [0, 0], refresh_calls
+    # Check before the entry refresh (clock=0, arming boundary), then again
+    # before the admission refresh (clock=0), then every iteration that does
+    # not return early (iter 1 at clock=0, iter 2 at clock=5), and a final
+    # check before the done return at clock=10 so a collector death between
+    # polls is attributed to this phase rather than masked by the caller's
+    # refresh.
+    assert check_calls == [0, 0, 0, 5, 10], check_calls
+
+
+def test_wait_deployment_checks_the_collector_without_one(monkeypatch):
+    # Without a collector the wait still works: the collector parameter is
+    # optional so the existing callers and tests that omit it keep their
+    # behavior.
+    monkeypatch.setattr(
+        rollout_dokploy,
+        "_deployments",
+        lambda *_args: [{"deploymentId": "new", "status": "done",
+                          "title": "title", "description": "description"}],
+    )
+    result = rollout_dokploy._wait_deployment(
+        "https://dokploy", "key", "app", {"old"}, "title", "description", None
+    )
+    assert result["deploymentId"] == "new"
+
+
 def test_wait_deployment_resets_processing_deadline_after_admission(monkeypatch, capsys):
     matching = {
         "deploymentId": "new",
