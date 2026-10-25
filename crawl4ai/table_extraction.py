@@ -308,11 +308,24 @@ class DefaultTableExtraction(TableExtractionStrategy):
                     rowspan = self._cell_span(cell, "rowspan")
                     if rowspan == 0:
                         rowspan = len(row.xpath("following-sibling::tr")) + 1
+                    # A colspan that starts before, but extends past, a column
+                    # still held by an earlier rowspan continuation must NOT
+                    # overwrite that slot. Yield the spanning column to the
+                    # pending continuation and let the colspan text fill only
+                    # the free columns of its span; otherwise the rowspan
+                    # continuation leaks into a later row or is dropped.
+                    # ``append_pending`` already advances ``col`` by one, so
+                    # the explicit increment here runs ONLY in the else branch
+                    # to avoid a double-increment that would skip a spanned
+                    # pending column (leaving it stale for a later row).
                     for _ in range(colspan):
-                        row_data.append(text)
-                        if rowspan > 1:
-                            pending[col] = (text, rowspan - 1)
-                        col += 1
+                        if col in pending:
+                            append_pending()
+                        else:
+                            row_data.append(text)
+                            if rowspan > 1:
+                                pending[col] = (text, rowspan - 1)
+                            col += 1
                 # Fill trailing columns still occupied by an earlier rowspan
                 # (a blank continuation row consumes its pending spans). This
                 # mirrors the body row loop and keeps the leaf row a complete
@@ -400,11 +413,26 @@ class DefaultTableExtraction(TableExtractionStrategy):
                 rowspan = self._cell_span(cell, "rowspan")
                 if rowspan == 0:
                     rowspan = len(row.xpath("following-sibling::tr")) + 1
+                # A colspan that starts before, but extends past, a column
+                # still held by an earlier rowspan continuation must NOT
+                # overwrite that slot. Yield the spanning column to the
+                # pending continuation and let the colspan text fill only
+                # the free columns of its span; otherwise the rowspan
+                # continuation leaks into a later row or is dropped (the
+                # WHATWG table model treats the overlap as an error; this
+                # resolves it by letting the rowspan keep its slot).
+                # ``append_pending`` already advances ``col`` by one, so
+                # the explicit increment here runs ONLY in the else branch
+                # to avoid a double-increment that would skip a spanned
+                # pending column (leaving it stale for a later row).
                 for _ in range(colspan):
-                    row_data.append(text)
-                    if rowspan > 1:
-                        pending[col] = (text, rowspan - 1)
-                    col += 1
+                    if col in pending:
+                        append_pending()
+                    else:
+                        row_data.append(text)
+                        if rowspan > 1:
+                            pending[col] = (text, rowspan - 1)
+                        col += 1
             # A blank continuation row still consumes a pending span. Fill
             # holes before a later pending column, but never consume a span
             # created by the current row.
