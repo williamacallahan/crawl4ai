@@ -24,6 +24,19 @@ base_directory = DB_PATH = os.path.join(
 os.makedirs(DB_PATH, exist_ok=True)
 DB_PATH = os.path.join(base_directory, "crawl4ai.db")
 
+# Provenance ledger for content-hash pointers. Must match
+# ``DatabaseMigration._POINTER_TABLE`` in ``crawl4ai/migrations.py``: the
+# one-time blob->hash migration re-run consults it to distinguish stored
+# 16-hex hash pointers from raw legacy 16-character hex content. The
+# migration created it inside ``migrate_database`` only, so a fresh install
+# whose migration was a no-op (0 rows) never had the table; the runtime
+# write path (``acache_url``) records provenance here so the ledger is
+# complete for rows cached after the one-time migration completed --
+# without it, a re-migration after a lost marker would corrupt any
+# runtime-cached pointer whose backing file is missing (see
+# ``migrations.DatabaseMigration.migrate_database``).
+_POINTER_TABLE = "crawl4ai_content_pointers"
+
 
 class CacheSettings(BaseModel):
     """Content/row payload budget (SQLite allocation overhead is not included)."""
@@ -264,9 +277,24 @@ class AsyncDatabaseManager:
                     response_headers TEXT DEFAULT "{}",
                     downloaded_files TEXT DEFAULT "{}"  -- New column added
                 )
-            """
+                """
+            )
+            # Content-pointer provenance ledger, mirroring the table the
+            # one-time blob->hash migration creates in ``migrate_database``.
+            # Idempotent (IF NOT EXISTS) so a DB that already has it from a
+            # prior migration is untouched, and a fresh install (whose
+            # migration was a 0-row no-op and never created the table) gets it
+            # so the runtime write path (``acache_url``) can record
+            # provenance. Schema kept identical to ``migrations.py``.
+            await db.execute(
+                f"""CREATE TABLE IF NOT EXISTS {_POINTER_TABLE} (
+                    url TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    PRIMARY KEY (url, content_type)
+                )"""
             )
             await db.commit()
+
 
     async def update_db_schema(self):
         """Update database schema if needed"""
@@ -628,6 +656,24 @@ class AsyncDatabaseManager:
             content_hashes = {}
             for field, (content, content_type) in content_map.items():
                 content_hashes[field] = await self._store_content(content, content_type)
+            # Record content-pointer provenance in the same transaction as
+            # the crawled_data upsert so a re-run of the one-time blob->hash
+            # migration (after a lost marker) can distinguish these stored
+            # 16-hex pointers from raw legacy 16-char hex content. Without
+            # this, a runtime-cached pointer whose backing file later goes
+            # missing would be unledgered and -- prior to the shape-based
+            # classification in ``migrate_database`` -- misclassified as raw
+            # legacy content and destructively re-hashed. Only non-empty
+            # content fields name a real pointer; ``INSERT OR IGNORE`` keeps
+            # the row for re-crawls idempotent (the (url, content_type) pair
+            # is the ledger's PK).
+            for field, (content, content_type) in content_map.items():
+                if content:
+                    await db.execute(
+                        f"INSERT OR IGNORE INTO {_POINTER_TABLE} "
+                        "(url, content_type) VALUES (?, ?)",
+                        (result.url, content_type),
+                    )
             await db.execute(
                 """
                 INSERT INTO crawled_data (
