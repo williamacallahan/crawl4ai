@@ -75,6 +75,20 @@ from crawl4ai.utils import (
 
 logger = logging.getLogger(__name__)
 LLM_PERMIT_KEY = "crawl4ai:llm:permit:v1"
+# redis-py resends a command whose reply was lost, so acquisition must be
+# idempotent per token: a replayed SET NX would find our own permit and report
+# the cluster busy while that orphaned permit blocks every replica until TTL.
+_ACQUIRE_LLM_PERMIT = """
+local holder = redis.call('GET', KEYS[1])
+if holder == ARGV[1] then
+  return 1
+end
+if holder then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
 _RELEASE_LLM_PERMIT = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
@@ -100,12 +114,13 @@ async def llm_permit(redis, config):
     # Start before the command: network latency must not extend our local
     # view of a lease Redis may already be counting down.
     confirmed_expiry = time.monotonic() + ttl
-    acquired = await redis.set(
-        LLM_PERMIT_KEY,
-        token,
-        nx=True,
-        ex=ttl,
-    )
+    try:
+        acquired = await redis.eval(_ACQUIRE_LLM_PERMIT, 1, LLM_PERMIT_KEY, token, ttl)
+    except BaseException:
+        # The script may have run before its reply was lost; release our token
+        # so a failed or cancelled acquisition never strands the global permit.
+        await _release_llm_permit(redis, token)
+        raise
     if not acquired:
         raise LlmCapacityBusy(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -169,12 +184,16 @@ async def llm_permit(redis, config):
         heartbeat.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat
-        try:
-            await redis.eval(_RELEASE_LLM_PERMIT, 1, LLM_PERMIT_KEY, token)
-        except Exception:
-            # Cleanup must never mask the result of the protected work; the
-            # permit self-releases via TTL when the Lua compare-and-del fails.
-            logger.exception("Failed to release LLM permit during cleanup")
+        await _release_llm_permit(redis, token)
+
+
+async def _release_llm_permit(redis, token):
+    try:
+        await redis.eval(_RELEASE_LLM_PERMIT, 1, LLM_PERMIT_KEY, token)
+    except Exception:
+        # Cleanup must never mask the result of the protected work; the
+        # permit self-releases via TTL when the Lua compare-and-del fails.
+        logger.exception("Failed to release LLM permit during cleanup")
 
 
 async def _enqueue_job(background_tasks, factory, principal=None, on_cancel=None):

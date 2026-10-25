@@ -35,14 +35,10 @@ from utils import load_config
 class PermitRedis:
     """Stub for the real ``llm_permit`` Redis dependency (offline)."""
 
-    def __init__(self, acquired=True):
-        self.acquired = acquired
+    def __init__(self):
         self.hset = AsyncMock()
         self.expire = AsyncMock()
         self.eval = AsyncMock(return_value=1)
-
-    async def set(self, *_args, **_kwargs):
-        return self.acquired
 
 
 def _llm_config():
@@ -118,21 +114,22 @@ def _md_crawl_result():
 
 def test_handle_llm_qa_releases_crawler_before_permit_acquire(monkeypatch):
     """The crawler must be released before ``llm_permit`` tries to acquire the
-    Redis permit (``redis.set``), so the permit-acquire wait never holds a
-    browser-pool slot. ``llm_permit`` calls ``redis.set`` first, so we observe
+    Redis permit (its acquire script), so the permit-acquire wait never holds a
+    browser-pool slot. ``llm_permit`` runs that script first, so we observe
     ``release_crawler``'s call count at that point."""
     release = AsyncMock()
     _patch_boundaries(monkeypatch, release, crawl_result=_qa_crawl_result())
     monkeypatch.setattr(api, "aperform_completion_with_backoff", AsyncMock(return_value=_completion()))
 
-    redis = PermitRedis(acquired=True)
+    redis = PermitRedis()
     permit_acquire_order = []
 
-    async def observing_set(*args, **kwargs):
-        permit_acquire_order.append(release.await_count)
-        return True
+    async def observing_eval(script, *args, **kwargs):
+        if script == api._ACQUIRE_LLM_PERMIT:
+            permit_acquire_order.append(release.await_count)
+        return 1
 
-    redis.set = observing_set
+    redis.eval = observing_eval
 
     asyncio.run(
         api.handle_llm_qa(
@@ -206,14 +203,15 @@ def test_handle_markdown_llm_releases_crawler_before_permit_acquire(monkeypatch)
     _patch_boundaries(monkeypatch, release, crawl_result=_md_crawl_result())
     monkeypatch.setattr(api, "aperform_completion_with_backoff", AsyncMock(return_value=_md_completion()))
 
-    redis = PermitRedis(acquired=True)
+    redis = PermitRedis()
     permit_acquire_order = []
 
-    async def observing_set(*args, **kwargs):
-        permit_acquire_order.append(release.await_count)
-        return True
+    async def observing_eval(script, *args, **kwargs):
+        if script == api._ACQUIRE_LLM_PERMIT:
+            permit_acquire_order.append(release.await_count)
+        return 1
 
-    redis.set = observing_set
+    redis.eval = observing_eval
 
     markdown = asyncio.run(
         api.handle_markdown_request(

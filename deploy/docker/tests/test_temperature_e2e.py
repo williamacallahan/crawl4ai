@@ -38,14 +38,10 @@ from utils import load_config
 
 
 class PermitRedis:
-    def __init__(self, acquired=True):
-        self.acquired = acquired
+    def __init__(self):
         self.hset = AsyncMock()
         self.expire = AsyncMock()
         self.eval = AsyncMock(return_value=1)
-
-    async def set(self, *_args, **_kwargs):
-        return self.acquired
 
 
 def _resolve(sever_temperature):

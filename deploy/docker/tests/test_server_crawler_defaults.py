@@ -22,13 +22,9 @@ from utils import load_config
 
 class PermitRedis:
     def __init__(self, acquired=True):
-        self.acquired = acquired
         self.hset = AsyncMock()
         self.expire = AsyncMock()
-        self.eval = AsyncMock(return_value=1)
-
-    async def set(self, *_args, **_kwargs):
-        return self.acquired
+        self.eval = AsyncMock(return_value=1 if acquired else 0)
 
 
 @pytest.mark.parametrize(
@@ -360,7 +356,7 @@ def test_concurrent_llm_request_fails_without_calling_provider(monkeypatch):
 
 def test_lost_llm_permit_cancels_the_protected_operation():
     redis = PermitRedis()
-    redis.eval = AsyncMock(side_effect=[0, 1])
+    redis.eval = AsyncMock(side_effect=[1, 0, 1])
     config = load_config()
     config["llm"]["permit_ttl_seconds"] = 0.03
 
@@ -384,7 +380,7 @@ def test_llm_permit_release_failure_does_not_discard_successful_work():
     into HTTP 500 responses.
     """
     redis = PermitRedis()
-    redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
+    redis.eval = AsyncMock(side_effect=[1, ConnectionError("Redis connection lost")])
     config = load_config()
     config["llm"]["permit_ttl_seconds"] = 300
 
@@ -398,15 +394,17 @@ def test_llm_permit_release_failure_does_not_discard_successful_work():
 
     assert result == "SUCCESS: LLM answer generated"
     # The renewal heartbeat never fires for a fast body with a 300s TTL, so the
-    # only eval call is the release attempt: it must still be made, and it must
-    # not raise out of the context manager.
-    redis.eval.assert_awaited_once()
+    # only eval call after acquisition is the release attempt: it must still be
+    # made, and it must not raise out of the context manager.
+    assert [call.args[0] for call in redis.eval.await_args_list] == [
+        api._ACQUIRE_LLM_PERMIT, api._RELEASE_LLM_PERMIT,
+    ]
 
 
 def test_llm_permit_release_failure_does_not_mask_body_exception():
     """Release cleanup failure must not replace the body's original exception."""
     redis = PermitRedis()
-    redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
+    redis.eval = AsyncMock(side_effect=[1, ConnectionError("Redis connection lost")])
     config = load_config()
     config["llm"]["permit_ttl_seconds"] = 300
 
@@ -421,7 +419,7 @@ def test_llm_permit_release_failure_does_not_mask_body_exception():
 def test_llm_permit_release_failure_does_not_mask_lease_lost_signal():
     """Release failure must not hide the lease-lost HTTPException raised on cancellation."""
     redis = PermitRedis()
-    redis.eval = AsyncMock(side_effect=[0, ConnectionError("Redis connection lost")])
+    redis.eval = AsyncMock(side_effect=[1, 0, ConnectionError("Redis connection lost")])
     config = load_config()
     config["llm"]["permit_ttl_seconds"] = 0.03
 
@@ -490,7 +488,7 @@ def test_handle_llm_qa_returns_result_when_permit_release_fails(monkeypatch):
     monkeypatch.setattr(egress_broker, "enforce_egress", lambda _config: None)
 
     redis = PermitRedis()
-    redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
+    redis.eval = AsyncMock(side_effect=[1, ConnectionError("Redis connection lost")])
 
     answer = asyncio.run(
         api.handle_llm_qa(
