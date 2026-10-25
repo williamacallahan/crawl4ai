@@ -112,7 +112,7 @@ When initializing `PDFContentScrapingStrategy`, you can configure its behavior u
     -   The extracted information is compiled into a `ScrapingResult` object:
         -   `cleaned_html`: Contains an HTML-like representation of the PDF, where each page's content is often wrapped in a `<div>` with page number information.
         -   `media`: A dictionary where `media["images"]` will contain information about extracted images if `extract_images` was `True`.
-        -   `links`: A dictionary where `links["urls"]` can contain URLs found within the PDF content.
+        -   `links`: The URLs found within the PDF content, classified against the PDF's own URL. Each entry is a dict with `href` (the URL), `text` (empty for PDF links, which have no anchor text), and `page` (the 1-based PDF page number the link appeared on). A URL is placed in `external` when its base domain differs from the PDF source's base domain; the PDF source's own base domain and any of its subdomains, as well as relative URLs, are placed in `internal`. On the `ScrapingResult` returned by this method, `links` is the pydantic `Links` model — access it as `result.links.internal` / `result.links.external` (or `result.links.model_dump()["internal"]` for dict access). The downstream `CrawlResult` exposes `links` as a plain dict, so `result.links["internal"]` / `result.links["external"]` apply there.
         -   `metadata`: A dictionary holding PDF metadata (e.g., title, author, num_pages).
 -   **`async ascrap(self, url: str, html: str, **kwargs) -> ScrapingResult`**:
     -   The asynchronous version of `scrap`. Under the hood, it typically runs the synchronous `scrap` method in a separate thread using `asyncio.to_thread` to avoid blocking the event loop.
