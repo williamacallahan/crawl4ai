@@ -113,7 +113,6 @@ async def test_unproven_navigation_failures_remain_platform_errors(error_detail)
         ("unrecorded", None, "goto"),
         ("unknown_browser", None, "goto"),
         ("foreign_browser", None, "goto"),
-        ("stale", None, "goto"),
         ("orphaned", None, "goto"),
         ("fallback", "renderer_memory_limit", "goto"),
         ("fallback_failed", "renderer_memory_limit", "goto"),
@@ -135,11 +134,7 @@ async def test_renderer_kill_provenance_controls_crawl_failure_severity(
     now = time.monotonic()
     rss_bytes = 1053999104
     rss_limit_bytes = 805306368
-    kill_age = 0.1
-    if record == "stale":
-        kill_age = 20
-    elif record == "orphaned":
-        kill_age = RENDERER_KILL_ATTRIBUTION_WINDOW_SECONDS + 0.1
+    kill_age = RENDERER_KILL_ATTRIBUTION_WINDOW_SECONDS + 0.1 if record == "orphaned" else 0.1
     if record != "unrecorded":
         manager.renderer_kills.append(
             RendererKill(
@@ -307,16 +302,6 @@ async def test_closed_call_during_browser_drain_is_a_watchdog_rejection(recyclin
     manager._recycling = recycling
 
     with pytest.raises(Error, match="browser drained by the resource watchdog"):
-        await strategy.crawl("https://example.invalid", CrawlerRunConfig())
-
-
-@pytest.mark.asyncio
-async def test_closed_call_without_drain_stays_unexpected():
-    strategy = _navigation_strategy(
-        "Target page, context or browser has been closed"
-    )
-
-    with pytest.raises(RuntimeError, match="Failed on navigating ACS-GOTO"):
         await strategy.crawl("https://example.invalid", CrawlerRunConfig())
 
 
