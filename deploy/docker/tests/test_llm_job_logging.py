@@ -52,7 +52,16 @@ def test_llm_job_classifies_permit_backpressure_without_hiding_defects(
         key = f"task:{task_id}"
         try:
             await redis.hset(key, mapping={"status": api.TaskStatus.PROCESSING.value})
-            monkeypatch.setattr(redis, "set", AsyncMock(return_value=False, side_effect=failure))
+            evaluate = redis.eval
+
+            async def acquire_refused(script, *args, **kwargs):
+                if script != api._ACQUIRE_LLM_PERMIT:
+                    return await evaluate(script, *args, **kwargs)
+                if failure is not None:
+                    raise failure
+                return 0
+
+            monkeypatch.setattr(redis, "eval", acquire_refused)
             await api.process_llm_extraction(
                 redis, config, task_id, "https://example.com", "extract"
             )
