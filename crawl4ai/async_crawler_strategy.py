@@ -988,6 +988,32 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         # raw:// or raw:
                         html_content = url[6:] if url.startswith("raw://") else url[4:]
 
+                    # patchright 1.56's `page.add_init_script` rewrites the
+                    # response of *network* `document` requests whose URL
+                    # starts with `http`, so the capture init scripts armed
+                    # by `setup_console_capture` / `setup_error_capture`
+                    # above never run for `set_content` (no network document)
+                    # or `file://` (non-http scheme). Give the adapter a
+                    # chance to prepend a capture bootstrap directly into
+                    # the HTML so it runs synchronously during
+                    # `page.set_content`'s parsing — *before* any user
+                    # inline `console.log` / uncaught error in the document
+                    # body. Adapters whose standard capture mechanism already
+                    # works for every scheme (PlaywrightAdapter /
+                    # StealthAdapter — `page.on("console")` events, or
+                    # standard-Playwright `add_init_script` CDP) return the
+                    # HTML unchanged. Only gated on
+                    # `capture_console_messages` so crawls that did not
+                    # request console capture pay no extra cost and see no
+                    # console-override side effects. See
+                    # `BrowserAdapter.bootstrap_capture_html` for the full
+                    # rationale (this fixes the silent `console_messages=[]`
+                    # regression introduced by commit 2550f3d2's
+                    # raw:/file:// browser-pipeline path combined with
+                    # `UndetectedAdapter`).
+                    if config.capture_console_messages:
+                        html_content = self.adapter.bootstrap_capture_html(html_content)
+
                     await page.set_content(html_content, wait_until=config.wait_until)
                     response = None
                     # For raw: URLs, only use base_url if provided; don't fall back to the raw HTML string
