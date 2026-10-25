@@ -271,8 +271,9 @@ class TestDumpLoad:
             use_persistent_context=False, accept_downloads=False, text_mode=True
         )
         strategy.browser_manager = SimpleNamespace(
-            get_page=AsyncMock(return_value=(page, MagicMock()))
+            get_page=AsyncMock(return_value=(page, MagicMock())), browser_pid=None
         )
+        strategy._page_crash_errors = {}
         strategy.execute_hook = AsyncMock()
         strategy.csp_compliant_wait = AsyncMock(return_value=True)
 

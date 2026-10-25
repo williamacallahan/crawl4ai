@@ -422,7 +422,9 @@ class AsyncWebCrawler:
                     _block_reason_for_result = ""
                     _done = False
                     _target_outcome = False
+                    _resource_limit_error = None
                     crawl_result = None
+                    async_response = None
                     _crawl_stats = {
                         "attempts": 0,
                         "retries": 0,
@@ -433,7 +435,7 @@ class AsyncWebCrawler:
 
                     try:
                         for _attempt in range(_max_attempts):
-                            if _done:
+                            if _done or _resource_limit_error is not None:
                                 break
 
                             if _attempt > 0:
@@ -545,8 +547,6 @@ class AsyncWebCrawler:
                                         break  # Success — exit proxy loop
 
                                 except Exception as _crawl_err:
-                                    if isinstance(_crawl_err, RendererResourceLimitError):
-                                        raise
                                     _target_outcome = (
                                         _proxy is None
                                         and isinstance(_crawl_err, TargetNavigationError)
@@ -557,6 +557,13 @@ class AsyncWebCrawler:
                                         "blocked": True,
                                         "reason": str(_crawl_err),
                                     })
+                                    if isinstance(_crawl_err, RendererResourceLimitError):
+                                        # Stop browser retries after a resource kill,
+                                        # but allow the configured fallback below.
+                                        _resource_limit_error = _crawl_err
+                                        _block_reason = str(_crawl_err)
+                                        crawl_result = None
+                                        break
                                     if not _target_outcome:
                                         self.logger.error_status(
                                             url=url,
@@ -680,7 +687,7 @@ class AsyncWebCrawler:
                         # All proxies threw exceptions and fallback either wasn't
                         # configured or also failed.  Build a minimal result so the
                         # caller gets crawl_stats instead of None.
-                        if _target_outcome:
+                        if _resource_limit_error is not None or _target_outcome:
                             failure_message = _block_reason
                         elif _block_reason:
                             failure_message = f"All proxies failed: {_block_reason}"
@@ -692,6 +699,7 @@ class AsyncWebCrawler:
                             success=False,
                             status_code=None,
                             error_message=failure_message,
+                            session_id=getattr(config, "session_id", None),
                         )
                         crawl_result.crawl_stats = _crawl_stats
 
@@ -704,7 +712,13 @@ class AsyncWebCrawler:
 
                     # Log failure reason before COMPLETE so users can see why it failed.
                     if crawl_result and not crawl_result.success and crawl_result.error_message:
-                        if _target_outcome:
+                        if _resource_limit_error is not None:
+                            self.logger.warning(
+                                message="Crawl rejected for {url}: {error}",
+                                tag="WARNING",
+                                params={"url": url, "error": crawl_result.error_message},
+                            )
+                        elif _target_outcome:
                             self.logger.info(
                                 f"{cache_context.display_url[:100]} | Target refusal: {crawl_result.error_message}",
                                 tag="TARGET",
@@ -717,7 +731,9 @@ class AsyncWebCrawler:
                             )
 
                     elapsed = time.perf_counter() - start_time
-                    if crawl_result and not crawl_result.success and _target_outcome:
+                    if crawl_result and not crawl_result.success and (
+                        _target_outcome or _resource_limit_error is not None
+                    ):
                         self.logger.info(
                             f"{cache_context.display_url[:100]} | ✗ | ⏱: {elapsed:.2f}s",
                             tag="COMPLETE",
@@ -759,18 +775,6 @@ class AsyncWebCrawler:
                     cached_result.redirected_url = cached_result.redirected_url or (None if is_raw_url else url)
                     return CrawlResultContainer(cached_result)
 
-            except RendererResourceLimitError as e:
-                error_message = str(e)
-                self.logger.warning(
-                    message="Crawl rejected for {url}: {error}",
-                    tag="WARNING",
-                    params={"url": url, "error": error_message},
-                )
-                return CrawlResultContainer(
-                    CrawlResult(
-                        url=url, html="", success=False, error_message=error_message
-                    )
-                )
             except Exception as e:
                 error_message = unexpected_error_message("_crawl_web", sys.exc_info())
 

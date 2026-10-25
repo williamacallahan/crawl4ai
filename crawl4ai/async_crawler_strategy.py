@@ -62,16 +62,22 @@ class RendererResourceLimitError(Error):
     def __init__(self, kill: RendererKill):
         self.kill = kill
         self.outcome = "renderer_memory_limit" if kill.reason == "rss" else "renderer_cpu_limit"
-        self.rss_bytes = kill.rss_bytes
-        self.rss_limit_bytes = kill.rss_limit_bytes
-        super().__init__(
-            f"{self.outcome}: rss_bytes={kill.rss_bytes} "
-            f"rss_limit_bytes={kill.rss_limit_bytes}"
-        )
+        if kill.reason == "rss":
+            self.rss_bytes = kill.rss_bytes
+            self.rss_limit_bytes = kill.rss_limit_bytes
+            detail = f"rss_bytes={kill.rss_bytes} rss_limit_bytes={kill.rss_limit_bytes}"
+        else:
+            self.cpu_cores = kill.cpu_cores
+            self.cpu_limit_cores = kill.cpu_limit_cores
+            detail = f"cpu_cores={kill.cpu_cores} cpu_limit_cores={kill.cpu_limit_cores}"
+        super().__init__(f"{self.outcome}: {detail}")
 
 
 # Chromium reports a killed renderer's crash within this window of the kill.
 RENDERER_KILL_CRASH_WINDOW_SECONDS = 10.0
+# Measured kill-to-crash delivery is 0.04–1.1s. Leave margin without letting
+# an orphaned kill explain an unrelated crash for the full recency window.
+RENDERER_KILL_ATTRIBUTION_WINDOW_SECONDS = 2.0
 
 
 def _interrupted_step(error: BaseException) -> str:
@@ -760,11 +766,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             nonlocal renderer_crashed, crashed_at, crash_cleanup, renderer_kill
             renderer_crashed = True
             crashed_at = time.monotonic()
-            self.browser_manager.page_crashes.append(crashed_at)
             # Claim synchronously, before cleanup or an interrupted operation
             # can yield to another page's crash handler.
             renderer_kill = self.browser_manager.attribute_renderer_kill(
-                crashed_at, RENDERER_KILL_CRASH_WINDOW_SECONDS,
+                crashed_at, RENDERER_KILL_ATTRIBUTION_WINDOW_SECONDS,
                 browser_pid=browser_pid,
             )
             self._page_crash_errors[crashed_page] = (
@@ -1470,7 +1475,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 captured_console.extend(final_messages or [])
 
             # Return complete response
-            self._raise_if_page_crashed(page)
+            if renderer_crashed:
+                if renderer_kill is not None:
+                    raise RendererResourceLimitError(renderer_kill)
+                raise Error("Target page crashed")
             self.browser_manager.consecutive_failures = 0
             return AsyncCrawlResponse(
                 html=html,

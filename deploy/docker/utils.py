@@ -436,15 +436,14 @@ _NAVIGATION_TIMEOUT = re.compile(r"Page\.goto: (Timeout \d{1,9}ms exceeded)")
 # withheld private text names the browser step it was spent in.
 # "All proxies failed: " is the same failure reported by the max_retries path.
 _PAGE_TIMEOUT = re.compile(r"(?:Error|All proxies failed): (Page timeout after \d{1,9}ms)")
-# The renderer watchdog killed this page's renderer for exceeding its resource
-# limit, or the pool drained the browser under it: a deliberate rejection of
-# the page, not a renderer fault.
+# The pool drained the browser under this page: a deliberate rejection of the
+# page, not a renderer fault.
 _RESOURCE_REJECTION = re.compile(
-    r"(?:Error|All proxies failed): (Target page crashed: renderer exceeded its (?:rss|cpu) limit"
-    r"|Target closed: browser drained by the resource watchdog)"
+    r"(?:Error|All proxies failed): (Target closed: browser drained by the resource watchdog)"
 )
 _RENDERER_RESOURCE_OUTCOME = re.compile(
-    r"renderer_(?:memory|cpu)_limit: rss_bytes=\d+ rss_limit_bytes=\d+"
+    r"(?:renderer_memory_limit: rss_bytes=\d+ rss_limit_bytes=\d+"
+    r"|renderer_cpu_limit: cpu_cores=\d+(?:\.\d+)? cpu_limit_cores=\d+(?:\.\d+)?)"
 )
 
 

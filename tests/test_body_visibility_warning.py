@@ -31,8 +31,9 @@ def _strategy(is_visible: bool, wait_seconds: float = 0.0):
         use_persistent_context=False, accept_downloads=False, text_mode=True, verbose=False
     )
     strategy.browser_manager = SimpleNamespace(
-        get_page=AsyncMock(return_value=(page, MagicMock()))
+        get_page=AsyncMock(return_value=(page, MagicMock())), browser_pid=None
     )
+    strategy._page_crash_errors = {}
     strategy.execute_hook = AsyncMock()
 
     async def wait(*args, **kwargs):

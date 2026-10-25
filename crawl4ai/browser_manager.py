@@ -33,6 +33,8 @@ class RendererKill:
     browser_pid: int
     rss_bytes: int
     rss_limit_bytes: int
+    cpu_cores: Optional[float] = None
+    cpu_limit_cores: Optional[float] = None
 
 # A hung Playwright call must not make the awaits above it uncancellable: the
 # pool's 60s close cap is what SIGKILLs an abandoned Chromium, and it only
@@ -828,9 +830,8 @@ class BrowserManager:
         # partially-created page.
         self._pages_served = 0
         self.consecutive_failures = 0
-        # Unclaimed watchdog kills for this owned browser, and page crash times.
+        # Unclaimed watchdog kills for this owned browser.
         self.renderer_kills: deque[RendererKill] = deque(maxlen=12)
-        self.page_crashes: deque[float] = deque(maxlen=12)
         self._recycle_due = False
         self._recycling = False
         self._closing = False
@@ -890,21 +891,19 @@ class BrowserManager:
         )
 
     def attribute_renderer_kill(
-        self, crashed_at: float, window: float, *, renderer_pid: Optional[int] = None,
-        browser_pid: Optional[int] = None,
+        self, crashed_at: float, window: float, *, browser_pid: Optional[int] = None,
     ) -> Optional[RendererKill]:
         """Claim one matching watchdog kill for a page's terminal crash."""
-        if renderer_pid is None and browser_pid is None:
+        if browser_pid is None:
             return None
         candidates = [
             kill for kill in self.renderer_kills
             if 0 <= crashed_at - kill.killed_at <= window
-            and (browser_pid is None or kill.browser_pid == browser_pid)
-            and (renderer_pid is None or kill.renderer_pid == renderer_pid)
+            and kill.browser_pid == browser_pid
         ]
-        # ponytail: two pages of one browser crashing at once can misattribute
-        # the first crash. CDP exposes no target-to-renderer PID mapping; use
-        # the owned browser and bounded recency until an exact API exists.
+        # ponytail: an orphaned kill or unrelated same-browser crash inside the
+        # two-second window can still misattribute a crash. Upgrade to exact
+        # attribution if CDP exposes a target-to-renderer PID mapping.
         # Ambiguous kills stay faults, and a kill can explain only one crash.
         if len(candidates) != 1:
             return None
@@ -976,7 +975,6 @@ class BrowserManager:
     async def _started_browser(self) -> None:
         """Publish a successful owned-browser start to the recycle barrier."""
         self.renderer_kills.clear()
-        self.page_crashes.clear()
         await self._attribute_browser_pid()
         self.consecutive_failures = 0
         self.pool_recycle_requested = False

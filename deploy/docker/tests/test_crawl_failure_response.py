@@ -57,9 +57,8 @@ def _library_failure(error: BaseException) -> str:
     (TimeoutError("Page timeout after 60000ms at async_crawler_strategy.py:1270 "
                   "(html = await self._settled_content(page))"),
      "Crawl failed: Page timeout after 60000ms", "WARNING"),
-    (RuntimeError("Target page crashed: renderer exceeded its rss limit "
-                  "(pid=11176 rss_bytes=1053999104 rss_limit_bytes=805306368)"),
-     "Crawl failed: Target page crashed: renderer exceeded its rss limit", "WARNING"),
+    (RuntimeError("Target closed: browser drained by the resource watchdog"),
+     "Crawl failed: Target closed: browser drained by the resource watchdog", "WARNING"),
     (RuntimeError("Target page crashed"), "Crawl failed", "ERROR"),
 ])
 def test_withheld_failures_report_one_line_with_url_and_target_level(error, public, level, caplog):
@@ -79,8 +78,8 @@ def test_withheld_failures_report_one_line_with_url_and_target_level(error, publ
 @pytest.mark.parametrize("raw,public", [
     ("All proxies failed: Page timeout after 1ms at x.py:1 (y)",
      "Crawl failed: Page timeout after 1ms"),
-    ("All proxies failed: Target page crashed: renderer exceeded its rss limit at x.py:1 (y)",
-     "Crawl failed: Target page crashed: renderer exceeded its rss limit"),
+    ("All proxies failed: Target closed: browser drained by the resource watchdog at x.py:1 (y)",
+     "Crawl failed: Target closed: browser drained by the resource watchdog"),
 ])
 def test_retried_target_failures_keep_their_reason_and_target_level(raw, public, caplog):
     # max_retries >= 1 reports a crawl's failure as "All proxies failed: <reason>".

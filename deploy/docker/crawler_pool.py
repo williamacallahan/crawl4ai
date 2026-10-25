@@ -986,6 +986,8 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                     killed_at=now, reason=reason, renderer_pid=process.pid,
                     browser_pid=browser_pid, rss_bytes=rss_bytes,
                     rss_limit_bytes=rss_limit_bytes,
+                    cpu_cores=cores if reason == "cpu" else None,
+                    cpu_limit_cores=WATCHDOG.renderer_cpu_cores if reason == "cpu" else None,
                 ))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             # Renderers exit while pages navigate; losing one during a sample

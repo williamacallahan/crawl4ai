@@ -220,7 +220,8 @@ def test_renderer_cpu_requires_sustained_window(pool, renderer_tree):
     assert renderer.killed == 1
     assert pool.RENDERER_KILLS == {"cpu": 1, "rss": 0}
     assert list(target.crawler_strategy.browser_manager.renderer_kills) == [
-        RendererKill(window, "cpu", renderer.pid, 1234, renderer.rss, 805306368)
+        RendererKill(window, "cpu", renderer.pid, 1234, renderer.rss, 805306368,
+                     cpu_cores=1.0, cpu_limit_cores=pool.WATCHDOG.renderer_cpu_cores)
     ]
 
 
@@ -304,9 +305,8 @@ def test_renderer_rss_limit_is_immediate_and_ignores_nonrenderers(pool, renderer
 
 
 @pytest.mark.parametrize("reason", ["cpu", "rss"])
-@pytest.mark.parametrize("identity", ["renderer", "browser"])
 def test_renderer_kill_attribution_requires_matching_owner_and_consumes_once(
-    pool, renderer_tree, reason, identity
+    pool, renderer_tree, reason
 ):
     from crawl4ai import BrowserConfig
     from crawl4ai.browser_manager import BrowserManager
@@ -324,37 +324,35 @@ def test_renderer_kill_attribution_requires_matching_owner_and_consumes_once(
     pool._watch_renderers(target, killed_at)
 
     assert renderer.killed == 1
-    record = RendererKill(killed_at, reason, renderer.pid, 1234, renderer.rss, 805306368)
+    record = RendererKill(
+        killed_at, reason, renderer.pid, 1234, renderer.rss, 805306368,
+        cpu_cores=1.0 if reason == "cpu" else None,
+        cpu_limit_cores=pool.WATCHDOG.renderer_cpu_cores if reason == "cpu" else None,
+    )
     assert list(manager.renderer_kills) == [record]
     crashed_at = killed_at + 0.1
-    manager.page_crashes.append(crashed_at)
-    assert manager.attribute_renderer_kill(
-        crashed_at, 1, renderer_pid=renderer.pid + 1, browser_pid=1234
-    ) is None
     assert manager.attribute_renderer_kill(crashed_at, 1, browser_pid=5678) is None
     assert manager.attribute_renderer_kill(crashed_at, 1) is None
-    owner = {"renderer_pid": renderer.pid} if identity == "renderer" else {"browser_pid": 1234}
-    assert manager.attribute_renderer_kill(killed_at - 0.1, 1, **owner) is None
-    assert manager.attribute_renderer_kill(killed_at + 1.1, 1, **owner) is None
-    assert manager.attribute_renderer_kill(crashed_at, 1, **owner) == record
-    assert manager.attribute_renderer_kill(crashed_at, 1, **owner) is None
+    assert manager.attribute_renderer_kill(killed_at - 0.1, 1, browser_pid=1234) is None
+    assert manager.attribute_renderer_kill(killed_at + 1.1, 1, browser_pid=1234) is None
+    assert manager.attribute_renderer_kill(crashed_at, 1, browser_pid=1234) == record
+    assert manager.attribute_renderer_kill(crashed_at, 1, browser_pid=1234) is None
     assert not manager.renderer_kills
 
 
-def test_renderer_kill_attribution_ignores_newer_kill_for_another_pid():
+def test_renderer_kill_attribution_ignores_newer_kill_for_another_browser():
     from crawl4ai import BrowserConfig
     from crawl4ai.browser_manager import BrowserManager
 
     manager = BrowserManager(BrowserConfig(headless=True, sleep_on_close=False))
     cpu_kill = RendererKill(10, "cpu", 42, 1234, 1024, 805306368)
-    rss_kill = RendererKill(10.1, "rss", 43, 1234, 805306369, 805306368)
+    rss_kill = RendererKill(10.1, "rss", 43, 5678, 805306369, 805306368)
     manager.renderer_kills.extend([cpu_kill, rss_kill])
-    manager.page_crashes.extend([10.2, 10.3])
 
-    assert manager.attribute_renderer_kill(10.3, 1, renderer_pid=44) is None
+    assert manager.attribute_renderer_kill(10.3, 1, browser_pid=9999) is None
+    assert manager.attribute_renderer_kill(10.3, 1, browser_pid=1234) == cpu_kill
     assert manager.attribute_renderer_kill(10.3, 1, browser_pid=1234) is None
-    assert manager.attribute_renderer_kill(10.3, 1, renderer_pid=42) == cpu_kill
-    assert manager.attribute_renderer_kill(10.3, 1, renderer_pid=43) == rss_kill
+    assert manager.attribute_renderer_kill(10.3, 1, browser_pid=5678) == rss_kill
 
 
 def test_excess_renderer_kills_do_not_attribute_an_unrelated_crash():
@@ -365,14 +363,10 @@ def test_excess_renderer_kills_do_not_attribute_an_unrelated_crash():
     manager.renderer_kills.extend(
         RendererKill(10, "cpu", pid, 1234, 1024, 805306368) for pid in range(42, 54)
     )
-    manager.page_crashes.append(10.1)
 
-    assert manager.attribute_renderer_kill(10.1, 1, renderer_pid=99) is None
     assert manager.attribute_renderer_kill(10.1, 1) is None
     assert manager.attribute_renderer_kill(10.1, 1, browser_pid=1234) is None
-    assert manager.attribute_renderer_kill(10.1, 1, renderer_pid=42) == RendererKill(
-        10, "cpu", 42, 1234, 1024, 805306368
-    )
+    assert len(manager.renderer_kills) == 12
 
 
 @pytest.mark.parametrize("process_type,recycle_due,drain_pending,recycled", [

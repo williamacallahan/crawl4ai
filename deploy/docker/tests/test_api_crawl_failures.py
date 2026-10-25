@@ -145,6 +145,8 @@ def test_markdown_success_logs_one_safe_terminal_event(
     ("Permission denied: /app/private/private-error", "Crawl failed", "ERROR"),
     ("renderer_memory_limit: rss_bytes=1053999104 rss_limit_bytes=805306368",
      "renderer_memory_limit: rss_bytes=1053999104 rss_limit_bytes=805306368", "WARNING"),
+    ("renderer_cpu_limit: cpu_cores=1.0 cpu_limit_cores=0.9",
+     "renderer_cpu_limit: cpu_cores=1.0 cpu_limit_cores=0.9", "WARNING"),
 ])
 def test_markdown_failed_result_joins_response_level_and_terminal_event(
     stock_client, server_module, monkeypatch, caplog, raw_error, public, level

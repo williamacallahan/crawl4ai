@@ -1,5 +1,4 @@
 import time
-from collections import deque
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -8,6 +7,7 @@ from playwright.async_api import Error
 from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig, ProxyConfig
 from crawl4ai.async_crawler_strategy import (
     AsyncPlaywrightCrawlerStrategy,
+    RENDERER_KILL_ATTRIBUTION_WINDOW_SECONDS,
     TargetNavigationError,
 )
 from crawl4ai.async_logger import AsyncLogger
@@ -61,7 +61,6 @@ def _navigation_strategy(error_detail, *, browser_manager=None):
     if browser_manager is None:
         browser_manager = MagicMock()
         browser_manager.tearing_down = False
-        browser_manager.page_crashes = deque()
         browser_manager.attribute_renderer_kill = Mock(return_value=None)
     strategy.browser_manager = browser_manager
     context = MagicMock()
@@ -115,6 +114,9 @@ async def test_unproven_navigation_failures_remain_platform_errors(error_detail)
         ("unknown_browser", None, "goto"),
         ("foreign_browser", None, "goto"),
         ("stale", None, "goto"),
+        ("orphaned", None, "goto"),
+        ("fallback", "renderer_memory_limit", "goto"),
+        ("fallback_failed", "renderer_memory_limit", "goto"),
         ("ambiguous", None, "goto"),
         ("consumed", None, "goto"),
         ("rss", "renderer_memory_limit", "mhtml"),
@@ -133,15 +135,22 @@ async def test_renderer_kill_provenance_controls_crawl_failure_severity(
     now = time.monotonic()
     rss_bytes = 1053999104
     rss_limit_bytes = 805306368
+    kill_age = 0.1
+    if record == "stale":
+        kill_age = 20
+    elif record == "orphaned":
+        kill_age = RENDERER_KILL_ATTRIBUTION_WINDOW_SECONDS + 0.1
     if record != "unrecorded":
         manager.renderer_kills.append(
             RendererKill(
-                killed_at=now - (20 if record == "stale" else 0.1),
+                killed_at=now - kill_age,
                 reason="cpu" if record == "cpu" else "rss",
                 renderer_pid=12345,
                 browser_pid=4321 if record == "foreign_browser" else 1234,
                 rss_bytes=rss_bytes,
                 rss_limit_bytes=rss_limit_bytes,
+                cpu_cores=1.0 if record == "cpu" else None,
+                cpu_limit_cores=0.9 if record == "cpu" else None,
             )
         )
     if record == "ambiguous":
@@ -149,7 +158,7 @@ async def test_renderer_kill_provenance_controls_crawl_failure_severity(
             RendererKill(now - 0.1, "rss", 12346, 1234, rss_bytes, rss_limit_bytes)
         )
     if record == "consumed":
-        manager.attribute_renderer_kill(now, 10, renderer_pid=12345, browser_pid=1234)
+        manager.attribute_renderer_kill(now, 10, browser_pid=1234)
 
     strategy = _navigation_strategy("ignored", browser_manager=manager)
     page, context = strategy.browser_manager.get_page.return_value
@@ -187,27 +196,45 @@ async def test_renderer_kill_provenance_controls_crawl_failure_severity(
     )
     crawler.ready = True
     fallback = AsyncMock(return_value="<p>fallback</p>")
+    if record == "fallback_failed":
+        fallback.side_effect = RuntimeError("fallback unavailable")
+    crawler.aprocess_html = AsyncMock(return_value=CrawlResult(
+        url="https://example.invalid", html="<p>fallback</p>", success=True,
+    ))
 
     result = await crawler.arun(
         "https://example.invalid",
         CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             max_retries=2 if expected_code else 0,
-            fallback_fetch_function=fallback if expected_code else None,
+            fallback_fetch_function=fallback if record.startswith("fallback") else None,
+            session_id="renderer-session",
         ),
     )
 
-    assert not result.success
+    assert result.success is (record == "fallback")
     assert page.goto.await_count == (1 if phase == "goto" else 0)
-    fallback.assert_not_awaited()
+    if record.startswith("fallback"):
+        fallback.assert_awaited_once_with("https://example.invalid")
+        assert result.crawl_stats["fallback_fetch_used"]
+    else:
+        fallback.assert_not_awaited()
     if expected_code:
-        assert result.error_message == (
-            f"{expected_code}: rss_bytes={rss_bytes} rss_limit_bytes={rss_limit_bytes}"
-        )
-        assert [event[:2] for event in logger.events if event[0] == "warning"] == [
-            ("warning", "WARNING")
-        ]
-        assert not any(event[0] == "error" for event in logger.events)
+        assert result.crawl_stats["attempts"] == 1
+        assert result.session_id == "renderer-session"
+        if record == "fallback":
+            assert result.crawl_stats["resolved_by"] == "fallback_fetch"
+            assert result.html == "<p>fallback</p>"
+        else:
+            detail = (
+                "cpu_cores=1.0 cpu_limit_cores=0.9" if record == "cpu" else
+                f"rss_bytes={rss_bytes} rss_limit_bytes={rss_limit_bytes}"
+            )
+            assert result.error_message == f"{expected_code}: {detail}"
+            assert any(event[:2] == ("warning", "WARNING") for event in logger.events)
+            assert any(event[:2] == ("info", "COMPLETE") for event in logger.events)
+        if record != "fallback_failed":
+            assert not any(event[0] == "error" for event in logger.events)
         assert manager.consecutive_failures == 0
     else:
         assert "Unexpected error in" in result.error_message
@@ -224,13 +251,11 @@ async def test_started_browser_clears_previous_renderer_failure_ledgers(monkeypa
     manager.renderer_kills.append(
         RendererKill(time.monotonic(), "rss", 12345, 1234, 1053999104, 805306368)
     )
-    manager.page_crashes.append(time.monotonic())
     monkeypatch.setattr(manager, "_attribute_browser_pid", AsyncMock())
 
     await manager._started_browser()
 
     assert not manager.renderer_kills
-    assert not manager.page_crashes
 
 
 @pytest.mark.asyncio
