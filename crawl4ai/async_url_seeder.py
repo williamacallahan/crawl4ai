@@ -494,8 +494,10 @@ class AsyncUrlSeeder:
         stop_event = asyncio.Event()
         seen: set[str] = set()
         filter_nonsense = config.filter_nonsense_urls  # Extract this for passing to workers
+        producer_error: Optional[BaseException] = None
 
         async def producer():
+            nonlocal producer_error
             try:
                 async with aclosing(gen()) as stream:
                     async for u in stream:
@@ -514,6 +516,7 @@ class AsyncUrlSeeder:
                             # Skip URLs that cause encoding errors (e.g. on Windows)
                             continue
             except Exception as e:
+                producer_error = e
                 self._log("error", "Producer encountered an error: {error}", params={
                           "error": str(e)}, tag="URL_SEED")
             finally:
@@ -577,6 +580,9 @@ class AsyncUrlSeeder:
         await asyncio.gather(prod_task, *workers)
         await queue.join()  # Ensure all queued items are processed
 
+        if producer_error is not None:
+            raise producer_error
+
         self._log("info", "Finished URL seeding for {domain}. Total URLs: {count}",
                   params={"domain": domain, "count": len(results)}, tag="URL_SEED")
 
@@ -628,10 +634,16 @@ class AsyncUrlSeeder:
             self.logger.verbose = config.verbose
 
         tasks = [
-            self.urls(domain, config)
+            asyncio.create_task(self.urls(domain, config))
             for domain in domains
         ]
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         final_results = dict(zip(domains, results))
         self._log(
@@ -1066,23 +1078,23 @@ class AsyncUrlSeeder:
             robots = f"https://{host}/robots.txt"
             try:
                 r = await self.client.get(robots, timeout=10, follow_redirects=True)
-                if 200 <= r.status_code < 300:
-                    sitemap_lines = [l.split(":", 1)[1].strip()
-                                     for l in r.text.splitlines()
-                                     if l.lower().startswith("sitemap:")]
-                    for sm in sitemap_lines:
-                        async with aclosing(self._iter_sitemap(sm)) as stream:
-                            async for u in stream:
-                                discovered_urls.append(u)
-                                if _match(u, pattern):
-                                    yield u
-                else:
-                    self._log("warning", "robots.txt unavailable for {d} HTTP{c}",
-                              params={"d": domain, "c": r.status_code}, tag="URL_SEED")
-                    return
             except Exception as e:
                 self._log("warning", "Failed to fetch robots.txt for {d}: {e}",
                           params={"d": domain, "e": str(e)}, tag="URL_SEED")
+                return
+            if 200 <= r.status_code < 300:
+                sitemap_lines = [l.split(":", 1)[1].strip()
+                                 for l in r.text.splitlines()
+                                 if l.lower().startswith("sitemap:")]
+                for sm in sitemap_lines:
+                    async with aclosing(self._iter_sitemap(sm)) as stream:
+                        async for u in stream:
+                            discovered_urls.append(u)
+                            if _match(u, pattern):
+                                yield u
+            else:
+                self._log("warning", "robots.txt unavailable for {d} HTTP{c}",
+                          params={"d": domain, "c": r.status_code}, tag="URL_SEED")
                 return
 
         # Step 4: Write to cache (FALLBACK: if write fails, URLs still yielded above)
@@ -1173,6 +1185,8 @@ class AsyncUrlSeeder:
             completed_count = 0
             total_sitemaps = len(sub_sitemaps)
 
+            sub_sitemap_errors: List[BaseException] = []
+
             async def process_subsitemap(sitemap_url: str):
                 try:
                     async with aclosing(self._iter_sitemap(sitemap_url)) as stream:
@@ -1181,6 +1195,7 @@ class AsyncUrlSeeder:
                 except Exception as e:
                     self._log("error", "Error processing sub-sitemap {url}: {error}",
                               params={"url": sitemap_url, "error": str(e)}, tag="URL_SEED")
+                    sub_sitemap_errors.append(e)
                 await result_queue.put(None)
 
             tasks = [asyncio.create_task(process_subsitemap(sm)) for sm in sub_sitemaps]
@@ -1202,6 +1217,9 @@ class AsyncUrlSeeder:
                     if not t.done():
                         t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            if sub_sitemap_errors:
+                raise sub_sitemap_errors[0]
         else:
             for u in regular_urls:
                 yield u
@@ -1213,11 +1231,11 @@ class AsyncUrlSeeder:
         except httpx.HTTPStatusError as e:
             self._log("warning", "Failed to fetch sitemap {url}: HTTP {status_code}",
                       params={"url": url, "status_code": e.response.status_code}, tag="URL_SEED")
-            return
+            raise
         except httpx.RequestError as e:
             self._log("warning", "Network error fetching sitemap {url}: {error}",
                       params={"url": url, "error": str(e)}, tag="URL_SEED")
-            return
+            raise
         except Exception as e:
             self._log("error", "Unexpected error fetching sitemap {url}: {error}",
                       params={"url": url, "error": str(e)}, tag="URL_SEED")
@@ -1357,6 +1375,8 @@ class AsyncUrlSeeder:
             completed_count = 0
             total_sitemaps = len(sub_sitemaps)
 
+            sub_sitemap_errors: List[BaseException] = []
+
             async def process_subsitemap(sitemap_url: str):
                 try:
                     self._log(
@@ -1368,6 +1388,7 @@ class AsyncUrlSeeder:
                 except Exception as e:
                     self._log("error", "Error processing sub-sitemap {url}: {error}",
                               params={"url": sitemap_url, "error": str(e)}, tag="URL_SEED")
+                    sub_sitemap_errors.append(e)
                 await result_queue.put(None)
 
             # Start all tasks
@@ -1394,6 +1415,11 @@ class AsyncUrlSeeder:
                     if not t.done():
                         t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Propagate the first sub-sitemap fetch error so urls(source="sitemap")
+            # does not report a partial result as success.
+            if sub_sitemap_errors:
+                raise sub_sitemap_errors[0]
         else:
             # Regular sitemap - yield URLs directly
             for u in regular_urls:
