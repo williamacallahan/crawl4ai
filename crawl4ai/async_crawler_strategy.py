@@ -32,7 +32,7 @@ from .async_configs import (
 )
 from .async_logger import AsyncLogger
 from .browser_adapter import BrowserAdapter, PlaywrightAdapter, UndetectedAdapter
-from .browser_manager import BrowserManager, PAGE_CLOSE_SECONDS
+from .browser_manager import BrowserManager, PAGE_CLOSE_SECONDS, RendererKill
 from .browser_budget import page_deadline, within_page_budget
 from .config import SCREENSHOT_HEIGHT_TRESHOLD
 from .js_snippet import load_js_script
@@ -54,6 +54,20 @@ _TARGET_NAVIGATION_REFUSALS: Final = (
 
 class TargetNavigationError(RuntimeError):
     """A direct target origin refused browser navigation."""
+
+
+class RendererResourceLimitError(Error):
+    """The resource watchdog deliberately killed a renderer of this browser."""
+
+    def __init__(self, kill: RendererKill):
+        self.kill = kill
+        self.outcome = "renderer_memory_limit" if kill.reason == "rss" else "renderer_cpu_limit"
+        self.rss_bytes = kill.rss_bytes
+        self.rss_limit_bytes = kill.rss_limit_bytes
+        super().__init__(
+            f"{self.outcome}: rss_bytes={kill.rss_bytes} "
+            f"rss_limit_bytes={kill.rss_limit_bytes}"
+        )
 
 
 # Chromium reports a killed renderer's crash within this window of the kill.
@@ -150,6 +164,9 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
         # Initialize session management
         self._downloaded_files = []
+        # Helpers that normally recover from optional export/DOM failures must
+        # propagate a terminal page crash to the crawl's classification owner.
+        self._page_crash_errors = {}
 
         # Initialize hooks system
         self.hooks = {
@@ -170,6 +187,11 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             logger=self.logger,
             use_undetected=isinstance(self.adapter, UndetectedAdapter)
         )
+
+    def _raise_if_page_crashed(self, page: Page) -> None:
+        error = self._page_crash_errors.get(page)
+        if error is not None:
+            raise error
 
     async def __aenter__(self):
         await self.start()
@@ -465,6 +487,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         params={"index": i},
                     )
             except Exception as e:
+                self._raise_if_page_crashed(page)
                 self.logger.error(
                     message="Error processing iframe {index}: {error}",
                     tag="ERROR",
@@ -712,10 +735,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         context = None
         execution_session = None
         renderer_crashed = False
-        # Playwright's crash event and CDP TargetInfo expose no renderer OS
-        # PID. SystemInfo lists processes without target ownership, and
-        # navigation can swap renderers, so this page's PID remains unknown.
-        renderer_pid = None
+        browser_pid = None
+        renderer_kill = None
         crashed_at = None
         crash_cleanup = None
 
@@ -736,10 +757,20 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 navigation_response = None
 
         def on_crash(crashed_page):
-            nonlocal renderer_crashed, crashed_at, crash_cleanup
+            nonlocal renderer_crashed, crashed_at, crash_cleanup, renderer_kill
             renderer_crashed = True
             crashed_at = time.monotonic()
             self.browser_manager.page_crashes.append(crashed_at)
+            # Claim synchronously, before cleanup or an interrupted operation
+            # can yield to another page's crash handler.
+            renderer_kill = self.browser_manager.attribute_renderer_kill(
+                crashed_at, RENDERER_KILL_CRASH_WINDOW_SECONDS,
+                browser_pid=browser_pid,
+            )
+            self._page_crash_errors[crashed_page] = (
+                RendererResourceLimitError(renderer_kill)
+                if renderer_kill is not None else Error("Target page crashed")
+            )
             # Closing the crashed target rejects its pending Playwright calls;
             # cancelling only the Python waiter leaves protocol promises alive.
             crash_cleanup = asyncio.create_task(
@@ -763,6 +794,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 user_agent=override_ua if ua_changed else None,
                 browser_hint=override_hint if ua_changed else None,
             )
+            browser_pid = self.browser_manager.browser_pid
 
             # Playwright evaluate promises can remain pending after SIGKILL.
             # The page crash event is the renderer's terminal signal.
@@ -1307,6 +1339,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         pass
                     await self.adapter.evaluate(page, update_image_dimensions_js)
                 except Exception as e:
+                    self._raise_if_page_crashed(page)
                     self.logger.error(
                         message="Error updating image dimensions: {error}",
                         tag="ERROR",
@@ -1437,6 +1470,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 captured_console.extend(final_messages or [])
 
             # Return complete response
+            self._raise_if_page_crashed(page)
             self.browser_manager.consecutive_failures = 0
             return AsyncCrawlResponse(
                 html=html,
@@ -1474,19 +1508,11 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # batch of slow or dead target sites times out together, and
             # counting those recycled healthy browsers under live crawls.
             if renderer_crashed or "target closed" in failure or "targetclosed" in failure or "has been closed" in failure:
-                self.browser_manager.consecutive_failures += 1
+                if renderer_kill is None:
+                    self.browser_manager.consecutive_failures += 1
             if renderer_crashed:
-                # Attribute only a proven PID match; an unknown renderer must
-                # remain a reported browser fault despite nearby kills.
-                kill_reason = self.browser_manager.attribute_renderer_kill(
-                    crashed_at or time.monotonic(),
-                    RENDERER_KILL_CRASH_WINDOW_SECONDS,
-                    renderer_pid=renderer_pid,
-                )
-                if kill_reason is not None:
-                    raise Error(
-                        f"Target page crashed: renderer exceeded its {kill_reason} limit"
-                    ) from error
+                if renderer_kill is not None:
+                    raise RendererResourceLimitError(renderer_kill) from error
                 raise Error("Target page crashed") from error
             closed = (
                 "target closed" in failure
@@ -1559,6 +1585,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         cleanup_cancelled = True
                     except Exception:
                         pass
+                self._page_crash_errors.pop(page, None)
                 if cleanup_cancelled:
                     raise asyncio.CancelledError
 
@@ -1806,6 +1833,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 )
             
         except Exception as e:
+            self._raise_if_page_crashed(page)
             self.logger.error(
                 message="Virtual scroll capture failed: {error}",
                 tag="VSCROLL",
@@ -2011,6 +2039,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             
             return mhtml_content
         except Exception as e:
+            self._raise_if_page_crashed(page)
             # Log the error but don't raise it - we'll just return None for the MHTML
             if self.logger:
                 self.logger.error(
@@ -2157,6 +2186,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
             return encoded
         except Exception as e:
+            self._raise_if_page_crashed(page)
             error_message = f"Failed to take large viewport screenshot: {str(e)}"
             self.logger.error(
                 message="Large viewport screenshot failed: {error}",
@@ -2189,6 +2219,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             screenshot = await page.screenshot(full_page=False)
             return base64.b64encode(screenshot).decode("utf-8")
         except Exception as e:
+            self._raise_if_page_crashed(page)
             error_message = f"Failed to take screenshot: {str(e)}"
             self.logger.error(
                 message="Screenshot failed: {error}",
@@ -2278,6 +2309,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         )
                     except Error as e:
                         # If it's due to navigation destroying the context, handle gracefully
+                        self._raise_if_page_crashed(page)
                         if "Execution context was destroyed" in str(e):
                             self.logger.info(
                                 "Navigation triggered by script, waiting for load state",
@@ -2339,6 +2371,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     results.append(result if result else {"success": True})
 
                 except Exception as e:
+                    self._raise_if_page_crashed(page)
                     # Catch anything else
                     self.logger.error(
                         message="Script chunk failed: {error}",
@@ -2350,6 +2383,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             return {"success": True, "results": results}
 
         except Exception as e:
+            self._raise_if_page_crashed(page)
             self.logger.error(
                 message="Script execution failed: {error}",
                 tag="JS_EXEC",

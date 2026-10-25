@@ -141,10 +141,14 @@ def test_markdown_success_logs_one_safe_terminal_event(
         assert sensitive not in event
 
 
-def test_markdown_failed_result_joins_redacted_response_and_terminal_event(
-    stock_client, server_module, monkeypatch, caplog
+@pytest.mark.parametrize("raw_error,public,level", [
+    ("Permission denied: /app/private/private-error", "Crawl failed", "ERROR"),
+    ("renderer_memory_limit: rss_bytes=1053999104 rss_limit_bytes=805306368",
+     "renderer_memory_limit: rss_bytes=1053999104 rss_limit_bytes=805306368", "WARNING"),
+])
+def test_markdown_failed_result_joins_response_level_and_terminal_event(
+    stock_client, server_module, monkeypatch, caplog, raw_error, public, level
 ):
-    raw_error = "Permission denied: /app/private/private-error"
     _install_markdown_crawler(
         monkeypatch,
         SimpleNamespace(success=False, error_message=raw_error),
@@ -161,7 +165,7 @@ def test_markdown_failed_result_joins_redacted_response_and_terminal_event(
 
     assert response.status_code == 502
     correlation = re.fullmatch(
-        r"Crawl failed \(correlation_id=([0-9a-f]{12})\)", response.json()["detail"]
+        re.escape(public) + r" \(correlation_id=([0-9a-f]{12})\)", response.json()["detail"]
     )
     assert correlation is not None
     correlation_id = correlation.group(1)
@@ -169,11 +173,12 @@ def test_markdown_failed_result_joins_redacted_response_and_terminal_event(
     assert event.startswith("event=md_terminal status=502 outcome=crawl_failure duration_ms=")
     assert f"correlation_id={correlation_id}" in event
     assert raw_error not in event
-    assert any(
-        f"[cid={correlation_id}]" in record.getMessage()
+    [failure] = [
+        record
         for record in caplog.records
-        if record.name == "utils"
-    )
+        if record.name == "utils" and f"[cid={correlation_id}]" in record.getMessage()
+    ]
+    assert failure.levelname == level
 
 
 def test_markdown_pass_through_failure_does_not_log_correlation(

@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 import hashlib
 import os
 import re
@@ -22,6 +23,16 @@ from .async_configs import BrowserConfig, CrawlerRunConfig
 from .config import DOWNLOAD_PAGE_TIMEOUT, PAGE_TIMEOUT
 from .js_snippet import load_js_script
 from .utils import get_chromium_path
+
+
+@dataclass(frozen=True)
+class RendererKill:
+    killed_at: float
+    reason: str
+    renderer_pid: int
+    browser_pid: int
+    rss_bytes: int
+    rss_limit_bytes: int
 
 # A hung Playwright call must not make the awaits above it uncancellable: the
 # pool's 60s close cap is what SIGKILLs an abandoned Chromium, and it only
@@ -817,10 +828,8 @@ class BrowserManager:
         # partially-created page.
         self._pages_served = 0
         self.consecutive_failures = 0
-        # (monotonic, exceeded limit, renderer pid) of watchdog kills, and
-        # (monotonic) page crashes. Only a proven renderer PID match can
-        # attribute a page crash to one of these kills.
-        self.renderer_kills: deque[tuple[float, str, int]] = deque(maxlen=12)
+        # Unclaimed watchdog kills for this owned browser, and page crash times.
+        self.renderer_kills: deque[RendererKill] = deque(maxlen=12)
         self.page_crashes: deque[float] = deque(maxlen=12)
         self._recycle_due = False
         self._recycling = False
@@ -881,19 +890,27 @@ class BrowserManager:
         )
 
     def attribute_renderer_kill(
-        self, crashed_at: float, window: float, *, renderer_pid: Optional[int] = None
-    ) -> Optional[str]:
-        """Name the resource limit a watchdog kill explains for this page's crash.
-
-        A kill of another renderer never explains this page's crash, even
-        when it is the only recent kill. Unknown page PIDs stay unattributed.
-        """
-        if renderer_pid is None:
+        self, crashed_at: float, window: float, *, renderer_pid: Optional[int] = None,
+        browser_pid: Optional[int] = None,
+    ) -> Optional[RendererKill]:
+        """Claim one matching watchdog kill for a page's terminal crash."""
+        if renderer_pid is None and browser_pid is None:
             return None
-        for killed_at, reason, killed_pid in reversed(self.renderer_kills):
-            if killed_pid == renderer_pid and 0 <= crashed_at - killed_at <= window:
-                return reason
-        return None
+        candidates = [
+            kill for kill in self.renderer_kills
+            if 0 <= crashed_at - kill.killed_at <= window
+            and (browser_pid is None or kill.browser_pid == browser_pid)
+            and (renderer_pid is None or kill.renderer_pid == renderer_pid)
+        ]
+        # ponytail: two pages of one browser crashing at once can misattribute
+        # the first crash. CDP exposes no target-to-renderer PID mapping; use
+        # the owned browser and bounded recency until an exact API exists.
+        # Ambiguous kills stay faults, and a kill can explain only one crash.
+        if len(candidates) != 1:
+            return None
+        kill = candidates[0]
+        self.renderer_kills.remove(kill)
+        return kill
 
     def request_pool_recycle(self, reason: str) -> None:
         """Drain and restart an unhealthy browser.

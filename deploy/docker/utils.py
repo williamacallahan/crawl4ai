@@ -443,6 +443,9 @@ _RESOURCE_REJECTION = re.compile(
     r"(?:Error|All proxies failed): (Target page crashed: renderer exceeded its (?:rss|cpu) limit"
     r"|Target closed: browser drained by the resource watchdog)"
 )
+_RENDERER_RESOURCE_OUTCOME = re.compile(
+    r"renderer_(?:memory|cpu)_limit: rss_bytes=\d+ rss_limit_bytes=\d+"
+)
 
 
 _TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
@@ -549,6 +552,10 @@ def public_crawl_error(
     """
     message = (raw or "").strip()
     public = public_error_detail(raw)
+    if _RENDERER_RESOURCE_OUTCOME.fullmatch(message):
+        return correlated_error(
+            public, raw, f"crawl failure url={url or 'unknown'}", logging.WARNING
+        )
     if not message or public == message[:500]:
         return CorrelatedError(public)
     # A recovered Chromium code or goto timeout means the target site failed, so

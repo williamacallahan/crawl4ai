@@ -27,6 +27,7 @@ from .async_crawler_strategy import (
     AsyncCrawlerStrategy,
     AsyncPlaywrightCrawlerStrategy,
     AsyncCrawlResponse,
+    RendererResourceLimitError,
     TargetNavigationError,
 )
 from .cache_context import CacheMode, CacheContext
@@ -544,6 +545,8 @@ class AsyncWebCrawler:
                                         break  # Success — exit proxy loop
 
                                 except Exception as _crawl_err:
+                                    if isinstance(_crawl_err, RendererResourceLimitError):
+                                        raise
                                     _target_outcome = (
                                         _proxy is None
                                         and isinstance(_crawl_err, TargetNavigationError)
@@ -756,6 +759,18 @@ class AsyncWebCrawler:
                     cached_result.redirected_url = cached_result.redirected_url or (None if is_raw_url else url)
                     return CrawlResultContainer(cached_result)
 
+            except RendererResourceLimitError as e:
+                error_message = str(e)
+                self.logger.warning(
+                    message="Crawl rejected for {url}: {error}",
+                    tag="WARNING",
+                    params={"url": url, "error": error_message},
+                )
+                return CrawlResultContainer(
+                    CrawlResult(
+                        url=url, html="", success=False, error_message=error_message
+                    )
+                )
             except Exception as e:
                 error_message = unexpected_error_message("_crawl_web", sys.exc_info())
 

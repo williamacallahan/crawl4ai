@@ -13,7 +13,7 @@ from crawl4ai.async_crawler_strategy import (
 from crawl4ai.async_logger import AsyncLogger
 from crawl4ai.async_webcrawler import AsyncWebCrawler
 from crawl4ai.async_webcrawler import async_db_manager
-from crawl4ai.browser_manager import BrowserManager
+from crawl4ai.browser_manager import BrowserManager, RendererKill
 from crawl4ai.cache_context import CacheMode
 from crawl4ai.models import AsyncCrawlResponse, CrawlResult
 
@@ -31,6 +31,9 @@ class _RecordingLogger:
 
     def error_status(self, url, error, tag="ERROR", **kwargs):
         self.events.append(("error", tag, error))
+
+    def error(self, message, tag="ERROR", **kwargs):
+        self.events.append(("error", tag, message))
 
     def url_status(self, url, success, timing, tag="FETCH", **kwargs):
         self.events.append(("success" if success else "error", tag, url))
@@ -103,58 +106,124 @@ async def test_unproven_navigation_failures_remain_platform_errors(error_detail)
 
 
 @pytest.mark.asyncio
-async def test_page_crash_without_renderer_pid_stays_a_fault_despite_recent_kill():
-    # A nearby kill can belong to another page. Playwright's crash event
-    # supplies no renderer PID, so timing alone cannot explain this crash.
+@pytest.mark.parametrize(
+    "record,expected_code,phase",
+    [
+        ("rss", "renderer_memory_limit", "goto"),
+        ("cpu", "renderer_cpu_limit", "goto"),
+        ("unrecorded", None, "goto"),
+        ("unknown_browser", None, "goto"),
+        ("foreign_browser", None, "goto"),
+        ("stale", None, "goto"),
+        ("ambiguous", None, "goto"),
+        ("consumed", None, "goto"),
+        ("rss", "renderer_memory_limit", "mhtml"),
+        ("unrecorded", None, "mhtml"),
+        ("rss", "renderer_memory_limit", "screenshot"),
+        ("unrecorded", None, "screenshot"),
+    ],
+)
+async def test_renderer_kill_provenance_controls_crawl_failure_severity(
+    tmp_path, record, expected_code, phase
+):
+    # Playwright supplies no renderer PID. Only one recent, unconsumed kill
+    # from this crawl's known browser can explain the terminal crash.
     manager = BrowserManager(BrowserConfig(headless=True))
+    manager.browser_pid = None if record == "unknown_browser" else 1234
+    now = time.monotonic()
+    rss_bytes = 1053999104
+    rss_limit_bytes = 805306368
+    if record != "unrecorded":
+        manager.renderer_kills.append(
+            RendererKill(
+                killed_at=now - (20 if record == "stale" else 0.1),
+                reason="cpu" if record == "cpu" else "rss",
+                renderer_pid=12345,
+                browser_pid=4321 if record == "foreign_browser" else 1234,
+                rss_bytes=rss_bytes,
+                rss_limit_bytes=rss_limit_bytes,
+            )
+        )
+    if record == "ambiguous":
+        manager.renderer_kills.append(
+            RendererKill(now - 0.1, "rss", 12346, 1234, rss_bytes, rss_limit_bytes)
+        )
+    if record == "consumed":
+        manager.attribute_renderer_kill(now, 10, renderer_pid=12345, browser_pid=1234)
+
     strategy = _navigation_strategy("ignored", browser_manager=manager)
-    page, _ = strategy.browser_manager.get_page.return_value
+    page, context = strategy.browser_manager.get_page.return_value
     crash_handlers = {}
     page.on = lambda event, handler: crash_handlers.__setitem__(event, handler)
     strategy.browser_manager._close_page_quietly = AsyncMock()
-    manager.renderer_kills.append((time.monotonic(), "rss", 12345))
 
     async def crash_then_fail(*args, **kwargs):
         crash_handlers["crash"](page)
         raise Error("Page crashed")
 
     page.goto = AsyncMock(side_effect=crash_then_fail)
+    logger = _RecordingLogger()
+    strategy.logger = logger
+    if phase != "goto":
+        # Exercise helpers through the supported page hook. These helpers
+        # normally swallow export errors; a terminal crash must escape them.
+        async def export_from_hook(page, **kwargs):
+            if phase == "mhtml":
+                await strategy.capture_mhtml(page)
+            else:
+                await strategy.take_screenshot_naive(page)
 
-    with pytest.raises(Error) as raised:
-        await strategy.crawl("https://example.invalid", CrawlerRunConfig())
+        strategy.set_hook("before_goto", export_from_hook)
+        page.wait_for_load_state = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.evaluate = AsyncMock()
+        page.context = context
+        context.new_cdp_session.return_value.send = AsyncMock(side_effect=crash_then_fail)
+        page.screenshot = AsyncMock(side_effect=crash_then_fail)
+    crawler = AsyncWebCrawler(
+        crawler_strategy=strategy,
+        base_directory=str(tmp_path),
+        logger=logger,
+    )
+    crawler.ready = True
+    fallback = AsyncMock(return_value="<p>fallback</p>")
 
-    assert str(raised.value) == "Target page crashed"
-    assert manager.consecutive_failures == 1
+    result = await crawler.arun(
+        "https://example.invalid",
+        CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            max_retries=2 if expected_code else 0,
+            fallback_fetch_function=fallback if expected_code else None,
+        ),
+    )
 
-
-@pytest.mark.asyncio
-async def test_page_crash_stays_a_fault_when_crashes_outnumber_kills():
-    # Multiple unknown renderers crashing near a kill remain browser faults.
-    manager = BrowserManager(BrowserConfig(headless=True))
-    strategy = _navigation_strategy("ignored", browser_manager=manager)
-    page, _ = strategy.browser_manager.get_page.return_value
-    crash_handlers = {}
-    page.on = lambda event, handler: crash_handlers.__setitem__(event, handler)
-    strategy.browser_manager._close_page_quietly = AsyncMock()
-    manager.page_crashes.append(time.monotonic())
-    manager.renderer_kills.append((time.monotonic(), "rss", 12345))
-
-    async def crash_then_fail(*args, **kwargs):
-        crash_handlers["crash"](page)
-        raise Error("Page crashed")
-
-    page.goto = AsyncMock(side_effect=crash_then_fail)
-
-    with pytest.raises(Error) as raised:
-        await strategy.crawl("https://example.invalid", CrawlerRunConfig())
-
-    assert str(raised.value) == "Target page crashed"
+    assert not result.success
+    assert page.goto.await_count == (1 if phase == "goto" else 0)
+    fallback.assert_not_awaited()
+    if expected_code:
+        assert result.error_message == (
+            f"{expected_code}: rss_bytes={rss_bytes} rss_limit_bytes={rss_limit_bytes}"
+        )
+        assert [event[:2] for event in logger.events if event[0] == "warning"] == [
+            ("warning", "WARNING")
+        ]
+        assert not any(event[0] == "error" for event in logger.events)
+        assert manager.consecutive_failures == 0
+    else:
+        assert "Unexpected error in" in result.error_message
+        assert "Target page crashed" in result.error_message
+        assert any(event[0] == "error" for event in logger.events)
+        assert not any(event[0] == "warning" for event in logger.events)
+        assert manager.consecutive_failures == 1
+    assert not strategy._page_crash_errors
 
 
 @pytest.mark.asyncio
 async def test_started_browser_clears_previous_renderer_failure_ledgers(monkeypatch):
     manager = BrowserManager(BrowserConfig(headless=True))
-    manager.renderer_kills.append((time.monotonic(), "rss", 12345))
+    manager.renderer_kills.append(
+        RendererKill(time.monotonic(), "rss", 12345, 1234, 1053999104, 805306368)
+    )
     manager.page_crashes.append(time.monotonic())
     monkeypatch.setattr(manager, "_attribute_browser_pid", AsyncMock())
 

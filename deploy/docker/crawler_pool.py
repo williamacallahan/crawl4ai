@@ -27,6 +27,7 @@ from utils import (
 )
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig
+from crawl4ai.browser_manager import RendererKill
 
 logger = logging.getLogger(__name__)
 CONFIG = load_config()
@@ -981,7 +982,11 @@ def _watch_renderers(crawler: AsyncWebCrawler, now: float) -> set[tuple[int, flo
                     "created_at=%s rss_bytes=%s rss_limit_bytes=%s",
                     process.pid, reason, browser_pid, identity[1], rss_bytes, rss_limit_bytes,
                 )
-                manager.renderer_kills.append((now, reason, process.pid))
+                manager.renderer_kills.append(RendererKill(
+                    killed_at=now, reason=reason, renderer_pid=process.pid,
+                    browser_pid=browser_pid, rss_bytes=rss_bytes,
+                    rss_limit_bytes=rss_limit_bytes,
+                ))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             # Renderers exit while pages navigate; losing one during a sample
             # must not stop sampling the other browsers.
