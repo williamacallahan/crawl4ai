@@ -170,6 +170,7 @@ class AsyncDatabaseManager:
         try:
             async with self.pool_lock:
                 if task_id not in self.connection_pool:
+                    conn = None
                     try:
                         conn = await aiosqlite.connect(self.db_path, timeout=30.0)
                         await conn.execute("PRAGMA journal_mode = WAL")
@@ -203,6 +204,18 @@ class AsyncDatabaseManager:
 
                         self.connection_pool[task_id] = conn
                     except Exception:
+                        # ``conn`` is inserted into ``connection_pool`` only
+                        # after *all* setup succeeds, so the outer ``finally``
+                        # cleanup (``if task_id in self.connection_pool``) does
+                        # not see a connection that failed mid-setup. Close it
+                        # here to avoid leaking the aiosqlite worker thread,
+                        # sqlite3 handle, and WAL file descriptors -- one leak
+                        # per failed attempt (3 per operation via
+                        # ``execute_with_retry``) -- that would otherwise persist
+                        # for the process lifetime (aiosqlite's Connection runs
+                        # a non-daemon thread that only stops on ``close()``).
+                        if conn is not None:
+                            await conn.close()
                         self.logger.error(
                             message="{error}",
                             tag="ERROR",
