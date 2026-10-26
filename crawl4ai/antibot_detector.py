@@ -232,9 +232,23 @@ def _looks_like_data(html: str) -> bool:
     # Raw JSON/XML (not wrapped in HTML)
     if stripped[0] in ('{', '['):
         return True
-    # Browser-rendered JSON: browsers wrap raw JSON in <html><body><pre>{...}</pre>
+    # Browser-rendered JSON/XML: Chromium wraps a raw JSON/XML response in
+    # <html><head></head><body>...</body></html>. Two shapes occur in practice:
+    #   - the documented viewer: <body><pre>{...}</pre> (served as application/json
+    #     or with no HTML, Chromium synthesises a <pre>-wrapped viewer), and
+    #   - the pass-through: <body>{...}</body> (when the response is already
+    #     text/html whose body is the raw JSON/XML — no <pre> is added).
+    # Recognize both so the data exemption holds for the production browser path.
     if stripped[:10].lower().startswith(('<html', '<!')):
         if re.search(r'<body[^>]*>\s*<pre[^>]*>\s*[{\[]', stripped[:500], re.IGNORECASE):
+            return True
+        if re.search(
+            r'<body[^>]*>\s*(?:'
+            r'[{\[]|'
+            r'<(?:[a-z_][\w.-]*:)?(?:rss|urlset|sitemapindex|feed|rdf)(?=[\s/>])'
+            r')',
+            stripped[:500], re.IGNORECASE,
+        ):
             return True
         return False
     # Feed and sitemap XML only; other < prefixed content is HTML.
@@ -400,7 +414,13 @@ def is_blocked(
         return True, f"HTTP {status_code} with HTML content ({html_len} bytes)"
 
     # --- Tier 2 patterns on other 4xx/5xx + short page ---
-    if status_code and status_code >= 400 and html_len < _TIER2_MAX_SIZE:
+    # Exempt JSON/XML data responses (parity with the 403/503, near-empty, and
+    # Tier 3 branches). Without the guard, a legitimate API error payload that
+    # quotes a tier-2 phrase is flagged as a block, and the 403/503 data
+    # exemption is nullified for phrase-bearing bodies (status_code >= 400
+    # subsumes 403/503).
+    if (status_code and status_code >= 400 and html_len < _TIER2_MAX_SIZE
+            and not _looks_like_data(html)):
         for pattern, reason in _TIER2_PATTERNS:
             if pattern.search(snippet):
                 return True, f"{reason} (HTTP {status_code}, {html_len} bytes)"
