@@ -400,9 +400,10 @@ def _memory_dispatcher(config):
 def _project_crawl_result(result, result_fields):
     """Narrow a crawl result to the caller's requested fields.
 
-    Kept from the fork: the durable CrawlJobQueue path honours `result_fields`,
-    and upstream dropped this helper along with the fire-and-forget job runner
-    it no longer needed. Still used by the streaming path below.
+    Applied by every crawl endpoint that advertises ``result_fields`` via
+    ``CrawlRequest``: the synchronous ``/crawl`` handler
+    (``handle_crawl_request``), the durable ``CrawlJobQueue`` path, and the
+    streaming ``stream_results`` serializer.
     """
     if not result_fields:
         return result
@@ -1396,6 +1397,7 @@ async def stream_results(
     crawler: Optional[AsyncWebCrawler],
     results_gen: AsyncGenerator,
     request_id: Optional[str] = None,
+    result_fields: Optional[List[str]] = None,
 ) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers.
 
@@ -1419,10 +1421,15 @@ async def stream_results(
                     result_dict["error_message"] = public_crawl_error(
                         result_dict["error_message"], result_dict.get("url")
                     )
+                # Read the per-URL verdict before projection: result_fields
+                # may omit "success", and the aggregate verdict tracked for
+                # the monitor must not depend on what the caller asked to see.
                 if result_dict.get("success"):
                     any_url_succeeded = True
                 elif first_error is None:
                     first_error = result_dict.get("error_message") or "Crawl failed"
+                if result_fields:
+                    result_dict = _project_crawl_result(result_dict, result_fields)
                 result_dict['server_memory_mb'] = server_memory_mb
                 if "fit_html" in result_dict and not (result_dict["fit_html"] is None or isinstance(result_dict["fit_html"], str)):
                     result_dict["fit_html"] = None

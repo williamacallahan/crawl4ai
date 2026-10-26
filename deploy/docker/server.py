@@ -1409,7 +1409,9 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         headers["X-Hooks-Warning"] = _HOOKS_CODE_WARNING
     
     return StreamingResponse(
-        stream_results(crawler, gen, request_id),
+        stream_results(
+            crawler, gen, request_id, result_fields=crawl_request.result_fields
+        ),
         media_type="application/x-ndjson",
         headers=headers,
     )
