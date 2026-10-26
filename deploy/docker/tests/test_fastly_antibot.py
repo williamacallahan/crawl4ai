@@ -4,15 +4,15 @@ from crawl4ai.antibot_detector import is_blocked
 
 
 @pytest.mark.parametrize("padding_size", [0, 20000, 60000])
-def test_fastly_client_challenge_is_blocked_at_http_200(padding_size):
+@pytest.mark.parametrize("script_url", ["script.js?reload=true", "script.js", "errors.js"])
+def test_fastly_client_challenge_is_blocked_at_http_200(padding_size, script_url):
     # Structure retained from OREF's HTTP 200 Client Challenge capture; omit
     # its per-request CAPTCHA data. Padding puts the scripts past fast scans.
     html = (
         "<html><head><title>Client Challenge</title></head><body><p>"
         + "Please enable JavaScript to proceed. " * 5
         + "x" * padding_size
-        + '</p><script src="/_fs-ch-example/errors.js"></script>'
-        + '<script src="/_fs-ch-example/script.js?reload=true"></script>'
+        + f'</p><script src="/_fs-ch-example/{script_url}"></script>'
         + "</body></html>"
     )
 

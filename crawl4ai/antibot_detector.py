@@ -25,7 +25,7 @@ from lxml import etree, html as lxml_html
 _CF_CHALLENGE_OPTIONS_RE = re.compile(r"window\._cf_chl_opt\s*=", re.IGNORECASE)
 _CF_INTERSTITIAL_TITLE_RE = re.compile(r"<title>\s*Just\s+a\s+moment", re.IGNORECASE)
 _FASTLY_CHALLENGE_SCRIPT_RE = re.compile(
-    r"/_fs-ch-[^/\s]+/(?:script|errors)\.js(?:[?#]|$)", re.IGNORECASE
+    r"/_fs-ch-[^/\s]+/(?:script|errors)\.js(?=[?#\"'\s>]|$)", re.IGNORECASE
 )
 
 
