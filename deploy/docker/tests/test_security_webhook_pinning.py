@@ -53,6 +53,36 @@ class TestWebhookPinning:
         ok = await _svc().send_webhook("http://169.254.169.254/cb", {"x": 1})
         assert ok is False
 
+    async def test_dns_failure_uses_full_retry_budget(self, monkeypatch):
+        from egress_broker import TargetUnresolvable
+
+        calls = []
+
+        def boom(url):
+            calls.append(url)
+            raise TargetUnresolvable()
+
+        monkeypatch.setattr(egress_broker, "resolve_and_pin", boom)
+        svc = WebhookDeliveryService({"webhooks": {"retry": {
+            "max_attempts": 5, "initial_delay_ms": 1, "timeout_ms": 5000}}})
+        ok = await svc.send_webhook("https://callback.example/cb", {"x": 1})
+        assert ok is False
+        assert len(calls) == 5
+
+    async def test_policy_block_remains_single_attempt(self, monkeypatch):
+        calls = []
+
+        def boom(url):
+            calls.append(url)
+            raise EgressBlocked()
+
+        monkeypatch.setattr(egress_broker, "resolve_and_pin", boom)
+        svc = WebhookDeliveryService({"webhooks": {"retry": {
+            "max_attempts": 5, "initial_delay_ms": 1, "timeout_ms": 5000}}})
+        ok = await svc.send_webhook("https://callback.example/cb", {"x": 1})
+        assert ok is False
+        assert len(calls) == 1
+
     async def test_redirect_to_internal_blocked(self, monkeypatch):
         server, port = await _raw_server(
             b"HTTP/1.1 302 Found\r\nLocation: http://evil.internal/\r\nContent-Length: 0\r\n\r\n"
