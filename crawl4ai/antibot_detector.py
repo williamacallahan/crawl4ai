@@ -19,11 +19,14 @@ import re
 from html.parser import HTMLParser
 from typing import Optional, Tuple
 
-from lxml import html as lxml_html
+from lxml import etree, html as lxml_html
 
 
 _CF_CHALLENGE_OPTIONS_RE = re.compile(r"window\._cf_chl_opt\s*=", re.IGNORECASE)
 _CF_INTERSTITIAL_TITLE_RE = re.compile(r"<title>\s*Just\s+a\s+moment", re.IGNORECASE)
+_FASTLY_CHALLENGE_SCRIPT_RE = re.compile(
+    r"/_fs-ch-[^/\s]+/(?:script|errors)\.js(?:[?#]|$)", re.IGNORECASE
+)
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +341,24 @@ def is_blocked(
     # --- HTTP 429 is always rate limiting ---
     if status_code == 429:
         return True, "HTTP 429 Too Many Requests"
+
+    # Fastly's HTTP 200 interstitial can exceed both size-based tiers. Require
+    # its actual title AND challenge script, not article text or quoted markup.
+    if _FASTLY_CHALLENGE_SCRIPT_RE.search(html[:500000]):
+        try:
+            document = lxml_html.document_fromstring(html[:500000])
+            title = document.find(".//title")
+            if (
+                title is not None
+                and re.fullmatch(r"\s*Client\s+Challenge\s*", title.text_content(), re.IGNORECASE)
+                and any(
+                    _FASTLY_CHALLENGE_SCRIPT_RE.match(script.get("src") or "")
+                    for script in document.iter("script")
+                )
+            ):
+                return True, "Fastly client challenge"
+        except (etree.ParserError, ValueError):
+            pass
 
     # --- Check for tier 1 patterns (high confidence, any page size) ---
     # First check the raw start of the page (fast path for small pages).
