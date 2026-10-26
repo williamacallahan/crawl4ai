@@ -25,6 +25,7 @@ Run:  pytest deploy/docker/tests/test_security_default_posture.py -v
 """
 
 import pytest
+from redis import asyncio as aioredis
 
 from redis_config import build_rate_limit_storage_uri, build_redis_url
 
@@ -202,6 +203,52 @@ class TestDefaultDeployIsSafe:
         assert url.startswith("redis://default:")
         assert "p%40ss%2Fw%3Ard" in url
         assert url.endswith("@localhost:6379/0")
+
+    def test_redis_url_brackets_ipv6_loopback_host(self, monkeypatch):
+        """REDIRECT_HOST=::1 (an entrypoint-supported loopback) must build a URL
+        redis-py can parse.
+
+        redis-py's from_url splits the netloc on ':'; an unbracketed IPv6 literal
+        like ``::1`` is misread (port ``:1:6379``) and raises ValueError at
+        construction time, before any connection — which kills gunicorn/worker
+        startup. The URL must wrap the host in brackets (``@[::1]:6379``) so it
+        parses, and the entrypoint's own ``::1`` allowlist stays usable.
+        """
+        monkeypatch.setenv("REDIS_HOST", "::1")
+        monkeypatch.setenv("REDIS_PASSWORD", "testpw")
+        url = build_redis_url({"redis": {"port": 6379, "db": 0}})
+        assert url == "redis://default:testpw@[::1]:6379/0"
+        # Behavioral: the bug crashed at from_url construction, not connect, so
+        # this assertion fails today (no live Redis required) and passes once
+        # the host is bracketed.
+        aioredis.from_url(url)
+
+    def test_redis_url_brackets_ipv6_host_from_config(self, monkeypatch):
+        """An IPv6 host set via config['redis']['host'] (no REDIS_HOST env) is
+        bracketed too — env override is only one of the two resolution paths."""
+        monkeypatch.delenv("REDIS_HOST", raising=False)
+        monkeypatch.setenv("REDIS_PASSWORD", "pw")
+        cfg = {"redis": {"host": "::1", "port": 6380, "db": 2, "ssl": True}}
+        url = build_redis_url(cfg)
+        assert url == "rediss://default:pw@[::1]:6380/2"
+        aioredis.from_url(url)
+
+    def test_redis_url_does_not_double_bracket_ipv6(self, monkeypatch):
+        """A host already supplied bracketed is left as-is (idempotent)."""
+        monkeypatch.setenv("REDIS_HOST", "[::1]")
+        monkeypatch.setenv("REDIS_PASSWORD", "pw")
+        url = build_redis_url({"redis": {"port": 6379, "db": 0}})
+        assert url == "redis://default:pw@[::1]:6379/0"
+        aioredis.from_url(url)
+
+    def test_redis_url_does_not_bracket_ipv4_or_hostname(self, monkeypatch):
+        """IPv4 addresses and hostnames (no colon) are never bracketed."""
+        monkeypatch.setenv("REDIS_PASSWORD", "pw")
+        for host in ("127.0.0.1", "localhost", "redis"):
+            monkeypatch.setenv("REDIS_HOST", host)
+            url = build_redis_url({"redis": {"port": 6379, "db": 0}})
+            assert url == f"redis://default:pw@{host}:6379/0", url
+            aioredis.from_url(url)
 
     def test_rate_limit_redis_storage_reuses_redis_password(self, monkeypatch):
         """SlowAPI must not connect to protected Redis without credentials."""
