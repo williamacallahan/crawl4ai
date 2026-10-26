@@ -300,6 +300,211 @@ async def test_fetch_text_gate(redis_client, monkeypatch):
         assert out["body"] == "body"
 
 
+# ───────────────────────── charset decode ─────────────────────────
+# Regression coverage for the bug where ``fetch`` unconditionally decoded
+# every archive body as UTF-8 with ``errors="replace"``, replacing each
+# non-ASCII byte of a non-UTF-8 snapshot (Latin-1/Shift-JIS/GBK — the norm on
+# older archive.org replays) with U+FFFD before the browser or API client
+# ever saw it. The right order is HTTP charset > <meta charset> > strict
+# UTF-8 > chardet > UTF-8-with-replace, mirroring AsyncHTTPCrawlerStrategy.
+
+def test_lookup_encoding_normalizes_and_validates():
+    assert archive_budget._lookup_encoding("ISO-8859-1") == "iso-8859-1"
+    assert archive_budget._lookup_encoding(' "utf-8" ') == "utf-8"
+    assert archive_budget._lookup_encoding("") is None
+    assert archive_budget._lookup_encoding(None) is None
+    # Unknown codec names are rejected (decode would otherwise raise LookupError).
+    assert archive_budget._lookup_encoding("x-not-a-real-codec") is None
+
+
+def test_content_type_charset_extracts_header_charset():
+    assert archive_budget._content_type_charset(
+        "text/html; charset=iso-8859-1") == "iso-8859-1"
+    # Case-insensitive name, surrounding whitespace, single/double quotes.
+    assert archive_budget._content_type_charset(
+        'text/html; CHARSET = "Shift_JIS"') == "shift_jis"
+    assert archive_budget._content_type_charset(
+        "text/html; charset=utf-8; boundary=foo") == "utf-8"
+    # Missing or empty charset parameter -> None.
+    assert archive_budget._content_type_charset("text/html") is None
+    assert archive_budget._content_type_charset("") is None
+    assert archive_budget._content_type_charset(None) is None
+    assert archive_budget._content_type_charset("text/html; charset=") is None
+    # Unknown codec -> None so a later fallback can run instead of crashing.
+    assert archive_budget._content_type_charset(
+        "text/html; charset=bogus-xyz") is None
+
+
+def test_meta_charset_sniffs_html5_and_html4_tags():
+    html5 = b'<html><head><meta charset="iso-8859-1"></head>'
+    assert archive_budget._meta_charset(html5) == "iso-8859-1"
+    html4 = (b'<html><head><meta http-equiv="content-type" '
+             b'content="text/html; charset=Shift_JIS"></head>')
+    assert archive_budget._meta_charset(html4) == "shift_jis"
+    # Unquoted attribute value still matches.
+    assert archive_budget._meta_charset(b'<meta charset=utf-8>') == "utf-8"
+    # No meta charset -> None.
+    assert archive_budget._meta_charset(b'<html><head><title>x</title></head>') is None
+    assert archive_budget._meta_charset(b'') is None
+    # Unknown codec in meta -> None (fall through to the next signal).
+    assert archive_budget._meta_charset(b'<meta charset="x-not-real">') is None
+    # Only the <head> region matters: a charset buried past 4 KB is ignored,
+    # which is fine because the <head> is always near the top of a real page.
+    assert archive_budget._meta_charset(b'<html>' * 2049 + b'<meta charset="utf-8">') is None
+
+
+@pytest.mark.asyncio
+async def test_decode_body_precedence_and_fallbacks():
+    """Header > meta > strict-UTF-8 > chardet > UTF-8-with-replace."""
+    # 1. HTTP header charset wins over any other signal.
+    body = b'<meta charset="utf-8">caf\xe9'
+    assert (await archive_budget._decode_body("text/html; charset=iso-8859-1", body)) \
+        == "<meta charset=\"utf-8\">café"
+    # 2. <meta charset> wins when the header has no charset.
+    body = b'<meta charset="iso-8859-1">caf\xe9 na\xefve'
+    assert (await archive_budget._decode_body("text/html", body)) \
+        == "<meta charset=\"iso-8859-1\">café naïve"
+    # 3. Valid UTF-8 with no declared charset decodes as UTF-8 (not misread
+    #    by chardet as Windows-1252 — the regression the strict-UTF-8 step
+    #    guards against for short multibyte sequences).
+    assert (await archive_budget._decode_body("text/html", "café ✓".encode("utf-8"))) \
+        == "café ✓"
+    # 4. Non-UTF-8 bytes with no declared charset fall through to chardet,
+    #    which detects the Latin-1 family for the live elmundo.es-style body.
+    body = b"<html><body>tecnolog\xeda Catalu\xf1a a\xf1os</body></html>"
+    assert (await archive_budget._decode_body("text/html", body)) \
+        == "<html><body>tecnología Cataluña años</body></html>"
+    # 5. Unknown header charset does not crash: lookup rejects it and the
+    #    next signal decides.
+    assert (await archive_budget._decode_body("text/html; charset=bogus-xyz", b"caf\xe9")) \
+        == "café"
+
+
+@pytest.mark.asyncio
+async def test_fetch_decodes_header_charset_non_utf8(redis_client, monkeypatch):
+    """A body served as text/html; charset=iso-8859-1 decodes with that
+    charset instead of every non-ASCII byte becoming U+FFFD."""
+    monkeypatch.setenv("CRAWL4AI_NODE", "fetch-charset-header")
+    body = b"<html><body><p>caf\xe9 na\xefve</p></body></html>"
+
+    async def opener(url, max_body):
+        return 200, {"Content-Type": "text/html; charset=iso-8859-1"}, body
+
+    out = await archive_budget.fetch(redis_client, budget_config(), ARCHIVE_URL,
+                                     opener=opener)
+    assert out["contentType"] == "text/html; charset=iso-8859-1"
+    assert out["body"] == "<html><body><p>café naïve</p></body></html>"
+    # The old behavior left a trail of replacement characters here.
+    assert "\ufffd" not in out["body"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_meta_charset_fallback_latin1(redis_client, monkeypatch):
+    """No header charset, but the page declares iso-8859-1 in a meta tag —
+    a common pattern for older snapshots the header-only fix would miss."""
+    monkeypatch.setenv("CRAWL4AI_NODE", "fetch-charset-meta")
+    body = (b'<html><head><meta charset="iso-8859-1">'
+            b'</head><body><p>caf\xe9 na\xefve</p></body></html>')
+
+    async def opener(url, max_body):
+        return 200, {"Content-Type": "text/html"}, body
+
+    out = await archive_budget.fetch(redis_client, budget_config(), ARCHIVE_URL,
+                                     opener=opener)
+    assert out["body"] == \
+        "<html><head><meta charset=\"iso-8859-1\"></head><body><p>café naïve</p></body></html>"
+    assert "\ufffd" not in out["body"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_chardet_fallback_latin1_no_signals(redis_client, monkeypatch):
+    """The live elmundo.es scenario: a header with no charset parameter and
+    a body of Latin-1 bytes that are not valid UTF-8. The chardet fallback
+    detects the Latin-1 family and decodes the snapshot's real text."""
+    monkeypatch.setenv("CRAWL4AI_NODE", "fetch-charset-chardet")
+    body = b"<html><body>tecnolog\xeda Catalu\xf1a a\xf1os</body></html>"
+
+    async def opener(url, max_body):
+        return 200, {"Content-Type": "text/html"}, body
+
+    out = await archive_budget.fetch(redis_client, budget_config(), ARCHIVE_URL,
+                                     opener=opener)
+    assert out["body"] == "<html><body>tecnología Cataluña años</body></html>"
+    assert "\ufffd" not in out["body"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_unknown_header_charset_does_not_crash(redis_client, monkeypatch):
+    """A bogus header charset falls through to the next signal, never 502."""
+    monkeypatch.setenv("CRAWL4AI_NODE", "fetch-charset-unknown")
+    body = b"caf\xe9"
+
+    async def opener(url, max_body):
+        return 200, {"Content-Type": "text/html; charset=not-a-real-codec"}, body
+
+    out = await archive_budget.fetch(redis_client, budget_config(), ARCHIVE_URL,
+                                     opener=opener)
+    assert out["body"] == "café"
+
+
+@pytest.mark.asyncio
+async def test_fetch_utf8_body_without_charset_is_unchanged(redis_client, monkeypatch):
+    """Regression: a valid UTF-8 body with no declared charset still decodes
+    as UTF-8 — the strict-UTF-8 step, not chardet, decides it (so a short
+    multibyte sequence is not misread as Windows-1252)."""
+    monkeypatch.setenv("CRAWL4AI_NODE", "fetch-charset-utf8")
+    body = "<html><body>café naïve ✓</body></html>".encode("utf-8")
+
+    async def opener(url, max_body):
+        return 200, {"Content-Type": "text/html"}, body
+
+    out = await archive_budget.fetch(redis_client, budget_config(), ARCHIVE_URL,
+                                     opener=opener)
+    assert out["body"] == "<html><body>café naïve ✓</body></html>"
+
+
+@pytest.mark.asyncio
+async def test_prefetch_carries_correctly_decoded_body(redis_client, monkeypatch):
+    """prefetch_archive feeds the renderer via ``raw:`` + the prefetched body
+    string, so a non-UTF-8 snapshot must be decoded before it reaches the
+    browser — otherwise the mojibake is baked in unrecoverably."""
+    from archive_transport import prefetch_archive
+    monkeypatch.setenv("CRAWL4AI_NODE", "prefetch-charset")
+
+    async def opener(url, max_body):
+        return 200, {"Content-Type": "text/html; charset=iso-8859-1"}, \
+            b"<html><body>caf\xe9 na\xefve</body></html>"
+
+    monkeypatch.setattr(archive_budget, "_default_opener", opener)
+    out = await prefetch_archive(redis_client, budget_config(), [ARCHIVE_URL])
+    assert out[ARCHIVE_URL]["body"] == "<html><body>café naïve</body></html>"
+    assert "\ufffd" not in out[ARCHIVE_URL]["body"]
+    assert out[ARCHIVE_URL]["responseHeaders"]["Content-Type"] == \
+        "text/html; charset=iso-8859-1"
+
+
+def test_archive_fetch_route_decodes_non_utf8_body(
+    app_client, monkeypatch, offline_dns,
+):
+    """POST /archive/fetch returns the decoded (not U+FFFD-replaced) body to
+    API clients in its JSONResponse — the corruption was previously shipped
+    straight through this route."""
+    monkeypatch.setenv("CRAWL4AI_NODE", "route-charset")
+
+    async def opener(url, max_body):
+        return 200, {"Content-Type": "text/html; charset=iso-8859-1"}, \
+            b"<html><body>caf\xe9 na\xefve</body></html>"
+
+    monkeypatch.setattr(archive_budget, "_default_opener", opener)
+    r = app_client.post("/archive/fetch", json={"url": ARCHIVE_URL},
+                        headers=_bearer())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["contentType"] == "text/html; charset=iso-8859-1"
+    assert body["body"] == "<html><body>café naïve</body></html>"
+    assert "\ufffd" not in body["body"]
+
+
 # ───────────────────────── prefetch ─────────────────────────
 @pytest.mark.asyncio
 async def test_prefetch_preserves_archive_responses(redis_client, monkeypatch):
