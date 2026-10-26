@@ -41,6 +41,12 @@ def build_redis_url(config: dict) -> str:
     db = rc.get("db", 0)
     scheme = "rediss" if rc.get("ssl", False) else "redis"
     auth = redis_auth_netloc(username, password)
+    # IPv6 literal hosts contain ":" and must be bracketed in the netloc
+    # (redis://[::1]:6379/0) or redis-py's URL parser misreads the colons as a
+    # host/port separator and raises ValueError during from_url, before any
+    # connection is attempted. Hosts already supplied bracketed are left as-is.
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        host = f"[{host}]"
     return f"{scheme}://{auth}{host}:{port}/{db}"
 
 
