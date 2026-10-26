@@ -469,22 +469,29 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     # Generate a unique class name for this iframe
                     class_name = f"extracted-iframe-content-{i}"
 
-                    # Replace the iframe with a div containing the extracted content
-                    _iframe = iframe_content.replace("`", "\\`")
-                    await self.adapter.evaluate(page,
-                        f"""
-                        () => {{
-                            const iframe = document.getElementById('iframe-{i}');
+                    # Replace the iframe with a div containing the extracted content.
+                    # Pass the iframe HTML as an evaluate argument so Playwright
+                    # serializes it structurally; interpolating it into the JS
+                    # source (e.g. inside a template literal) would let `${...}`
+                    # sequences in iframe content execute as JavaScript in the
+                    # parent page origin and let backslashes corrupt the content
+                    # or raise a SyntaxError that silently drops the iframe.
+                    await self.adapter.evaluate(
+                        page,
+                        """
+                        (args) => {
+                            const iframe = document.getElementById(args.id);
                             const div = document.createElement('div');
                             const parser = new DOMParser();
-                            const doc = parser.parseFromString(`{_iframe}`, 'text/html');
-                            while (doc.body.firstChild) {{
+                            const doc = parser.parseFromString(args.html, 'text/html');
+                            while (doc.body.firstChild) {
                                 div.appendChild(doc.body.firstChild);
-                            }}
-                            div.className = '{class_name}';
+                            }
+                            div.className = args.className;
                             iframe.replaceWith(div);
-                        }}
-                    """
+                        }
+                        """,
+                        {"html": iframe_content, "className": class_name, "id": f"iframe-{i}"},
                     )
                 else:
                     self.logger.warning(

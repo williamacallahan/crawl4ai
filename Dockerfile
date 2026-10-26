@@ -219,6 +219,7 @@ RUN uv venv --system-site-packages /tmp/browser-test-env \
         tests/regression/test_robots_blocked_return_type.py \
         tests/regression/test_c4a_wait_text_injection.py \
         tests/regression/test_c4a_wait_text_integration.py \
+        tests/regression/test_process_iframes_template_injection.py \
         tests/regression/test_reg_browser.py \
         tests/regression/test_reg_deep_crawl.py \
         tests/test_issue_2161_overlay_html_body.py
