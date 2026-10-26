@@ -627,6 +627,68 @@ check("503 rss-widget lookalike is blocked",
 
 
 # =========================================================================
+# Tier-2 data-exemption regression — JSON/XML API errors containing a tier-2
+# phrase on a 4xx/5xx status must NOT be flagged as anti-bot blocks.
+# =========================================================================
+# Bug: the "Tier 2 patterns on other 4xx/5xx + short page" branch scanned the
+# raw body for block phrases WITHOUT the `_looks_like_data()` guard every
+# sibling branch applies, so a legitimate JSON/XML API error payload that
+# quotes a tier-2 phrase on ANY 4xx/5xx status was flagged as a block. The
+# 403/503 data exemption was also nullified for phrase-bearing data bodies
+# (status_code >= 400 subsumes 403/503) — the function contradicted its own
+# data classification within a single call. Fix: the tier-2 branch applies
+# the same `not _looks_like_data(html)` guard as the 403/503, near-empty, and
+# structural-integrity branches; `_looks_like_data` was also extended to
+# recognize Chromium's no-`<pre>` pass-through render of a text/html JSON/XML
+# body.
+print("\n=== TIER-2 DATA-EXEMPTION REGRESSION (4xx/5xx + phrase in JSON/XML) ===\n")
+
+# --- Bug-report repros (must be False after the fix) ---
+check("401 JSON 'Access Denied: token expired' is not blocked (data exemption)",
+    is_blocked(401, '{"error":"Access Denied: token expired"}'),
+    False)
+check("403 JSON 'Access Denied' is not blocked (data exemption; was self-contradicting)",
+    is_blocked(403, '{"error": "Access Denied"}'),
+    False)
+check("404 JSON 'blocked by security policy' is not blocked (data exemption)",
+    is_blocked(404, '{"errors":[{"code":"blocked by security policy"}]}'),
+    False)
+check("401 RSS feed with <title>Access Denied</title> is not blocked (data exemption)",
+    is_blocked(401, '<rss version="2.0"><channel><item><title>Access Denied</title></item></channel></rss>'),
+    False)
+# Production path: Playwright/Chromium wraps a raw JSON response as
+# <html><body><pre>{...}</pre>.
+check("403 browser-wrapped JSON with 'Access Denied' is not blocked (data exemption)",
+    is_blocked(403, '<html><body><pre>{"error": "Access Denied"}</pre></body></html>'),
+    False)
+# Production path variant: Playwright/Chromium renders a text/html response whose
+# body IS raw JSON/XML directly inside <body> (NO <pre> wrapper) — observed in an
+# e2e crawl of a 401 JSON API served as text/html. _looks_like_data must recognize
+# this pass-through shape too, or the tier-2 guard exempts nothing on the real path.
+check("401 browser-rendered JSON directly in <body> (no <pre>) is not blocked (data exemption)",
+    is_blocked(401, '<html><head></head><body>{"error":"Access Denied: token expired"}</body></html>'),
+    False)
+check("401 browser-rendered XML feed directly in <body> (no <pre>) is not blocked (data exemption)",
+    is_blocked(401, '<html><head></head><body><rss version="2.0"><channel><item><title>Access Denied</title></item></channel></rss></body></html>'),
+    False)
+
+# --- Differential: the non-data HTML twin of each repro MUST still be flagged.
+#     Pins that the guard exempts DATA only, not all 4xx/5xx, and that the
+#     no-<pre> rule does not over-match every <body>...text... body. ---
+check("401 HTML 'Access Denied' is still blocked (control for JSON twin)",
+    is_blocked(401, '<html><body>Access Denied</body></html>'),
+    True, "Access Denied")
+check("401 browser-rendered HTML 'Access Denied' directly in <body> (no <pre>) is still blocked",
+    is_blocked(401, '<html><head></head><body>Access Denied</body></html>'),
+    True, "Access Denied")
+# 403/503 HTML with a tier-2 phrase fires the always-block branch (reason
+# cites the status), pinning their detection path separately from tier-2.
+check("503 HTML 'Access Denied' is still blocked via always-block branch",
+    is_blocked(503, '<html><body>Access Denied</body></html>'),
+    True, "503")
+
+
+# =========================================================================
 # LARGE-PAGE DEEP SCAN — script-embedded block markers (HTTP 200)
 # =========================================================================
 # Commit 254ef05 added a large-page Tier 1 deep scan that strips
@@ -996,4 +1058,100 @@ def test_script_block_pass_ignores_sensor_only_script():
     assert 'captcha.px-cdn.net' not in page
     assert 'orchestrate' not in page
     assert is_blocked(200, page) == (False, "")
+
+
+# =========================================================================
+# pytest-style regression test for the tier-2 data-exemption fix.
+#
+# Per this file's convention (see the comment above the foster-parenting
+# tests), the `is_blocked`-level shapes for this fix are covered by the
+# `check()` cases in the TIER-2 DATA-EXEMPTION REGRESSION section above. The
+# function below covers the guards that are NOT otherwise exercised there:
+# the direct `_looks_like_data` classification of each data body, plus the
+# differential assertion that the non-data HTML twin of each repro stays
+# flaggable — pinning that the fix exempts DATA only, not all 4xx/5xx.
+# =========================================================================
+
+
+def test_tier2_data_exemption_on_4xx_5xx_errors():
+    # Bug: the "Tier 2 patterns on other 4xx/5xx + short page" branch scanned
+    # the raw body for block phrases WITHOUT the `_looks_like_data()` guard
+    # every sibling branch applies. A legitimate JSON/XML API error payload
+    # that quotes a tier-2 phrase on any 4xx/5xx status was flagged as a
+    # block — escalating through retries, paid fallback, and success=False
+    # with `"Blocked by anti-bot protection"` and discarding the data. The
+    # 403/503 data exemption was also nullified for phrase-bearing data
+    # bodies, since status_code >= 400 subsumes 403/503 and this branch
+    # fired right after the guarded one skipped — the function contradicted
+    # its own data classification within a single call. The fix applies the
+    # same `not _looks_like_data(html)` guard as the 403/503, near-empty,
+    # and structural-integrity branches.
+
+    # Each data body must classify as data AND not be blocked, on a 4xx/5xx
+    # status. Statuses 401/404/500 were never exercised before this fix (the
+    # existing suite only pinned 200/403/429/503/None).
+    data_cases = [
+        (401, '{"error":"Access Denied: token expired"}'),
+        (403, '{"error": "Access Denied"}'),
+        (404, '{"errors":[{"code":"blocked by security policy"}]}'),
+        (401, '<rss version="2.0"><channel><item><title>Access Denied</title></item></channel></rss>'),
+        (403, '<html><body><pre>{"error": "Access Denied"}</pre></body></html>'),
+        # Production-path variant observed in an e2e browser crawl of a 401
+        # JSON API served as text/html: Chromium puts the raw JSON directly
+        # in <body> with NO <pre> wrapper. _looks_like_data must recognize it.
+        (401, '<html><head></head><body>{"error":"Access Denied: token expired"}</body></html>'),
+        (401, '<html><head></head><body><rss version="2.0"><channel><item><title>Access Denied</title></item></channel></rss></body></html>'),
+    ]
+    for status, body in data_cases:
+        assert _looks_like_data(body) is True, f"body must classify as data: {body[:40]!r}"
+        blocked, reason = is_blocked(status, body)
+        assert not blocked, (
+            f"a tier-2 phrase in a data body on HTTP {status} must not be flagged "
+            f"as a block; got {reason!r} for body {body[:40]!r}"
+        )
+
+    # Differential: the non-data HTML twin of each repro (same status, same
+    # tier-2 phrase, but a real HTML block page) MUST still be flagged. This
+    # is the load-bearing guard that the fix exempts DATA only, not all 4xx/5xx.
+    html_controls = [
+        (401, '<html><body>Access Denied</body></html>', "Access Denied"),
+        # browser-rendered JSON directly in <body> with NON-JSON text (no <pre>) is
+        # NOT data and must stay flaggable — pins the no-<pre> rule does not
+        # over-match every <body>...text... pattern.
+        (401, '<html><head></head><body>Access Denied</body></html>', "Access Denied"),
+    ]
+    for status, body, substr in html_controls:
+        assert _looks_like_data(body) is False, f"control must NOT classify as data: {body[:40]!r}"
+        blocked, reason = is_blocked(status, body)
+        assert blocked, f"HTML control on HTTP {status} must still be flagged; body={body!r}"
+        assert substr.lower() in reason.lower(), f"reason {reason!r} must cite {substr!r}"
+
+    # The 403/503 near-empty + always-block branch covers their HTML twins
+    # (reason cites the status), pinning their detection path separately from
+    # tier-2 — the data exemption does not perturb the 403/503 always-block rule.
+    assert "403" in is_blocked(403, '<html><body><h1>Access Denied</h1></body></html>')[1]
+    assert "503" in is_blocked(503, '<html><body>Access Denied</body></html>')[1]
+
+
+def test_tier2_branch_condition_still_covers_html_errors():
+    # Pin the branch's reach for non-data HTML errors so a future tightening
+    # (e.g. accidentally scoping the tier-2 guard to only 401/404) is caught:
+    # every status >= 400 with a tier-2 phrase on a short HTML page is still
+    # blocked, and every status >= 400 with the same phrase in a data body
+    # is exempt. The two directions together are the fix's contract.
+    for status in (400, 401, 403, 404, 429, 500, 503, 504):
+        # 429 is always-block regardless of body and surfaced from the top of
+        # is_blocked; the tier-2 branch is unreachable for 429 because the 429
+        # check returns first. Assert the observed behavior to document the
+        # asymmetry, not to constrain it.
+        html_body = '<html><body>Access Denied</body></html>'
+        json_body = '{"error":"Access Denied"}'
+        html_blocked = is_blocked(status, html_body)[0]
+        json_blocked = is_blocked(status, json_body)[0]
+        if status == 429:
+            # 429 is unconditionally a block for both bodies.
+            assert html_blocked is True and json_blocked is True
+        else:
+            assert html_blocked is True, f"HTML Access Denied on {status} must be blocked"
+            assert json_blocked is False, f"JSON Access Denied on {status} must be exempt"
 
