@@ -30,8 +30,10 @@ import asyncio
 import errno
 import math
 import os
+import re
 from urllib.parse import urljoin, urlparse
 
+import chardet
 from fastapi import HTTPException, status
 
 FETCH_USER_AGENT = "aVentureBot/1.0 (+https://aventure.vc) crawl4ai"
@@ -183,6 +185,98 @@ def _is_text_content_type(content_type) -> bool:
     )
 
 
+def _lookup_encoding(name: str):
+    """A normalized, Python-loadable codec for ``name`` or ``None``.
+
+    Meta tags and archive.org headers occasionally carry names Python does
+    not know (e.g. ``x-user-defined``); decoding with such a name raises
+    ``LookupError``, so they are discarded and the next fallback runs.
+    """
+    if not name:
+        return None
+    candidate = name.strip().strip("'\"").lower()
+    if not candidate:
+        return None
+    try:
+        "".encode(candidate)
+    except (LookupError, ValueError):
+        return None
+    return candidate
+
+
+def _content_type_charset(content_type: str):
+    """The ``charset=`` parameter of a Content-Type header, or ``None``.
+
+    ``"text/html; charset=iso-8859-1"`` -> ``"iso-8859-1"``. The HTTP header
+    is the highest-precedence encoding signal, so this is consulted before
+    the body is sniffed. Quotes and surrounding whitespace are stripped.
+    """
+    for part in (content_type or "").split(";")[1:]:
+        name, sep, value = part.partition("=")
+        if not sep:
+            continue
+        if name.strip().lower() == "charset":
+            return _lookup_encoding(value)
+    return None
+
+
+# <meta charset="..."> (HTML5) and <meta http-equiv=content-type
+# content="...charset=..."> (HTML4) — one pattern matches both. The head of
+# virtually every archived page fits in the first 4 KB; latin-1 makes every
+# byte a codepoint so the regex sees the whole octet string.
+_META_CHARSET_RE = re.compile(
+    rb'<meta[^>]*charset\s*=\s*["\']?\s*([a-zA-Z0-9_\-:.]+)', re.IGNORECASE,
+)
+
+
+def _meta_charset(body: bytes):
+    """A charset declared inside ``body``'s own ``<head>``, or ``None``.
+
+    Many older archive.org snapshots replay their original headers with no
+    ``charset=`` parameter; the page's only encoding signal is its ``<meta>``
+    tag. Scanning the first 4 KB with a byte regex (latin-1 transparent) is
+    enough for the ``<head>`` of essentially every archived page.
+    """
+    m = _META_CHARSET_RE.search(body[:4096])
+    if not m:
+        return None
+    return _lookup_encoding(m.group(1).decode("ascii", errors="ignore"))
+
+
+async def _decode_body(content_type: str, body: bytes) -> str:
+    """Decode response bytes honoring every encoding signal, in precedence.
+
+    Order: HTTP ``Content-Type`` charset > ``<meta charset>`` sniffer >
+    strict UTF-8 > ``chardet`` detection > UTF-8 with replacement. This
+    matches the WHATWG encoding precedence (header before meta) and reuses
+    the codebase's existing ``chardet`` fallback (already used by
+    ``AsyncHTTPCrawlerStrategy._handle_http``), which the archive replay
+    path previously bypassed by decoding unconditionally as UTF-8.
+
+    The strict-UTF-8 step comes before ``chardet`` so a valid UTF-8 body
+    with no declared charset still decodes as UTF-8 (its overwhelmingly
+    likely intent for a modern snapshot) instead of being second-guessed by
+    a heuristic that misreads short multibyte sequences. Bodies that are
+    not valid UTF-8 — the category this bug produced mojibake for — fail
+    this step and fall through to ``chardet``, exactly as the live
+    ``elmundo.es`` snapshot (Latin-1, byte ``0xF1``) does.
+
+    ``errors="replace"`` on the final decode keeps a partial decode from
+    raising, so an unknown charset never turns a fetched archive body into
+    a 502 — local corruption stays local, as the previous UTF-8-with-replace
+    behavior did for ASCII/UTF-8 bodies.
+    """
+    encoding = _content_type_charset(content_type) or _meta_charset(body)
+    if not encoding:
+        try:
+            body.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            detection = await asyncio.to_thread(chardet.detect, body)
+            encoding = detection.get("encoding") or "utf-8"
+    return body.decode(encoding, errors="replace")
+
+
 async def _default_opener(url: str, max_body_bytes: int):
     """One GET with redirect following off; returns (status, headers, body).
 
@@ -297,7 +391,7 @@ async def fetch(redis, config: dict, url: str, *, opener=None, include_headers=F
         "url": current,
         "status": status_code,
         "contentType": content_type,
-        "body": body.decode("utf-8", errors="replace"),
+        "body": await _decode_body(content_type, body),
     }
     if include_headers:
         result["responseHeaders"] = dict(headers)
