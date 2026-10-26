@@ -167,6 +167,7 @@ class WebhookDeliveryService:
         from egress_broker import (
             ALLOW_INSECURE_TLS,
             EgressBlocked,
+            TargetUnresolvable,
             resolve_and_pin_async,
         )
 
@@ -174,6 +175,8 @@ class WebhookDeliveryService:
         for _hop in range(_MAX_WEBHOOK_REDIRECTS + 1):
             try:
                 pin = await resolve_and_pin_async(current)
+            except TargetUnresolvable:
+                raise
             except EgressBlocked as e:
                 raise _WebhookBlocked(str(e))
 
