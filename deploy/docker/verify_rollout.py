@@ -292,6 +292,10 @@ def main() -> None:
     try:
         commands[command]()
     except Exception as error:
+        if isinstance(error, subprocess.CalledProcessError):
+            # The workflow retains this log privately and publishes only the
+            # summary below. repr keeps captured newlines out of that prefix.
+            print(f"subprocess stdout={error.stdout!r} stderr={error.stderr!r}", file=sys.stderr)
         try:
             line = _public_failure(command, error)
         except Exception:
