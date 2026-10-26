@@ -29,6 +29,12 @@ def crawl_result(monkeypatch):
         async def arun(self, *args, **kwargs):
             return result
 
+        async def arun_many(self, *args, **kwargs):
+            async def results():
+                yield result
+
+            return results()
+
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
     monkeypatch.setattr(crawler_pool, "get_crawler", AsyncMock(return_value=Crawler()))
     monkeypatch.setattr(crawler_pool, "release_crawler", AsyncMock())
@@ -106,6 +112,191 @@ def test_invalid_result_field_matches_job_error(stock_client, crawl_result):
     job = stock_client.post("/crawl/job", json=payload, headers=headers)
     assert sync.status_code == job.status_code == 422
     assert sync.json()["detail"] == job.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,payload", [
+    ("/crawl/stream", {}),
+    ("/crawl", {"crawler_config": {"stream": True}}),
+])
+@pytest.mark.parametrize("fields", [["url", "success"], ["markdown"], [], None])
+async def test_stream_result_fields_match_job(
+    server_module, crawl_result, monkeypatch, path, payload, fields,
+):
+    """Streaming entry points project result_fields just like /crawl and /crawl/job.
+
+    Both /crawl/stream and /crawl with crawler_config.stream=True accept and
+    validate result_fields (they share CrawlRequestWithHooks); the streamed
+    NDJSON result line must carry only the requested fields plus the server
+    metadata that is added after projection.
+    """
+    import httpx
+
+    # The streaming handler acquires a crawler lazily inside the response
+    # iterator and skips archive materialization when nothing is prefetched.
+    monkeypatch.setattr(api, "prefetch_archive", AsyncMock(return_value=None))
+
+    body = {"urls": [crawl_result.url], **payload}
+    if fields is not None:
+        body["result_fields"] = fields
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            path, json=body,
+            headers={**auth_headers(), "Accept-Encoding": "identity"},
+        )
+    assert response.status_code == 200
+    lines = [ln for ln in response.text.splitlines() if ln.strip()]
+    # The completion marker is server metadata, unaffected by result_fields.
+    assert json.loads(lines[-1]) == {"status": "completed"}
+
+    result_line = json.loads(lines[0])
+    # server_memory_mb is added after the projection, so it always survives.
+    assert "server_memory_mb" in result_line
+    del result_line["server_memory_mb"]
+
+    expected = crawl_result.model_dump()
+    if fields:
+        expected = {field: expected[field] for field in fields if field in expected}
+    assert result_line == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,payload", [
+    ("/crawl/stream", {}),
+    ("/crawl", {"crawler_config": {"stream": True}}),
+])
+async def test_stream_invalid_result_field_rejected(server_module, crawl_result, monkeypatch, path, payload):
+    """An invalid result_fields value is rejected by the shared schema on every endpoint."""
+    import httpx
+
+    monkeypatch.setattr(api, "prefetch_archive", AsyncMock(return_value=None))
+    body = {"urls": [crawl_result.url], "result_fields": ["not_a_field"], **payload}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(path, json=body, headers=auth_headers())
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,payload", [
+    ("/crawl/stream", {}),
+    ("/crawl", {"crawler_config": {"stream": True}}),
+])
+async def test_stream_projection_preserves_monitor_verdict(
+    server_module, monkeypatch, path, payload,
+):
+    """The per-URL verdict is read before projection so the monitor record is
+    correct even when result_fields omits "success".
+    """
+    import httpx
+    import monitor
+
+    result = CrawlResult(url="https://example.com", success=True, html="x")
+
+    class Crawler:
+        async def arun_many(self, *args, **kwargs):
+            async def results():
+                yield result
+
+            return results()
+
+    monkeypatch.setattr(api, "prefetch_archive", AsyncMock(return_value=None))
+    monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
+    monkeypatch.setattr(crawler_pool, "get_crawler", AsyncMock(return_value=Crawler()))
+    monkeypatch.setattr(crawler_pool, "release_crawler", AsyncMock())
+
+    ends = []
+
+    class FakeMonitor:
+        async def track_request_start(self, *args, **kwargs):
+            return None
+
+        async def track_request_end(self, request_id, *, success, error, status_code):
+            ends.append((success, error, status_code))
+
+    monkeypatch.setattr(monitor, "get_monitor", lambda: FakeMonitor())
+
+    body = {"urls": ["https://example.com"], "result_fields": ["markdown"], **payload}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            path, json=body,
+            headers={**auth_headers(), "Accept-Encoding": "identity"},
+        )
+    assert response.status_code == 200
+    assert ends, "track_request_end was not invoked"
+    success, error, status_code = ends[0]
+    assert success is True
+    assert error is None
+    assert status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,payload", [
+    ("/crawl/stream", {}),
+    ("/crawl", {"crawler_config": {"stream": True}}),
+])
+async def test_stream_projection_failed_crawl_records_failure(
+    server_module, monkeypatch, path, payload,
+):
+    """A streamed failed result records failure for the monitor and projects to
+    the requested fields, even when result_fields omits "success" and
+    "error_message" (mirroring the sync /crawl failed-path contract).
+    """
+    import httpx
+    import monitor
+
+    result = CrawlResult(
+        url="https://example.com", success=False, html="",
+        error_message="Wait condition failed: selector not found",
+    )
+
+    class Crawler:
+        async def arun_many(self, *args, **kwargs):
+            async def results():
+                yield result
+
+            return results()
+
+    monkeypatch.setattr(api, "prefetch_archive", AsyncMock(return_value=None))
+    monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
+    monkeypatch.setattr(crawler_pool, "get_crawler", AsyncMock(return_value=Crawler()))
+    monkeypatch.setattr(crawler_pool, "release_crawler", AsyncMock())
+
+    ends = []
+
+    class FakeMonitor:
+        async def track_request_start(self, *args, **kwargs):
+            return None
+
+        async def track_request_end(self, request_id, *, success, error, status_code):
+            ends.append((success, error, status_code))
+
+    monkeypatch.setattr(monitor, "get_monitor", lambda: FakeMonitor())
+
+    body = {"urls": ["https://example.com"], "result_fields": ["url"], **payload}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server_module.app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            path, json=body,
+            headers={**auth_headers(), "Accept-Encoding": "identity"},
+        )
+    assert response.status_code == 200
+    lines = [ln for ln in response.text.splitlines() if ln.strip()]
+    assert json.loads(lines[-1]) == {"status": "completed"}
+    result_line = json.loads(lines[0])
+    assert set(result_line) == {"url", "server_memory_mb"}
+    assert result_line["url"] == "https://example.com"
+    assert ends, "track_request_end was not invoked"
+    success, error, status_code = ends[0]
+    assert success is False
+    assert error == "Wait condition failed: selector not found"
+    assert status_code == 200
 
 
 @pytest.mark.asyncio
