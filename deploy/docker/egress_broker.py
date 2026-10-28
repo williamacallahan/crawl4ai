@@ -102,20 +102,6 @@ def _resolve(host: str, port: int):
         raise TargetUnresolvable()
 
 
-def assert_host_allowed(host: str, port: int = 0) -> None:
-    """Resolve `host` and reject if ANY answer is non-global. Opaque on failure."""
-    if ALLOW_INTERNAL:
-        return
-    if not host:
-        raise EgressBlocked()
-    low = host.lower()
-    if low in _BLOCKED_HOSTNAMES or low.startswith("host.docker.internal"):
-        raise EgressBlocked()
-    for *_, sockaddr in _resolve(host, port):
-        if is_forbidden_ip(sockaddr[0]):
-            raise EgressBlocked()
-
-
 def resolve_and_pin(url: str) -> PinnedTarget:
     """Resolve `url` once, reject if any answer is non-global, and pin one IP.
 
@@ -161,11 +147,6 @@ async def resolve_and_pin_async(url: str) -> PinnedTarget:
     API/proxy event loop for every outbound connection path.
     """
     return await asyncio.to_thread(resolve_and_pin, url)
-
-
-def check_redirect(location: str) -> PinnedTarget:
-    """Re-validate (and pin) a redirect Location. Same rule as the initial hop."""
-    return resolve_and_pin(location)
 
 
 ALLOW_INSECURE_TLS = os.environ.get("CRAWL4AI_ALLOW_INSECURE_TLS", "false").lower() == "true"
