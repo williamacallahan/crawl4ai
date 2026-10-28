@@ -46,7 +46,6 @@ class CrawlState:
     kb_embeddings: Optional[Any] = None  # Will be numpy array
     query_embeddings: Optional[Any] = None  # Will be numpy array
     expanded_queries: List[str] = field(default_factory=list)
-    coverage_shape: Optional[Any] = None  # Alpha shape
     semantic_gaps: List[Tuple[List[float], float]] = field(default_factory=list)  # Serializable
     embedding_model: str = ""
     
@@ -182,7 +181,6 @@ class AdaptiveConfig:
     query_llm_config: Optional[Union[LLMConfig, Dict]] = None  # Config for query expansion (chat completion)
     n_query_variations: int = 10
     coverage_threshold: float = 0.85
-    alpha_shape_alpha: float = 0.5
     
     # Minimum confidence threshold for relevance
     embedding_min_confidence_threshold: float = 0.1  # Below this, content is considered completely irrelevant
@@ -792,31 +790,6 @@ class EmbeddingStrategy(CrawlStrategy):
         
         return train_embeddings, train_queries
     
-    def compute_coverage_shape(self, query_points: Any, alpha: float = 0.5):
-        """Find the minimal shape that covers all query points using alpha shape"""
-        try:
-            
-            
-            if len(query_points) < 3:
-                return None
-            
-            # For high-dimensional embeddings (e.g., 384-dim, 768-dim), 
-            # alpha shapes require exponentially more points than available.
-            # Instead, use a statistical coverage model
-            query_points = np.array(query_points)
-            
-            # Store coverage as centroid + radius model
-            coverage = {
-                'center': np.mean(query_points, axis=0),
-                'std': np.std(query_points, axis=0),
-                'points': query_points,
-                'radius': np.max(np.linalg.norm(query_points - np.mean(query_points, axis=0), axis=1))
-            }
-            return coverage
-        except Exception:
-            # Fallback if computation fails
-            return None
-    
     def find_coverage_gaps(self, kb_embeddings: Any, query_embeddings: Any) -> List[Tuple[Any, float]]:
         """Calculate gap distances for all query variations using vectorized operations"""
         
@@ -1186,10 +1159,6 @@ class EmbeddingStrategy(CrawlStrategy):
         # Invalidate distance matrix cache since KB changed
         self._kb_embeddings_hash = None
         self._distance_matrix_cache = None
-            
-        # Update coverage shape if needed
-        if hasattr(state, 'query_embeddings') and state.query_embeddings is not None:
-            state.coverage_shape = self.compute_coverage_shape(state.query_embeddings, self.config.alpha_shape_alpha if hasattr(self, 'config') else 0.5)
 
 
 class AdaptiveCrawler:
