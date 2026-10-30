@@ -534,10 +534,15 @@ app.add_middleware(SecurityHeadersMiddleware, hsts=bool(config["security"].get("
 
 # Outermost, so one cancel unwinds every layer; every layer is pure ASGI, as a
 # BaseHTTPMiddleware task group would re-cancel the handler's cleanup. Only
-# routes that hold a browser page are listed; /crawl/job's enqueue must finish.
+# routes that hold a browser page are listed. `paths` is an exact path match so
+# the /crawl entry does not pull in /crawl/job (enqueue) or /crawl/stream (a
+# stream that handles its own disconnect). `prefixes` is method- and segment-
+# aware: GET /llm covers the browser-holding GET /llm/{url:path} route while
+# leaving POST /llm/job (enqueue) outside, exactly as /crawl/job is outside.
 app.add_middleware(
     CancelOnDisconnectMiddleware,
     paths=frozenset({"/crawl", "/md", "/html", "/screenshot", "/pdf", "/execute_js"}),
+    prefixes=frozenset({("GET", "/llm")}),
 )
 
 
