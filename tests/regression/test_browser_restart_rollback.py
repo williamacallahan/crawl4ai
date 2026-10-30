@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from crawl4ai import BrowserConfig
+from crawl4ai import BrowserConfig, CrawlerRunConfig
 from crawl4ai import browser_manager as browser_manager_module
 from tests.regression.test_browser_lifecycle_residuals import (  # noqa: F401
     _Context,
@@ -69,15 +69,31 @@ async def test_failed_restart_cleans_up_startup_without_joining_its_parent(monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drain_until_deadline", [False, True])
-async def test_external_cdp_health_quarantine_waits_for_drain(
+async def test_external_cdp_health_recycle_drains_then_reconnects(
     monkeypatch, drain_until_deadline
 ):
+    """A cdp_url manager's health recycle drains in-flight pages first, then
+    reconnects this manager's own CDP client via start() instead of latching
+    pool_recycle_requested -- the bug fixed here permanently bricked a
+    standalone-library (non-pool) manager after one transient close fault.
+    """
     monkeypatch.setattr(browser_manager_module, "RECYCLE_DRAIN_MIN_SECONDS", 0.05)
     monkeypatch.setattr(browser_manager_module, "RECYCLE_DRAIN_MAX_SECONDS", 0.05)
     manager = _manager(
         BrowserConfig(cdp_url="http://external.example:9222", cdp_cleanup_on_close=False)
     )
-    manager.start = AsyncMock()
+    reconnected = asyncio.Event()
+
+    async def start():
+        # start() reconnects this manager's own CDP client to the external
+        # endpoint (the external process is left alone); _started_browser
+        # publishes the fresh connection and clears the recycle latch.
+        manager.browser = _Context()
+        manager.default_context = _Context()
+        await manager._started_browser()
+        reconnected.set()
+
+    manager.start = start
     connection = _Context()
     manager.browser = connection
     token = await manager._admit_page_acquisition(page_timeout_ms=10)
@@ -95,28 +111,117 @@ async def test_external_cdp_health_quarantine_waits_for_drain(
     waiter = asyncio.create_task(manager._admit_page_acquisition(page_timeout_ms=10))
     try:
         await asyncio.sleep(0)
-        assert not waiter.done()
+        assert not waiter.done(), "admission opened before in-flight pages drained"
         if drain_until_deadline:
             await asyncio.wait_for(asyncio.shield(deadline), timeout=1)
         else:
             await manager._finish_admission(token)
 
-        assert manager.pool_recycle_requested
+        # The drain released the in-flight token and triggered a reconnect
+        # rather than latching pool_recycle_requested forever.
+        assert not manager.pool_recycle_requested
+        await asyncio.wait_for(asyncio.shield(manager._recycle_task), timeout=1)
+        assert reconnected.is_set()
         assert manager._recycle_done.is_set()
-        manager.request_pool_recycle("late page close failure")
-        assert manager._recycle_done.is_set()
-        assert not manager._active_acquisitions
-        with pytest.raises(RuntimeError, match="unavailable"):
-            await asyncio.wait_for(waiter, timeout=1)
-        manager.start.assert_not_awaited()
-        assert manager._recycle_task is None
-        assert manager.browser is connection
-        assert not connection.closed
+        # The in-flight token was drained by the recycle (a parked waiter may
+        # already have re-added its own -- that admission reopens is asserted
+        # below).
+        assert token not in manager._active_acquisitions
+        # This client's old connection was torn down; start() built a fresh one.
+        assert manager.browser is not connection
+        assert connection.closed
+        # A parked acquisition reopens once the reconnect lands -- no
+        # "Browser manager is unavailable" (the permanent-latch symptom).
+        token_after = await asyncio.wait_for(waiter, timeout=1)
+        assert token_after in manager._active_acquisitions
+        assert token_after is not token
+        assert not manager.pool_recycle_requested
     finally:
         waiter.cancel()
-        deadline.cancel()
+        if deadline is not None and not deadline.done():
+            deadline.cancel()
         await asyncio.gather(waiter, deadline, return_exceptions=True)
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cdp_url_manager_keeps_serving_crawls_after_transient_close_fault():
+    """End-to-end: a standalone-library (non-pool) cdp_url manager keeps
+    serving crawls after one transient page.close() failure. Pre-fix the
+    first failure latched pool_recycle_requested and every later get_page
+    raised "Browser manager is unavailable" with no in-library remedy short
+    of rebuilding the whole AsyncWebCrawler.
+    """
+    manager = _manager(
+        BrowserConfig(cdp_url="http://external.example:9222", cdp_cleanup_on_close=False)
+    )
+    reconnected = asyncio.Event()
+
+    async def start():
+        manager.browser = object()
+        manager.default_context = _Context()
+        await manager._started_browser()
+        reconnected.set()
+
+    manager.start = start
+    manager.browser = _Context()
+
+    first_page, _ = await manager.get_page(CrawlerRunConfig())
+
+    async def transient_close():
+        raise RuntimeError("page close timed out")
+
+    first_page.close = transient_close
+    await manager.release_page_with_context(first_page)
+
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if manager._recycle_task is not None and manager._recycle_task.done():
+            break
+    assert reconnected.is_set()
+    assert not manager.pool_recycle_requested
+
+    # A later crawl succeeds instead of failing with "unavailable".
+    second_page, _ = await manager.get_page(CrawlerRunConfig())
+    assert second_page is not first_page
+    await manager.release_page_with_context(second_page)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cdp_url_recycle_failure_closes_admission_not_loops_forever():
+    """If the external CDP endpoint is genuinely down, the cdp_url reconnect
+    fails and the manager closes admission (so the pool discards the crawler
+    via _is_live/_closing and a standalone user gets a clear error), rather
+    than looping reconnects or latching pool_recycle_requested. This is the
+    shared _recycle_browser failure path, exercised here on the new cdp_url
+    close(_for_recycle=True) disconnect branch.
+    """
+    manager = _manager(
+        BrowserConfig(cdp_url="http://external.example:9222", cdp_cleanup_on_close=False)
+    )
+
+    async def start():
+        raise RuntimeError("CDP endpoint is not ready after startup")
+
+    manager.start = start
+    manager.browser = _Context()
+
+    # No in-flight pages, so the drain completes immediately and the
+    # reconnect attempt runs at once.
+    manager.request_pool_recycle("external browser health fault")
+    await asyncio.wait_for(manager._pool_recycle_task, timeout=2)
+    await asyncio.wait_for(asyncio.shield(manager._recycle_task), timeout=2)
+
+    assert manager._closing
+    assert not manager._recycling
+    assert manager._recycle_done.is_set()
+    # A failed reconnect must not latch pool_recycle_requested; _closing is the
+    # pool's discard signal instead (crawler_pool._is_live checks _closing).
+    assert not manager.pool_recycle_requested
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await manager._admit_page_acquisition()
+    await manager.close()
 
 
 @pytest.mark.asyncio

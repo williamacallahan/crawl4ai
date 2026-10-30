@@ -2236,14 +2236,14 @@ class BrowserManager:
         if self._drain_deadline is not None:
             self._drain_deadline.cancel()
             self._drain_deadline = None
-        if not self._owns_browser_process():
-            # Only its owner may restart an external CDP process. Once this
-            # client's pages drain, let the pool replace its connection.
-            self.pool_recycle_requested = True
-            self._recycle_due = False
-            self._pool_recycle_pending = False
-            self._recycle_done.set()
-            return
+        # An externally supplied CDP endpoint is not ours to *restart*, but
+        # this manager still owns its own Playwright client connection to it.
+        # A transient close fault is recovered by draining in-flight pages,
+        # disconnecting this client, and reconnecting via start() -- which
+        # resets pool_recycle_requested in _started_browser -- rather than
+        # latching the flag and leaving a standalone (non-pool) consumer
+        # permanently wedged with "Browser manager is unavailable". The pool
+        # sees _recycling while this runs and a self-healed manager afterwards.
         self._recycling = True
         self._recycle_task = asyncio.create_task(self._recycle_browser())
         self._recycle_task.add_done_callback(self._consume_recycle_result)
@@ -2710,14 +2710,17 @@ class BrowserManager:
                 await self._close_contexts()
                 # An explicit CDP URL is externally owned. Do not recycle or
                 # terminate it; optional cleanup only disconnects this client.
-                if self.config.cdp_cleanup_on_close:
-                    await self._close_sessions()
-                    await self._close_contexts()
+                # A health recycle (_for_recycle) must always disconnect this
+                # client and stop its Playwright driver so the subsequent
+                # start() reconnects from scratch (and _started_browser clears
+                # the recycle latch). cdp_cleanup_on_close only governs the
+                # user-facing close(), not the internal recycling path.
+                if self.config.cdp_cleanup_on_close or _for_recycle:
                     if self._default_context_owned and self.default_context is not None:
                         await self._close_context_quietly(self.default_context)
                     if self.browser:
                         await self._close_browser_quietly(self.browser)
-                    if self.config.cdp_close_delay > 0:
+                    if not _for_recycle and self.config.cdp_close_delay > 0:
                         await asyncio.sleep(self.config.cdp_close_delay)
                     await self._stop_playwright()
                     self.browser = None
