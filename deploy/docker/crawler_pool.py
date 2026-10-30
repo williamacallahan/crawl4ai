@@ -885,17 +885,19 @@ def _runnable_ns_by_tid(pid: int) -> dict[int, int]:
     time whatever the load. Fields one and two of
     /proc/<pid>/task/<tid>/schedstat are those two times.
     """
+    # procfs answers ENOENT for an exited task whose entry is gone, and ESRCH
+    # (ProcessLookupError) for one that exited while its entry stays open.
     task_dir = f"/proc/{pid}/task"
     try:
         tids = os.listdir(task_dir)
-    except FileNotFoundError as error:
+    except (FileNotFoundError, ProcessLookupError) as error:
         raise psutil.NoSuchProcess(pid) from error
     runnable_ns_by_tid = {}
     for tid in tids:
         try:
             with open(f"{task_dir}/{tid}/schedstat") as schedstat:
                 on_cpu_ns, run_queue_ns, _ = schedstat.read().split()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue  # The thread exited between listing and reading.
         runnable_ns_by_tid[int(tid)] = int(on_cpu_ns) + int(run_queue_ns)
     return runnable_ns_by_tid
