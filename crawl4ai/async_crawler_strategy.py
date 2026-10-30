@@ -635,15 +635,18 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         Site script can navigate after the readiness checks pass; Chromium then
         refuses the snapshot rather than return a half-replaced document. Wait
         for the new document and read that, so the HTML and page.url describe
-        the same page.
+        the same page. A client redirect chain refuses once per hop, and
+        Playwright resolves the load-state wait at once while the old
+        document's events are still recorded, so read until one document holds
+        still; the page budget ends a page that never stops navigating.
         """
-        try:
-            return await within_page_budget(page.content())
-        except Error as error:
-            if "page is navigating" not in str(error):
-                raise
-        await within_page_budget(page.wait_for_load_state("domcontentloaded"))
-        return await within_page_budget(page.content())
+        while True:
+            try:
+                return await within_page_budget(page.content())
+            except Error as error:
+                if "page is navigating" not in str(error):
+                    raise
+            await within_page_budget(page.wait_for_load_state("domcontentloaded"))
 
     async def _terminate_page(self, page: Page, timeout: float, session=None) -> None:
         """Interrupt through a session attached before site JavaScript can wedge it."""
