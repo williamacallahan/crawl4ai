@@ -619,6 +619,42 @@ async def _finish_llm_task(redis, key: str, mapping: dict, config: dict) -> bool
     ))
 
 
+# Bounded so shutdown cannot hang; shielded so a worker CancelledError cannot
+# abort it. After the CAS flips the task terminal, every compensating path
+# (the shutdown ``cancel_task`` and the orphan reaper) only acts on
+# ``processing`` tasks, so an interrupted delivery here is permanently
+# unrecoverable. ``asyncio.shield`` keeps the delivery running past the
+# enclosing job's CancelledError; we then await the shielded task directly so
+# it actually completes before re-raising the cancellation, letting the
+# worker exit cleanly (``cancel_task``'s CAS loses on an already-terminal
+# task, so it skips its own duplicate notification).
+_LLM_WEBHOOK_TIMEOUT_SECONDS = 10
+
+
+async def _deliver_terminal_webhook(
+    webhook_service: WebhookDeliveryService,
+    *,
+    timeout: float = _LLM_WEBHOOK_TIMEOUT_SECONDS,
+    **kwargs: Any,
+) -> None:
+    """Deliver a terminal LLM webhook that survives worker cancellation."""
+    inner = asyncio.create_task(
+        asyncio.wait_for(webhook_service.notify_job_completion(**kwargs), timeout=timeout)
+    )
+    cancelled = False
+    try:
+        await asyncio.shield(inner)
+    except asyncio.CancelledError:
+        cancelled = True
+    except asyncio.TimeoutError:
+        return
+    if not inner.done():
+        with suppress(asyncio.TimeoutError, Exception):
+            await inner
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
 async def handle_llm_qa(
     url: str,
     query: str,
@@ -759,13 +795,14 @@ async def process_llm_extraction(
                 return
 
             # Send webhook notification on failure
-            await webhook_service.notify_job_completion(
+            await _deliver_terminal_webhook(
+                webhook_service,
                 task_id=task_id,
                 task_type="llm_extraction",
                 status="failed",
                 urls=[url],
                 webhook_config=webhook_config,
-                error=error_msg
+                error=error_msg,
             )
             return
         # Provider by name only; base_url/api_token server-derived (no exfil).
@@ -832,13 +869,14 @@ async def process_llm_extraction(
                 return
 
             # Send webhook notification on failure
-            await webhook_service.notify_job_completion(
+            await _deliver_terminal_webhook(
+                webhook_service,
                 task_id=task_id,
                 task_type="llm_extraction",
                 status="failed",
                 urls=[url],
                 webhook_config=webhook_config,
-                error=error_message
+                error=error_message,
             )
             return
 
@@ -864,13 +902,14 @@ async def process_llm_extraction(
             return
 
         # Send webhook notification on successful completion
-        await webhook_service.notify_job_completion(
+        await _deliver_terminal_webhook(
+            webhook_service,
             task_id=task_id,
             task_type="llm_extraction",
             status="completed",
             urls=[url],
             webhook_config=webhook_config,
-            result=result_data
+            result=result_data,
         )
 
     except Exception as e:
@@ -893,13 +932,14 @@ async def process_llm_extraction(
             return
 
         # Send webhook notification on failure
-        await webhook_service.notify_job_completion(
+        await _deliver_terminal_webhook(
+            webhook_service,
             task_id=task_id,
             task_type="llm_extraction",
             status="failed",
             urls=[url],
             webhook_config=webhook_config,
-            error=error_message
+            error=error_message,
         )
     finally:
         await _stop_llm_heartbeat(heartbeat)
