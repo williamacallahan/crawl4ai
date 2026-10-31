@@ -539,13 +539,6 @@ async def test_high_dimensional_handling():
             )
             
             console.print(f"[green]✓ Successfully handled {len(state.expanded_queries)} queries in 384D space[/green]")
-            console.print(f"Coverage shape type: {type(state.coverage_shape)}")
-            
-            if isinstance(state.coverage_shape, dict):
-                console.print(f"Coverage model: centroid + radius")
-                console.print(f"  - Center shape: {state.coverage_shape['center'].shape if 'center' in state.coverage_shape else 'N/A'}")
-                console.print(f"  - Radius: {state.coverage_shape.get('radius', 'N/A'):.3f}")
-            
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
             console.print("[yellow]This demonstrates why alpha shapes don't work in high dimensions[/yellow]")
