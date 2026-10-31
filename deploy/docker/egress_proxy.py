@@ -40,6 +40,7 @@ logger = logging.getLogger("crawl4ai.egress")
 _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _BLOCKED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
 _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
+_EXPECTATION_FAILED = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 18\r\n\r\nExpectation Failed"
 _MAX_HEADER_BYTES = 64 * 1024
 _HEX_DIGITS = b"0123456789abcdefABCDEF"
 # Hop-by-hop fields the proxy replaces with its own Connection: close.
@@ -48,6 +49,28 @@ _CONNECTION_FIELDS = (b"connection", b"proxy-connection", b"keep-alive")
 _STOP_DEADLINE_S = 5.0
 # How long one stop() pass waits for Server.wait_closed() before sweeping again.
 _STOP_SWEEP_S = 0.1
+
+
+def _body_framing(headers: bytes) -> tuple[int | None, bool]:
+    """Return (Content-Length, chunked) parsed from ``headers`` (raw header
+    lines joined by ``\\r\\n``).  Content-Length is ``None`` when absent or
+    unparseable; chunked is True only when ``Transfer-Encoding: chunked`` is
+    present."""
+    content_length: int | None = None
+    chunked = False
+    for line in headers.split(b"\r\n"):
+        if not line:
+            continue
+        name, _, value = line.partition(b":")
+        lname = name.strip().lower()
+        if lname == b"content-length":
+            try:
+                content_length = int(value.strip())
+            except ValueError:
+                content_length = None
+        elif lname == b"transfer-encoding" and b"chunked" in value.lower():
+            chunked = True
+    return content_length, chunked
 
 # Chromium turns every CONNECT answer other than 200/407 into
 # net::ERR_TUNNEL_CONNECTION_FAILED (net/http/http_proxy_client_socket.cc,
@@ -419,10 +442,33 @@ class PinningProxy:
             return
 
         headers = await self._read_headers(client_reader)
+        # RFC 7230 §3.3.3 forbids a request that carries both
+        # ``Content-Length`` and ``Transfer-Encoding``: an origin that uses
+        # ``Content-Length`` would read a different request boundary than the
+        # proxy, which relays the chunked body.  ``_body_framing`` parses
+        # framing from the original request headers so a ``Connection``
+        # nomination cannot hide either one.  Reject before opening the
+        # upstream connection or forwarding any bytes.
+        if self._has_conflicting_framing(headers):
+            await self._reply(client_writer, _BAD)
+            return
         try:
-            body_length = _request_body_length(headers)
+            _request_body_length(headers)
         except ValueError:
             await self._reply(client_writer, _BAD)
+            return
+        # Reject unsupported ``Expect`` values before opening the upstream
+        # connection or forwarding the request body.  ``_relay_one`` reads the
+        # full request body before the upstream response, so a client using
+        # ``Expect: x-...`` that waits for an interim/final response before
+        # sending its body would deadlock the relay.  ``100-continue`` is the
+        # only expectation handled locally (it is stripped from the upstream
+        # request and the proxy emits the interim ``100 Continue`` itself
+        # below); any other ``Expect`` is rejected with ``417`` per RFC 7231
+        # §5.1.1 so the client learns not to send the body and the proxy never
+        # opens or holds an upstream connection for an unsatisfiable request.
+        if self._unsupported_expect(headers):
+            await self._reply(client_writer, _EXPECTATION_FAILED)
             return
         path = sp.path or "/"
         if sp.query:
@@ -438,12 +484,44 @@ class PinningProxy:
             ).encode("latin-1")
             if upstream[2]:
                 out += upstream[2]
-        # Only this request was validated and pinned, so the connection carries
-        # exactly one exchange in each direction (see _forward_request_body).
+        # Only the first request on this connection was validated and rewritten.
+        # Strip every hop-by-hop header -- the client's ``Connection`` plus any
+        # header it nominates by name (e.g. ``Connection: X-Foo, keep-alive``)
+        # and the standard hop-by-hop set -- and force close, so a keep-alive
+        # client cannot reuse this socket to smuggle a second, unvalidated
+        # absolute-form request through to the first request's pinned IP.  The
+        # generated ``Host`` is added below, after this filter, so it is never
+        # stripped even if a malicious client writes ``Connection: Host``; and
+        # ``Content-Length`` / ``Transfer-Encoding`` are preserved so the body
+        # framing _relay_one forwards to the upstream stays correct.  This guard
+        # previously lived only in the upstream-proxy branch; the direct branch
+        # leaked the client's Connection header (HTTP/1.1 default keep-alive
+        # preserves the socket) and the raw _splice then piped every later
+        # request verbatim, unvalidated, to the first pinned destination.
+        header_lines = [line for line in headers.split(b"\r\n") if line]
+        nominated = set()
+        expect_continue = False
+        for line in header_lines:
+            name, _, value = line.partition(b":")
+            lname = name.strip().lower()
+            if lname == b"connection":
+                nominated.update(
+                    token.strip().lower()
+                    for token in value.split(b",")
+                    if token.strip()
+                )
+            elif lname == b"expect" and b"100-continue" in value.strip().lower():
+                expect_continue = True
+        framing = {b"content-length", b"transfer-encoding"}
+        drop = (nominated - framing) | {
+            b"connection", b"keep-alive", b"te", b"trailer", b"upgrade",
+        }
+        if expect_continue:
+            drop.add(b"expect")
         headers = b"".join(
             line + b"\r\n"
-            for line in headers.split(b"\r\n")
-            if line and not line.lower().startswith(b"connection:")
+            for line in header_lines
+            if line.split(b":", 1)[0].strip().lower() not in drop
         ) + b"Connection: close\r\n"
         out += b"Host: " + _bracket(sp.hostname).encode("latin-1")
         if sp.port:
@@ -460,15 +538,29 @@ class PinningProxy:
             await self._reply(client_writer, _BLOCKED)
             return
         _record_dial_outcome(sp.hostname, port, None)
-        # A cancel or error before the splice owns the upstream still closes it.
+        # A cancel or error before the relay owns the upstream still closes it.
         try:
             up_writer.write(out)
             await up_writer.drain()
-            await self._splice(
-                client_writer,
-                up_writer,
-                self._forward_request_body(client_reader, up_writer, body_length),
-                self._relay_response(up_reader, client_writer),
+            # ``_relay_one`` reads the full request body before reading the
+            # upstream response, so a client using ``Expect: 100-continue``
+            # would deadlock waiting for an interim response we never forward.
+            # We stripped ``Expect`` from the upstream request so the origin
+            # does not wait for one either; send the interim response to the
+            # client ourselves so it sends the body, which ``_relay_one`` then
+            # forwards.
+            if expect_continue:
+                client_writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                await client_writer.drain()
+            # _relay_one forwards exactly this one request and its single
+            # response, then closes both sockets -- it never pipes a subsequent
+            # client request to the already-pinned upstream, so an origin that
+            # ignores our forced ``Connection: close`` still cannot be used to
+            # smuggle a second, unvalidated absolute-form request to the pinned
+            # IP.  CONNECT keeps the raw bidirectional _splice because its
+            # payload is opaque TLS.
+            await self._relay_one(
+                method, headers, client_reader, client_writer, up_reader, up_writer
             )
         finally:
             await self._safe_close(up_writer)
@@ -637,6 +729,235 @@ class PinningProxy:
             if not direction.cancelled():
                 direction.result()
 
+    async def _relay_one(self, method, req_headers, c_reader, c_writer,
+                        u_reader, u_writer):
+        """Relay exactly one HTTP/1.1 request and its response, then close both
+        sockets.
+
+        Used on the plain-HTTP path (direct dial and upstream-chained) instead
+        of the raw bidirectional ``_splice``: only the first request on this
+        connection was validated and re-pinned, so after forwarding it (and any
+        request body) and its single framed response we close both ends.  A
+        keep-alive client -- or an origin/upstream that ignores the forced
+        ``Connection: close`` we appended -- cannot reuse this socket to
+        smuggle a second, unvalidated absolute-form request to the pinned IP,
+        because no client bytes are ever piped to the upstream after the first
+        request body.  CONNECT keeps ``_splice`` because its payload is opaque
+        TLS (or another tunnelled protocol) this proxy must not frame.
+        """
+        await self._forward_http_body(c_reader, u_writer, req_headers)
+        try:
+            await self._forward_http_response(method, u_reader, c_writer)
+        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
+            logger.debug("proxy one-request response relay failed: %s", error)
+        finally:
+            await self._safe_close(c_writer)
+            await self._safe_close(u_writer)
+
+    async def _forward_http_body(self, c_reader, u_writer, req_headers):
+        """Forward a request body framed by ``req_headers`` (Content-Length or
+        chunked); without framing there is no body, since ``_read_headers``
+        already consumed up to the terminating blank line."""
+        content_length, chunked = _body_framing(req_headers)
+        try:
+            if chunked:
+                await self._forward_chunked(c_reader, u_writer)
+            elif content_length is not None and content_length > 0:
+                remaining = content_length
+                while remaining > 0:
+                    chunk = await c_reader.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    u_writer.write(chunk)
+                    await u_writer.drain()
+                    remaining -= len(chunk)
+        except (OSError, ConnectionError, asyncio.TimeoutError) as error:
+            logger.debug("proxy request body relay failed: %s", error)
+
+    async def _forward_http_response(self, method, u_reader, c_writer):
+        """Read one HTTP/1.1 response from ``u_reader``, forward it to
+        ``c_writer``, and return as soon as the response body is complete so
+        the caller can close both ends without waiting for the upstream to
+        close (an origin that ignores ``Connection: close`` cannot hold the
+        socket open for a smuggled second request).
+
+        The response is accumulated into a buffer and written to the client
+        in 64 KiB chunks (a small response is written as a single chunk), the
+        same way the raw ``_splice`` delivered it -- so a client that issues
+        one bounded ``read()`` for a small response observes the whole
+        response in that read, then EOF when we close, instead of a fragment
+        of it (status line or a single header line) per ``read()``.
+        """
+        # Forward any interim 1xx responses (100 Continue, 103 Early Hints) to
+        # the client and keep reading until the final response.  The request
+        # path strips ``Upgrade``, so 101 Switching Protocols does not occur
+        # here; a 101 is treated as the final response (no body) below.
+        while True:
+            status_line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+            if not status_line:
+                return
+            status_code = 0
+            parts = status_line.split(b" ", 2)
+            if len(parts) >= 2:
+                try:
+                    status_code = int(parts[1])
+                except ValueError:
+                    status_code = 0
+            content_length, chunked = None, False
+            header_lines = []
+            connection_value = b""
+            while True:
+                line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                name, _, value = line.partition(b":")
+                lname = name.strip().lower()
+                if lname == b"connection":
+                    connection_value = value.strip().lower()
+                    continue
+                header_lines.append(line)
+                if lname == b"content-length":
+                    try:
+                        content_length = int(value.strip())
+                    except ValueError:
+                        content_length = None
+                elif lname == b"transfer-encoding" and b"chunked" in value.lower():
+                    chunked = True
+            # Rewrite hop-by-hop response headers: drop the origin's
+            # ``Connection`` and every header it nominates by name, drop
+            # ``Keep-Alive``/``TE``/``Trailer``/``Upgrade``, and append our own
+            # ``Connection: close`` so the client treats this socket as
+            # single-use and does not try to reuse it for a second (smuggled)
+            # request.  ``Content-Length`` and ``Transfer-Encoding`` are kept so
+            # the body framing the relay forwards to the client stays correct,
+            # except that RFC 7230 §3.3.2 forbids sending ``Content-Length``
+            # alongside a ``Transfer-Encoding``: when the response is chunked we
+            # drop ``Content-Length`` and let the chunked framing speak for
+            # itself.
+            framing = {b"content-length", b"transfer-encoding"}
+            nominated = set()
+            if connection_value:
+                nominated.update(
+                    token.strip()
+                    for token in connection_value.split(b",")
+                    if token.strip()
+                )
+            drop = (nominated - framing) | {
+                b"keep-alive", b"te", b"trailer", b"upgrade",
+            }
+            if chunked:
+                drop.add(b"content-length")
+            buf = bytearray(status_line)
+            for line in header_lines:
+                if line.split(b":", 1)[0].strip().lower() in drop:
+                    continue
+                buf.extend(line)
+            buf.extend(b"Connection: close\r\n\r\n")
+            if 100 <= status_code < 200 and status_code != 101:
+                c_writer.write(buf)
+                await c_writer.drain()
+                buf.clear()
+                continue
+            break
+
+        async def flush(threshold: int = 65536):
+            if len(buf) >= threshold:
+                c_writer.write(buf)
+                await c_writer.drain()
+                buf.clear()
+
+        no_body = (
+            method.upper() == "HEAD"
+            or status_code == 101
+            or status_code in (204, 304)
+        )
+        if no_body:
+            c_writer.write(buf)
+            await c_writer.drain()
+            return
+        if chunked:
+            while True:
+                line = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                buf.extend(line)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                size_field = line.strip().split(b";", 1)[0] or b"0"
+                try:
+                    size = int(size_field, 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    while True:
+                        trailer = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                        buf.extend(trailer)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                remaining = size
+                while remaining > 0:
+                    chunk = await u_reader.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    remaining -= len(chunk)
+                    await flush()
+                crlf = await asyncio.wait_for(u_reader.readline(), timeout=30)
+                buf.extend(crlf)
+                await flush()
+        elif content_length is not None:
+            remaining = content_length
+            while remaining > 0:
+                chunk = await u_reader.read(min(65536, remaining))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                remaining -= len(chunk)
+                await flush()
+        else:
+            while True:
+                chunk = await u_reader.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                await flush()
+        if buf:
+            c_writer.write(buf)
+            await c_writer.drain()
+
+    async def _forward_chunked(self, src, dst):
+        """Copy a chunked HTTP/1.1 body (including the terminating zero-size
+        chunk and any trailers) from ``src`` to ``dst`` verbatim."""
+        while True:
+            line = await asyncio.wait_for(src.readline(), timeout=30)
+            dst.write(line)
+            await dst.drain()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            size_field = line.strip().split(b";", 1)[0] or b"0"
+            try:
+                size = int(size_field, 16)
+            except ValueError:
+                break
+            if size == 0:
+                while True:
+                    trailer = await asyncio.wait_for(src.readline(), timeout=30)
+                    dst.write(trailer)
+                    await dst.drain()
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            remaining = size
+            while remaining > 0:
+                chunk = await src.read(min(65536, remaining))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                await dst.drain()
+                remaining -= len(chunk)
+            crlf = await asyncio.wait_for(src.readline(), timeout=30)
+            dst.write(crlf)
+            await dst.drain()
+
     async def _reply(self, writer, payload: bytes):
         try:
             writer.write(payload)
@@ -644,6 +965,37 @@ class PinningProxy:
         except (OSError, ConnectionError) as error:
             logger.debug("proxy reply failed: %s", error)
         await self._safe_close(writer)
+
+    @staticmethod
+    def _has_conflicting_framing(headers: bytes) -> bool:
+        """True if the request headers carry both ``Content-Length`` and a
+        chunked ``Transfer-Encoding``.  RFC 7230 §3.3.3 requires such a request
+        to be rejected; relaying both lets the proxy and an origin that reads
+        ``Content-Length`` disagree on the request boundary."""
+        _, chunked = _body_framing(headers)
+        if not chunked:
+            return False
+        return any(
+            line.split(b":", 1)[0].strip().lower() == b"content-length"
+            for line in headers.split(b"\r\n")
+            if line
+        )
+
+    @staticmethod
+    def _unsupported_expect(headers: bytes) -> bool:
+        """True if the request headers carry an ``Expect`` value other than
+        ``100-continue`` (which ``_handle_absolute`` handles locally)."""
+        for line in headers.split(b"\r\n"):
+            if not line:
+                continue
+            name, _, value = line.partition(b":")
+            if name.strip().lower() != b"expect":
+                continue
+            tokens = [t.strip().lower() for t in value.split(b",") if t.strip()]
+            if tokens and all(t == b"100-continue" for t in tokens):
+                continue
+            return True
+        return False
 
     @staticmethod
     async def _safe_close(writer):
