@@ -27,6 +27,7 @@ node's budget across two keys, so an unset variable fails loudly with 503.
 from __future__ import annotations
 
 import asyncio
+import base64
 import errno
 import math
 import os
@@ -220,14 +221,19 @@ async def _default_opener(url: str, max_body_bytes: int):
         ) from exc
 
 
-async def fetch(redis, config: dict, url: str, *, opener=None, include_headers=False) -> dict:
+async def fetch(
+    redis, config: dict, url: str, *, opener=None, include_headers=False, binary=False,
+) -> dict:
     """Reserve a budget slot, GET an archive.org URL, and return its body.
 
     Redirects are followed manually — one reservation per hop, at most
     ``archive.max_redirect_hops`` hops — and a Location that leaves the archive
     hosts stops the fetch with 502. The body is capped at
     ``limits.max_body_bytes`` (0 = unbounded) and must be text (text/*, JSON,
-    or XML); violations answer 502 and 415. Archive 429/503 and refused
+    or XML); violations answer 502 and 415. With ``binary`` the media-type gate
+    is skipped and the exact bytes return base64-encoded as ``bodyBase64``
+    (no ``body``); the cap, redirect, and budget rules are unchanged and ``url``
+    stays the final archive URL after the redirect chain. Archive 429/503 and refused
     connections pause the node budget and raise ArchiveBudgetSpent; any other
     archive status keeps its body for the caller to report.
 
@@ -288,17 +294,25 @@ async def fetch(redis, config: dict, url: str, *, opener=None, include_headers=F
             detail="archive body exceeds max_body_bytes",
         )
     content_type = _header(headers, "content-type") or ""
-    if not _is_text_content_type(content_type):
+    if binary:
+        result = {
+            "url": current,
+            "status": status_code,
+            "contentType": content_type,
+            "bodyBase64": base64.b64encode(body).decode("ascii"),
+        }
+    elif not _is_text_content_type(content_type):
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail="archive body is not text",
         )
-    result = {
-        "url": current,
-        "status": status_code,
-        "contentType": content_type,
-        "body": body.decode("utf-8", errors="replace"),
-    }
+    else:
+        result = {
+            "url": current,
+            "status": status_code,
+            "contentType": content_type,
+            "body": body.decode("utf-8", errors="replace"),
+        }
     if include_headers:
         result["responseHeaders"] = dict(headers)
     return result

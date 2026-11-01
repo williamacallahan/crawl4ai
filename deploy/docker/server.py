@@ -927,7 +927,7 @@ async def archive_fetch(
     """Fetch one archive.org (or web.archive.org) URL through this node's
     shared per-IP budget. Non-archive hosts get 400; a spent node budget gets
     a typed 429 ``archive_budget_spent`` for the back-end's overflow lane."""
-    return JSONResponse(await archive_budget.fetch(redis, config, body.url))
+    return JSONResponse(await archive_budget.fetch(redis, config, body.url, binary=body.binary))
 
 
 # ── artifact store helpers ───────────────────────────────────

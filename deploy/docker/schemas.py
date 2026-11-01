@@ -89,8 +89,13 @@ class RawCode(BaseModel):
     code: str
 
 class ArchiveFetchRequest(BaseModel):
-    """Request body for /archive/fetch (archive.org hosts only)."""
+    """Request body for /archive/fetch (archive.org hosts only).
+
+    ``binary`` opts into the exact response bytes (``bodyBase64``) for non-text
+    media; the default text mode is unchanged.
+    """
     url: str
+    binary: bool = False
 
 class HTMLRequest(BaseModel):
     url: str
