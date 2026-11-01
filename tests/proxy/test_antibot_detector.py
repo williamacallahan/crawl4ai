@@ -997,20 +997,3 @@ def test_script_block_pass_ignores_sensor_only_script():
     assert 'orchestrate' not in page
     assert is_blocked(200, page) == (False, "")
 
-
-
-def test_redirect_stub_with_meta_refresh_target_is_not_blocked():
-    # Real 443-byte Wayback capture of a 2003 site root: JS + meta refresh to index.asp, empty body.
-    stub = ('<html>\n<head>\n<meta http-equiv="Pragma" content="no-cache">\n'
-            '<script language="Javascript">\n<!--\nif (navigator.appName != "Microsoft Internet Explorer") {\n'
-            'location.replace("index.asp");\n}\n// -->\n</script>\n'
-            '<meta http-equiv="refresh" content="0; URL=index.asp">\n'
-            '<title>Vesper Business</title>\n</head>\n<body bgcolor="#FFFFFF"></body></html>')
-    assert is_blocked(200, stub) == (False, "")
-    # The same empty shell with no refresh target stays a structural block.
-    shell = stub.replace('<meta http-equiv="refresh" content="0; URL=index.asp">', '')
-    blocked, reason = is_blocked(200, shell)
-    assert blocked and reason.startswith("Structural:")
-    # A targetless refresh (challenge interstitial style) stays blocked.
-    timed = stub.replace('content="0; URL=index.asp"', 'content="360"')
-    assert is_blocked(200, timed)[0]

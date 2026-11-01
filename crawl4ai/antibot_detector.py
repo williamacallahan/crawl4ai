@@ -115,13 +115,6 @@ _CONTENT_ELEMENTS_RE = re.compile(
     r'<(?:p|h[1-6]|article|section|li|td|a|pre)\b', re.IGNORECASE
 )
 _SCRIPT_TAG_RE = re.compile(r'<script\b', re.IGNORECASE)
-# A page whose only job is `<meta http-equiv="refresh" content="N; URL=...">` is a
-# redirect stub the origin really served (an archived capture of a 2000s site root
-# is often one), not a block: challenge interstitials refresh without a target.
-_META_REFRESH_TARGET_RE = re.compile(
-    r'<meta\b[^>]*http-equiv\s*=\s*["\']?refresh["\']?[^>]*content\s*=\s*["\']?\s*\d+\s*;\s*url\s*=\s*[^"\'>\s]',
-    re.IGNORECASE,
-)
 _STYLE_TAG_RE = re.compile(r'<style\b[\s\S]*?</style>', re.IGNORECASE)
 _SCRIPT_BLOCK_RE = re.compile(r'<script\b[\s\S]*?</script>', re.IGNORECASE)
 _TAG_RE = re.compile(r'<[^>]+>')
@@ -308,11 +301,6 @@ def _structural_integrity_check(html: str) -> Tuple[bool, str]:
     script_count = len(_SCRIPT_TAG_RE.findall(html))
     if script_count > 0 and content_elements == 0 and visible_len < 100:
         signals.append("script_heavy_shell")
-
-    # A declared redirect to a concrete URL explains the empty body; the target, not
-    # this stub, is the page to judge.
-    if content_elements == 0 and visible_len < 50 and _META_REFRESH_TARGET_RE.search(html):
-        return False, ""
 
     # Scoring
     signal_count = len(signals)
