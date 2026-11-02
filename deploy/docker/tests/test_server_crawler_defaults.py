@@ -74,7 +74,7 @@ def test_markdown_uses_server_render_readiness_default(monkeypatch):
 
     async def arun(_crawler, *args, **kwargs):
         captured["config"] = kwargs["config"]
-        return SimpleNamespace(success=True, markdown=markdown_result)
+        return SimpleNamespace(success=True, markdown=markdown_result, redirected_url=None)
 
     async def get_crawler(_browser_config):
         return object()
@@ -88,7 +88,7 @@ def test_markdown_uses_server_render_readiness_default(monkeypatch):
     monkeypatch.setattr(crawler_pool, "release_crawler", release_crawler)
     monkeypatch.setattr(egress_broker, "enforce_egress", lambda _config: None)
 
-    markdown = asyncio.run(
+    markdown, _ = asyncio.run(
         api.handle_markdown_request(
             object(),
             "https://example.com",
@@ -118,6 +118,7 @@ def test_llm_markdown_uses_one_async_provider_call(monkeypatch):
             return_value=SimpleNamespace(
                 success=True,
                 cleaned_html="<h1>Example</h1>",
+                redirected_url=None,
                 markdown=SimpleNamespace(
                     raw_markdown="# Example",
                     fit_markdown="",
@@ -150,7 +151,7 @@ def test_llm_markdown_uses_one_async_provider_call(monkeypatch):
         },
     )
 
-    markdown = asyncio.run(
+    markdown, _ = asyncio.run(
         api.handle_markdown_request(
             PermitRedis(),
             "https://example.com",

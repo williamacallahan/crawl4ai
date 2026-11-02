@@ -154,6 +154,7 @@ def _patch_md_response(monkeypatch, captured):
         success=True,
         cleaned_html="<h1>Example</h1>",
         markdown=SimpleNamespace(raw_markdown="# Example", fit_markdown=""),
+        redirected_url=None,
     )
 
     async def fake_arun(_crawler, *a, **kw):
@@ -199,7 +200,7 @@ def test_md_temperature_reaches_litellm(monkeypatch, caller_temp, server_temp, e
     _patch_md_response(monkeypatch, captured)
     monkeypatch.setattr(llm_broker, "resolve_llm", _resolve(server_temp))
 
-    markdown = asyncio.run(
+    markdown, _ = asyncio.run(
         api.handle_markdown_request(
             PermitRedis(),
             "https://example.com",

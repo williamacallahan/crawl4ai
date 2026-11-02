@@ -914,8 +914,8 @@ async def handle_markdown_request(
     provider: Optional[str] = None,
     temperature: Optional[float] = None,
     base_url: Optional[str] = None
-) -> str:
-    """Handle markdown generation requests."""
+) -> Tuple[str, Optional[str]]:
+    """Return selected markdown and the crawler-observed final navigation URL."""
     config = config or {}
     crawler: Optional[AsyncWebCrawler] = None
     llm = None
@@ -1021,11 +1021,14 @@ async def handle_markdown_request(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail="LLM markdown filter returned no content",
                 )
-            return markdown
+            return markdown, result.redirected_url
 
-        return (result.markdown.raw_markdown
-                if filter_type == FilterType.RAW
-                else result.markdown.fit_markdown)
+        return (
+            result.markdown.raw_markdown
+            if filter_type == FilterType.RAW
+            else result.markdown.fit_markdown,
+            result.redirected_url,
+        )
 
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")

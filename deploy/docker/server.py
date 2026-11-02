@@ -839,7 +839,7 @@ async def get_markdown(
     trace_id, client_request_id = _markdown_correlation(request)
     started_monotonic = time.monotonic()
     try:
-        markdown = await handle_markdown_request(
+        markdown, redirected_url = await handle_markdown_request(
             redis, body.url, body.f, body.q, body.c, config, body.provider,
             body.temperature
         )
@@ -856,6 +856,7 @@ async def get_markdown(
     response = JSONResponse(
         {
             "url": body.url,
+            "redirected_url": redirected_url,
             "filter": body.f,
             "query": body.q,
             "cache": body.c,

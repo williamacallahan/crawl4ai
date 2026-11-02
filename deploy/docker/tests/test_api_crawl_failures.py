@@ -41,6 +41,45 @@ def _markdown_terminal_events(caplog):
     ]
 
 
+@pytest.mark.parametrize("filter_type,expected", [("raw", "raw text"), ("fit", "fit text"), ("bm25", "fit text")])
+@pytest.mark.parametrize("landed", [None, "https://publisher.example/article"])
+def test_markdown_preserves_requested_url_and_observed_landing(
+    stock_client, server_module, monkeypatch, filter_type, expected, landed
+):
+    from auth import create_access_token
+    from crawl4ai.models import CrawlResult, MarkdownGenerationResult
+
+    requested = "https://tracker.example/redirect?article=1"
+    _install_markdown_crawler(
+        monkeypatch,
+        CrawlResult(
+            url=requested,
+            html="<p>article</p>",
+            success=True,
+            redirected_url=landed,
+            markdown=MarkdownGenerationResult(
+                raw_markdown="raw text",
+                markdown_with_citations="raw text",
+                references_markdown="",
+                fit_markdown="fit text",
+            ),
+        ),
+    )
+    token = create_access_token({"sub": "test@example.com"})
+    response = stock_client.post(
+        "/md",
+        json={"url": requested, "f": filter_type},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["url"] == requested
+    assert payload.get("redirected_url") == landed
+    assert payload["markdown"] == expected
+    assert payload["success"] is True
+
+
 @pytest.mark.parametrize("error_message,expected_detail", [
     ("Blocked by anti-bot protection: challenge", "Blocked by anti-bot protection: challenge"),
     ("Permission denied: /app/private/cache.db", "Crawl failed"),
@@ -114,6 +153,7 @@ def test_markdown_success_logs_one_safe_terminal_event(
         SimpleNamespace(
             success=True,
             markdown=SimpleNamespace(raw_markdown=markdown, fit_markdown=markdown),
+            redirected_url=None,
         ),
     )
     from auth import create_access_token
@@ -223,6 +263,7 @@ def test_markdown_terminal_event_omits_malformed_correlation_headers(
         SimpleNamespace(
             success=True,
             markdown=SimpleNamespace(raw_markdown="markdown", fit_markdown="markdown"),
+            redirected_url=None,
         ),
     )
     from auth import create_access_token
