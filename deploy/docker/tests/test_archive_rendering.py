@@ -23,7 +23,8 @@ async def test_equal_bodies_use_original_matchers_and_response_metadata(stream):
     urls = ["https://archive.org/a", "https://archive.org/b"]
     html = '<html><body><p>Identical archived content.</p><a href="child">Child</a></body></html>'
     responses = {
-        u: {"url": u + "/final/", "status": 404 if i else 200,
+        u: {"url": u + "/final/", "initialStatus": 302 if i else 200,
+            "status": 404 if i else 200,
             "body": html, "responseHeaders": {"X-Seed": str(i)}}
         for i, u in enumerate(urls)
     }
@@ -40,7 +41,9 @@ async def test_equal_bodies_use_original_matchers_and_response_metadata(stream):
     by_url = {r.url: r for r in results}
     assert set(by_url) == set(urls)
     assert by_url[urls[0]].status_code == 200
-    assert by_url[urls[1]].status_code == 404
+    assert by_url[urls[0]].redirected_status_code == 200
+    assert by_url[urls[1]].status_code == 302
+    assert by_url[urls[1]].redirected_status_code == 404
     assert by_url[urls[1]].response_headers["X-Seed"] == "1"
     assert by_url[urls[1]].redirected_url == urls[1] + "/final/"
     assert all(c.base_url is None for c in configs)
@@ -67,7 +70,7 @@ async def test_mixed_groups_keep_both_results_and_release_on_close(monkeypatch, 
             active -= 1
 
     monkeypatch.setattr(transport, "owned_crawler", owned)
-    responses = {urls[0]: {"url": urls[0], "status": 200,
+    responses = {urls[0]: {"url": urls[0], "initialStatus": 200, "status": 200,
                           "body": "<p>archive content</p>", "responseHeaders": {}}}
     cfg = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, word_count_threshold=0, stream=stream)
     results = [r async for r in grouped_results(urls, BrowserConfig(), cfg,
@@ -104,7 +107,7 @@ async def test_raw_screenshot_never_fetches_remote_assets(effective_browser_args
     html = f'<html><head><link rel="stylesheet" href="{asset}"></head><body>Snapshot</body></html>'
     browser = BrowserConfig(headless=True, text_mode=False, extra_args=effective_browser_args)
     strategy = ArchiveHTMLStrategy(
-        {original: {"url": original, "status": 200, "body": html,
+        {original: {"url": original, "initialStatus": 200, "status": 200, "body": html,
                     "responseHeaders": {"Content-Type": "text/html"}}},
         browser_config=browser,
     )

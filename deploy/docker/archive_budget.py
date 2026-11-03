@@ -254,6 +254,7 @@ async def fetch(
     max_body = int(config["limits"]["max_body_bytes"])
     open_url = opener or _default_opener
     current = str(url)
+    initial_status = None
     for _hop in range(int(config["archive"]["max_redirect_hops"])):
         wait = await reserve(redis, config)
         if wait > 0:
@@ -269,6 +270,8 @@ async def fetch(
         except _ArchiveUpstreamRefused:
             retry_after = await pause(redis, config)
             raise ArchiveBudgetSpent(retry_after, node())
+        if initial_status is None:
+            initial_status = status_code
         if status_code in (429, 503):
             retry_after = await pause(redis, config)
             raise ArchiveBudgetSpent(retry_after, node())
@@ -314,5 +317,6 @@ async def fetch(
             "body": body.decode("utf-8", errors="replace"),
         }
     if include_headers:
+        result["initialStatus"] = initial_status
         result["responseHeaders"] = dict(headers)
     return result

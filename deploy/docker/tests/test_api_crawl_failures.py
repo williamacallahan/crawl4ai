@@ -1,4 +1,6 @@
+import asyncio
 import re
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -324,3 +326,94 @@ def test_markdown_terminal_event_omits_malformed_correlation_headers(
     assert "client_request_id=" not in event
     assert malformed_traceparent not in event
     assert malformed_client_request_id not in event
+
+
+def test_inline_markdown_does_not_report_synthetic_http_success(
+    stock_client, server_module, monkeypatch
+):
+    from auth import create_access_token
+
+    requested = "raw:<p>Inline content</p>"
+    _install_markdown_crawler(monkeypatch, CrawlResult(
+        url=requested, html="<p>Inline content</p>", success=True, status_code=200,
+        redirected_url="https://base.example/", redirected_status_code=200,
+        markdown=MarkdownGenerationResult(
+            raw_markdown="Inline content", markdown_with_citations="Inline content",
+            references_markdown="",
+        ),
+    ))
+    token = create_access_token({"sub": "test@example.com"})
+    response = stock_client.post(
+        "/md", json={"url": requested, "f": "raw"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["markdown"] == "Inline content"
+    assert payload["status_code"] is None
+    assert payload["redirected_status_code"] is None
+    assert payload["redirected_url"] is None
+
+
+@pytest.mark.parametrize("failure,expected_status", [
+    ("permit", 503), ("empty", 502), ("timeout", 504), ("internal", 500),
+])
+def test_post_render_llm_failure_keeps_capture_and_safe_http_error(
+    stock_client, server_module, monkeypatch, failure, expected_status
+):
+    import api
+    import llm_broker
+    from auth import create_access_token
+    from test_llm_crawler_release_timing import _resolve_llm
+
+    _install_markdown_crawler(monkeypatch, CrawlResult(
+        url="https://example.com/", html="<p>Captured article</p>",
+        cleaned_html="<p>Captured article</p>", success=True, status_code=302,
+        redirected_url="https://example.com/article", redirected_status_code=200,
+        markdown=MarkdownGenerationResult(
+            raw_markdown="Captured article", markdown_with_citations="Captured article",
+            references_markdown="",
+        ),
+    ))
+    monkeypatch.setattr(llm_broker, "resolve_llm", _resolve_llm())
+
+    @asynccontextmanager
+    async def permit(*args):
+        if failure == "permit":
+            raise HTTPException(503, "LLM capacity busy", headers={"Retry-After": "30"})
+        yield
+
+    async def complete(**kwargs):
+        if failure == "timeout":
+            raise asyncio.TimeoutError()
+        if failure == "internal":
+            raise RuntimeError("Permission denied: /private/llm-cache")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=""))])
+
+    monkeypatch.setattr(api, "llm_permit", permit)
+    monkeypatch.setattr(api, "aperform_completion_with_backoff", complete)
+    token = create_access_token({"sub": "test@example.com"})
+    response = stock_client.post(
+        "/md", json={"url": "https://example.com/", "f": "llm"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == expected_status
+    payload = response.json()
+    assert payload["html"] == "<p>Captured article</p>"
+    assert payload["raw_markdown"] == "Captured article"
+    assert payload["status_code"] == 302
+    assert payload["redirected_status_code"] == 200
+    assert payload["redirected_url"] == "https://example.com/article"
+    assert "/private/llm-cache" not in response.text
+    if failure == "internal":
+        assert payload["error"] == "Internal server error"
+        assert re.fullmatch(r"[0-9a-f]{12}", payload["correlation_id"])
+    else:
+        assert payload["detail"] == {
+            "permit": "LLM capacity busy", "empty": "LLM markdown filter returned no content",
+            "timeout": "Crawl exceeded the time limit",
+        }[failure]
+    if failure == "permit":
+        assert response.headers["Retry-After"] == "30"

@@ -60,7 +60,7 @@ async def test_oversized_page_does_not_abort_raw_batch(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["cache", "fallback"])
+@pytest.mark.parametrize("source", ["network", "cache", "fallback"])
 async def test_alternate_html_sources_cannot_bypass_limit(tmp_path, monkeypatch, source):
     crawler = _crawler(tmp_path)
     html = "<p>" + "x" * 128 + "</p>"
@@ -71,9 +71,17 @@ async def test_alternate_html_sources_cannot_bypass_limit(tmp_path, monkeypatch,
         config.cache_mode = CacheMode.READ_ONLY
         monkeypatch.setattr(
             async_db_manager, "aget_cached_url",
-            AsyncMock(return_value=CrawlResult(url="https://example.test", html=html, success=True)),
+            AsyncMock(return_value=CrawlResult(
+                url="https://example.test", html=html, success=True, status_code=302,
+                redirected_url="https://publisher.test/missing", redirected_status_code=404,
+            )),
         )
         crawl = AsyncMock(side_effect=AssertionError("cache hit refetched"))
+    elif source == "network":
+        crawl = AsyncMock(return_value=AsyncCrawlResponse(
+            html=html, response_headers={}, status_code=302,
+            redirected_url="https://publisher.test/missing", redirected_status_code=404,
+        ))
     else:
         crawl = AsyncMock(side_effect=TargetNavigationError("net::ERR_CONNECTION_REFUSED"))
         config.fallback_fetch_function = AsyncMock(return_value=html)
@@ -83,10 +91,14 @@ async def test_alternate_html_sources_cannot_bypass_limit(tmp_path, monkeypatch,
 
     assert result.success is False
     assert result.error_message == "html_too_large: 135 exceeds 64"
+    assert result.html == ""
+    assert result.status_code == (None if source == "fallback" else 302)
+    assert result.redirected_url == (None if source == "fallback" else "https://publisher.test/missing")
+    assert result.redirected_status_code == (None if source == "fallback" else 404)
     scraper.assert_not_awaited()
     if source == "cache":
         crawl.assert_not_awaited()
-    else:
+    elif source == "fallback":
         config.fallback_fetch_function.assert_awaited_once()
 
 
@@ -127,3 +139,22 @@ async def test_unusable_oversized_cache_still_heals_by_refetching(tmp_path, monk
 def test_html_limit_requires_positive_integer(limit):
     with pytest.raises(ValueError, match="max_html_bytes must be a positive integer"):
         CrawlerRunConfig(max_html_bytes=limit)
+
+
+@pytest.mark.asyncio
+async def test_scraping_failure_retains_observed_navigation(tmp_path, monkeypatch):
+    crawler = _crawler(tmp_path)
+    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+    monkeypatch.setattr(crawler.crawler_strategy, "crawl", AsyncMock(return_value=AsyncCrawlResponse(
+        html=HEALED_PAGE, response_headers={}, status_code=302,
+        redirected_url="https://publisher.test/article", redirected_status_code=451,
+    )))
+    monkeypatch.setattr(config.scraping_strategy, "ascrap", AsyncMock(side_effect=ValueError("scraper failed")))
+
+    result = await crawler.arun("https://example.test/", config=config)
+
+    assert result.success is False
+    assert result.html == HEALED_PAGE
+    assert result.status_code == 302
+    assert result.redirected_url == "https://publisher.test/article"
+    assert result.redirected_status_code == 451

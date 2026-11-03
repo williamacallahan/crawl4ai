@@ -25,6 +25,8 @@ from crawl4ai.cache_context import CacheMode
 @pytest.mark.browser
 @pytest.mark.asyncio
 async def test_js_navigation_updates_landed_status(local_server):
+    from api import markdown_capture
+
     async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False, extra_args=["--no-sandbox"])) as crawler:
         result = await crawler.arun(
             local_server + "/js-nav-source",
@@ -38,6 +40,11 @@ async def test_js_navigation_updates_landed_status(local_server):
     # The original-request fields deliberately retain first-response semantics.
     assert result.status_code == 200
     assert result.response_headers.get("x-source-page") == "source"
+    capture = markdown_capture(result)
+    assert (capture["status_code"], capture["redirected_status_code"]) == (200, 404)
+    assert capture["redirected_url"] == local_server + "/js-nav-target"
+    assert '"datePublished":"2025-03-21T10:00:00Z"' in capture["html"]
+    assert "JS navigation target reached" in capture["raw_markdown"]
 
 
 @pytest.mark.browser

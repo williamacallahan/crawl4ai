@@ -355,8 +355,10 @@ without another crawl. The raw field does not contain LLM-filtered output.
 committed document at `redirected_url`, including JavaScript navigation. A successful crawl
 does not imply that the document returned HTTP 200. Unknown status or landing observations
 remain `null`; clients must not infer a successful document status from the endpoint's HTTP 200.
-Correlated crawl failures retain available observations beside the existing redacted `detail`
-in their HTTP 502 response. No final-hop response headers are inferred or exposed.
+Inline HTML has no HTTP status or observed landing URL. Archive redirects retain their actual
+first and final fetch statuses separately. Crawl failures and post-render LLM errors retain
+available observations beside their existing error body and status; HTTP 500 details remain
+redacted. No final-hop response headers are inferred or exposed.
 
 ### HTML Extraction Endpoint
 

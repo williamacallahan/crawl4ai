@@ -26,6 +26,7 @@ from llm_broker import LLMProviderNotAllowed
 from redis import asyncio as aioredis
 from redis.exceptions import RedisError
 from utils import (
+    CorrelatedError,
     CrawlResourceSettings,
     FilterType,
     ResultEncoding,
@@ -415,28 +416,28 @@ def markdown_capture(result: CrawlResult) -> dict:
     capture = result.model_dump(include={
         "html", "status_code", "redirected_url", "redirected_status_code",
     })
+    if result.url.startswith(("raw:", "raw://")):
+        capture.update(status_code=None, redirected_url=None, redirected_status_code=None)
     markdown = result.markdown
     capture["raw_markdown"] = markdown.raw_markdown if markdown is not None else None
     return capture
 
 
-class CorrelatedCrawlFailure(HTTPException):
-    """A redacted failed result that retains its capture and private error-record id."""
+class MarkdownFailure(HTTPException):
+    """An HTTP failure retaining the available render for the central error handler."""
 
-    def __init__(self, detail: str, correlation_id: Optional[str], result: CrawlResult):
-        super().__init__(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
-        self.correlation_id = correlation_id
+    def __init__(self, error: HTTPException, result: CrawlResult):
+        super().__init__(status_code=error.status_code, detail=error.detail, headers=error.headers)
+        self.correlation_id = error.detail.correlation_id if isinstance(error.detail, CorrelatedError) else None
         self.result = result
 
 
 def _raise_for_crawl_failure(result, *, url: Optional[str] = None, correlate_error: bool = False):
     if not result.success:
-        if correlate_error:
-            detail = public_crawl_error(result.error_message, url)
-            raise CorrelatedCrawlFailure(detail, detail.correlation_id, result)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=public_error_detail(result.error_message),
+            detail=(public_crawl_error(result.error_message, url) if correlate_error
+                    else public_error_detail(result.error_message)),
         )
 
 
@@ -930,6 +931,7 @@ async def handle_markdown_request(
     """Return selected markdown alongside the render that produced it."""
     config = config or {}
     crawler: Optional[AsyncWebCrawler] = None
+    result: Optional[CrawlResult] = None
     llm = None
     try:
         # Validate provider if using LLM filter
@@ -1042,18 +1044,17 @@ async def handle_markdown_request(
             result,
         )
 
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
-    except HTTPException:
-        raise
-    except LLMProviderNotAllowed as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Markdown error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+    except Exception as error:
+        if isinstance(error, asyncio.TimeoutError):
+            error = HTTPException(status_code=504, detail="Crawl exceeded the time limit")
+        elif isinstance(error, LLMProviderNotAllowed):
+            error = HTTPException(status_code=400, detail=str(error))
+        elif not isinstance(error, HTTPException):
+            logger.error("Markdown error: %s", error, exc_info=True)
+            error = HTTPException(status_code=500, detail=str(error))
+        if result is None:
+            raise error
+        raise MarkdownFailure(error, result) from error
     finally:
         if crawler:
             await _dispose_crawler(crawler)

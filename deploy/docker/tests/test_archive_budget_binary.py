@@ -9,7 +9,8 @@ from test_archive_budget import ARCHIVE_URL, budget_config, redis_client, redis_
 
 
 @pytest.mark.asyncio
-async def test_fetch_binary_returns_exact_bytes_and_final_url(redis_client, monkeypatch):
+@pytest.mark.parametrize("include_headers", [False, True])
+async def test_fetch_binary_returns_exact_bytes_and_final_url(redis_client, monkeypatch, include_headers):
     """Binary mode returns base64 bytes with the post-redirect URL; no 415."""
     monkeypatch.setenv("CRAWL4AI_NODE", "fetch-binary")
     gif = b"GIF89a\x00\xff\x10"
@@ -24,14 +25,18 @@ async def test_fetch_binary_returns_exact_bytes_and_final_url(redis_client, monk
 
     out = await archive_budget.fetch(
         redis_client, budget_config(), ARCHIVE_URL, opener=opener, binary=True,
+        include_headers=include_headers,
     )
     assert calls == [ARCHIVE_URL, landed]
-    assert out == {
+    expected = {
         "url": landed,
         "status": 200,
         "contentType": "image/gif",
         "bodyBase64": base64.b64encode(gif).decode("ascii"),
     }
+    if include_headers:
+        expected.update(initialStatus=302, responseHeaders={"Content-Type": "image/gif"})
+    assert out == expected
 
     async def direct(url, max_body):
         return 200, {"Content-Type": "image/gif"}, gif

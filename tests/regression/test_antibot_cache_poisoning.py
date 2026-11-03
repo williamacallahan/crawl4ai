@@ -260,8 +260,9 @@ async def test_successful_crawl_still_cached_under_enabled(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("landed", [None, "https://publisher.example/article"])
 async def test_successful_crawl_served_from_cache_hit_under_enabled(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, landed
 ):
     """No regression on the cache-hit path: a cached successful result is
     served directly (no refetch, no rewrite)."""
@@ -269,7 +270,7 @@ async def test_successful_crawl_served_from_cache_hit_under_enabled(
         url=URL,
         html=LIVE_HTML,
         success=True,
-        status_code=200,
+        redirected_url=landed,
         cache_status="hit",
     )
     acache = _patch_cache(monkeypatch, cached=cached)
@@ -283,6 +284,9 @@ async def test_successful_crawl_served_from_cache_hit_under_enabled(
     assert result.success is True
     assert result.html == LIVE_HTML
     assert result.cache_status == "hit"
+    assert result.redirected_url == landed
+    assert result.status_code is None
+    assert result.redirected_status_code is None
     assert crawler.crawler_strategy.crawl_calls == 0
     acache.assert_not_awaited()
 

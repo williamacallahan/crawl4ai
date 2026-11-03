@@ -255,6 +255,9 @@ class AsyncWebCrawler:
                 "Invalid URL, make sure the URL is a non-empty string")
 
         async with self._lock or self.nullcontext():
+            async_response: AsyncCrawlResponse = None
+            cached_result: CrawlResult = None
+            html = ""
             try:
                 self.logger.verbose = config.verbose
 
@@ -266,8 +269,6 @@ class AsyncWebCrawler:
                 cache_context = CacheContext(url, config.cache_mode, False)
 
                 # Initialize processing variables
-                async_response: AsyncCrawlResponse = None
-                cached_result: CrawlResult = None
                 screenshot_data = None
                 pdf_data = None
                 extracted_content = None
@@ -333,7 +334,7 @@ class AsyncWebCrawler:
                     cached_result = None
 
                 if cached_result:
-                    oversized = self._html_size_failure(url, cached_result.html, config)
+                    oversized = self._html_size_failure(url, cached_result.html, config, cached_result)
                     if oversized is not None:
                         return CrawlResultContainer(oversized)
                     html = sanitize_input_encode(cached_result.html)
@@ -477,7 +478,7 @@ class AsyncWebCrawler:
                                     async_response = await self.crawler_strategy.crawl(
                                         url, config=config)
 
-                                    oversized = self._html_size_failure(url, async_response.html, config)
+                                    oversized = self._html_size_failure(url, async_response.html, config, async_response)
                                     if oversized is not None:
                                         return CrawlResultContainer(oversized)
                                     html = sanitize_input_encode(async_response.html)
@@ -695,11 +696,13 @@ class AsyncWebCrawler:
                             failure_message = "All proxies failed"
                         crawl_result = CrawlResult(
                             url=url,
-                            html="",
+                            html=html,
                             success=False,
-                            status_code=None,
                             error_message=failure_message,
                             session_id=getattr(config, "session_id", None),
+                            **(async_response.model_dump(include={
+                                "status_code", "redirected_url", "redirected_status_code",
+                            }) if async_response is not None else {}),
                         )
                         crawl_result.crawl_stats = _crawl_stats
 
@@ -770,9 +773,6 @@ class AsyncWebCrawler:
                     )
                     cached_result.session_id = getattr(
                         config, "session_id", None)
-                    # For raw: URLs, don't fall back to the raw HTML string as redirected_url
-                    is_raw_url = url.startswith("raw:") or url.startswith("raw://")
-                    cached_result.redirected_url = cached_result.redirected_url or (None if is_raw_url else url)
                     return CrawlResultContainer(cached_result)
 
             except Exception as e:
@@ -784,14 +784,21 @@ class AsyncWebCrawler:
                     tag="ERROR",
                 )
 
+                observed = async_response if async_response is not None else cached_result
                 return CrawlResultContainer(
                     CrawlResult(
-                        url=url, html="", success=False, error_message=error_message
+                        url=url, html=html, success=False, error_message=error_message,
+                        **(observed.model_dump(include={
+                            "status_code", "redirected_url", "redirected_status_code",
+                        }) if observed is not None else {}),
                     )
                 )
 
     @staticmethod
-    def _html_size_failure(url: str, html: str, config: CrawlerRunConfig) -> Optional[CrawlResult]:
+    def _html_size_failure(
+        url: str, html: str, config: CrawlerRunConfig,
+        observed: AsyncCrawlResponse | CrawlResult | None = None,
+    ) -> Optional[CrawlResult]:
         # Count in chunks: a rejected page must not allocate another page-sized
         # UTF-8 buffer. Match sanitize_input_encode's handling of lone surrogates.
         size = sum(
@@ -803,6 +810,9 @@ class AsyncWebCrawler:
                 url=url, html="", success=False,
                 error_message=f"html_too_large: {size} exceeds {config.max_html_bytes}",
                 session_id=config.session_id,
+                **(observed.model_dump(include={
+                    "status_code", "redirected_url", "redirected_status_code",
+                }) if observed is not None else {}),
             )
         return None
 

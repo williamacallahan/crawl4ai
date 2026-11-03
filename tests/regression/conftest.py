@@ -566,7 +566,9 @@ JS_NAV_SOURCE_HTML = """\
 JS_NAV_TARGET_HTML = """\
 <!DOCTYPE html>
 <html>
-<head><title>JS Navigation Target</title></head>
+<head><title>JS Navigation Target</title>
+    <script type="application/ld+json">{"@type":"NewsArticle","datePublished":"2025-03-21T10:00:00Z"}</script>
+</head>
 <body>
     <h1>JS navigation target reached</h1>
     <p>This document is served with status 404 so the landed status code is

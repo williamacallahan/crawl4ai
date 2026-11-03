@@ -43,7 +43,8 @@ class ArchiveHTMLStrategy(AsyncPlaywrightCrawlerStrategy):
             "raw:" + fetched["body"],
             config=config.clone(base_url=fetched["url"]), **kwargs,
         )
-        response.status_code = fetched["status"]
+        response.status_code = fetched["initialStatus"]
+        response.redirected_status_code = fetched["status"]
         response.response_headers = fetched["responseHeaders"]
         response.redirected_url = fetched["url"]
         return response

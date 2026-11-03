@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from api import (
-    CorrelatedCrawlFailure,
+    MarkdownFailure,
     _raise_for_crawl_failure,
     handle_crawl_request,
     handle_llm_qa,
@@ -706,12 +706,13 @@ async def _http_exception_handler(request: Request, exc: _StarletteHTTPException
     if exc.status_code == 500:
         cid = uuid.uuid4().hex[:12]
         logger.error("server error 500 [cid=%s]: %s", cid, exc.detail)
-        return JSONResponse(
-            {"error": "Internal server error", "correlation_id": cid},
-            status_code=500,
-        )
+        payload = {"error": "Internal server error", "correlation_id": cid}
+    else:
+        payload = {"detail": exc.detail}
+    if isinstance(exc, MarkdownFailure):
+        payload.update(markdown_capture(exc.result))
     return JSONResponse(
-        {"detail": exc.detail},
+        payload,
         status_code=exc.status_code,
         headers=getattr(exc, "headers", None),
     )
@@ -844,19 +845,16 @@ async def get_markdown(
             redis, body.url, body.f, body.q, body.c, config, body.provider,
             body.temperature
         )
-    except CorrelatedCrawlFailure as error:
+    except MarkdownFailure as error:
         _log_markdown_terminal(
             started_monotonic,
-            status.HTTP_502_BAD_GATEWAY,
+            error.status_code,
             "crawl_failure",
             trace_id,
             client_request_id,
             error.correlation_id,
         )
-        return JSONResponse(
-            {"detail": error.detail, **markdown_capture(error.result)},
-            status_code=error.status_code,
-        )
+        raise
     response = JSONResponse(
         {
             "url": body.url,
