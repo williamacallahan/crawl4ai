@@ -1175,6 +1175,14 @@ This is the easiest way to translate Python configuration to JSON requests when 
 
 Install the SDK: `pip install crawl4ai`
 
+Before running this example, export the same operator token the Docker server
+expects (set via `CRAWL4AI_API_TOKEN`, or `security.api_token` in the server
+config when that variable is unset):
+
+```bash
+export CRAWL4AI_API_TOKEN="your-token"
+```
+
 The Python SDK provides a convenient way to interact with the Docker API.
 
 > **⚠️ Changed in 0.9.0:** the SDK's function-based hooks (`hooks={...}` with
@@ -1185,12 +1193,19 @@ The Python SDK provides a convenient way to interact with the Docker API.
 
 ```python
 import asyncio
+import os
 from crawl4ai.docker_client import Crawl4aiDockerClient
 from crawl4ai import BrowserConfig, CrawlerRunConfig, CacheMode
 
 async def main():
-    # Point to the correct server port
-    async with Crawl4aiDockerClient(base_url="http://localhost:11235", verbose=True) as client:
+    # Point to the correct server port. The hardened (0.9.0+) /token handler
+    # requires the operator CRAWL4AI_API_TOKEN in the request body, so pass it
+    # here — authenticate() reuses it to mint a JWT when JWT is enabled.
+    async with Crawl4aiDockerClient(
+        base_url="http://localhost:11235",
+        api_token=os.environ["CRAWL4AI_API_TOKEN"],
+        verbose=True,
+    ) as client:
         # If JWT is enabled on the server, authenticate first:
         # await client.authenticate("user@example.com") # See Server Configuration section
 
@@ -1241,6 +1256,7 @@ The Docker client supports the following parameters:
 - `verify_ssl` (bool): Verify SSL certificates (default: True)
 - `verbose` (bool): Enable verbose logging (default: True)
 - `log_file` (Optional[str]): Path to log file (default: None)
+- `api_token` (Optional[str]): Operator token matching the server's effective token from `CRAWL4AI_API_TOKEN` (or `security.api_token` when unset); required to call `authenticate()` when JWT is enabled (default: None)
 
 **crawl() Method**:
 - `urls` (List[str]): List of URLs to crawl
