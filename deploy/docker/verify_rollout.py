@@ -125,7 +125,8 @@ def _deploy() -> None:
         rollout_tasks.verify_route(base, api_key, application_id, app_name)
         original_census = withdrawals.census(app_name)
         collector = withdrawals.Withdrawals(
-            app_name, baseline, Path(f"{rollout_tasks._task_proof_path()}.withdrawals.json"), rollout_policy.TIMEOUT_SECONDS
+            app_name, baseline, Path(f"{rollout_tasks._task_proof_path()}.withdrawals.json"),
+            rollout_policy.TIMEOUT_SECONDS, rollout_policy.WITHDRAWAL_COLLECT_SECONDS
         )
         if collector.start() != original_census:
             raise RuntimeError("baseline task identity changed while arming withdrawal proof")
@@ -163,15 +164,25 @@ def _deploy() -> None:
             {"applicationId": application_id, "title": title, "description": description},
         )
         deployment_id = rollout_dokploy._wait_deployment(
-            base, api_key, application_id, prior_ids, title, description
+            base, api_key, application_id, prior_ids, title, description, collector
         )["deploymentId"]
         deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
+        # The Swarm-update wait has its own fresh caller bound; refresh the
+        # runner's deadline to match so a slow update reports its own error
+        # rather than failing a collector whose runner deadline the queue wait
+        # consumed.
+        collector.refresh()
         while True:
             state, started_at = rollout_tasks._update_state(app_name)
             # Swarm can still expose the previous terminal result while
             # Dokploy's newly submitted update is waiting to start.
             current_update = started_at != "" and started_at != prior_started_at
             if current_update and state == "completed":
+                # Surface a collector death that landed between the last check
+                # and this poll before the post-update refresh, so it is
+                # attributed to the Swarm-update phase and not masked into the
+                # proof phase.
+                collector.check()
                 break
             if current_update and state in {"paused", "rollback_paused", "rollback_completed"}:
                 raise withdrawals.StateError(
@@ -179,7 +190,15 @@ def _deploy() -> None:
                 )
             if time.monotonic() >= deadline:
                 raise TimeoutError("Swarm update did not reach completed")
+            # Fail fast on a collector death (or its internal journal expiry)
+            # inside the wait that owns the slow update rather than at the
+            # finish barrier after a successful rollout.
+            collector.check()
             time.sleep(5)
+        # The public proofs and the finish barrier each take their own fresh
+        # caller span; refresh so a slow proof phase does not fail the
+        # collector for the time the Swarm-update wait consumed.
+        collector.refresh()
     final = rollout_dokploy._application(base, api_key, application_id)
     rollout_policy._policy(final)
     if not rollout_dokploy._record_converged(final, candidate, revision, placement):
@@ -212,6 +231,14 @@ def _deploy() -> None:
     ) != task_proof:
         raise RuntimeError("Crawl4AI task census changed during public proof")
     if collector is not None:
+        # The finish barrier gets its own fresh caller span: each collector's
+        # end marker and "complete" log appear within seconds, so a refresh
+        # here keeps the runner's deadline from misreporting a slow earlier
+        # phase as the final collector `"expired"` error. Check first so a
+        # collector that expired during the public proofs is attributed to
+        # that phase rather than masked by the refresh.
+        collector.check()
+        collector.refresh()
         withdrawal_proof = collector.finish(withdrawals.census(app_name))
     proof = {
         "revision": revision,
