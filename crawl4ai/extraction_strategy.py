@@ -225,28 +225,17 @@ class CosineStrategy(ExtractionStrategy):
         self.verbose = kwargs.get("verbose", False)
 
         self.buffer_embeddings = np.array([])
-        self.get_embedding_method = "direct"
 
         self.device = get_device()
-        # import torch
-        # self.device = torch.device('cpu')
 
         self.default_batch_size = calculate_batch_size(self.device)
 
         if self.verbose:
             print(f"[LOG] Loading Extraction Model for {self.device.type} device.")
 
-        # if False and self.device.type == "cpu":
-        #     self.model = load_onnx_all_MiniLM_l6_v2()
-        #     self.tokenizer = self.model.tokenizer
-        #     self.get_embedding_method = "direct"
-        # else:
-
         self.tokenizer, self.model = load_HF_embedding_model(model_name)
         self.model.to(self.device)
         self.model.eval()
-
-        self.get_embedding_method = "batch"
 
         self.buffer_embeddings = np.array([])
 
@@ -254,7 +243,6 @@ class CosineStrategy(ExtractionStrategy):
             print(f"[LOG] Loading Multilabel Classifier for {self.device.type} device.")
 
         self.nlp, _ = load_text_multilabel_classifier()
-        # self.default_batch_size = 16 if self.device.type == 'cpu' else 64
 
         if self.verbose:
             print(
@@ -338,9 +326,6 @@ class CosineStrategy(ExtractionStrategy):
         Returns:
             NumPy array of embeddings.
         """
-        # if self.buffer_embeddings.any() and not bypass_buffer:
-        #     return self.buffer_embeddings
-
         if self.device.type in ["cpu", "gpu", "cuda", "mps"]:
             import torch
 
@@ -383,9 +368,7 @@ class CosineStrategy(ExtractionStrategy):
         from scipy.cluster.hierarchy import linkage, fcluster
         from scipy.spatial.distance import pdist
 
-        self.timer = time.time()
         embeddings = self.get_embeddings(sentences, bypass_buffer=True)
-        # print(f"[LOG] 🚀 Embeddings computed in {time.time() - self.timer:.2f} seconds")
         # Compute pairwise cosine distances
         distance_matrix = pdist(embeddings, "cosine")
         # Perform agglomerative clustering respecting order
@@ -431,7 +414,6 @@ class CosineStrategy(ExtractionStrategy):
             List[Dict[str, Any]]: A list of processed JSON blocks.
         """
         # Assume `html` is a list of text chunks for this strategy
-        t = time.time()
         # Split by delimiter; fall back to double-newline splitting for raw text
         text_chunks = html.split(self.DEL)
         if len(text_chunks) == 1:
@@ -447,7 +429,6 @@ class CosineStrategy(ExtractionStrategy):
 
         # Perform clustering
         labels = self.hierarchical_clustering(text_chunks)
-        # print(f"[LOG] 🚀 Clustering done in {time.time() - t:.2f} seconds")
 
         # Organize texts by their cluster labels, retaining order
         t = time.time()
@@ -699,7 +680,6 @@ class LLMExtractionStrategy(ExtractionStrategy):
                         # If it is a list then assign that to blocks
                         blocks = blocks
                 else:
-                    # blocks = extract_xml_data(["blocks"], response.choices[0].message.content)["blocks"]
                     blocks = extract_xml_data(["blocks"], content)["blocks"]
                     blocks = json.loads(blocks)
 
@@ -778,9 +758,6 @@ class LLMExtractionStrategy(ExtractionStrategy):
                 time.sleep(0.5)  # 500 ms delay between each processing
         else:
             # Parallel processing using ThreadPoolExecutor
-            # extract_func = partial(self.extract, url)
-            # for ix, section in enumerate(merged_sections):
-            #     extracted_content.append(extract_func(ix, section))
 
             with ThreadPoolExecutor(max_workers=4) as executor:
                 extract_func = partial(self.extract, url)
@@ -2570,7 +2547,6 @@ class RegexExtractionStrategy(ExtractionStrategy):
     # Extraction
     # ------------------------------------------------------------------ #
     def extract(self, url: str, content: str, *q, **kw) -> List[Dict[str, Any]]:
-        # text = self._plain_text(html)
         out: List[Dict[str, Any]] = []
 
         for label, cre in self._compiled.items():
@@ -2584,14 +2560,6 @@ class RegexExtractionStrategy(ExtractionStrategy):
                     }
                 )
         return out
-
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
-    def _plain_text(self, content: str) -> str:
-        if self.input_format == "text":
-            return content
-        return BeautifulSoup(content, "lxml").get_text(" ", strip=True)
 
     # ------------------------------------------------------------------ #
     # LLM-assisted pattern generator
