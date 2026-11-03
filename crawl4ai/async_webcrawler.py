@@ -503,6 +503,7 @@ class AsyncWebCrawler:
                                             tag="FETCH",
                                         )
 
+                                    crawl_result = None
                                     crawl_result = await self.aprocess_html(
                                         url=url, html=html,
                                         extracted_content=extracted_content,
