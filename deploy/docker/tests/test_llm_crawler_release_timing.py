@@ -214,7 +214,7 @@ def test_handle_markdown_llm_releases_crawler_before_permit_acquire(monkeypatch)
 
     redis.eval = observing_eval
 
-    markdown, landed = asyncio.run(
+    markdown, result = asyncio.run(
         api.handle_markdown_request(
             redis, "https://example.com", api.FilterType.LLM,
             query="Keep the title", config=_llm_config(),
@@ -222,7 +222,8 @@ def test_handle_markdown_llm_releases_crawler_before_permit_acquire(monkeypatch)
     )
 
     assert markdown == "# Filtered"
-    assert landed == "https://publisher.example/article"
+    assert result.redirected_url == "https://publisher.example/article"
+    assert result.markdown.raw_markdown == "# Example"
     assert permit_acquire_order == [1]
 
 
@@ -295,7 +296,7 @@ def test_markdown_non_llm_branches_release_in_finally_only(monkeypatch, filter_t
         AsyncMock(side_effect=AssertionError("LLM provider must not be called for non-LLM filters")),
     )
 
-    markdown, landed = asyncio.run(
+    markdown, result = asyncio.run(
         api.handle_markdown_request(
             PermitRedis(), "https://example.com", filter_type,
             query="ignored for non-LLM", config=_llm_config(),
@@ -304,6 +305,6 @@ def test_markdown_non_llm_branches_release_in_finally_only(monkeypatch, filter_t
 
     expected = "# raw" if filter_type == api.FilterType.RAW else "# fit"
     assert markdown == expected
-    assert landed is None
+    assert result.redirected_url is None
     assert release.await_count == 1
     api.aperform_completion_with_backoff.assert_not_awaited()

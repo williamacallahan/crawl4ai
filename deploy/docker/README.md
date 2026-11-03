@@ -14,6 +14,7 @@
   - [REST API Examples](#rest-api-examples)
   - [Asynchronous Jobs with Webhooks](#asynchronous-jobs-with-webhooks)
 - [Additional API Endpoints](#additional-api-endpoints)
+  - [Markdown Endpoint](#markdown-endpoint)
   - [HTML Extraction Endpoint](#html-extraction-endpoint)
   - [Screenshot Endpoint](#screenshot-endpoint)
   - [PDF Export Endpoint](#pdf-export-endpoint)
@@ -341,6 +342,21 @@ Access the MCP tool schemas at `http://localhost:11235/mcp/schema` for detailed 
 ## Additional API Endpoints
 
 In addition to the core `/crawl` and `/crawl/stream` endpoints, the server provides several specialized endpoints:
+
+### Markdown Endpoint
+
+`POST /md` accepts `url`, `f` (`fit`, `raw`, `bm25`, or `llm`), optional `q`, and `c`.
+The response preserves the requested `url` and selected `markdown`, and includes observations
+from that same render: `html`, `raw_markdown`, `status_code`, `redirected_url`, and
+`redirected_status_code`. An empty filtered `markdown` can therefore reuse `raw_markdown`
+without another crawl. The raw field does not contain LLM-filtered output.
+
+`status_code` describes the first HTTP response; `redirected_status_code` describes the
+committed document at `redirected_url`, including JavaScript navigation. A successful crawl
+does not imply that the document returned HTTP 200. Unknown status or landing observations
+remain `null`; clients must not infer a successful document status from the endpoint's HTTP 200.
+Correlated crawl failures retain available observations beside the existing redacted `detail`
+in their HTTP 502 response. No final-hop response headers are inferred or exposed.
 
 ### HTML Extraction Endpoint
 

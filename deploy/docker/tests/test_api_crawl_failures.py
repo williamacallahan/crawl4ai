@@ -2,6 +2,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from crawl4ai.models import CrawlResult, MarkdownGenerationResult
 from fastapi import HTTPException
 
 from api import _raise_for_crawl_failure
@@ -41,27 +42,35 @@ def _markdown_terminal_events(caplog):
     ]
 
 
-@pytest.mark.parametrize("filter_type,expected", [("raw", "raw text"), ("fit", "fit text"), ("bm25", "fit text")])
+@pytest.mark.parametrize("filter_type,fit,expected", [
+    ("raw", "fit text", "raw text"),
+    ("fit", "fit text", "fit text"),
+    ("bm25", "fit text", "fit text"),
+    ("fit", "", ""),
+    ("bm25", "", ""),
+])
 @pytest.mark.parametrize("landed", [None, "https://publisher.example/article"])
 def test_markdown_preserves_requested_url_and_observed_landing(
-    stock_client, server_module, monkeypatch, filter_type, expected, landed
+    stock_client, server_module, monkeypatch, filter_type, fit, expected, landed
 ):
     from auth import create_access_token
-    from crawl4ai.models import CrawlResult, MarkdownGenerationResult
 
     requested = "https://tracker.example/redirect?article=1"
+    rendered_html = '<html><head><meta property="article:published_time" content="2025-03-21T10:00:00Z"></head><body>article</body></html>'
     _install_markdown_crawler(
         monkeypatch,
         CrawlResult(
             url=requested,
-            html="<p>article</p>",
+            html=rendered_html,
             success=True,
             redirected_url=landed,
+            status_code=302 if landed else 200,
+            redirected_status_code=404 if landed else 200,
             markdown=MarkdownGenerationResult(
                 raw_markdown="raw text",
                 markdown_with_citations="raw text",
                 references_markdown="",
-                fit_markdown="fit text",
+                fit_markdown=fit,
             ),
         ),
     )
@@ -77,6 +86,10 @@ def test_markdown_preserves_requested_url_and_observed_landing(
     assert payload["url"] == requested
     assert payload.get("redirected_url") == landed
     assert payload["markdown"] == expected
+    assert payload["raw_markdown"] == "raw text"
+    assert payload["html"] == rendered_html
+    assert payload["status_code"] == (302 if landed else 200)
+    assert payload["redirected_status_code"] == (404 if landed else 200)
     assert payload["success"] is True
 
 
@@ -108,7 +121,9 @@ def test_crawl_failure_is_reported_as_sanitized_bad_gateway(error_message, expec
 def test_single_url_crawl_failure_reaches_client(
     stock_client, server_module, monkeypatch, method, path, payload, error_message, expected_detail
 ):
-    failed_result = SimpleNamespace(success=False, error_message=error_message)
+    failed_result = CrawlResult(
+        url="https://example.com", html="", success=False, error_message=error_message,
+    )
 
     class FailedCrawler:
         async def arun(self, *args, **kwargs):
@@ -150,9 +165,14 @@ def test_markdown_success_logs_one_safe_terminal_event(
     markdown = "private markdown must not reach the terminal event"
     _install_markdown_crawler(
         monkeypatch,
-        SimpleNamespace(
+        CrawlResult(
+            url=target_url,
+            html="<p>article</p>",
             success=True,
-            markdown=SimpleNamespace(raw_markdown=markdown, fit_markdown=markdown),
+            markdown=MarkdownGenerationResult(
+                raw_markdown=markdown, fit_markdown=markdown,
+                markdown_with_citations=markdown, references_markdown="",
+            ),
             redirected_url=None,
         ),
     )
@@ -193,7 +213,11 @@ def test_markdown_failed_result_joins_response_level_and_terminal_event(
 ):
     _install_markdown_crawler(
         monkeypatch,
-        SimpleNamespace(success=False, error_message=raw_error),
+        CrawlResult(
+            url="https://private.example/secret-path", success=False, error_message=raw_error,
+            html="<p>Observed unavailable document</p>", status_code=200,
+            redirected_url="https://publisher.example/unavailable", redirected_status_code=451,
+        ),
     )
     from auth import create_access_token
 
@@ -206,6 +230,12 @@ def test_markdown_failed_result_joins_response_level_and_terminal_event(
     )
 
     assert response.status_code == 502
+    payload = response.json()
+    assert payload["html"] == "<p>Observed unavailable document</p>"
+    assert payload["status_code"] == 200
+    assert payload["redirected_status_code"] == 451
+    assert payload["redirected_url"] == "https://publisher.example/unavailable"
+    assert payload["raw_markdown"] is None
     correlation = re.fullmatch(
         re.escape(public) + r" \(correlation_id=([0-9a-f]{12})\)", response.json()["detail"]
     )
@@ -229,7 +259,7 @@ def test_markdown_pass_through_failure_does_not_log_correlation(
     raw_error = "Blocked by anti-bot protection: challenge"
     _install_markdown_crawler(
         monkeypatch,
-        SimpleNamespace(success=False, error_message=raw_error),
+        CrawlResult(url="https://private.example/secret-path", html="", success=False, error_message=raw_error),
     )
     from auth import create_access_token
 
@@ -242,7 +272,10 @@ def test_markdown_pass_through_failure_does_not_log_correlation(
     )
 
     assert response.status_code == 502
-    assert response.json() == {"detail": raw_error}
+    assert response.json() == {
+        "detail": raw_error, "html": "", "raw_markdown": None, "status_code": None,
+        "redirected_url": None, "redirected_status_code": None,
+    }
     event, = _markdown_terminal_events(caplog)
     assert event.startswith("event=md_terminal status=502 outcome=crawl_failure duration_ms=")
     assert "correlation_id=" not in event
@@ -260,9 +293,14 @@ def test_markdown_terminal_event_omits_malformed_correlation_headers(
     malformed_client_request_id = "Bearer private-credential"
     _install_markdown_crawler(
         monkeypatch,
-        SimpleNamespace(
+        CrawlResult(
+            url="https://private.example",
+            html="<p>article</p>",
             success=True,
-            markdown=SimpleNamespace(raw_markdown="markdown", fit_markdown="markdown"),
+            markdown=MarkdownGenerationResult(
+                raw_markdown="markdown", fit_markdown="markdown",
+                markdown_with_citations="markdown", references_markdown="",
+            ),
             redirected_url=None,
         ),
     )

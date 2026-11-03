@@ -65,6 +65,7 @@ from crawl4ai.content_filter_strategy import (
 )
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+from crawl4ai.models import CrawlResult
 from crawl4ai.prompts import PROMPT_FILTER_CONTENT
 from crawl4ai.utils import (
     aperform_completion_with_backoff,
@@ -409,19 +410,30 @@ def _project_crawl_result(result, result_fields):
     return {field: result[field] for field in result_fields if field in result}
 
 
-class CorrelatedCrawlFailure(HTTPException):
-    """A redacted failed result that retains its private error-record id."""
+def markdown_capture(result: CrawlResult) -> dict:
+    """Observations from the same render, without its headers or internal diagnostics."""
+    capture = result.model_dump(include={
+        "html", "status_code", "redirected_url", "redirected_status_code",
+    })
+    markdown = result.markdown
+    capture["raw_markdown"] = markdown.raw_markdown if markdown is not None else None
+    return capture
 
-    def __init__(self, detail: str, correlation_id: Optional[str]):
+
+class CorrelatedCrawlFailure(HTTPException):
+    """A redacted failed result that retains its capture and private error-record id."""
+
+    def __init__(self, detail: str, correlation_id: Optional[str], result: CrawlResult):
         super().__init__(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
         self.correlation_id = correlation_id
+        self.result = result
 
 
 def _raise_for_crawl_failure(result, *, url: Optional[str] = None, correlate_error: bool = False):
     if not result.success:
         if correlate_error:
             detail = public_crawl_error(result.error_message, url)
-            raise CorrelatedCrawlFailure(detail, detail.correlation_id)
+            raise CorrelatedCrawlFailure(detail, detail.correlation_id, result)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=public_error_detail(result.error_message),
@@ -914,8 +926,8 @@ async def handle_markdown_request(
     provider: Optional[str] = None,
     temperature: Optional[float] = None,
     base_url: Optional[str] = None
-) -> Tuple[str, Optional[str]]:
-    """Return selected markdown and the crawler-observed final navigation URL."""
+) -> Tuple[Optional[str], CrawlResult]:
+    """Return selected markdown alongside the render that produced it."""
     config = config or {}
     crawler: Optional[AsyncWebCrawler] = None
     llm = None
@@ -1021,13 +1033,13 @@ async def handle_markdown_request(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail="LLM markdown filter returned no content",
                 )
-            return markdown, result.redirected_url
+            return markdown, result
 
         return (
             result.markdown.raw_markdown
             if filter_type == FilterType.RAW
             else result.markdown.fit_markdown,
-            result.redirected_url,
+            result,
         )
 
     except asyncio.TimeoutError:

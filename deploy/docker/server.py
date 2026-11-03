@@ -30,6 +30,7 @@ from api import (
     handle_llm_qa,
     handle_markdown_request,
     handle_stream_crawl_request,
+    markdown_capture,
     server_crawler_config,
     stream_results,
 )
@@ -839,7 +840,7 @@ async def get_markdown(
     trace_id, client_request_id = _markdown_correlation(request)
     started_monotonic = time.monotonic()
     try:
-        markdown, redirected_url = await handle_markdown_request(
+        markdown, result = await handle_markdown_request(
             redis, body.url, body.f, body.q, body.c, config, body.provider,
             body.temperature
         )
@@ -852,11 +853,14 @@ async def get_markdown(
             client_request_id,
             error.correlation_id,
         )
-        raise
+        return JSONResponse(
+            {"detail": error.detail, **markdown_capture(error.result)},
+            status_code=error.status_code,
+        )
     response = JSONResponse(
         {
             "url": body.url,
-            "redirected_url": redirected_url,
+            **markdown_capture(result),
             "filter": body.f,
             "query": body.q,
             "cache": body.c,
