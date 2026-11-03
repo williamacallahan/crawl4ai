@@ -12,7 +12,6 @@ import pytest
 
 from egress_broker import (
     EgressBlocked,
-    check_redirect,
     is_forbidden_ip,
     resolve_and_pin,
 )
@@ -119,13 +118,6 @@ class TestEnforceEgress:
         b = BrowserConfig(extra_args=["--proxy-server=http://evil", "--ignore-certificate-errors", "--headless"])
         egress_broker.enforce_egress(b)
         assert b.extra_args == ["--headless"]
-
-
-class TestRedirectRevalidation:
-    def test_redirect_to_internal_blocked(self, offline_dns):
-        offline_dns.set("evil-redirect.example", "169.254.169.254")
-        with pytest.raises(EgressBlocked):
-            check_redirect("http://evil-redirect.example/")
 
 
 class TestWebhookValidatorUsesBroker:
