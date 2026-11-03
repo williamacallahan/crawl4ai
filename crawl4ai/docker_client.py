@@ -3,7 +3,6 @@ from base64 import b64decode
 import httpx
 import json
 import warnings
-from urllib.parse import urljoin
 
 from .async_configs import BrowserConfig, CrawlerRunConfig
 from .models import CrawlResult
@@ -25,16 +24,52 @@ class RequestError(Crawl4aiClientError):
     pass
 
 
+_ERROR_BODY_LIMIT = 512
+
+
+def _bounded_response_text(response: httpx.Response) -> str:
+    """Return up to ``_ERROR_BODY_LIMIT`` chars of ``response`` body as text.
+
+    Used when an error response carries no JSON ``detail`` — typically a
+    reverse proxy's plain-text 502/503 or an HTML error page — so the
+    diagnostic body that explains the failure is not lost behind the bare
+    HTTPX error text. The body must already have been read
+    (``response.aread()`` for a streamed response, or the default auto-read
+    for a regular request). Decode errors are replaced rather than raised so
+    a non-UTF-8 body never breaks building the message; the result is capped
+    so a multi-megabyte error page never floods the log or exception.
+    """
+    try:
+        text = response.text
+    except (UnicodeDecodeError, httpx.RequestError):
+        return f"<{len(response.content)} undecodable bytes>"
+    if len(text) <= _ERROR_BODY_LIMIT:
+        return text
+    return f"{text[:_ERROR_BODY_LIMIT]}... ({len(text)} bytes total)"
+
+
 def _http_error_detail(response: httpx.Response, error: httpx.HTTPStatusError) -> Any:
-    """Return an object-shaped JSON detail or the HTTPX error text."""
+    """Return an object-shaped JSON ``detail``, or the HTTPX error text with a
+    bounded slice of the response body appended.
+
+    A reverse proxy in front of the server often returns a plain-text 502/503
+    (or an HTML error page) with no JSON ``detail``; the bare ``str(error)``
+    HTTPX renders in that case drops the proxy's diagnostic body. To keep
+    those failures diagnosable we retain the HTTPX text and append the first
+    ``_ERROR_BODY_LIMIT`` chars of the decoded response body whenever no JSON
+    ``detail`` is available (non-JSON content type, JSON parse failure, or a
+    JSON payload without a ``detail`` field).
+    """
     fallback = str(error)
     if "application/json" not in response.headers.get("content-type", ""):
-        return fallback
+        return f"{fallback}: {_bounded_response_text(response)}"
     try:
         payload = response.json()
     except ValueError:
-        return fallback
-    return payload.get("detail", fallback) if isinstance(payload, dict) else fallback
+        return f"{fallback}: {_bounded_response_text(response)}"
+    if isinstance(payload, dict) and "detail" in payload:
+        return payload["detail"]
+    return f"{fallback}: {_bounded_response_text(response)}"
 
 
 def _decode_pdf(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,7 +132,7 @@ class Crawl4aiDockerClient:
         ``authenticate(email)`` call cannot succeed against the server
         without one.
         """
-        url = urljoin(self.base_url, "/token")
+        url = f"{self.base_url}/token"
         credential = api_token or self._api_token
         if not credential:
             raise ConnectionError(
@@ -130,8 +165,16 @@ class Crawl4aiDockerClient:
     async def _check_server(self) -> None:
         """Check if server is reachable, raising an error if not."""
         try:
-            await self._http_client.get(urljoin(self.base_url, "/health"))
+            response = await self._http_client.get(f"{self.base_url}/health")
+            response.raise_for_status()
             self.logger.success(f"Connected to {self.base_url}", tag="READY")
+        except httpx.HTTPStatusError as e:
+            error_msg = (
+                f"Server unreachable: Server error {e.response.status_code}: "
+                f"{_http_error_detail(e.response, e)}"
+            )
+            self.logger.error(error_msg, tag="ERROR")
+            raise ConnectionError(error_msg)
         except httpx.RequestError as e:
             self.logger.error(f"Server unreachable: {str(e)}", tag="ERROR")
             raise ConnectionError(f"Cannot connect to server: {str(e)}")
@@ -217,7 +260,7 @@ class Crawl4aiDockerClient:
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> httpx.Response:
         """Make an HTTP request with error handling."""
-        url = urljoin(self.base_url, endpoint)
+        url = f"{self.base_url}{endpoint}"
         try:
             response = await self._http_client.request(method, url, **kwargs)
             response.raise_for_status()
