@@ -174,6 +174,32 @@ def class_id_control_html():
     """
 
 
+@pytest.fixture
+def class_id_mid_string_boilerplate_html():
+    """Boilerplate ``<div>`` whose ``class``/``id`` match the negative-pattern
+    regex only when the matcher scans the *whole* string, not just the start.
+    Real-world CMS naming conventions like ``site-footer`` / ``page-footer``
+    prefix the keyword, so ``re.match`` (anchored at the start) misses them
+    while ``re.search`` (used by ``is_excluded``) catches them. The div is a
+    ``<div>`` (not a ``<footer>`` tag) so ``_remove_unwanted_tags`` does not
+    catch it by tag name — the ``class_id_weight`` penalty is the only line of
+    defense. At the default ``threshold=0.48`` the other metrics put it just
+    above the cutoff, so the penalty is the deciding factor (bug: kept; fix:
+    pruned)."""
+    return """
+    <html><body>
+    <div class="site-footer" id="page-footer"><ul>
+    <li><a href="/">Home</a></li>
+    <li><a href="/about">About</a></li>
+    <li><a href="/contact">Contact</a></li>
+    </ul>Sitemap</div>
+    <main><article><p>This is the genuine main article body with sufficient
+    substantive words to clear the word threshold and remain in the filtered
+    output.</p></article></main>
+    </body></html>
+    """
+
+
 class TestPruningContentFilter:
     def test_basic_pruning(self, basic_html):
         """Test basic content pruning functionality"""
@@ -436,6 +462,114 @@ class TestClassIdWeightPenalty:
             "non-boilerplate control div should survive at 0.48 (no penalty)"
         )
         assert "main article body" in combined, "main content must survive"
+
+
+class TestClassIdWeightAnchoring:
+    """Regression tests for the ``re.match`` vs ``re.search`` anchoring bug in
+    ``_compute_class_id_weight``.
+
+    The shared ``negative_patterns`` regex (``nav|footer|header|sidebar|...``)
+    is meant to detect boilerplate tokens anywhere in a class/id string. The
+    sibling method ``RelevantContentFilter.is_excluded`` correctly uses
+    ``re.search`` on this pattern, but ``_compute_class_id_weight`` was using
+    ``re.match``, which is anchored at the start of the string. Real-world
+    boilerplate names almost never begin with the keyword (``site-footer``,
+    ``main-nav``, ``page-header-inner``, multi-class lists like ``flex nav``),
+    so the penalty almost never fired — leaking footer/navigation junk into
+    the filtered markdown. These tests use values where the boilerplate word
+    is *not* at the start of the string so the bug is observable."""
+
+    def test_compute_class_id_weight_catches_mid_string_class(self):
+        """Direct unit test: a class attribute with the boilerplate keyword in
+        the middle of the string must produce the same penalty as one that
+        starts with the keyword. Fails on ``re.match`` (anchored)."""
+        from bs4 import BeautifulSoup
+
+        f = PruningContentFilter()
+        soup = BeautifulSoup('<div class="site-footer"></div>', "lxml")
+        div = soup.find("div")
+        assert f._compute_class_id_weight(div) == -0.5
+
+    def test_compute_class_id_weight_catches_mid_string_both(self):
+        """When both ``class`` and ``id`` carry a mid-string boilerplate token
+        the penalty must stack to ``-1.0`` (matches the start-anchored case
+        ``<div class="nav" id="footer">``). Also covers the ``id`` side of the
+        anchoring bug, which is the same code path as the ``class`` side."""
+        from bs4 import BeautifulSoup
+
+        f = PruningContentFilter()
+        soup = BeautifulSoup(
+            '<div class="site-footer" id="page-footer"></div>', "lxml"
+        )
+        div = soup.find("div")
+        assert f._compute_class_id_weight(div) == -1.0
+
+    def test_class_id_weight_consistent_with_is_excluded(self):
+        """The class/id boilerplate decision in ``_compute_class_id_weight``
+        must agree with ``RelevantContentFilter.is_excluded`` for the same
+        input, since both methods apply the identical ``negative_patterns``
+        regex for the same purpose (only their ``.search`` vs ``.match``
+        choice differed). Parametrized over mid-string, multi-class,
+        start-anchored, and non-boilerplate cases so a future divergence in
+        either direction (anchoring or penalty amount) is caught."""
+        from bs4 import BeautifulSoup
+
+        f = PruningContentFilter()
+        cases = [
+            ("site-footer", "page-footer"),
+            ("flex nav", "main"),
+            ("content", "story"),
+            ("nav", "footer"),
+            ("page-header-inner", "sidebar-widget"),
+        ]
+        for cls, elem_id in cases:
+            soup = BeautifulSoup(
+                f'<div class="{cls}" id="{elem_id}"></div>', "lxml"
+            )
+            div = soup.find("div")
+            weight = f._compute_class_id_weight(div)
+            excluded = f.is_excluded(div)
+            # is_excluded returns True iff either class or id matches the
+            # negative pattern; weight is -0.5 per match.
+            if excluded:
+                assert weight < 0, (
+                    f"is_excluded=True but weight={weight} for "
+                    f"class={cls!r} id={elem_id!r}"
+                )
+            else:
+                assert weight == 0, (
+                    f"is_excluded=False but weight={weight} for "
+                    f"class={cls!r} id={elem_id!r}"
+                )
+
+    def test_mid_string_boilerplate_pruned_end_to_end(
+        self, class_id_mid_string_boilerplate_html
+    ):
+        """End-to-end: a ``<div class="site-footer" id="page-footer">`` block
+        (mid-string boilerplate tokens; not a ``<footer>``/``<nav>`` tag so
+        ``_remove_unwanted_tags`` cannot catch it) is pruned at the default
+        fixed threshold on a page where it sits next to a legitimate
+        ``<main><article>``. Fails on ``re.match`` (the boilerplate survives
+        because no penalty fires)."""
+        f = PruningContentFilter(threshold_type="fixed", threshold=0.48)
+        contents = f.filter_content(class_id_mid_string_boilerplate_html)
+        combined = " ".join(contents).lower()
+
+        boilerplate_kept = any(
+            "<div" in b and "Sitemap" in b for b in contents
+        )
+        assert not boilerplate_kept, (
+            "mid-string boilerplate (site-footer/page-footer) survived "
+            "pruning — re.match anchoring bug"
+        )
+        assert "site-footer" not in combined, (
+            "boilerplate class name should not be in the filtered output"
+        )
+        assert "page-footer" not in combined, (
+            "boilerplate id should not be in the filtered output"
+        )
+        assert "main article body" in combined, "main content must survive"
+        assert "sitemap" not in combined, "boilerplate text must be pruned"
 
 
 if __name__ == "__main__":
