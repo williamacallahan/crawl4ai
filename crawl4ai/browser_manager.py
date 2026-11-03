@@ -2411,29 +2411,44 @@ class BrowserManager:
             async with self._recycle_lock:
                 if self._closing or self.pool_recycle_requested:
                     raise RuntimeError("Browser manager is unavailable")
-            context, page, _ = self.sessions[session_id]
-            self.sessions[session_id] = (context, page, time.time())
-            await self._note_page_served(session_id=session_id)
-            try:
-                await page.evaluate("window.stop()")
-            except asyncio.CancelledError:
-                # A client disconnect says nothing about the browser.
-                raise
-            except (asyncio.TimeoutError, PlaywrightTimeoutError):
-                # The caller has not received this retained page yet, so its
-                # timeout cleanup cannot interrupt a busy session renderer.
-                self.request_pool_recycle("session acquisition interrupted")
-                raise
-            except Exception:
-                pass
-            async with self._recycle_lock:
-                if self._closing:
-                    raise RuntimeError("Browser manager closed during session acquisition")
-                if self.sessions.get(session_id, (None, None, None))[1] is not page:
-                    raise RuntimeError("Browser manager restarted during session acquisition")
-                if self.pool_recycle_requested:
-                    raise RuntimeError("Browser manager is unavailable")
-            return page, context
+            # Tolerate a pop between the membership check above and this
+            # lookup: a kill path that bypasses the per-session lock (or a
+            # future bug) used to raise KeyError here, killing the crawl.
+            # The per-session lock in _kill_session makes this branch
+            # unreachable; this is defense in depth.
+            entry = self.sessions.get(session_id)
+            if entry is not None:
+                context, page, _ = entry
+                self.sessions[session_id] = (context, page, time.time())
+                await self._note_page_served(session_id=session_id)
+                try:
+                    await page.evaluate("window.stop()")
+                except asyncio.CancelledError:
+                    # A client disconnect says nothing about the browser.
+                    raise
+                except (asyncio.TimeoutError, PlaywrightTimeoutError):
+                    # The caller has not received this retained page yet, so
+                    # its timeout cleanup cannot interrupt a busy session
+                    # renderer.
+                    self.request_pool_recycle("session acquisition interrupted")
+                    raise
+                except Exception:
+                    pass
+                async with self._recycle_lock:
+                    if self._closing:
+                        raise RuntimeError("Browser manager closed during session acquisition")
+                    if self.sessions.get(session_id, (None, None, None))[1] is not page:
+                        raise RuntimeError("Browser manager restarted during session acquisition")
+                    if self.pool_recycle_requested:
+                        raise RuntimeError("Browser manager is unavailable")
+                return page, context
+            # entry is None: the session was reaped while we were suspended
+            # on the recycle lock. _admit_page_acquisition returned None for
+            # the in-sessions case, so re-admit (which now sees no session)
+            # to give the fresh-allocation path a consistent real token.
+            token = await self._admit_page_acquisition(
+                crawlerRunConfig.page_timeout or PAGE_TIMEOUT, session_id=session_id
+            )
 
         context = None
         page = None
@@ -2539,10 +2554,25 @@ class BrowserManager:
             )
             raise
 
-    async def _kill_session(self, session_id: str) -> None:
-        entry = self.sessions.pop(session_id, None)
-        if entry is None:
-            return
+    async def _kill_session(self, session_id: str, *, only_if_expired: bool = False) -> None:
+        # Serialize with get_page's per-session lock so the pop can never
+        # land inside _get_page_impl's reuse window for this session (the
+        # membership check -> bare lookup pair is separated by an await on
+        # the recycle lock and by page.evaluate yields).
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            entry = self.sessions.get(session_id)
+            if entry is None:
+                return
+            if (
+                only_if_expired
+                and time.time() - entry[2] <= self.session_ttl
+            ):
+                # Reaped by _cleanup_expired_sessions, then reused by a
+                # concurrent get_page that refreshed last_used after the
+                # snapshot. Leave it alive for the next idle reap.
+                return
+            self.sessions.pop(session_id, None)
         _, page, _ = entry
         await self._release_page_with_context(page)
 
@@ -2619,7 +2649,13 @@ class BrowserManager:
         )
 
     def _cleanup_expired_sessions(self):
-        """Clean up expired sessions based on TTL."""
+        """Clean up expired sessions based on TTL.
+
+        Spawned kill tasks take the per-session lock so they cannot land
+        inside a concurrent get_page's reuse window. Each task re-checks
+        expiry under that lock so a session reused (last_used refreshed)
+        after this snapshot is left alive for the next idle reap.
+        """
         current_time = time.time()
         expired_sessions = [
             sid
@@ -2627,7 +2663,9 @@ class BrowserManager:
             if current_time - last_used > self.session_ttl
         ]
         for sid in expired_sessions:
-            self._track_background_task(asyncio.create_task(self._kill_session(sid)))
+            self._track_background_task(asyncio.create_task(
+                self._kill_session(sid, only_if_expired=True)
+            ))
 
     async def _close_contexts(self) -> None:
         # Under the lock, so a context _acquire_context is creating is either
