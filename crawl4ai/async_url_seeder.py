@@ -63,9 +63,6 @@ if TYPE_CHECKING:
 
 # ────────────────────────────────────────────────────────────────────────── consts
 COLLINFO_URL = "https://index.commoncrawl.org/collinfo.json"
-# CACHE_DIR = pathlib.Path("~/.crawl4ai").expanduser() # REMOVED: now managed by __init__
-# CACHE_DIR.mkdir(exist_ok=True) # REMOVED: now managed by __init__
-# INDEX_CACHE = CACHE_DIR / "latest_cc_index.txt" # REMOVED: now managed by __init__
 TTL = timedelta(days=7)  # Keeping this constant as it's a seeder-specific TTL
 
 _meta_rx = re.compile(
@@ -378,8 +375,6 @@ class AsyncUrlSeeder:
             if log_method:
                 log_method(message=message, tag=tag,
                            params=kwargs.get('params', {}))
-            # else: # Fallback for unknown level, should not happen with AsyncLoggerBase
-            #     print(f"[{tag}] {level.upper()}: {message.format(**kwargs)}")
 
     # ───────── cache helpers ─────────
     def _cache_path(self, kind: str, url: str) -> Path:
@@ -523,7 +518,6 @@ class AsyncUrlSeeder:
         async def worker(res_list: List[Dict[str, Any]]):
             while True:
                 if queue.empty() and producer_done.is_set():
-                    # self._log("debug", "Worker exiting: queue empty and producer done.", tag="URL_SEED")
                     break
                 try:
                     # Increased timeout slightly
@@ -1429,7 +1423,6 @@ class AsyncUrlSeeder:
             status = "valid" if ok else "not_valid"
             self._log("info" if ok else "warning", "HEAD {status} for {final_url}",
                       params={"status": status.upper(), "final_url": final or url}, tag="URL_SEED")
-            # head_data = _parse_head(html) if ok else {}
             head_data = await asyncio.to_thread(_parse_head, html) if ok else {}
             entry = {
                 "url": final or url,
@@ -1736,45 +1729,6 @@ class AsyncUrlSeeder:
         ]
         if any(path.endswith(f'/{file}') for file in utility_files):
             return True
-        
-        # # 4. Feed files
-        # if path.endswith(('.rss', '.atom', '/feed', '/rss', '/atom', '/feed.xml', '/rss.xml')):
-        #     return True
-        
-        # # 5. API endpoints and data files
-        # api_patterns = ['/api/', '/v1/', '/v2/', '/v3/', '/graphql', '/.json', '/.xml']
-        # if any(pattern in path for pattern in api_patterns):
-        #     return True
-        
-        # # 6. Archive and download files
-        # download_extensions = [
-        #     '.zip', '.tar', '.gz', '.rar', '.7z', '.bz2',
-        #     '.exe', '.dmg', '.pkg', '.deb', '.rpm',
-        #     '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-        #     '.csv', '.tsv', '.sql', '.db', '.sqlite'
-        # ]
-        # if any(path.endswith(ext) for ext in download_extensions):
-        #     return True
-        
-        # # 7. Media files (often not useful for text content)
-        # media_extensions = [
-        #     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico',
-        #     '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm',
-        #     '.mp3', '.wav', '.ogg', '.m4a', '.flac',
-        #     '.woff', '.woff2', '.ttf', '.eot', '.otf'
-        # ]
-        # if any(path.endswith(ext) for ext in media_extensions):
-        #     return True
-        
-        # # 8. Source code and config files
-        # code_extensions = [
-        #     '.js', '.css', '.scss', '.sass', '.less',
-        #     '.map', '.min.js', '.min.css',
-        #     '.py', '.rb', '.php', '.java', '.cpp', '.h',
-        #     '.yaml', '.yml', '.toml', '.ini', '.conf', '.config'
-        # ]
-        # if any(path.endswith(ext) for ext in code_extensions):
-        #     return True
         
         # 9. Hidden files and directories
         path_parts = path.split('/')
