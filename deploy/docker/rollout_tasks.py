@@ -15,6 +15,19 @@ import rollout_http
 import rollout_policy
 
 
+# A withdrawn `docker service ps` row whose Status.State never reached RUNNING
+# never started a backend and withdrew nothing. Swarm can retain such a frozen
+# row after reaping the real terminal predecessor: the orchestrator sets the
+# row's DesiredState to shutdown, but Status.State freezes at a never-started
+# dispatch point (new/pending/assigned/accepted/ready/preparing/starting) when
+# the node dies mid-dispatch or the update is superseded. Terminal states
+# (shutdown/complete/failed/rejected) and orphaned (which may have started a
+# backend and is covered by the stranded-node rule) are not excused here.
+NEVER_STARTED_STATES = frozenset({
+    "new", "pending", "assigned", "accepted", "ready", "preparing", "starting",
+})
+
+
 def _service_spec(app_name: str) -> dict[str, Any]:
     result = subprocess.run(
         ["docker", "service", "inspect", app_name, "--format", "{{json .Spec}}"],
@@ -266,13 +279,17 @@ def _verify_tasks(
         desired, state = _task_state(str(candidate["ID"])[:12])
         if desired != "running" or state != "running":
             raise RuntimeError("Swarm task history contradicts the start-first rollout")
-        # A withdrawn task still in assigned state never started a backend.
-        # Swarm can retain it even after reaping the real terminal predecessor.
+        # A withdrawn task whose Status.State never reached RUNNING never started
+        # a backend and withdrew nothing; Swarm can retain such a frozen row
+        # even after reaping the real terminal predecessor. Drop every never-
+        # started row from the slot's history so it cannot become its real
+        # predecessor and trip the strict check below; terminal and orphaned
+        # rows are not excused and stay strict here and via the stranded rule.
         history = [
             row for row in by_slot[str(candidate.get("Name"))]
             if not (
                 str(row.get("DesiredState", "")).lower() == "shutdown"
-                and _task_state(str(row["ID"])[:12]) == ("shutdown", "assigned")
+                and _task_state(str(row["ID"])[:12])[1] in NEVER_STARTED_STATES
             )
         ]
         # Swarm reaps terminal predecessors with task-history-limit=1, but
