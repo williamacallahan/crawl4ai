@@ -117,6 +117,56 @@ def test_outbox_finishes_only_after_success(status, attempts):
     asyncio.run(scenario())
 
 
+def test_dns_failure_exhausts_retry_budget_before_dropping(monkeypatch):
+    async def scenario():
+        import egress_broker
+        from egress_broker import TargetUnresolvable
+
+        pins = []
+
+        def boom(url):
+            pins.append(url)
+            raise TargetUnresolvable()
+
+        monkeypatch.setattr(egress_broker, "resolve_and_pin", boom)
+        pending = queue()
+        pending.reserve_outbox_attempt.side_effect = range(1, 4)
+        sender = service()
+        worker = CrawlJobWorker(pending, {}, "worker", webhook_service=sender)
+        await worker.process_outbox("1-0", event())
+        assert len(pins) == 3
+        assert pending.reserve_outbox_attempt.await_count == 3
+        pending.finish_outbox.assert_not_awaited()
+        pending.fail_outbox.assert_awaited_once_with("1-0", "worker")
+
+    asyncio.run(scenario())
+
+
+def test_policy_block_drops_outbox_after_single_attempt(monkeypatch):
+    async def scenario():
+        import egress_broker
+        from egress_broker import EgressBlocked
+
+        pins = []
+
+        def boom(url):
+            pins.append(url)
+            raise EgressBlocked()
+
+        monkeypatch.setattr(egress_broker, "resolve_and_pin", boom)
+        pending = queue()
+        pending.reserve_outbox_attempt.side_effect = range(1, 4)
+        sender = service()
+        worker = CrawlJobWorker(pending, {}, "worker", webhook_service=sender)
+        await worker.process_outbox("1-0", event())
+        assert len(pins) == 1
+        assert pending.reserve_outbox_attempt.await_count == 1
+        pending.finish_outbox.assert_not_awaited()
+        pending.fail_outbox.assert_awaited_once_with("1-0", "worker")
+
+    asyncio.run(scenario())
+
+
 def test_outbox_heartbeat_loss_cancels_active_send():
     async def scenario():
         pending = queue()
