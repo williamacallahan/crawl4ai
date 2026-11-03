@@ -103,6 +103,20 @@ class BodySizeLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+def _under_method_prefix(method, path, prefixes):
+    """Whether ``(method, path)`` is covered by a segment-aware prefix in ``prefixes``.
+
+    A prefix ``p`` matches ``path == p`` or ``path.startswith(p + "/")`` so
+    ``/llm`` covers ``/llm`` and ``/llm/<arg>`` but not ``/llmfoo``. The method
+    guard keeps an enqueue on the same path prefix (e.g. ``POST /llm/job``) out
+    of scope, mirroring the exact-``paths`` exclusion of ``/crawl/job``.
+    """
+    return any(
+        m == method and (path == p or path.startswith(p + "/"))
+        for m, p in prefixes
+    )
+
+
 class CancelOnDisconnectMiddleware:
     """Cancel a browser-bound handler whose client hangs up before its response.
 
@@ -115,14 +129,27 @@ class CancelOnDisconnectMiddleware:
     (listen_for_disconnect), once the body is consumed so it never takes body
     bytes from the handler. A started response is left to finish: a stream
     handles its own disconnect, and nothing remains to free.
+
+    ``paths`` is an exact path match for routes whose ``scope["path"]`` is a
+    fixed string. ``prefixes`` is a method- and segment-aware match for
+    path-param routes whose ``scope["path"]`` carries the full ``/prefix/<arg>``
+    string (e.g. ``GET /llm/{url:path}`` -> ``/llm/<url>``); the method guard
+    prevents cancelling a same-path enqueue such as ``POST /llm/job``.
     """
 
-    def __init__(self, app, paths: frozenset[str]):
+    def __init__(self, app, paths: frozenset[str] = frozenset(),
+                 prefixes: frozenset[tuple[str, str]] = frozenset()):
         self.app = app
         self.paths = paths
+        self.prefixes = prefixes
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"] not in self.paths:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope["path"]
+        if path not in self.paths and not _under_method_prefix(
+                scope.get("method"), path, self.prefixes):
             await self.app(scope, receive, send)
             return
         body_consumed = asyncio.Event()

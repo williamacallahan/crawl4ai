@@ -78,6 +78,41 @@ async def hang_up_after(server_module, path, payload, started, while_open):
         await asyncio.wait_for(serving, timeout=10)
 
 
+async def hang_up_get_after(server_module, path, started, while_open):
+    """Bodiless GET over a real socket, wait for ``started``, hang up, close.
+
+    A ``GET /llm/{url:path}`` request carries its URL in the path and no body, so
+    uvicorn's first ``http.request`` has ``more_body=False`` and the inner
+    `BodySizeLimitMiddleware` drain loop fires `body_consumed` without the
+    handler ever reading a body -- the same watcher the POST routes rely on.
+    """
+    from auth import create_access_token
+
+    server = uvicorn.Server(uvicorn.Config(
+        server_module.app, host="127.0.0.1", port=0, lifespan="off",
+        log_level="warning", timeout_graceful_shutdown=1,
+    ))
+    serving = asyncio.create_task(server.serve())
+    try:
+        while not server.started:
+            await asyncio.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            f"Authorization: Bearer {create_access_token({'sub': 'test@example.com'})}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), timeout=10)
+        await while_open()
+        writer.close()
+        await writer.wait_closed()
+        yield
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(serving, timeout=10)
+
+
 async def eventually(check, seconds):
     for _attempt in range(int(seconds * 100)):
         if await check():
@@ -167,3 +202,99 @@ def test_hangup_during_llm_markdown_releases_the_cluster_llm_permit(
             await redis.aclose()
 
     asyncio.run(exercise())
+
+
+def test_hangup_cancels_the_llm_get_crawl_and_frees_its_page_slot(
+    server_module, routes, monkeypatch
+):
+    """GET /llm/{url:path} holds a pooled browser through the whole crawl, so a
+    client that hangs up must be cancelled and its page-budget slot freed -- the
+    gap that the original six-ROUTES matrix never exercised."""
+    import crawler_pool
+
+    async def exercise():
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def arun(*_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def slot_is_held():
+            with pytest.raises(crawler_pool.BrowserCapacityError):
+                await routes.acquire(0)
+
+        async def slot_is_free():
+            try:
+                (await routes.acquire(0)).close()
+                return True
+            except crawler_pool.BrowserCapacityError:
+                return False
+
+        admit(monkeypatch, arun)
+        async for _ in hang_up_get_after(
+            server_module, "/llm/example.com?q=hello", started, slot_is_held
+        ):
+            await asyncio.wait_for(cancelled.wait(), timeout=5)
+            assert await eventually(slot_is_free, 1), \
+                "the hung-up GET /llm crawl still holds its page slot"
+
+    asyncio.run(exercise())
+
+
+def test_under_method_prefix_is_segment_aware_and_method_scoped():
+    """The prefix match is method-scoped and respects the path segment boundary,
+    so a GET /llm prefix never catches POST /llm/job or an unrelated /llmfoo."""
+    from governor import _under_method_prefix
+
+    prefixes = frozenset({("GET", "/llm")})
+
+    assert _under_method_prefix("GET", "/llm", prefixes)
+    assert _under_method_prefix("GET", "/llm/example.com", prefixes)
+    assert _under_method_prefix("GET", "/llm/https:/host/path", prefixes)
+    assert not _under_method_prefix("POST", "/llm", prefixes), \
+        "POST /llm/job (enqueue) shares the /llm path prefix and must not match a GET prefix"
+    assert not _under_method_prefix("GET", "/llmfoo", prefixes), \
+        "segment boundary must hold: /llmfoo is not under /llm"
+    assert not _under_method_prefix("GET", "/llmjob", prefixes)
+    assert not _under_method_prefix("GET", "/crawl", prefixes)
+    assert not _under_method_prefix("GET", "/llm", frozenset())
+
+
+def test_browser_holding_routes_covered_and_jobs_are_not(server_module):
+    """The wired middleware covers every browser-holding route (now including
+    GET /llm/{url:path}) and still spares the enqueues and stream that share a
+    path prefix -- adding /llm must not regress /llm/job any more than /crawl
+    regresses /crawl/job."""
+    from governor import CancelOnDisconnectMiddleware, _under_method_prefix
+
+    wired = [m for m in server_module.app.user_middleware
+             if m.cls is CancelOnDisconnectMiddleware]
+    assert len(wired) == 1, "CancelOnDisconnectMiddleware must be wired exactly once"
+    paths = wired[0].kwargs.get("paths", frozenset())
+    prefixes = wired[0].kwargs.get("prefixes", frozenset())
+
+    def covered(method, path):
+        return path in paths or _under_method_prefix(method, path, prefixes)
+
+    holding_browser = [
+        ("POST", "/crawl"), ("POST", "/md"), ("POST", "/html"),
+        ("POST", "/screenshot"), ("POST", "/pdf"), ("POST", "/execute_js"),
+        ("GET", "/llm/example.com"),
+        ("GET", "/llm/https:/example.com/path"),
+    ]
+    for method, path in holding_browser:
+        assert covered(method, path), \
+            f"{method} {path} holds a browser page and must be covered"
+
+    must_not_cancel = [
+        ("POST", "/crawl/job"), ("POST", "/crawl/stream"),
+        ("GET", "/crawl/job/crawl_x"),
+        ("POST", "/llm/job"),
+    ]
+    for method, path in must_not_cancel:
+        assert not covered(method, path), \
+            f"{method} {path} must not be cancelled (enqueue must finish / no browser held)"
