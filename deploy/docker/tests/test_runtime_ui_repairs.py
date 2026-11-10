@@ -15,7 +15,6 @@ import httpx
 import pytest
 from auth_gate import AuthGateMiddleware
 from egress_broker import PinnedTarget
-from fastapi import BackgroundTasks, Request
 from governor import BodySizeLimitMiddleware
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -277,46 +276,6 @@ async def test_dns_resolution_runs_off_the_event_loop(monkeypatch):
     )
     assert ticked.is_set()
     assert result.ip == "93.184.216.34"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("job_kind", ["llm", "crawl"])
-async def test_job_webhook_validation_runs_off_the_event_loop(monkeypatch, job_kind):
-    import job
-    import utils
-
-    def slow_validate(_url):
-        time.sleep(0.05)
-
-    async def accepted(*_args, **_kwargs):
-        return {"accepted": True}
-
-    monkeypatch.setattr(utils, "validate_webhook_url", slow_validate)
-    if job_kind == "llm":
-        payload = job.LlmJobPayload(
-            url="https://example.com",
-            q="summary",
-            webhook_config={"webhook_url": "https://hooks.example/callback"},
-        )
-        monkeypatch.setattr(job, "handle_llm_request", accepted)
-        enqueue = job.llm_job_enqueue(
-            payload,
-            BackgroundTasks(),
-            Request({"type": "http", "scheme": "http", "server": ("test", 80)}),
-            None,
-        )
-    else:
-        payload = job.CrawlJobPayload(
-            urls=["https://example.com"],
-            webhook_config={"webhook_url": "https://hooks.example/callback"},
-        )
-        monkeypatch.setattr(job, "handle_crawl_job", accepted)
-        enqueue = job.crawl_job_enqueue(payload, BackgroundTasks(), None)
-
-    task = asyncio.create_task(enqueue)
-    await asyncio.sleep(0.01)
-    assert not task.done()
-    assert await task == {"accepted": True}
 
 
 @pytest.mark.asyncio

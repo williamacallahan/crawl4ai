@@ -8,10 +8,13 @@ redirects are refused.
 """
 
 import asyncio
+from threading import Event, get_ident
 
 import egress_broker
 import pytest
 from egress_broker import EgressBlocked, PinnedTarget
+from fastapi import BackgroundTasks, Request
+from starlette.responses import JSONResponse
 from webhook import WebhookDeliveryService
 
 pytestmark = pytest.mark.posture
@@ -30,6 +33,72 @@ async def _raw_server(response: bytes):
 def _svc():
     return WebhookDeliveryService({"webhooks": {"retry": {"max_attempts": 2,
                                    "initial_delay_ms": 1, "timeout_ms": 5000}}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_kind", ["llm", "crawl"])
+async def test_job_webhook_validation_runs_off_the_event_loop(monkeypatch, job_kind):
+    import api
+    import job
+    import utils
+
+    loop = asyncio.get_running_loop()
+    loop_thread = get_ident()
+    started = loop.create_future()
+    release = Event()
+    calls = []
+    webhook_url = "https://hooks.example/callback"
+    webhook = {"webhook_url": webhook_url}
+    llm_response = JSONResponse({"task_id": "llm_test"}, status_code=202)
+
+    def blocking_validate(url):
+        calls.append(url)
+        assert get_ident() != loop_thread
+        if len(calls) == 1:
+            loop.call_soon_threadsafe(started.set_result, None)
+        release.wait()
+
+    async def accepted(*_args, **kwargs):
+        assert kwargs["webhook_config"]["webhook_url"] == webhook_url
+        return llm_response if job_kind == "llm" else "crawl_test"
+
+    monkeypatch.setattr(
+        utils if job_kind == "llm" else api, "validate_webhook_url", blocking_validate
+    )
+    if job_kind == "llm":
+        payload = job.LlmJobPayload(
+            url="https://example.com", q="summary", webhook_config=webhook
+        )
+        monkeypatch.setattr(job, "handle_llm_request", accepted)
+        enqueue = job.llm_job_enqueue(
+            payload,
+            BackgroundTasks(),
+            Request({"type": "http", "scheme": "http", "server": ("test", 80)}),
+            None,
+        )
+    else:
+        payload = job.CrawlJobPayload(urls=["https://example.com"], webhook_config=webhook)
+        monkeypatch.setattr(job, "_config", {})
+        monkeypatch.setattr(api.CrawlJobQueue, "enqueue", accepted)
+        enqueue = job.crawl_job_enqueue(payload, BackgroundTasks(), None)
+
+    task = asyncio.create_task(enqueue)
+    try:
+        done, _ = await asyncio.wait(
+            {task, started}, timeout=30, return_when=asyncio.FIRST_COMPLETED
+        )
+        if task.done():
+            task.result()
+        assert started in done
+        assert not task.done()
+    finally:
+        release.set()
+        if not started.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert task.result() == (llm_response if job_kind == "llm" else {"task_id": "crawl_test"})
+    assert calls == [webhook_url]
 
 
 @pytest.mark.asyncio
