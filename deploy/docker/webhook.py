@@ -14,6 +14,7 @@ from urllib.parse import urljoin
 
 import aiohttp
 from aiohttp.abc import AbstractResolver
+from egress_broker import TargetResolutionUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,8 @@ class WebhookDeliveryService:
                     logger.warning(f"Webhook rejected with status {status}")
                     return False  # client error - don't retry
                 logger.warning(f"Webhook failed with status {status}, will retry")
+            except TargetResolutionUnavailable:
+                logger.warning("Webhook destination resolution temporarily unavailable (attempt %s)", attempt)
             except _WebhookBlocked as exc:
                 # SSRF: target (or a redirect hop) resolved non-global. Do not
                 # retry - it will not become safe.
@@ -174,6 +177,8 @@ class WebhookDeliveryService:
         for _hop in range(_MAX_WEBHOOK_REDIRECTS + 1):
             try:
                 pin = await resolve_and_pin_async(current)
+            except TargetResolutionUnavailable:
+                raise
             except EgressBlocked as e:
                 raise _WebhookBlocked(str(e))
 

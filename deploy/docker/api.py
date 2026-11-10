@@ -18,6 +18,7 @@ from crawl_job_queue import (
     CrawlJobQueue,
     CrawlJobQueueFull,
 )
+from egress_broker import TargetResolutionUnavailable
 from fastapi import HTTPException, Request, status
 from fastapi.background import BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -44,6 +45,7 @@ from utils import (
     public_crawl_error,
     validate_llm_provider,
     validate_url_destination,
+    validate_webhook_url,
 )
 from webhook import WebhookDeliveryService
 from archive_transport import acquire_crawler, collect_results, grouped_results, prefetch_archive
@@ -718,7 +720,7 @@ async def handle_llm_qa(
             )
 
         return response.choices[0].message.content
-    except HTTPException:
+    except (HTTPException, TargetResolutionUnavailable):
         raise
     except LLMProviderNotAllowed as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -890,7 +892,7 @@ async def process_llm_extraction(
         # This runs as a background task, so the central 500 handler never sees
         # it: str(e) would land verbatim in the task hash that /llm/job/{id}
         # returns and in the caller-supplied webhook.
-        level = logging.WARNING if isinstance(e, LlmCapacityBusy) else logging.ERROR
+        level = logging.WARNING if isinstance(e, (LlmCapacityBusy, TargetResolutionUnavailable)) else logging.ERROR
         error_message = (
             str(e)
             if isinstance(e, LlmExtractionRejected)
@@ -1044,6 +1046,8 @@ async def handle_markdown_request(
             result,
         )
 
+    except TargetResolutionUnavailable:
+        raise
     except Exception as error:
         if isinstance(error, asyncio.TimeoutError):
             error = HTTPException(status_code=504, detail="Crawl exceeded the time limit")
@@ -1115,7 +1119,7 @@ async def handle_llm_request(
             owner=requester,
         )
 
-    except HTTPException:
+    except (HTTPException, TargetResolutionUnavailable):
         raise  # 429/503 (queue/quota), 400, etc. - don't mask as 500
     except Exception:
         logger.exception("LLM endpoint failed")
@@ -1394,6 +1398,9 @@ async def _close_aborted_request(request_id: str, pending: Optional[BaseExceptio
         if isinstance(pending, HTTPException) and pending.status_code != 500:
             aborted_status = pending.status_code
             aborted_error = str(pending.detail)[:500]
+        elif isinstance(pending, TargetResolutionUnavailable):
+            aborted_status = 503
+            aborted_error = "Temporary URL resolution failure"
         else:
             aborted_status = 500
             aborted_error = (
@@ -1723,7 +1730,7 @@ async def handle_crawl_request(
         # Per-crawl wall-clock deadline exceeded.
         raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
 
-    except HTTPException:
+    except (HTTPException, TargetResolutionUnavailable):
         # Deliberate status (e.g. 400 SSRF "URL blocked") must pass through
         # rather than be genericized to 500 by the handler below.
         raise
@@ -1912,7 +1919,7 @@ async def handle_stream_crawl_request(
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
 
-    except HTTPException:
+    except (HTTPException, TargetResolutionUnavailable):
         # Deliberate status (e.g. 400 SSRF "URL blocked") must pass through
         # rather than be genericized to 500 by the handler below.
         raise
@@ -1947,6 +1954,11 @@ async def handle_crawl_job(
     the API process or worker restarts.
     """
     try:
+        if webhook_config:
+            try:
+                await asyncio.to_thread(validate_webhook_url, str(webhook_config["webhook_url"]))
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
         task_id = await CrawlJobQueue(redis, config).enqueue(
             urls=urls,
             browser_config=browser_config,
@@ -1956,6 +1968,12 @@ async def handle_crawl_job(
             owner=owner,
             trace_id=trace_id,
         )
+    except TargetResolutionUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Crawl job not queued: temporary URL resolution failure",
+            headers={"Retry-After": "30"},
+        ) from None
     except CrawlJobPayloadRejected as error:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
     except CrawlJobPrincipalQuotaExceeded as error:

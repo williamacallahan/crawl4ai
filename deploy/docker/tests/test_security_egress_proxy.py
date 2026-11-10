@@ -878,3 +878,50 @@ class TestEnforceEgressWiring:
         egress_broker.enforce_egress(b)
         assert b.proxy_config is not None
         assert b.proxy_config.server == "http://127.0.0.1:9999"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["CONNECT", "GET"])
+async def test_temporary_dns_blocks_and_clears_permanent_code(monkeypatch, method):
+    import egress_broker
+    from utils import public_error_detail
+
+    monkeypatch.setattr(egress_broker, "ALLOW_INTERNAL", False)
+    monkeypatch.setattr(egress_proxy, "_dial_failures", type(egress_proxy._dial_failures)())
+    error_number = socket.EAI_NONAME
+
+    def unavailable(host, port, *args, **kwargs):
+        raise socket.gaierror(error_number, "private resolver information")
+
+    monkeypatch.setattr(socket, "getaddrinfo", unavailable)
+    proxy = PinningProxy()
+    await proxy.start()
+    port = 443 if method == "CONNECT" else 80
+    url = f"{'https' if method == 'CONNECT' else 'http'}://unavailable.example:{port}/"
+    request = (
+        f"CONNECT unavailable.example:{port} HTTP/1.1\r\n\r\n"
+        if method == "CONNECT" else
+        f"GET {url} HTTP/1.1\r\nHost: unavailable.example\r\n\r\n"
+    ).encode()
+    try:
+        for error_number, expected in [
+            (socket.EAI_NONAME, "net::ERR_NAME_NOT_RESOLVED"),
+            (socket.EAI_AGAIN, None),
+            (socket.EAI_AGAIN, None),
+        ]:
+            reader, writer = await asyncio.open_connection(proxy.bound_host, proxy.bound_port)
+            try:
+                writer.write(request)
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), timeout=5)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+            assert response == b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
+            assert egress_proxy.tunnel_failure_code(url) == expected
+            if expected is None:
+                for prefix in ("Page.goto: ", "All proxies failed: Page.goto: "):
+                    detail = public_error_detail(f"{prefix}net::ERR_TUNNEL_CONNECTION_FAILED at {url}")
+                    assert "ERR_NAME_NOT_RESOLVED" not in detail
+    finally:
+        await proxy.stop()

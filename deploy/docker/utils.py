@@ -776,12 +776,14 @@ def validate_webhook_url(url: str) -> None:
     forms). The raised message is intentionally opaque - it never echoes the
     resolved IP or hostname, so this is not a DNS/oracle leak.
     """
-    from egress_broker import EgressBlocked, resolve_and_pin
+    from egress_broker import EgressBlocked, TargetResolutionUnavailable, resolve_and_pin
     parsed = urlparse(str(url))
     if not parsed.hostname:
         raise ValueError("URL must have a valid hostname")
     try:
         resolve_and_pin(url)
+    except TargetResolutionUnavailable:
+        raise
     except EgressBlocked:
         raise ValueError("URL blocked")
 

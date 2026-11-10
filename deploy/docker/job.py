@@ -135,17 +135,10 @@ async def crawl_job_enqueue(
         _td: Annotated[dict | None, Depends(_principal_dep)],
         traceparent: Annotated[str | None, Header()] = None,
 ):
-    webhook_config = None
-    if payload.webhook_config:
-        from utils import validate_webhook_url
-        try:
-            await asyncio.to_thread(
-                validate_webhook_url,
-                str(payload.webhook_config.webhook_url),
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        webhook_config = payload.webhook_config.model_dump(mode='json')
+    webhook_config = (
+        payload.webhook_config.model_dump(mode="json")
+        if payload.webhook_config else None
+    )
 
     return await handle_crawl_job(
         _redis,

@@ -88,6 +88,7 @@ from schemas import (
     PDFRequest,
     ScreenshotRequest,
 )
+from egress_broker import TargetResolutionUnavailable
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.exceptions import HTTPException as _StarletteHTTPException
@@ -715,6 +716,15 @@ async def _http_exception_handler(request: Request, exc: _StarletteHTTPException
         payload,
         status_code=exc.status_code,
         headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(TargetResolutionUnavailable)
+async def _target_resolution_unavailable_handler(request: Request, exc: TargetResolutionUnavailable):
+    return JSONResponse(
+        {"detail": "Temporary URL resolution failure"},
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        headers={"Retry-After": "30"},
     )
 
 

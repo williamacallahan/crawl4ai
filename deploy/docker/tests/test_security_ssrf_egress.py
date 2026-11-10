@@ -140,3 +140,65 @@ class TestWebhookValidatorUsesBroker:
         from utils import validate_webhook_url
         offline_dns.set("hook.example", "93.184.216.34")
         validate_webhook_url("http://hook.example/cb")  # no raise
+
+
+class TestTemporaryResolution:
+    @pytest.mark.parametrize("error_number", [socket.EAI_AGAIN, socket.EAI_NONAME, socket.EAI_FAIL, None])
+    def test_only_eai_again_is_temporary(self, monkeypatch, error_number):
+        import egress_broker
+        from egress_broker import TargetResolutionUnavailable, TargetUnresolvable
+
+        monkeypatch.setattr(egress_broker, "ALLOW_INTERNAL", False)
+        calls = []
+
+        def unavailable(host, port, *args, **kwargs):
+            calls.append((host, port))
+            raise socket.gaierror(error_number, "private resolver information for unavailable.example")
+
+        monkeypatch.setattr(socket, "getaddrinfo", unavailable)
+        expected = TargetResolutionUnavailable if error_number == socket.EAI_AGAIN else TargetUnresolvable
+        with pytest.raises(expected) as caught:
+            resolve_and_pin("https://unavailable.example/path")
+        assert type(caught.value) is expected
+        assert str(caught.value) == caught.value.reason == "URL blocked"
+        assert calls == [("unavailable.example", 443)]
+
+    @pytest.mark.parametrize("validator_name", ["validate_webhook_url", "validate_url_destination"])
+    def test_validators_preserve_temporary_type(self, monkeypatch, validator_name):
+        import egress_broker
+        import utils
+        from egress_broker import TargetResolutionUnavailable
+
+        monkeypatch.setattr(egress_broker, "ALLOW_INTERNAL", False)
+        monkeypatch.setattr(utils, "ALLOW_INTERNAL_URLS", False)
+
+        def unavailable(*args, **kwargs):
+            raise socket.gaierror(socket.EAI_AGAIN, "private resolver information")
+
+        monkeypatch.setattr(socket, "getaddrinfo", unavailable)
+        with pytest.raises(TargetResolutionUnavailable) as caught:
+            getattr(utils, validator_name)("https://unavailable.example/path")
+        assert str(caught.value) == "URL blocked"
+
+    @pytest.mark.parametrize("error_number", [socket.EAI_NONAME, socket.EAI_FAIL])
+    @pytest.mark.parametrize("validator_name", ["validate_webhook_url", "validate_url_destination"])
+    def test_permanent_dns_keeps_validation_rejection(self, monkeypatch, error_number, validator_name):
+        import egress_broker
+        import utils
+        from fastapi import HTTPException
+
+        monkeypatch.setattr(egress_broker, "ALLOW_INTERNAL", False)
+        monkeypatch.setattr(utils, "ALLOW_INTERNAL_URLS", False)
+
+        def unavailable(*args, **kwargs):
+            raise socket.gaierror(error_number, "private resolver information")
+
+        monkeypatch.setattr(socket, "getaddrinfo", unavailable)
+        expected = ValueError if validator_name == "validate_webhook_url" else HTTPException
+        with pytest.raises(expected) as caught:
+            getattr(utils, validator_name)("https://unavailable.example/path")
+        if isinstance(caught.value, HTTPException):
+            assert caught.value.status_code == 400
+            assert caught.value.detail == "URL blocked (SSRF protection): URL blocked"
+        else:
+            assert str(caught.value) == "URL blocked"

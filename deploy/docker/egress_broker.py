@@ -58,6 +58,10 @@ class TargetUnresolvable(EgressBlocked):
     """The target host has no DNS answer: a dead target, not a policy block."""
 
 
+class TargetResolutionUnavailable(EgressBlocked):
+    """The resolver is temporarily unavailable; no permanent target verdict."""
+
+
 @dataclass
 class PinnedTarget:
     scheme: str
@@ -98,7 +102,9 @@ def is_forbidden_ip(ip_str: str) -> bool:
 def _resolve(host: str, port: int):
     try:
         return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
+    except socket.gaierror as error:
+        if error.errno == socket.EAI_AGAIN:
+            raise TargetResolutionUnavailable() from None
         raise TargetUnresolvable()
 
 

@@ -18,6 +18,7 @@ from crawl_job_queue import (
     CrawlJobQueue,
 )
 from crawler_pool import close_all, janitor, use_worker_admission_wait
+from egress_broker import TargetResolutionUnavailable
 from egress_proxy import start_pinning_proxy, stop_pinning_proxy
 from fastapi import HTTPException, status
 from redis import asyncio as aioredis
@@ -308,7 +309,7 @@ class CrawlJobWorker:
                 f"archive_budget_spent: {error.detail}; retry after {error.retry_after}s"
             )
             return await self.queue.complete(entry, payload, attempt, error=error_message)
-        except (HTTPException, OSError, RuntimeError, TypeError, ValueError) as error:
+        except (HTTPException, TargetResolutionUnavailable, OSError, RuntimeError, TypeError, ValueError) as error:
             # This worker is a separate process: the API's central 500 handler
             # never sees these, so nothing else genericizes them before they
             # reach the task hash /crawl/job/{id} returns and the webhook. A
@@ -320,11 +321,13 @@ class CrawlJobWorker:
                 # 502/503/504 are a failed target, a busy server, or a crawl
                 # deadline; a server-side fault behind a 502 was already logged
                 # at ERROR by public_crawl_error.
-                upstream = isinstance(error, HTTPException) and error.status_code in {
-                    status.HTTP_502_BAD_GATEWAY,
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    status.HTTP_504_GATEWAY_TIMEOUT,
-                }
+                upstream = isinstance(error, TargetResolutionUnavailable) or (
+                    isinstance(error, HTTPException) and error.status_code in {
+                        status.HTTP_502_BAD_GATEWAY,
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        status.HTTP_504_GATEWAY_TIMEOUT,
+                    }
+                )
                 error_message = correlated_error(
                     "Crawl job failed",
                     error,

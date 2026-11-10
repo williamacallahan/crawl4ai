@@ -77,3 +77,79 @@ class TestWebhookPinning:
         out = await r.resolve("good.example", 443)
         assert out[0]["host"] == "203.0.113.7"
         assert out[0]["hostname"] == "good.example"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_name,expected_attempts", [("EAI_AGAIN", 2), ("EAI_NONAME", 1), ("EAI_FAIL", 1)])
+async def test_dns_delivery_uses_existing_bounded_retry_owner(monkeypatch, error_name, expected_attempts):
+    import socket
+
+    monkeypatch.setattr(egress_broker, "ALLOW_INTERNAL", False)
+    calls = []
+    reservations = []
+
+    def unavailable(host, port, *args, **kwargs):
+        calls.append(host)
+        raise socket.gaierror(getattr(socket, error_name), "private resolver information")
+
+    async def reserve():
+        reservations.append(len(reservations) + 1)
+        return reservations[-1]
+
+    monkeypatch.setattr(socket, "getaddrinfo", unavailable)
+    assert await _svc().send_webhook("https://unavailable.example/cb", {}, before_attempt=reserve) is False
+    assert calls == ["unavailable.example"] * expected_attempts
+    assert reservations == list(range(1, expected_attempts + 1))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redirect", [False, True])
+async def test_temporary_dns_then_normal_resolution_delivers_webhook(monkeypatch, redirect):
+    import socket
+
+    # Exercise real DNS classification, pinning and aiohttp against loopback
+    # using the documented trusted-internal deployment configuration.
+    monkeypatch.setattr(egress_broker, "ALLOW_INTERNAL", True)
+    posts = []
+
+    async def handle(reader, writer):
+        request = await reader.readuntil(b"\r\n\r\n")
+        for line in request.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                await reader.readexactly(int(line.split(b":", 1)[1]))
+        posts.append(request)
+        if redirect and b"Host: origin.example:" in request:
+            writer.write(f"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://hook.example:{port}/cb\r\nContent-Length: 0\r\n\r\n".encode())
+        else:
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    calls = []
+    failed_once = False
+    reservations = []
+
+    def resolve(host, requested_port, *args, **kwargs):
+        nonlocal failed_once
+        calls.append(host)
+        if host == "hook.example" and not failed_once:
+            failed_once = True
+            raise socket.gaierror(socket.EAI_AGAIN, "private resolver information")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", requested_port))]
+
+    async def reserve():
+        reservations.append(len(reservations) + 1)
+        return reservations[-1]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    host = "origin.example" if redirect else "hook.example"
+    try:
+        assert await _svc().send_webhook(f"http://{host}:{port}/cb", {}, before_attempt=reserve) is True
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert reservations == [1, 2]
+    assert calls == (["origin.example", "hook.example", "origin.example", "hook.example"] if redirect else ["hook.example", "hook.example"])
+    assert len(posts) == (3 if redirect else 1)

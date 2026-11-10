@@ -8,9 +8,11 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -26,7 +28,7 @@ from test_crawl_job_queue_redis import redis_url  # noqa: F401
 DOCKER_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DOCKER_DIR))
 
-from crawl_job_queue import CrawlJobLeaseLost, CrawlJobQueue  # noqa: E402
+from crawl_job_queue import CrawlJobAttempt, CrawlJobLeaseLost, CrawlJobQueue  # noqa: E402
 from crawl_job_worker import CrawlJobWorker  # noqa: E402
 from work_queue import principal_lease_key  # noqa: E402
 
@@ -289,6 +291,70 @@ def test_clean_retry_is_reclaimed_and_keeps_the_attempt_budget(redis_url):
             assert len(executions) == 2
             assert await client.xlen(queue.settings.stream) == 0
     asyncio.run(exercise())
+
+
+def test_temporary_dns_after_enqueue_uses_fenced_bounded_retry(redis_url, monkeypatch, caplog):
+    import egress_broker
+    import utils
+
+    original_resolver = socket.getaddrinfo
+    outage = False
+    failed_resolutions = []
+
+    def resolve(host, port, *args, **kwargs):
+        if host != "example.com":
+            return original_resolver(host, port, *args, **kwargs)
+        if outage:
+            failed_resolutions.append(host)
+            raise socket.gaierror(socket.EAI_AGAIN, "temporary resolver failure")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr("crawl_job_queue.validate_url_destination", utils.validate_url_destination)
+    monkeypatch.setattr(utils, "ALLOW_INTERNAL_URLS", False)
+    monkeypatch.setattr(egress_broker, "ALLOW_INTERNAL", False)
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    caplog.set_level(logging.WARNING)
+
+    async def exercise():
+        nonlocal outage
+        async with isolated_queue(redis_url) as (client, queue, enqueue, _owner):
+            task_id = await enqueue({"webhook_url": "https://hooks.example.com/notify"})
+            entry = (await queue.read_new("first"))[0]
+            outage = True
+            await CrawlJobWorker(queue, queue.config, "first")._process_entry(entry)
+            payload_key = queue.payload_key(task_id)
+            assert await client.hget(payload_key, "attempt_state") == b"retry"
+            assert await client.hget(payload_key, "attempt") == b"1"
+            task = await client.hgetall(queue.task_key(task_id))
+            assert task[b"status"] == b"processing"
+            assert task[b"last_error"].startswith(b"Crawl job failed")
+            assert b"example.com" not in task[b"last_error"]
+            assert await client.xlen(queue.settings.stream) == 1
+            assert await client.xlen(queue.outbox_stream) == 0
+            assert len(await client.xpending_range(queue.settings.stream, queue.settings.group, "-", "+", 4)) == 1
+            first_attempt = CrawlJobAttempt(
+                number=1,
+                fence_token=(await client.hget(payload_key, "fence_token")).decode(),
+                consumer="first",
+            )
+            await stale(client, queue, entry, "first")
+            assert await queue.claim_stale("second") == [entry]
+            with pytest.raises(CrawlJobLeaseLost):
+                await queue.mark_retry(entry, await queue.load_payload(task_id), "first", first_attempt, "stale")
+            await CrawlJobWorker(queue, queue.config, "second")._process_entry(entry)
+            task = await client.hgetall(queue.task_key(task_id))
+            assert task[b"status"] == b"failed" and task[b"attempt"] == b"2"
+            assert await client.xlen(queue.settings.stream) == 0
+            assert await client.xlen(queue.outbox_stream) == 1
+            assert await queue.read_new("third") == []
+            assert len(failed_resolutions) == 2
+
+    asyncio.run(exercise())
+    records = [record for record in caplog.records if record.name in {"utils", "crawl_job_worker"}]
+    assert any(record.levelno == logging.WARNING and "Crawl job failed" in record.getMessage() for record in records)
+    assert any("retaining it for lease-based retry" in record.getMessage() for record in records)
+    assert all(record.levelno < logging.ERROR for record in records)
+    assert all("Crawl job not queued" not in record.getMessage() for record in records)
 
 
 def test_worker_immediately_delivers_once_without_fallback_duplicate(redis_url, local_webhook):

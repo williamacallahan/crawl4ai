@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from redis.exceptions import ResponseError
+from egress_broker import TargetResolutionUnavailable
 from crawl_job_outbox import APPEND_OUTBOX_LUA, CrawlJobOutbox
 from schemas import CrawlRequest
 from utils import (
@@ -476,6 +477,8 @@ class CrawlJobQueue(CrawlJobOutbox):
         for url in normalized:
             try:
                 await asyncio.to_thread(validate_url_destination, url)
+            except TargetResolutionUnavailable:
+                raise
             except Exception as error:
                 raise CrawlJobPayloadRejected("Rejected crawl job URL") from error
         return normalized
