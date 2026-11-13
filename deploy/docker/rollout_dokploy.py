@@ -131,8 +131,19 @@ def _wait_deployment(
     prior_ids: set[str],
     title: str,
     description: str,
+    collector: withdrawals.Withdrawals | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
+    if collector is not None:
+        # Check before refreshing: the arming work before this call can
+        # outlast the runner deadline that started when the collector was
+        # constructed, and refreshing would mask that expiry instead of
+        # reporting it at this phase boundary.
+        collector.check()
+        # Refresh at the same boundary the caller's own deadline does, so a
+        # queue wait within its own TIMEOUT_SECONDS bound never fails a
+        # collector whose runner deadline the earlier arming consumed.
+        collector.refresh()
     admitted = False
     while time.monotonic() < deadline:
         try:
@@ -159,14 +170,36 @@ def _wait_deployment(
         if matching:
             owned = matching[0]
             if not admitted:
+                if collector is not None:
+                    # Check before refreshing: a queue wait that outlasted the
+                    # runner deadline would be masked by the refresh below, so
+                    # surface the expired collector here instead of extending it
+                    # into the processing phase.
+                    collector.check()
                 admitted = True
                 deadline = time.monotonic() + rollout_policy.TIMEOUT_SECONDS
+                if collector is not None:
+                    # The processing phase gets its own fresh caller bound; the
+                    # runner keeps pace so a slow processing wait reports its
+                    # own error, not a stale queue-admission collector expiry.
+                    collector.refresh()
                 print("stock Dokploy deployment was admitted; waiting for processing", flush=True)
             status = owned.get("status")
             if status == "done":
+                if collector is not None:
+                    # Surface a collector death that landed between the last
+                    # check and this poll before the caller refreshes the
+                    # deadline, so it is attributed to this phase and not the
+                    # finish barrier.
+                    collector.check()
                 return owned
             if status in {"error", "cancelled"}:
                 raise withdrawals.StateError(f"stock Dokploy deployment ended in {status}", status)
+        if collector is not None:
+            # Surface a collector death inside the wait that owns it instead of
+            # at the finish barrier, so a journal that expired or a collector
+            # that failed during queue/processing is attributed to this phase.
+            collector.check()
         time.sleep(5)
     if admitted:
         raise TimeoutError("stock Dokploy deployment did not finish after queue admission")
