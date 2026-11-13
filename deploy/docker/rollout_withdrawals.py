@@ -304,14 +304,18 @@ class Withdrawals:
                 if state in {"failed", "rejected", "complete", "shutdown"} or time.monotonic() >= self.deadline:
                     raise RuntimeError("withdrawal collector did not start")
                 time.sleep(1)
-            while not any(row.get("ready") for row in self._logs(service)):
+            while True:
                 self._guard(node)
+                if any(row.get("ready") for row in self._logs(service)):
+                    break
                 time.sleep(1)
             # The collector has already observed its initial native cache anchor.
             marker = f"{self.prefix}-{node}-arm"
             marker_service = self._create(marker, node, "pass")
-            while not any(row.get("armed") for row in self._logs(service)):
+            while True:
                 self._guard(node)
+                if any(row.get("armed") for row in self._logs(service)):
+                    break
                 time.sleep(1)
             self._marker(marker_service, node)
         self.baseline = census(self.app)
