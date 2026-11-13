@@ -159,27 +159,69 @@ def test_verify_tasks_rejects_record_label_drift_beside_control_plane_labels(
         )
 
 
+NEVER_STARTED_STATES = [
+    "new", "pending", "assigned", "accepted", "ready", "preparing", "starting",
+]
+
+
+@pytest.mark.parametrize("never_started_state", NEVER_STARTED_STATES)
 @pytest.mark.parametrize("retain_terminal_predecessor", [False, True])
-def test_converged_rollout_ignores_a_never_started_assigned_predecessor(
-    monkeypatch, retain_terminal_predecessor,
+def test_rollout_ignores_a_never_started_predecessor_in_both_proofs(
+    monkeypatch, retain_terminal_predecessor, never_started_state,
 ):
+    # A withdrawn task frozen at a Status.State below RUNNING never started a
+    # backend, so it withdrew nothing. The deploy gate must drop it from the
+    # slot's history for both the strict converged proof and the lenient
+    # baseline proof, whether or not Swarm also retained the real terminal
+    # predecessor behind it. The ghost sits on a Ready eligible node, so neither
+    # the Rejected nor the stranded-node leniencies would rescue it alone: the
+    # never-started filter is the only path that clears the strict check.
     rows, runtimes = _healed_baseline_rows()
-    rows[1].update(ID="assigned1", CurrentState="Assigned 12 hours ago")
+    rows[1].update(
+        ID="never1",
+        CurrentState=f"{never_started_state.capitalize()} 12 hours ago",
+    )
     if retain_terminal_predecessor:
         rows.insert(2, dict(rows[1], ID="old1", CurrentState="Shutdown 1m"))
     _wire_verify_tasks(monkeypatch, rows, runtimes)
     task_state = rollout_tasks._task_state
     monkeypatch.setattr(rollout_tasks, "_task_state", lambda task: (
-        ("shutdown", "assigned") if task == "assigned1" else task_state(task)
+        ("shutdown", never_started_state) if task == "never1"
+        else task_state(task)
     ))
 
-    proof = rollout_tasks._verify_tasks(
-        "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES),
-    )
+    for converged in (True, False):
+        proof = rollout_tasks._verify_tasks(
+            "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES),
+            converged=converged,
+        )
+        assert proof["tasks"] == sorted(f"task{slot}" for slot in SLOTS)
+        assert proof["instances"] == sorted(f"container{slot}" for slot in SLOTS)
+        assert len(proof["nodes"]) == rollout_policy.REPLICAS
+        assert set(proof["nodes"]) <= ELIGIBLE_NODES
 
-    assert proof["tasks"] == sorted(f"task{slot}" for slot in SLOTS)
-    assert proof["instances"] == sorted(f"container{slot}" for slot in SLOTS)
-    assert len(proof["nodes"]) == rollout_policy.REPLICAS and set(proof["nodes"]) <= ELIGIBLE_NODES
+
+@pytest.mark.parametrize("ghost_state", ["running", "failed", "rejected", "orphaned"])
+def test_converged_rollout_does_not_excuse_a_started_or_terminal_ghost_predecessor(
+    monkeypatch, ghost_state,
+):
+    # A withdrawn row whose Status.State reached RUNNING, died terminally
+    # (failed/rejected), or was orphaned (which may have started a backend) is
+    # not a never-started ghost: the converged proof must still reach the strict
+    # predecessor-state check and reject it. This guards the never-started
+    # filter against widening past RUNNING into terminal/orphaned states; the
+    # baseline down-node leniencies are exercised by the tests below.
+    rows, runtimes = _healed_baseline_rows()
+    _wire_verify_tasks(monkeypatch, rows, runtimes)
+    task_state = rollout_tasks._task_state
+    monkeypatch.setattr(rollout_tasks, "_task_state", lambda task: (
+        ("shutdown", ghost_state) if task == "ghost1"
+        else task_state(task)
+    ))
+    with pytest.raises(RuntimeError, match="contradicts the start-first rollout"):
+        rollout_tasks._verify_tasks(
+            "crawl4ai", BASELINE, "baseline", (ELIGIBLE_NODES, ELIGIBLE_NODES),
+        )
 
 
 def test_baseline_tolerates_a_ghost_predecessor_on_a_down_node(monkeypatch):
