@@ -427,23 +427,33 @@ def _cc_cfg(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_urls_midstream_error_returns_partial_and_leaves_no_cache(tmp_path):
-    failing = _FakeStreamResponse(_cc_records(CC_URLS), raise_after=2)
+@pytest.mark.parametrize("raise_after", [0, 2])
+async def test_urls_midstream_or_zero_yield_error_raises_and_leaves_no_cache(
+        tmp_path, raise_after):
+    failing = _FakeStreamResponse(_cc_records(CC_URLS), raise_after=raise_after)
     seeder = _make_seeder(tmp_path, [failing, _ok_response()])
     path = _cc_cache_path(seeder)
-    tmp = path.with_suffix(path.suffix + ".tmp")
 
-    cfg = _cc_cfg()
-    results = await seeder.urls(DOMAIN, cfg)
-    returned = sorted(r["url"] for r in results)
-    assert returned == sorted(CC_URLS[:2]), "user silently got a truncated set"
-    assert len(returned) == 2 < len(CC_URLS)
+    with pytest.raises(httpx.ReadError):
+        await seeder.urls(DOMAIN, _cc_cfg())
     assert not path.exists(), "urls() left a truncated cache after mid-stream error"
-    assert not tmp.exists()
 
     # Second call with the default force=False refetches (no cache present).
-    cfg2 = _cc_cfg()
-    results2 = await seeder.urls(DOMAIN, cfg2)
+    results2 = await seeder.urls(DOMAIN, _cc_cfg())
+    assert sorted(r["url"] for r in results2) == sorted(CC_URLS), "second call did not refetch the full set"
+    assert path.read_text().splitlines() == CC_URLS
+
+
+@pytest.mark.asyncio
+async def test_urls_non_503_status_raises_through_urls(tmp_path):
+    seeder = _make_seeder(tmp_path, [_status_response(404), _ok_response()])
+    path = _cc_cache_path(seeder)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await seeder.urls(DOMAIN, _cc_cfg())
+    assert not path.exists(), "urls() left a cache after a non-503 HTTP failure"
+
+    results2 = await seeder.urls(DOMAIN, _cc_cfg())
     assert sorted(r["url"] for r in results2) == sorted(CC_URLS), "second call did not refetch the full set"
     assert path.read_text().splitlines() == CC_URLS
 
