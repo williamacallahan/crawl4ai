@@ -1395,8 +1395,9 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
             result["top_level_structure"] = _get_top_level_structure(html_content)
             return result
 
-        # Analyze field coverage
-        all_fields = schema.get("fields", [])
+        # Analyze field coverage — include baseFields because extract() merges
+        # them into every extracted item alongside schema["fields"].
+        all_fields = schema.get("fields", []) + schema.get("baseFields", [])
         field_names = [f["name"] for f in all_fields]
         result["total_fields"] = len(field_names)
 
@@ -1437,7 +1438,9 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
 
         # Check for missing expected fields (strict mode)
         if expected_fields:
-            schema_field_names = {f["name"] for f in schema.get("fields", [])}
+            schema_field_names = {f["name"] for f in schema.get("fields", [])} | {
+                f["name"] for f in schema.get("baseFields", [])
+            }
             missing = [f for f in expected_fields if f not in schema_field_names]
             if missing:
                 result["issues"].append(
@@ -1446,8 +1449,9 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
 
         # Success criteria
         if expected_fields:
-            # Strict: all expected fields must exist in schema AND be populated
-            schema_field_names = {f["name"] for f in schema.get("fields", [])}
+            # Strict: all expected fields must be populated.
+            # (populated_names is derived from fields + baseFields, so
+            # membership implies the field exists in the schema.)
             populated_names = {
                 fd["name"] for fd in result["field_details"] if fd["populated_count"] > 0
             }
