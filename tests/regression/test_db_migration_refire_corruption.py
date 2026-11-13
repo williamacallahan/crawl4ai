@@ -350,17 +350,13 @@ async def test_migration_rerun_with_missing_content_files_does_not_corrupt(
     cached = await mgr.aget_cached_url(url)
     assert cached is not None and cached.html == original_html
 
-    # Persist the migration provenance while the backing file is available.
-    # A later rerun can then distinguish this pointer from raw legacy text even
-    # after the file and marker disappear.
-    await run_migration(mgr.db_path)
-
-    # Simulate the failure mode: the DB persists but the content file is lost.
+    # Production failure mode: DB persists, content file + marker lost. Do NOT
+    # seed the ledger with an intermediate run -- that was the masking step the
+    # bug-report called out. ``acache_url`` already records provenance.
     os.remove(html_file_before)
     assert not os.path.exists(html_file_before)
 
-    # Remove the marker so the one-time migration re-fires (e.g. operator
-    # restored only crawl4ai.db, or the marker lived on ephemeral storage).
+    # Remove the marker so the one-time migration re-fires.
     os.remove(mgr.version_manager.migration_marker)
     assert mgr.version_manager.needs_migration() is True
 
@@ -377,8 +373,7 @@ async def test_migration_rerun_with_missing_content_files_does_not_corrupt(
     )
 
     # 2. No (hash-of-hash) backing file must have been written with the old
-    #    hash string as its body -- the only sound recovery for a missing file
-    #    is a cache miss, not a rewritten pointer.
+    #    hash string as its body -- the only sound recovery is a cache miss.
     assert not os.path.exists(
         os.path.join(mgr.content_paths["html"], hash_after)
     ), "a backing file was (re)created for an intact pointer; the migration re-hashed the hash string"
@@ -388,12 +383,10 @@ async def test_migration_rerun_with_missing_content_files_does_not_corrupt(
     cached_after = await mgr.aget_cached_url(url)
     assert cached_after is None, (
         f"cache returned {getattr(cached_after, 'html', cached_after)!r} "
-        f"instead of a self-healing miss; the hash string was served as page content"
+        f"instead of a self-healing miss"
     )
 
-    # 4. Re-crawling restores a healthy row: acache_url overwrites the
-    #    (unchanged) pointer with a fresh hash-backed file and reads back the
-    #    original content -- confirming the self-heal completes end-to-end.
+    # 4. Re-crawling restores a healthy row (self-heal completes end-to-end).
     await mgr.acache_url(_result(url, html=original_html))
     cached_healed = await mgr.aget_cached_url(url)
     assert cached_healed is not None
@@ -414,16 +407,14 @@ async def test_migration_rerun_with_missing_content_files_does_not_corrupt(
 async def test_migration_rerun_missing_file_leaves_each_content_column_intact(
     tmp_path, monkeypatch, column, read_key
 ):
-    """G5: every content column's hash pointer is left intact when its file is missing.
+    """G5: each content column's hash pointer is left intact when its file is missing.
 
-    The destructive re-hash failure mode is not specific to the ``html`` column:
-    ``migrate_database`` calls ``_store_content`` for all five content columns
-    (html, cleaned_html, markdown, extracted_content, screenshot). For each
-    column this test builds a pre-migrated row whose target column holds a real
-    16-hex hash pointer backed by a content file, deletes that file, removes the
-    marker so the one-time migration re-fires, re-runs ``run_migration``, and
-    asserts: the column pointer is unchanged (no hash-of-hash), no new backing
-    file was (re)created, and ``aget_cached_url`` self-heals as a cache miss.
+    The destructive re-hash failure mode is not specific to the ``html`` column.
+    For each column this test builds a pre-migrated row whose target column
+    holds a real 16-hex hash pointer backed by a content file, deletes that
+    file (without seeding the ledger), removes the marker, re-runs
+    ``run_migration``, and asserts: pointer unchanged, no new backing file,
+    ``aget_cached_url`` self-heals as a cache miss (fix 1: shape classification).
     """
     _set_version(monkeypatch, "0.9.3")
     mgr = _new_manager(tmp_path)
@@ -439,13 +430,8 @@ async def test_migration_rerun_missing_file_leaves_each_content_column_intact(
     backing = os.path.join(mgr.content_paths[read_key], h)
     with open(backing, "w") as f:
         f.write(sample)
-    fields = {
-        "html": "",
-        "cleaned_html": "",
-        "markdown": "",
-        "extracted_content": "",
-        "screenshot": "",
-    }
+    fields = {"html": "", "cleaned_html": "", "markdown": "",
+              "extracted_content": "", "screenshot": ""}
     fields[column] = h
     await _insert_raw_blob_row(mgr, url, **fields)
     assert (await _db_column(mgr, url, column)) == h
@@ -455,11 +441,9 @@ async def test_migration_rerun_missing_file_leaves_each_content_column_intact(
         f"{column}: expected a cache HIT before deleting the backing file"
     )
 
-    # Persist provenance while the backing file is still available so the
-    # rerun can distinguish this pointer from raw legacy text.
-    await run_migration(mgr.db_path)
-
-    # The failure mode: DB persists, the backing file + the marker are lost.
+    # Failure mode: DB persists, backing file + marker lost. No ledger seeding
+    # (the masking step): this re-migration reaches ``known=False``, so passing
+    # requires shape-based classification (fix 1), not the ledger.
     os.remove(backing)
     os.remove(mgr.version_manager.migration_marker)
     assert mgr.version_manager.needs_migration() is True
@@ -472,15 +456,13 @@ async def test_migration_rerun_missing_file_leaves_each_content_column_intact(
         f"{column}: pointer was re-hashed {h} -> {after} when its backing "
         f"file was missing"
     )
-    # 2. No backing file was (re)created for the intact pointer (the only sound
-    #    recovery for a missing file is a cache miss, not a rewritten pointer).
+    # 2. No backing file was (re)created for the intact pointer.
     assert not os.path.exists(backing), (
         f"{column}: a backing file was recreated at the (unchanged) pointer path"
     )
     # 3. The cache self-heals as a MISS, not a HIT serving the hash string.
     assert await mgr.aget_cached_url(url) is None, (
-        f"{column}: cache served content instead of a self-healing miss after "
-        f"the migration re-fired with the backing file missing"
+        f"{column}: cache served content instead of a self-healing miss"
     )
 
 
@@ -520,31 +502,49 @@ async def test_is_content_hash_guard():
 
 
 @pytest.mark.asyncio
-async def test_migration_hashes_raw_16_hex_legacy_content(tmp_path, monkeypatch):
-    """Raw legacy text with hash-shaped content must not become a pointer."""
+async def test_migration_treats_raw_16_hex_legacy_as_pointer_self_heal_miss(
+    tmp_path, monkeypatch
+):
+    """Raw legacy 16-hex text is treated as a pointer (self-healing cache miss).
+
+    A 16-hex value is indistinguishable from a stored content-hash pointer, so
+    ``migrate_database`` trusts shape-based classification and leaves it intact
+    rather than force-rehashing it. The only alternative (force-hash unledgered
+    16-hex values) is exactly what corrupts runtime-cached pointers with missing
+    backing files. The sound recovery is a self-healing cache miss on read.
+    """
     _set_version(monkeypatch, "0.9.3")
     mgr = _new_manager(tmp_path)
     await mgr.initialize()
     mgr._initialized = True
     url = "https://e.com/raw-hex"
     raw = "0123456789abcdef"
-    await _insert_raw_blob_row(
-        mgr,
-        url,
-        html=raw,
-        cleaned_html="",
-        markdown="",
-        extracted_content="",
-        screenshot="",
-    )
+    await _insert_raw_blob_row(mgr, url, html=raw, cleaned_html="", markdown="",
+                              extracted_content="", screenshot="")
 
     await run_migration(mgr.db_path)
 
+    # 1. The 16-hex value is left intact (treated as a pointer), NOT re-hashed
+    #    into a hash-of-hash pointer.
     stored = await _db_column(mgr, url, "html")
-    assert stored == generate_content_hash(raw)
-    assert stored != raw
-    cached = await mgr.aget_cached_url(url)
-    assert cached is not None and cached.html == raw
+    assert stored == raw, (
+        f"raw 16-hex value re-hashed to {stored!r}; force-hashing unledgered "
+        f"16-hex values corrupts runtime-cached pointers with missing files"
+    )
+    assert stored != generate_content_hash(raw)
+    # 2. No backing file was (re)created for the untouched pointer.
+    assert not os.path.exists(os.path.join(mgr.content_paths["html"], raw))
+    assert not os.path.exists(
+        os.path.join(mgr.content_paths["html"], generate_content_hash(raw)))
+    # 3. No backing file -> self-healing MISS, not a HIT serving the raw value.
+    assert await mgr.aget_cached_url(url) is None, (
+        "16-hex value served as page content instead of a self-healing miss"
+    )
+    # 4. Re-crawling restores a healthy row (self-heal completes end-to-end).
+    await mgr.acache_url(_result(url, html=raw))
+    cached_healed = await mgr.aget_cached_url(url)
+    assert cached_healed is not None
+    assert cached_healed.html == raw
 
 
 # ---------------------------------------------------------------------------
