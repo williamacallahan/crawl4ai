@@ -326,13 +326,20 @@ class RobotsParser:
             )
             result = cursor.fetchone()
             
-            # Only update if hash changed or no previous entry
+            # Only update content if hash changed or no previous entry;
+            # otherwise just refresh fetch_time so the TTL window is re-armed
+            # after a successful refetch of unchanged robots.txt.
             if not result or result[0] != hash_val:
                 conn.execute(
-                    """INSERT OR REPLACE INTO robots_cache 
-                       (domain, rules, fetch_time, hash) 
+                    """INSERT OR REPLACE INTO robots_cache
+                       (domain, rules, fetch_time, hash)
                        VALUES (?, ?, ?, ?)""",
                     (domain, content, int(time.time()), hash_val)
+                )
+            else:
+                conn.execute(
+                    "UPDATE robots_cache SET fetch_time = ? WHERE domain = ?",
+                    (int(time.time()), domain)
                 )
 
     async def can_fetch(self, url: str, user_agent: str = "*") -> bool:
