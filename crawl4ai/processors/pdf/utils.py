@@ -5,8 +5,8 @@ def apply_png_predictor(data, width, bits, color_channels):
     bytes_per_pixel = (bits * color_channels) // 8
     if (bits * color_channels) % 8 != 0:
         bytes_per_pixel += 1
-        
-    stride = width * bytes_per_pixel
+
+    stride = (width * bits * color_channels + 7) // 8
     scanline_length = stride + 1  # +1 for filter byte
     
     if len(data) % scanline_length != 0:
