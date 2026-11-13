@@ -138,6 +138,43 @@ class TestSerializationParity:
         assert set(cr.model_dump(include={"markdown"}).keys()) == {"markdown"}
 
 
+class TestSequenceSpecIncludeExclude:
+    """Regression for the crash from commit ``ffa868b8``: the ``_whole``
+    helper in ``_serialize_markdown`` indexed ``spec["markdown"]`` for any
+    non-set spec whose membership check passed, so a list/tuple ``exclude``
+    naming ``markdown`` raised ``TypeError`` (wrapped as
+    ``PydanticSerializationError``), aborting the entire
+    ``model_dump``/``model_dump_json``. Pre-``ffa868b8`` (commit
+    ``2e9c1743``) treated list/tuple specs as whole-field exclusion, matching
+    pydantic's own field semantics; these tests pin that restored behavior.
+    Pydantic's runtime honors sequence specs even though its ``IncEx`` type
+    alias only declares set/Mapping forms."""
+
+    def test_model_dump_exclude_list_drops_markdown(self):
+        """``model_dump(exclude=["markdown"])`` omits ``markdown`` (was a crash)."""
+        cr = _result(md=_md())
+        out = cr.model_dump(exclude=["markdown"])
+        assert "markdown" not in out and out.get("url") and out.get("html")
+
+    def test_model_dump_exclude_tuple_drops_markdown(self):
+        """``model_dump(exclude=("markdown",))`` omits ``markdown`` (was a crash)."""
+        cr = _result(md=_md())
+        out = cr.model_dump(exclude=("markdown",))
+        assert "markdown" not in out and out.get("url") and out.get("html")
+
+    def test_model_dump_json_exclude_list_drops_markdown(self):
+        """``model_dump_json(exclude=["markdown"])`` omits ``markdown`` (was a crash)."""
+        cr = _result(md=_md())
+        out = json.loads(cr.model_dump_json(exclude=["markdown"]))
+        assert "markdown" not in out and out.get("url")
+
+    def test_model_dump_exclude_list_other_field_keeps_markdown(self):
+        """A list exclude NOT naming ``markdown`` keeps it and drops only the named field."""
+        cr = _result(md=_md())
+        out = cr.model_dump(exclude=["url"])
+        assert "url" not in out and "markdown" in out
+
+
 class TestNestedDictIncludeExclude:
     """Pydantic v2's ``include``/``exclude`` accept a dict-valued nested
     spec (``{'markdown': {'fit_markdown'}}``) to select sub-fields of a
