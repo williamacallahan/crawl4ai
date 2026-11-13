@@ -95,7 +95,7 @@ class TerminalUI:
                             self.monitor.is_running = False
                             break
 
-                    time.sleep(self.refresh_rate)
+                    self.stop_event.wait(self.refresh_rate)
 
                     # Just check if the monitor was stopped
                     if not self.monitor.is_running:
@@ -121,7 +121,7 @@ class TerminalUI:
                         self.monitor.is_running = False
                         break
 
-                time.sleep(self.refresh_rate)
+                self.stop_event.wait(self.refresh_rate)
 
                 if not self.monitor.is_running:
                     break
@@ -464,10 +464,9 @@ class CrawlerMonitor:
         with self._lock:
             self.end_time = time.time()
             self.is_running = False
-            
-            # Stop the terminal UI
-            if self.enable_ui and self.terminal_ui:
-                self.terminal_ui.stop()
+
+        if self.enable_ui and self.terminal_ui:
+            self.terminal_ui.stop()
     
     def add_task(self, task_id: str, url: str):
         """
