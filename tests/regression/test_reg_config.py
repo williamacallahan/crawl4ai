@@ -51,10 +51,10 @@ class TestBrowserConfigDefaults:
         assert cfg.browser_type == "chromium"
 
     def test_viewport_defaults(self):
-        """Default viewport should be 1080x600."""
+        """Default viewport should be 1440x900."""
         cfg = BrowserConfig()
-        assert cfg.viewport_width == 1080
-        assert cfg.viewport_height == 600
+        assert cfg.viewport_width == 1440
+        assert cfg.viewport_height == 900
 
     def test_javascript_enabled_default(self):
         """JavaScript should be enabled by default."""
@@ -200,7 +200,7 @@ class TestBrowserConfigClassDefaults:
             assert len(defaults) == 0
             cfg = BrowserConfig()
             assert cfg.headless is True
-            assert cfg.viewport_width == 1080
+            assert cfg.viewport_width == 1440
         finally:
             BrowserConfig.reset_defaults()
 

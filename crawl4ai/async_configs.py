@@ -427,11 +427,11 @@ def _bounded_viewport(params: dict) -> None:
         if not isinstance(viewport, dict):
             raise UntrustedConfigError("field 'viewport' on BrowserConfig must be an object")
         viewport = {key: value for key, value in viewport.items() if key in {"width", "height"}}
-        width = viewport.get("width", params.get("viewport_width", 1080))
-        height = viewport.get("height", params.get("viewport_height", 600))
+        width = viewport.get("width", params.get("viewport_width", 1440))
+        height = viewport.get("height", params.get("viewport_height", 900))
     else:
-        width = params.get("viewport_width", 1080)
-        height = params.get("viewport_height", 600)
+        width = params.get("viewport_width", 1440)
+        height = params.get("viewport_height", 900)
 
     width = _bounded_number(
         "BrowserConfig", "viewport_width", width,
@@ -1072,8 +1072,8 @@ class BrowserConfig:
                              Default: None.
         proxy_config (ProxyConfig or dict or None): Detailed proxy configuration, e.g. {"server": "...", "username": "..."}.
                                      If None, no additional proxy config. Default: None.
-        viewport_width (int): Default viewport width for pages. Default: 1080.
-        viewport_height (int): Default viewport height for pages. Default: 600.
+        viewport_width (int): Default viewport width for pages. Default: 1440.
+        viewport_height (int): Default viewport height for pages. Default: 900.
         viewport (dict): Default viewport dimensions for pages. If set, overrides viewport_width and viewport_height.
                          Default: None.
         device_scale_factor (float): The device pixel ratio used for rendering pages. Controls how many
@@ -1145,8 +1145,8 @@ class BrowserConfig:
         channel: str = "chromium",
         proxy: str = None,
         proxy_config: Union[ProxyConfig, dict, None] = None,
-        viewport_width: int = 1080,
-        viewport_height: int = 600,
+        viewport_width: int = 1440,
+        viewport_height: int = 900,
         viewport: dict = None,
         device_scale_factor: float = 1.0,
         accept_downloads: bool = False,

@@ -92,7 +92,7 @@ class TestDefaultInjection:
         assert cfg.headless is False
         # Other params keep their hardcoded defaults
         assert cfg.browser_type == "chromium"
-        assert cfg.viewport_width == 1080
+        assert cfg.viewport_width == 1440
 
     def test_multiple_instances_get_defaults(self):
         BrowserConfig.set_defaults(headless=False)

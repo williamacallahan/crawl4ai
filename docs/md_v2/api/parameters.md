@@ -26,8 +26,8 @@ browser_cfg = BrowserConfig(
 | **`cdp_url`**         | `str` (default: `None`)                | Chrome DevTools Protocol endpoint URL (e.g., `"ws://localhost:9222/devtools/browser/"`). Set automatically based on `browser_mode`.   |
 | **`debugging_port`**  | `int` (default: `9222`)                | Port for browser debugging protocol.                                                                                                   |
 | **`host`**            | `str` (default: `"localhost"`)         | Host for browser connection.                                                                                                           |
-| **`viewport_width`**  | `int` (default: `1080`)                | Initial page width (in px). Useful for testing responsive layouts.                                                                    |
-| **`viewport_height`** | `int` (default: `600`)                 | Initial page height (in px).                                                                                                          |
+| **`viewport_width`**  | `int` (default: `1440`)                | Initial page width (in px). Useful for testing responsive layouts.                                                                    |
+| **`viewport_height`** | `int` (default: `900`)                 | Initial page height (in px).                                                                                                          |
 | **`viewport`**        | `dict` (default: `None`)               | Viewport dimensions dict. If set, overrides `viewport_width` and `viewport_height`.                                                   |
 | **`device_scale_factor`** | `float` (default: `1.0`)           | Device pixel ratio for rendering. Use `2.0` for Retina-quality screenshots. Higher values produce larger images and use more memory.  |
 | **`proxy`**           | `str` (deprecated)                      | Deprecated. Use `proxy_config` instead. If set, it will be auto-converted internally. |

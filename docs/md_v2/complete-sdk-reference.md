@@ -1718,8 +1718,8 @@ browser_cfg = BrowserConfig(
 |-----------------------|----------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------|
 | **`browser_type`**    | `"chromium"`, `"firefox"`, `"webkit"`<br/>*(default: `"chromium"`)* | Which browser engine to use. `"chromium"` is typical for many sites, `"firefox"` or `"webkit"` for specialized tests.                 |
 | **`headless`**        | `bool` (default: `True`)               | Headless means no visible UI. `False` is handy for debugging.                                                                         |
-| **`viewport_width`**  | `int` (default: `1080`)                | Initial page width (in px). Useful for testing responsive layouts.                                                                    |
-| **`viewport_height`** | `int` (default: `600`)                 | Initial page height (in px).                                                                                                          |
+| **`viewport_width`**  | `int` (default: `1440`)                | Initial page width (in px). Useful for testing responsive layouts.                                                                    |
+| **`viewport_height`** | `int` (default: `900`)                 | Initial page height (in px).                                                                                                          |
 | **`proxy`**           | `str` (deprecated)                      | Deprecated. Use `proxy_config` instead. If set, it will be auto-converted internally. |
 | **`proxy_config`**    | `dict` (default: `None`)               | For advanced or multi-proxy needs, specify details like `{"server": "...", "username": "...", ...}`.                                  |
 | **`use_persistent_context`** | `bool` (default: `False`)       | If `True`, uses a **persistent** browser context (keep cookies, sessions across runs). Also sets `use_managed_browser=True`.          |
