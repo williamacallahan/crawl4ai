@@ -9,6 +9,7 @@ from crawl4ai import BrowserConfig
 from crawl4ai.async_configs import Provenance
 
 import api
+from crawl4ai.async_configs import UntrustedConfigError
 from utils import load_config
 
 
@@ -49,12 +50,24 @@ def test_a_requested_viewport_and_user_agent_are_kept():
     )
 
 
-def test_a_requested_viewport_object_wins_over_the_server_dimensions():
-    loaded, _ = _load(
+def test_a_partial_viewport_object_takes_the_missing_dimension_from_the_server():
+    loaded, shipped = _load(
         {"type": "BrowserConfig", "params": {"viewport": {"type": "dict", "value": {"width": 1024}}}}
     )
 
-    assert loaded.viewport_width == 1024
+    assert (loaded.viewport_width, loaded.viewport_height) == (1024, shipped["viewport_height"])
+
+
+@pytest.mark.parametrize("params", [[], None, "headless"])
+def test_a_malformed_envelope_is_still_rejected(params):
+    with pytest.raises(UntrustedConfigError):
+        _load({"type": "BrowserConfig", "params": params})
+
+
+def test_an_envelope_type_beside_bare_fields_keeps_them():
+    loaded, _ = _load({"type": "BrowserConfig", "headless": False})
+
+    assert loaded.headless is False
 
 
 def test_a_random_user_agent_request_is_left_to_its_generator():

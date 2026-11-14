@@ -263,17 +263,6 @@ def _apply_server_browser_policy(browser_config, config):
     return browser_config
 
 
-def _wire_params(request_config, type_name):
-    """The fields a wire config names, from its typed envelope or bare kwargs."""
-    request_config = request_config or {}
-    params = (
-        request_config.get("params", {})
-        if request_config.get("type") == type_name
-        else request_config
-    )
-    return params if isinstance(params, dict) else {}
-
-
 def with_server_browser_defaults(request_config, config):
     """Name the server's viewport and user agent where a wire browser config omits them.
 
@@ -283,22 +272,33 @@ def with_server_browser_defaults(request_config, config):
     its client hints from the user agent when it is constructed.
     """
     browser_defaults = config["crawler"]["browser"].get("kwargs", {})
-    requested = _wire_params(request_config, "BrowserConfig")
+    request_config = request_config or {}
+    typed = request_config.get("type") == "BrowserConfig"
+    requested = request_config.get("params") if typed else request_config
+    # A malformed envelope, or one of another type, goes to the loader as sent so
+    # it is rejected or read exactly as before.
+    if not isinstance(requested, dict) or (not typed and "type" in requested):
+        return request_config
     filled = dict(requested)
-    if "viewport" not in filled:
-        for field in ("viewport_width", "viewport_height"):
-            if field in browser_defaults:
-                filled.setdefault(field, browser_defaults[field])
+    # A viewport object missing a dimension takes it from these fields.
+    for field in ("viewport_width", "viewport_height"):
+        if field in browser_defaults:
+            filled.setdefault(field, browser_defaults[field])
     if "user_agent" in browser_defaults and not filled.keys() & {"user_agent", "user_agent_mode"}:
         filled["user_agent"] = browser_defaults["user_agent"]
-    if (request_config or {}).get("type") == "BrowserConfig":
-        return {**request_config, "params": filled}
-    return filled
+    return {**request_config, "params": filled} if typed else filled
 
 
 def apply_server_crawler_defaults(loaded_config, request_config, config):
     """Apply server defaults only when the wire request omitted the field."""
-    request_params = _wire_params(request_config, "CrawlerRunConfig")
+    request_config = request_config or {}
+    request_params = (
+        request_config.get("params", {})
+        if request_config.get("type") == "CrawlerRunConfig"
+        else request_config
+    )
+    if not isinstance(request_params, dict):
+        request_params = {}
     for key, value in config["crawler"]["base_config"].items():
         if key not in request_params and hasattr(loaded_config, key):
             setattr(loaded_config, key, value)

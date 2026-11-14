@@ -2122,7 +2122,6 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             dimensions = await self.get_page_dimensions(page)
             layout_width = (original_viewport or {}).get("width") or self.browser_config.viewport_width
             page_width = min(dimensions["width"], layout_width)
-            page_height = min(dimensions["height"], _MAX_RENDER_PIXELS // page_width)
 
             # Freeze element dimensions before viewport change to prevent
             # responsive CSS from rescaling images (fixes Elementor distortion)
@@ -2136,6 +2135,14 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     }
                 });
             """)
+
+            # Captures come back in device pixels, so the budget divides by the
+            # device pixel ratio squared as well as the CSS width.
+            pixel_ratio = await page.evaluate("window.devicePixelRatio") or 1
+            page_height = min(
+                dimensions["height"],
+                int(_MAX_RENDER_PIXELS // (page_width * pixel_ratio * pixel_ratio)),
+            )
 
             # Set a large viewport
             large_viewport_height = min(

@@ -28,24 +28,26 @@ def _strategy(page_width, page_height):
     return strategy
 
 
-def _page(width, height):
-    """A page whose screenshots are the size of its current viewport."""
+def _page(width, height, pixel_ratio=None):
+    """A page whose screenshots are its current viewport in device pixels."""
     page = MagicMock()
     page.viewport_size = {"width": width, "height": height}
+    scale = pixel_ratio or 1
 
     async def resize(size):
         page.viewport_size = dict(size)
 
     async def screenshot(**_kwargs):
         buffer = BytesIO()
-        Image.new("RGB", (page.viewport_size["width"], page.viewport_size["height"])).save(
-            buffer, format="JPEG"
-        )
+        size = (page.viewport_size["width"] * scale, page.viewport_size["height"] * scale)
+        Image.new("RGB", size).save(buffer, format="JPEG")
         return buffer.getvalue()
 
     page.set_viewport_size = AsyncMock(side_effect=resize)
     page.screenshot = AsyncMock(side_effect=screenshot)
-    page.evaluate = AsyncMock(return_value=None)
+    page.evaluate = AsyncMock(
+        side_effect=lambda script: pixel_ratio if script == "window.devicePixelRatio" else None
+    )
     return page
 
 
@@ -62,6 +64,19 @@ async def test_full_page_capture_keeps_the_layout_width_and_the_pixel_budget():
     assert image.height == _MAX_RENDER_PIXELS // 1280
     assert max(call.args[0]["width"] for call in page.set_viewport_size.call_args_list) == 1280
     assert page.viewport_size == {"width": 1280, "height": 800}
+
+
+@pytest.mark.asyncio
+async def test_a_high_density_capture_counts_device_pixels_against_the_budget():
+    page = _page(1440, 900, pixel_ratio=2)
+    strategy = _strategy(page_width=1440, page_height=50_000)
+
+    with patch("crawl4ai.async_crawler_strategy.asyncio.sleep", new_callable=AsyncMock):
+        encoded = await strategy.take_screenshot_scroller(page, screenshot_height_threshold=4000)
+
+    image = Image.open(BytesIO(base64.b64decode(encoded)))
+    assert image.width == 2880
+    assert image.width * image.height <= _MAX_RENDER_PIXELS
 
 
 @pytest.mark.asyncio
