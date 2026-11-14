@@ -313,8 +313,8 @@ class BrowserConfig:
                              Default: None.
         proxy_config (ProxyConfig or dict or None): Detailed proxy configuration, e.g. {"server": "...", "username": "..."}.
                                      If None, no additional proxy config. Default: None.
-        viewport_width (int): Default viewport width for pages. Default: 1080.
-        viewport_height (int): Default viewport height for pages. Default: 600.
+        viewport_width (int): Default viewport width for pages. Default: 1440.
+        viewport_height (int): Default viewport height for pages. Default: 900.
         viewport (dict): Default viewport dimensions for pages. If set, overrides viewport_width and viewport_height.
                          Default: None.
         verbose (bool): Enable verbose logging.
@@ -358,8 +358,8 @@ class BrowserConfig:
         channel: str = "chromium",
         proxy: str = None,
         proxy_config: Union[ProxyConfig, dict, None] = None,
-        viewport_width: int = 1080,
-        viewport_height: int = 600,
+        viewport_width: int = 1440,
+        viewport_height: int = 900,
         viewport: dict = None,
         accept_downloads: bool = False,
         downloads_path: str = None,
@@ -404,8 +404,8 @@ class BrowserConfig:
         self.viewport_height = viewport_height
         self.viewport = viewport
         if self.viewport is not None:
-            self.viewport_width = self.viewport.get("width", 1080)
-            self.viewport_height = self.viewport.get("height", 600)
+            self.viewport_width = self.viewport.get("width", 1440)
+            self.viewport_height = self.viewport.get("height", 900)
         self.accept_downloads = accept_downloads
         self.downloads_path = downloads_path
         self.storage_state = storage_state
@@ -469,8 +469,8 @@ class BrowserConfig:
             channel=kwargs.get("channel", "chromium"),
             proxy=kwargs.get("proxy"),
             proxy_config=kwargs.get("proxy_config", None),
-            viewport_width=kwargs.get("viewport_width", 1080),
-            viewport_height=kwargs.get("viewport_height", 600),
+            viewport_width=kwargs.get("viewport_width", 1440),
+            viewport_height=kwargs.get("viewport_height", 900),
             accept_downloads=kwargs.get("accept_downloads", False),
             downloads_path=kwargs.get("downloads_path"),
             storage_state=kwargs.get("storage_state"),
