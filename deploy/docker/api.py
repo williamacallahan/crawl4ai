@@ -263,16 +263,42 @@ def _apply_server_browser_policy(browser_config, config):
     return browser_config
 
 
-def apply_server_crawler_defaults(loaded_config, request_config, config):
-    """Apply server defaults only when the wire request omitted the field."""
+def _wire_params(request_config, type_name):
+    """The fields a wire config names, from its typed envelope or bare kwargs."""
     request_config = request_config or {}
-    request_params = (
+    params = (
         request_config.get("params", {})
-        if request_config.get("type") == "CrawlerRunConfig"
+        if request_config.get("type") == type_name
         else request_config
     )
-    if not isinstance(request_params, dict):
-        request_params = {}
+    return params if isinstance(params, dict) else {}
+
+
+def with_server_browser_defaults(request_config, config):
+    """Name the server's viewport and user agent where a wire browser config omits them.
+
+    Without them a caller renders at the SDK's 1080x600 and sends its Chrome 116
+    user agent, which contradicts the Chrome 156 client hints the browser reports.
+    The defaults join the wire params before load because BrowserConfig derives
+    its client hints from the user agent when it is constructed.
+    """
+    browser_defaults = config["crawler"]["browser"].get("kwargs", {})
+    requested = _wire_params(request_config, "BrowserConfig")
+    filled = dict(requested)
+    if "viewport" not in filled:
+        for field in ("viewport_width", "viewport_height"):
+            if field in browser_defaults:
+                filled.setdefault(field, browser_defaults[field])
+    if "user_agent" in browser_defaults and not filled.keys() & {"user_agent", "user_agent_mode"}:
+        filled["user_agent"] = browser_defaults["user_agent"]
+    if (request_config or {}).get("type") == "BrowserConfig":
+        return {**request_config, "params": filled}
+    return filled
+
+
+def apply_server_crawler_defaults(loaded_config, request_config, config):
+    """Apply server defaults only when the wire request omitted the field."""
+    request_params = _wire_params(request_config, "CrawlerRunConfig")
     for key, value in config["crawler"]["base_config"].items():
         if key not in request_params and hasattr(loaded_config, key):
             setattr(loaded_config, key, value)
@@ -1544,7 +1570,7 @@ async def handle_crawl_request(
     try:
         urls = await _normalize_and_validate_seeds(urls)
         loaded_browser_config = BrowserConfig.load(
-            browser_config,
+            with_server_browser_defaults(browser_config, config),
             provenance=Provenance.UNTRUSTED,
         )
         _apply_server_browser_policy(loaded_browser_config, config)
@@ -1795,7 +1821,7 @@ async def handle_stream_crawl_request(
         # this, leaving /crawl/stream (and /crawl with stream=true) unguarded.
         urls = await _normalize_and_validate_seeds(urls)
         loaded_browser_config = BrowserConfig.load(
-            browser_config,
+            with_server_browser_defaults(browser_config, config),
             provenance=Provenance.UNTRUSTED,
         )
         _apply_server_browser_policy(loaded_browser_config, config)

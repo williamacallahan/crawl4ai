@@ -185,6 +185,11 @@ crawler:
       text_mode: true
       memory_saving_mode: true
       avoid_ads: true
+      # Every server browser renders at this size unless a request names its
+      # own: 1440 wide clears the 1200/1280/1366 desktop breakpoints, so pages
+      # render their desktop navigation, and viewport screenshots show it.
+      viewport_width: 1440
+      viewport_height: 900
       # ~330 pages reach one process's browser per 6h at production load, so a
       # 500-page budget never restarted a browser before the replica recycle.
       max_pages_before_recycle: 100
