@@ -20,11 +20,12 @@ import aiofiles
 import aiohttp
 import chardet
 from aiohttp.client import ClientTimeout
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from playwright.async_api import Error, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .async_configs import (
+    _MAX_RENDER_PIXELS,
     BrowserConfig,
     CrawlerRunConfig,
     HTTPCrawlerConfig,
@@ -2069,7 +2070,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 except Exception:
                     pass
 
-    async def take_screenshot(self, page, **kwargs) -> str:
+    async def take_screenshot(self, page, **kwargs) -> Optional[str]:
         """
         Take a screenshot of the current page.
 
@@ -2097,7 +2098,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # Page is too long, try to take a full-page screenshot
             return await self.take_screenshot_scroller(page, **kwargs)
 
-    async def take_screenshot_scroller(self, page: Page, **kwargs) -> str:
+    async def take_screenshot_scroller(self, page: Page, **kwargs) -> Optional[str]:
         """
         Attempt to set a large viewport and take a full-page screenshot.
         If still too large, segment the page as before.
@@ -2109,16 +2110,19 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             kwargs: Additional keyword arguments
 
         Returns:
-            str: The base64-encoded screenshot data
+            Optional[str]: The base64-encoded screenshot, or None when capture failed
         """
         try:
             # Save original viewport so we can restore it after capture
             original_viewport = page.viewport_size
 
-            # Get page height
+            # Content wider than the layout viewport (a sideways carousel) would
+            # otherwise set the capture width, and an endless page its height.
+            # These bounds cap the renderer surface and the stitched image in memory.
             dimensions = await self.get_page_dimensions(page)
-            page_width = dimensions["width"]
-            page_height = dimensions["height"]
+            layout_width = (original_viewport or {}).get("width") or self.browser_config.viewport_width
+            page_width = min(dimensions["width"], layout_width)
+            page_height = min(dimensions["height"], _MAX_RENDER_PIXELS // page_width)
 
             # Freeze element dimensions before viewport change to prevent
             # responsive CSS from rescaling images (fixes Elementor distortion)
@@ -2204,26 +2208,22 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 tag="ERROR",
                 params={"error": error_message},
             )
-            # return error image
-            img = Image.new("RGB", (800, 600), color="black")
-            draw = ImageDraw.Draw(img)
-            font = ImageFont.load_default()
-            draw.text((10, 10), error_message, fill=(255, 255, 255), font=font)
-            buffered = BytesIO()
-            img.save(buffered, format="JPEG")
-            return base64.b64encode(buffered.getvalue()).decode("utf-8")
+            return None
         # finally:
         #     await page.close()
 
-    async def take_screenshot_naive(self, page: Page) -> str:
+    async def take_screenshot_naive(self, page: Page) -> Optional[str]:
         """
         Takes a screenshot of the current page.
+
+        A failed capture returns None rather than a picture of the error, which
+        callers would otherwise store as the page's screenshot.
 
         Args:
             page (Page): The Playwright page instance
 
         Returns:
-            str: Base64-encoded screenshot image
+            Optional[str]: Base64-encoded screenshot, or None when capture failed
         """
         try:
             # The page is already loaded, just take the screenshot
@@ -2237,16 +2237,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 tag="ERROR",
                 params={"error": error_message},
             )
-
-            # Generate an error image
-            img = Image.new("RGB", (800, 600), color="black")
-            draw = ImageDraw.Draw(img)
-            font = ImageFont.load_default()
-            draw.text((10, 10), error_message, fill=(255, 255, 255), font=font)
-
-            buffered = BytesIO()
-            img.save(buffered, format="JPEG")
-            return base64.b64encode(buffered.getvalue()).decode("utf-8")
+            return None
         # finally:
         #     await page.close()
 

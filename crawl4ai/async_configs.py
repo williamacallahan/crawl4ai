@@ -1218,8 +1218,8 @@ class BrowserConfig:
         self.viewport_height = viewport_height
         self.viewport = viewport
         if self.viewport is not None:
-            self.viewport_width = self.viewport.get("width", 1080)
-            self.viewport_height = self.viewport.get("height", 600)
+            self.viewport_width = self.viewport.get("width", viewport_width)
+            self.viewport_height = self.viewport.get("height", viewport_height)
         self.device_scale_factor = device_scale_factor
         self.accept_downloads = accept_downloads
         self.downloads_path = downloads_path

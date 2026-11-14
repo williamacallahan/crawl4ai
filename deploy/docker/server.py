@@ -1041,6 +1041,8 @@ async def generate_screenshot(
         results = await _arun_before_deadline(crawler, body.url, cfg)
         _raise_for_crawl_failure(results[0])
         screenshot_data = results[0].screenshot
+        if not screenshot_data:
+            raise HTTPException(500, detail="The page loaded but its screenshot capture failed")
         art = await asyncio.to_thread(
             _store_artifact,
             "png",
