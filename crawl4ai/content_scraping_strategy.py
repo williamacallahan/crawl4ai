@@ -593,6 +593,15 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
             "th",
         }
 
+        # Elements that were whitespace-only (or contained only a whitespace-only
+        # descendant removed earlier this pass). Removals happen bottom-up, so
+        # when a whitespace-only inline element lives inside an empty wrapper
+        # (e.g. the Google Docs "<span style=...><span style=...> </span></span>"
+        # pattern) the inner element is removed first and marks its wrapper here;
+        # the wrapper's own ``.text`` is ``None`` but it must still act as a
+        # whitespace separator so the words around it do not get concatenated.
+        ws_only = set()
+
         for el in reversed(list(root.iterdescendants())):
             if not isinstance(el, lhtml.HtmlElement):
                 continue
@@ -625,7 +634,15 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                     prev = el.getprevious()
                     has_before = prev is not None or bool((parent.text or "").strip())
                     has_after = bool((tail or "").strip()) or el.getnext() is not None
-                    if el.text and not text_content and has_before and has_after:
+                    # ``is_ws_only`` is true when the element itself is whitespace-only
+                    # (``el.text`` is whitespace and it has no real text content) or
+                    # when a whitespace-only descendant was removed earlier this pass
+                    # and marked this element via ``ws_only``. In both cases, removing
+                    # it would join the words on either side, so a separator is kept
+                    # -- but only between content on both sides (``has_before``/
+                    # ``has_after``), so edges like "[ link]" or "##  Title" stay clean.
+                    is_ws_only = bool(el.text and not text_content) or (el in ws_only)
+                    if is_ws_only and has_before and has_after:
                         # Keep a separator between words a whitespace-only element
                         # split; at an edge it would land inside "[ link]" or "##  ".
                         tail = " " + (tail or "")
@@ -634,6 +651,11 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                             prev.tail = (prev.tail or "") + tail
                         else:
                             parent.text = (parent.text or "") + tail
+                    if is_ws_only:
+                        # Let the wrapper carry the separator: when it is removed
+                        # next, ``is_ws_only`` will be true even though its own
+                        # ``.text`` is ``None``.
+                        ws_only.add(parent)
                     parent.remove(el)
 
         return root

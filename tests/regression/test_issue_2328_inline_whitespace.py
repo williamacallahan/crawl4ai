@@ -67,3 +67,79 @@ def test_edge_whitespace_element_adds_no_space_inside_markdown(body, expected):
         input_html=cleaned, base_url="https://example.com/"
     ).raw_markdown
     assert expected in markdown
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_md"),
+    [
+        ("<p>Word<span><span> </span></span>Word2</p>", "Word Word2"),
+        ('<p>Word<span style="font-weight:400"><span style="white-space:pre"> </span></span>Word2</p>', "Word Word2"),
+        ("<p>Word<span><span><span> </span></span></span>Word2</p>", "Word Word2"),
+        ("<p>one<span><span> </span></span>two<span><span> </span></span>three</p>", "one two three"),
+    ],
+    ids=["nested-spans", "google-docs-style", "three-deep", "two-nested-gaps"],
+)
+def test_nested_whitespace_only_wrappers_keep_word_separator(strategy, body, expected_md):
+    html = f"<html><body>{body}</body></html>"
+    result = strategy._scrap("http://test.com", html)
+    md = DefaultMarkdownGenerator().generate_markdown(
+        input_html=result["cleaned_html"], base_url="http://test.com"
+    )
+    assert expected_md in md.raw_markdown
+
+
+def test_nested_google_docs_pattern_keeps_separator_in_cleaned_html_and_markdown(strategy):
+    html = (
+        "<html><body>"
+        '<p>Word<span style="font-weight:400"><span style="white-space:pre"> </span></span>Word2</p>'
+        "</body></html>"
+    )
+    cleaned = strategy.scrap("http://test.com", html).cleaned_html
+    assert cleaned == "<html><body><p>Word Word2</p></body></html>"
+    markdown = DefaultMarkdownGenerator().generate_markdown(
+        input_html=cleaned, base_url="http://test.com"
+    ).raw_markdown
+    assert "Word Word2" in markdown
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("<p><span><span> </span></span>Word</p>", "Word"),
+        ("<p>Word<span><span> </span></span></p>", "Word"),
+        ("<p><span style=\"font-weight:400\"><span style=\"white-space:pre\"> </span></span>Word</p>", "Word"),
+    ],
+    ids=["leading", "trailing", "leading-google-docs"],
+)
+def test_nested_whitespace_wrapper_at_edge_adds_no_space(strategy, body, expected):
+    html = f"<html><body>{body}</body></html>"
+    cleaned = strategy.scrap("http://test.com", html).cleaned_html
+    markdown = DefaultMarkdownGenerator().generate_markdown(
+        input_html=cleaned, base_url="http://test.com"
+    ).raw_markdown
+    # No leading/trailing space should appear around the lone word.
+    assert " Word" not in markdown
+    assert "Word " not in markdown
+    assert expected in markdown
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ('<p>See <a href="https://example.com/blog"><span><span> </span></span>Blog</a> now</p>'),
+        ('<p>See <a href="https://example.com/blog">Blog<span><span> </span></span></a> now</p>'),
+        ("<h2><span><span> </span></span>Title</h2>"),
+        ('<h2><span style="font-weight:400"><span style="white-space:pre"> </span></span>Title</h2>'),
+    ],
+    ids=["link-leading-nested", "link-trailing-nested", "heading-leading-nested", "heading-leading-google-docs"],
+)
+def test_nested_whitespace_wrapper_at_edge_adds_no_space_inside_markdown(body):
+    html = f"<html><body><article>{body}<p>Padding paragraph with enough words.</p></article></body></html>"
+    markdown = DefaultMarkdownGenerator().generate_markdown(
+        input_html=LXMLWebScrapingStrategy().scrap("https://example.com/", html).cleaned_html,
+        base_url="https://example.com/",
+    ).raw_markdown
+    assert "[Blog](https://example.com/blog)" in markdown or "## Title" in markdown
+    # None of the edge artefacts the c1d5c81c gating was added to suppress.
+    assert "[ Blog]" not in markdown
+    assert "##  Title" not in markdown
