@@ -20,10 +20,7 @@ def _config():
     return {
         "crawler": {
             "browser": {
-                "kwargs": {
-                    "memory_saving_mode": True,
-                    "max_pages_before_recycle": 500,
-                },
+                "kwargs": {"max_pages_before_recycle": 500},
                 "extra_args": ["--no-sandbox", "--disable-dev-shm-usage"],
             }
         }
@@ -32,15 +29,11 @@ def _config():
 
 def test_resource_policy_enforces_server_browser_limits(monkeypatch):
     monkeypatch.delenv("CRAWL4AI_CHROMIUM_SANDBOX", raising=False)
-    browser_config = BrowserConfig(
-        memory_saving_mode=False,
-        max_pages_before_recycle=0,
-    )
+    browser_config = BrowserConfig(max_pages_before_recycle=0)
 
     result = api._apply_server_browser_policy(browser_config, _config())
 
     assert result is browser_config
-    assert result.memory_saving_mode is True
     assert result.max_pages_before_recycle == 500
     assert result.extra_args == ["--no-sandbox", "--disable-dev-shm-usage"]
 
@@ -54,10 +47,7 @@ def test_resource_policy_honors_chromium_sandbox_opt_in(monkeypatch):
 
 
 def test_resource_policy_preserves_stricter_recycle_limit():
-    browser_config = BrowserConfig(
-        memory_saving_mode=True,
-        max_pages_before_recycle=100,
-    )
+    browser_config = BrowserConfig(max_pages_before_recycle=100)
 
     result = api._apply_server_browser_policy(browser_config, _config())
 

@@ -246,9 +246,8 @@ def _apply_server_browser_policy(browser_config, config):
     browser_config.extra_args = get_browser_extra_args(config)
 
     # Not text_mode: it changes the image scores back-end reads; server-built configs keep it.
-    for flag in ("memory_saving_mode", "avoid_ads"):
-        if browser_defaults.get(flag, False):
-            setattr(browser_config, flag, True)
+    if browser_defaults.get("avoid_ads", False):
+        browser_config.avoid_ads = True
 
     recycle_limit = browser_defaults.get("max_pages_before_recycle", 0)
     requested_recycle_limit = browser_config.max_pages_before_recycle

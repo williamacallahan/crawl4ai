@@ -85,11 +85,18 @@ def hostile_site():
                     }});
                 """)
                 if kind == "memory":
+                    # ?heap=1 grows V8's own heap (32 MiB of doubles per chunk, copied
+                    # from one array so it grows as fast as the buffers), which its
+                    # --max-old-space-size cap governs; buffers live outside it.
+                    chunk = (
+                        "(window.t ||= Array.from({length: 4 * 1024 * 1024}, (_, i) => i + 0.5)).slice()"
+                        if query.get("heap") else "new Uint8Array(new ArrayBuffer(32 * 1024 * 1024))"
+                    )
                     payload = _document("""
                         addEventListener('load', () => {
                             window.buffers = [];
                             function grow() {
-                                const b = new Uint8Array(new ArrayBuffer(32 * 1024 * 1024));
+                                const b = """ + chunk + """;
                                 for (let j = 0; j < b.length; j += 4096) b[j] = 1;
                                 window.buffers.push(b);
                                 if (window.buffers.length === 4) fetch('/armed?kind=memory');
@@ -337,7 +344,8 @@ async def test_infinite_javascript_fails_by_deadline_and_renderer_stops(browser_
 
 
 @pytest.mark.asyncio
-async def test_bounded_arraybuffer_attack_fails_and_releases_rss(browser_probe, hostile_site):
+@pytest.mark.parametrize("path", ["/memory", "/memory?heap=1"])
+async def test_bounded_allocation_attack_fails_and_releases_rss(browser_probe, hostile_site, path):
     probe = browser_probe
     await _normal(probe, hostile_site)
     import crawler_pool
@@ -345,7 +353,7 @@ async def test_bounded_arraybuffer_attack_fails_and_releases_rss(browser_probe, 
     baseline = probe.rss()
     kills_before = getattr(crawler_pool, "RENDERER_KILLS", {}).get("rss", 0)
     task = asyncio.create_task(probe.crawl(
-        hostile_site.base + "/memory", timeout_ms=8000,
+        hostile_site.base + path, timeout_ms=8000,
         delay_before_return_html=2,
     ))
     await hostile_site.armed("memory")

@@ -183,7 +183,10 @@ crawler:
     kwargs:
       headless: true
       text_mode: true
-      memory_saving_mode: true
+      # Not memory_saving_mode: its 512 MiB V8 heap cap crashed JS-heavy
+      # renderers (~900 MiB of heap) before the 768 MiB renderer_rss_mb
+      # watchdog could end them as a typed renderer_memory_limit outcome.
+      # extra_args carries its cache-discard flag and a heap cap above the watchdog.
       avoid_ads: true
       # Every server browser renders at this size unless a request names its
       # own: 1440 wide clears the 1200/1280/1366 desktop breakpoints, so pages
@@ -210,6 +213,10 @@ crawler:
       - "--disable-dev-shm-usage"
       - "--disable-gpu"
       - "--disable-software-rasterizer"
+      - "--aggressive-cache-discard"
+      # Backstop only: the watchdog samples every 5 s, and a heap growing past
+      # 768 MiB is ended there long before it reaches twice that.
+      - "--js-flags=--max-old-space-size=1536"
       # --disable-web-security removed for security (enables cross-origin access)
       # --allow-insecure-localhost / --ignore-certificate-errors removed: they
       # disabled TLS verification for every crawl (MITM / SSRF-to-internal-TLS).
