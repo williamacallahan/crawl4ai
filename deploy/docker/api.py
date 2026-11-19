@@ -248,6 +248,9 @@ def _apply_server_browser_policy(browser_config, config):
     # Not text_mode: it changes the image scores back-end reads; server-built configs keep it.
     if browser_defaults.get("avoid_ads", False):
         browser_config.avoid_ads = True
+    # extra_args owns the heap cap; a caller's memory_saving_mode would add a
+    # second, lower one and give the request its own pool browser.
+    browser_config.memory_saving_mode = False
 
     recycle_limit = browser_defaults.get("max_pages_before_recycle", 0)
     requested_recycle_limit = browser_config.max_pages_before_recycle
