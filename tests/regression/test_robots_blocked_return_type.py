@@ -50,7 +50,7 @@ async def _start_server(port: int, robots_body: str):
     async def robots(_req):
         return web.Response(text=robots_body, content_type="text/plain")
 
-    async def index(_req):
+    async def index(req):
         paras = "".join(
             f"<p>Paragraph number {i} with some real sentences.</p>"
             for i in range(20)
@@ -58,7 +58,8 @@ async def _start_server(port: int, robots_body: str):
         return web.Response(
             text=(
                 "<html><head><title>Test Page</title></head><body>"
-                f"<h1>Hello World</h1>{paras}</body></html>"
+                f"<h1>Hello World</h1>{paras}"
+                f"<p id=\"agent\">{req.headers.get('User-Agent')}</p></body></html>"
             ),
             content_type="text/html",
         )
@@ -179,12 +180,20 @@ _DENY_ALTERNATE_ROBOTS = (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("persistent", [False, True])
-async def test_robots_checks_the_agent_the_crawl_sends(persistent, tmp_path):
-    """robots.txt is judged under the agent the request goes out with. An
-    isolated context sends the crawl's own user_agent, so rules denying it
-    block the crawl. A persistent context keeps its launch agent and ignores
-    the crawl's, so the same rules must not block it."""
+@pytest.mark.parametrize(
+    "persistent, headers, blocked",
+    [
+        # An isolated context sends the crawl's own user_agent.
+        (False, {}, True),
+        # A persistent browser ignores it and sends its launch agent...
+        (True, {}, False),
+        # ...or a configured User-Agent header, in any casing.
+        (True, {"user-agent": "Alternate/1"}, True),
+    ],
+)
+async def test_robots_checks_the_agent_the_crawl_sends(persistent, headers, blocked, tmp_path):
+    """robots.txt is judged under the agent the request goes out with, so
+    rules denying Alternate block exactly the crawls that send it."""
     port = _free_port()
     runner = await _start_server(port, _DENY_ALTERNATE_ROBOTS)
     browser_config = BrowserConfig(
@@ -192,6 +201,7 @@ async def test_robots_checks_the_agent_the_crawl_sends(persistent, tmp_path):
         verbose=False,
         extra_args=["--no-sandbox"],
         user_agent="BrowserDefault/1",
+        headers=dict(headers),
         use_persistent_context=persistent,
         user_data_dir=str(tmp_path / "profile") if persistent else None,
     )
@@ -207,9 +217,10 @@ async def test_robots_checks_the_agent_the_crawl_sends(persistent, tmp_path):
                     verbose=False,
                 ),
             )
-            if persistent:
-                assert result.success is True
-            else:
+            if blocked:
                 assert result.status_code == 403
+            else:
+                assert result.success is True
+                assert '<p id="agent">BrowserDefault/1</p>' in result.html
     finally:
         await runner.cleanup()

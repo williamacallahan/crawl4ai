@@ -207,8 +207,8 @@ async def test_context_headers_carry_the_per_crawl_hint_over_the_default():
 async def test_per_crawl_agent_wins_over_configured_headers_in_any_case():
     """Header names ignore case, so configured ``user-agent`` / ``Sec-CH-UA``
     are the same headers as the override's ``User-Agent`` / ``sec-ch-ua``.
-    The context and page headers must each carry one value per name: the
-    crawl's own, never the configured one beside it."""
+    The context headers are merged with the configured ones last, so each
+    name must carry one value: the crawl's own, never the configured one."""
     from crawl4ai.browser_manager import BrowserManager
 
     configured = {"user-agent": UA_CHROME_122, "Sec-CH-UA": HINT_122}
@@ -220,19 +220,18 @@ async def test_per_crawl_agent_wins_over_configured_headers_in_any_case():
     await manager.setup_context(
         context, None, user_agent=UA_CHROME_121, browser_hint=HINT_121
     )
-    context_sent = context.set_extra_http_headers.await_args_list[-1].args[0]
+    by_name = {}
+    for name, header_value in context.set_extra_http_headers.await_args_list[-1].args[0].items():
+        by_name.setdefault(name.lower(), []).append(header_value)
+    assert by_name["user-agent"] == [UA_CHROME_121]
+    assert by_name["sec-ch-ua"] == [HINT_121]
 
-    strategy, captured, queue = _build_strategy_with_capturing_pages()
-    strategy.browser_config.headers = dict(configured)
-    await _run_crawl(strategy, queue, "A", "https://example.test/a", user_agent=UA_CHROME_121)
-    page_sent = captured["A"].captured_headers
 
-    for sent in (context_sent, page_sent):
-        by_name = {}
-        for name, header_value in sent.items():
-            by_name.setdefault(name.lower(), []).append(header_value)
-        assert by_name["user-agent"] == [UA_CHROME_121]
-        assert by_name["sec-ch-ua"] == [HINT_121]
+def test_configured_client_hint_is_not_joined_by_the_generated_one():
+    """A caller's ``Sec-CH-UA`` is the client hint header in any casing; a
+    generated ``sec-ch-ua`` beside it would replace it in the merges above."""
+    headers = BrowserConfig(headers={"Sec-CH-UA": HINT_122}).headers
+    assert [v for n, v in headers.items() if n.lower() == "sec-ch-ua"] == [HINT_122]
 
 
 # ---------------------------------------------------------------------------

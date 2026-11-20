@@ -1254,7 +1254,8 @@ class BrowserConfig:
             pass
 
         self.browser_hint = UAGen.generate_client_hints(self.user_agent)
-        self.headers.setdefault("sec-ch-ua", self.browser_hint)
+        if not any(name.lower() == "sec-ch-ua" for name in self.headers):
+            self.headers["sec-ch-ua"] = self.browser_hint
 
         # Set appropriate browser management flags based on browser_mode
         if self.browser_mode == "builtin":

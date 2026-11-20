@@ -38,6 +38,7 @@ from .markdown_generation_strategy import (
 from .deep_crawling import DeepCrawlDecorator
 from .async_logger import AsyncLogger, AsyncLoggerBase
 from .async_configs import BrowserConfig, CrawlerRunConfig, ProxyConfig, SeedingConfig, DomainMapperConfig
+from .browser_manager import configured_user_agent
 from .async_dispatcher import *  # noqa: F403
 from .async_dispatcher import BaseDispatcher, MemoryAdaptiveDispatcher, RateLimiter
 from .async_url_seeder import AsyncUrlSeeder
@@ -393,10 +394,11 @@ class AsyncWebCrawler:
                     from urllib.parse import urlparse
 
                     # Check robots.txt if enabled (once, before any attempts),
-                    # under the agent the crawl will send: a persistent context
-                    # keeps its launch agent and ignores a per-crawl one.
+                    # under the agent the crawl will send: its own user_agent,
+                    # except that a persistent browser ignores it and sends the
+                    # configured one (_crawl_web, BrowserManager._new_context).
                     if config and config.check_robots_txt:
-                        robots_agent = self.browser_config.user_agent
+                        robots_agent = configured_user_agent(self.browser_config)
                         if config.user_agent and not self.browser_config.use_persistent_context:
                             robots_agent = config.user_agent
                         if not await self.robots_parser.can_fetch(url, robots_agent):
