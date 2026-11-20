@@ -4,8 +4,8 @@ One strategy and one ``BrowserConfig`` serve every concurrent crawl, and
 ``_crawl_web`` yields at ``await browser_manager.get_page(...)``. Reading the
 per-crawl UA back from shared state after that await let one crawl ship
 another's UA (commit fdd989785). The fix captures the UA and client hint
-before the await, threads the UA through ``get_page`` into the context
-signature and ``new_context(user_agent=...)`` (the on-wire value), and never
+before the await, passes the UA through ``get_page`` to
+``new_context(user_agent=...)`` (the on-wire value) for each fresh context, and never
 writes it into the shared config, which the Docker pool reuses across requests.
 
 Offline tests mock the browser surface; the ``@pytest.mark.browser`` tests at
