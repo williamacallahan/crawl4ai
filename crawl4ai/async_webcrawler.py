@@ -395,7 +395,8 @@ class AsyncWebCrawler:
                     # Check robots.txt if enabled (once, before any attempts)
                     if config and config.check_robots_txt:
                         if not await self.robots_parser.can_fetch(
-                            url, self.browser_config.user_agent
+                            url,
+                            config.user_agent or self.browser_config.user_agent,
                         ):
                             return CrawlResultContainer(
                                 CrawlResult(

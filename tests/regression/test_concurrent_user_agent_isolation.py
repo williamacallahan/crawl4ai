@@ -198,6 +198,32 @@ async def test_per_crawl_user_agent_leaves_shared_browser_config_unchanged():
     assert strategy.browser_config.headers == original_headers
 
 
+@pytest.mark.asyncio
+async def test_context_headers_carry_the_per_crawl_hint_over_the_default():
+    """The context-level headers are what the browser sends once a hook (the
+    Docker ``set_headers`` hook) replaces the page-level headers. BrowserConfig
+    seeds its own sec-ch-ua into ``headers``, so the per-crawl hint must win
+    over that default, while an extra configured header still applies."""
+    from crawl4ai.browser_manager import BrowserManager
+
+    manager = BrowserManager(
+        BrowserConfig(user_agent=UA_CHROME_122, headers={"Accept-Language": "fr"})
+    )
+    context = MagicMock()
+    context.set_extra_http_headers = AsyncMock()
+    context.add_cookies = AsyncMock()
+    context.add_init_script = AsyncMock()
+
+    await manager.setup_context(
+        context, None, user_agent=UA_CHROME_121, browser_hint=HINT_121
+    )
+
+    sent = context.set_extra_http_headers.await_args_list[-1].args[0]
+    assert sent["User-Agent"] == UA_CHROME_121
+    assert sent["sec-ch-ua"] == HINT_121
+    assert sent["Accept-Language"] == "fr"
+
+
 # ---------------------------------------------------------------------------
 # Offline tests: single-crawl happy paths (no regression on the non-racy path)
 # ---------------------------------------------------------------------------

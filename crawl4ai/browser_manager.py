@@ -1512,6 +1512,14 @@ class BrowserManager:
                 "sec-ch-ua": effective_hint,
             }
             combined_headers.update(self.config.headers)
+            # config.headers carries the browser default's sec-ch-ua, so a
+            # per-crawl override must be applied after it. The page-level
+            # headers carry the same override, but a hook that replaces them
+            # (set_extra_http_headers) falls back to these context headers.
+            if user_agent is not None:
+                combined_headers["User-Agent"] = user_agent
+            if browser_hint is not None:
+                combined_headers["sec-ch-ua"] = browser_hint
             await context.set_extra_http_headers(combined_headers)
 
         # Add default cookie (skip for raw:/file:// URLs which are not valid cookie URLs)
