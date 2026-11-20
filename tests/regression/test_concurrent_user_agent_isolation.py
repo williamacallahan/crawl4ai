@@ -181,24 +181,21 @@ async def test_locals_used_not_post_await_shared_state():
 
 
 @pytest.mark.asyncio
-async def test_shared_browser_config_still_mutated_for_context_creation():
-    """The fix still mutates the shared ``browser_config`` (load-bearing for
-    ``navigator.userAgent`` / context-level headers at context creation, see
-    ``BrowserManager.create_browser_context`` / ``setup_context``). The
-    leftover (last writer's UA) is the documented behavior; the page-level
-    HTTP headers remain correct per-crawl regardless."""
+async def test_per_crawl_user_agent_leaves_shared_browser_config_unchanged():
+    """A per-crawl UA must not become the browser's default: the Docker pool
+    reuses one crawler across requests, so a later request that sets no UA
+    would otherwise send the earlier request's UA and sec-ch-ua."""
     strategy, _, queue = _build_strategy_with_capturing_pages()
+    original_ua = strategy.browser_config.user_agent
+    original_hint = strategy.browser_config.browser_hint
+    original_headers = dict(strategy.browser_config.headers)
     await asyncio.gather(
         _run_crawl(strategy, queue, "A", "https://example.test/a", user_agent=UA_CHROME_121),
         _run_crawl(strategy, queue, "B", "https://example.test/b", user_agent=UA_CHROME_122),
     )
-    # Shared config holds the last writer's UA - documented leftover; this
-    # is NOT the page-level HTTP race fixed here, see the bug report's
-    # "Scope: the leftover corruption" note.
-    assert strategy.browser_config.user_agent in (UA_CHROME_121, UA_CHROME_122)
-    last = strategy.browser_config.user_agent
-    assert strategy.browser_config.browser_hint == UAGen.generate_client_hints(last)
-    assert strategy.browser_config.headers["sec-ch-ua"] == UAGen.generate_client_hints(last)
+    assert strategy.browser_config.user_agent == original_ua
+    assert strategy.browser_config.browser_hint == original_hint
+    assert strategy.browser_config.headers == original_headers
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +215,6 @@ async def test_magic_mode_generates_and_applies_ua_to_page():
     assert h is not None
     assert h.get("User-Agent"), "magic mode must generate a non-empty User-Agent"
     assert h["sec-ch-ua"] == UAGen.generate_client_hints(h["User-Agent"])
-    assert strategy.browser_config.user_agent == h["User-Agent"]
 
 
 @pytest.mark.asyncio
@@ -427,3 +423,32 @@ async def test_arun_many_per_url_user_agent_isolation_e2e():
         assert other_ua not in body, (
             f"cross-leak for {url}: other UA {other_ua!r} present in body={body[:200]!r}"
         )
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_default_crawl_after_override_sends_the_configured_user_agent_e2e():
+    """One crawler, as the Docker pool reuses it: a crawl with a per-crawl UA,
+    then a crawl with none. The second must reach the server with the
+    browser's configured UA, not the first crawl's."""
+    from crawl4ai import AsyncWebCrawler
+
+    base_url, _thread = _start_echo_server()
+    configured_ua = UA_CHROME_122
+    async with AsyncWebCrawler(
+        config=BrowserConfig(
+            headless=True, verbose=False, extra_args=["--no-sandbox"],
+            user_agent=configured_ua,
+        )
+    ) as crawler:
+        override = await crawler.arun(f"{base_url}/override", config=CrawlerRunConfig(
+            user_agent=UA_CHROME_121, cache_mode=CacheMode.BYPASS, verbose=False,
+        ))
+        default = await crawler.arun(f"{base_url}/default", config=CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS, verbose=False,
+        ))
+
+    assert override.success and UA_CHROME_121 in override.html, override.error_message
+    assert default.success, default.error_message
+    assert configured_ua in default.html, default.html[:200]
+    assert UA_CHROME_121 not in default.html, "per-crawl UA leaked into a later crawl"

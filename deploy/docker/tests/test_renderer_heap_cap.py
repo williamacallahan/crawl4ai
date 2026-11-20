@@ -21,7 +21,11 @@ def test_server_launch_args_cap_the_heap_above_the_renderer_watchdog(monkeypatch
     )._build_browser_args()["args"]
 
     (js_flags,) = [arg for arg in launch_args if arg.startswith("--js-flags=")]
-    heap_cap_mb = int(js_flags.rsplit("=", 1)[1])
+    (heap_option,) = [
+        option for option in js_flags.removeprefix("--js-flags=").split()
+        if option.startswith("--max-old-space-size=")
+    ]
+    heap_cap_mb = int(heap_option.removeprefix("--max-old-space-size="))
     watchdog_mb = BrowserWatchdogSettings.from_config(shipped).renderer_rss_mb
     # Above the watchdog so it, not V8, ends a heavy page; at most 1 GiB so
     # renderers growing between watchdog samples stay inside the replica limit.

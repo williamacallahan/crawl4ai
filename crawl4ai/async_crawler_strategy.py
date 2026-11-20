@@ -700,16 +700,12 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         # changing it here would only desync browser_config from reality.
         # Users should set user_agent or user_agent_mode on BrowserConfig.
         #
-        # NOTE: ``self.browser_config`` is a single object shared across every
-        # concurrent ``_crawl_web`` invocation (one strategy + one
-        # ``BrowserConfig`` per ``AsyncWebCrawler``, used concurrently by
-        # ``arun``/``arun_many``). The per-crawl UA and client hint MUST be
-        # captured into locals here, BEFORE the ``await self.browser_manager.
-        # get_page(...)`` below: a concurrent crawl can overwrite the shared
-        # fields while this coroutine is suspended at that ``await``, and the
-        # post-``await`` ``page.set_extra_http_headers(...)`` would otherwise
-        # ship the other crawl's UA / sec-ch-ua on this crawl's wire
-        # (TOCTOU on the page-level HTTP User-Agent / sec-ch-ua headers).
+        # ``self.browser_config`` is shared by every crawl on this browser
+        # (concurrent ``arun``/``arun_many`` calls and, in the Docker server,
+        # later requests on the same pooled browser). A per-crawl UA and its
+        # client hint therefore live only in these locals, threaded into
+        # ``get_page`` and the page headers below; writing them back to the
+        # shared config would leak them into every later crawl that sets none.
         ua_changed = False
         override_ua = None
         override_hint = None
@@ -723,23 +719,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     **(config.user_agent_generator_config or {})
                 )
                 ua_changed = True
-
-        # Keep sec-ch-ua in sync whenever the UA changed. Still mutate the
-        # shared ``browser_config`` so ``create_browser_context`` /
-        # ``setup_context`` (which run inside the awaited ``get_page``) see
-        # the per-crawl UA. The locals captured above are what we use for the
-        # page-level HTTP headers AFTER the ``await`` (see ``set_extra_http_
-        # headers`` below), so this mutation does not feed back into the racy
-        # page-level read.
         if ua_changed:
             override_hint = UAGen.generate_client_hints(override_ua)
-            self.browser_config.user_agent = override_ua
-            self.browser_config.browser_hint = override_hint
-            headers = getattr(self.browser_config, "headers", None)
-            if headers is None:
-                headers = {}
-                self.browser_config.headers = headers
-            headers["sec-ch-ua"] = override_hint
 
         page = None
         context = None

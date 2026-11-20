@@ -231,3 +231,33 @@ def test_heartbeat_survives_a_redis_outage(redis_url):
             await client.aclose()
 
     asyncio.run(exercise())
+
+
+def test_pool_refusal_tells_the_caller_to_retry(redis_url, extraction_worker, monkeypatch):
+    import crawler_pool
+
+    config, _entered, _finish = extraction_worker
+    monkeypatch.setattr(
+        crawler_pool, "get_crawler", AsyncMock(side_effect=crawler_pool.BrowserCapacityError())
+    )
+
+    async def exercise():
+        client = aioredis.from_url(redis_url)
+        task_id = f"llm_{uuid4().hex}"
+        key = f"task:{task_id}"
+        try:
+            await client.hset(key, mapping={
+                "status": TaskStatus.PROCESSING.value,
+                "created_at": datetime.now().isoformat(), "url": "https://example.com",
+            })
+            await api.process_llm_extraction(
+                client, config, task_id, "https://example.com", "extract",
+            )
+            return decode_redis_hash(await client.hgetall(key))
+        finally:
+            await client.delete(key)
+            await client.aclose()
+
+    stored = asyncio.run(exercise())
+    assert stored["status"] == TaskStatus.FAILED.value
+    assert stored["error"].startswith("Crawler browser pool is at capacity (correlation_id=")

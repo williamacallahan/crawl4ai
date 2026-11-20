@@ -930,12 +930,15 @@ async def process_llm_extraction(
         from crawler_pool import BrowserCapacityError
         expected = (LlmCapacityBusy, BrowserCapacityError, TargetResolutionUnavailable)
         level = logging.WARNING if isinstance(e, expected) else logging.ERROR
+        # A pool refusal is retryable; say so instead of the generic failure.
+        reason = (
+            "Crawler browser pool is at capacity"
+            if isinstance(e, BrowserCapacityError) else "LLM extraction failed"
+        )
         error_message = (
             str(e)
             if isinstance(e, LlmExtractionRejected)
-            else correlated_error(
-                "LLM extraction failed", e, f"llm extraction task={task_id}", level=level
-            )
+            else correlated_error(reason, e, f"llm extraction task={task_id}", level=level)
         )
         logger.log(level, "LLM extraction error: %s", e, exc_info=True)
         if not await _finish_llm_task(redis, f"task:{task_id}", {
