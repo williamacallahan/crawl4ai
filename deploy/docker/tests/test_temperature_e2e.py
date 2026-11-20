@@ -221,14 +221,8 @@ def test_md_temperature_reaches_litellm(monkeypatch, caller_temp, server_temp, e
 # ---------------------------------------------------------------------------
 
 class _FakeCrawler:
-    def __init__(self, captured, **_kwargs):
+    def __init__(self, captured):
         self._captured = captured
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return None
 
     async def arun(self, *, config, **_kwargs):
         strat = config.extraction_strategy
@@ -246,7 +240,8 @@ def _run_extraction(monkeypatch, caller_temp, server_temp):
     redis = PermitRedis()
     webhook = SimpleNamespace(notify_job_completion=AsyncMock())
 
-    monkeypatch.setattr(api, "AsyncWebCrawler", lambda **kw: _FakeCrawler(captured, **kw))
+    monkeypatch.setattr(crawler_pool, "get_crawler", AsyncMock(return_value=_FakeCrawler(captured)))
+    monkeypatch.setattr(crawler_pool, "release_crawler", AsyncMock())
     monkeypatch.setattr(api, "validate_url_destination", lambda _u: None)
     monkeypatch.setattr(api, "WebhookDeliveryService", lambda _c: webhook)
     monkeypatch.setattr(egress_broker, "enforce_egress", lambda _c: None)

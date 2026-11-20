@@ -363,6 +363,7 @@ async def test_bounded_allocation_attack_fails_and_releases_rss(browser_probe, h
         await asyncio.sleep(0.02)
     result, elapsed = await task
     assert not result.success, "allocation-plus-spin document unexpectedly succeeded"
+    assert "renderer_memory_limit" in (result.error_message or ""), result.error_message
     assert elapsed < 8, f"memory watchdog failed to abort quickly: {elapsed:.2f}s"
     assert getattr(crawler_pool, "RENDERER_KILLS", {}).get("rss", 0) > kills_before, (
         "real renderer RSS never triggered the default 768 MiB watchdog"

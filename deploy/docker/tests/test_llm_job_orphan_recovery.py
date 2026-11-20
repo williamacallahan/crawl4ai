@@ -82,21 +82,13 @@ def extraction_worker(monkeypatch):
     entered, finish = asyncio.Event(), asyncio.Event()
 
     class Crawler:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            pass
-
         async def arun(self, **_kwargs):
             entered.set()
             await finish.wait()
             return SimpleNamespace(success=True, extracted_content='{"answer": "late"}')
 
     from contextlib import asynccontextmanager
+    import crawler_pool
     import egress_broker
     import llm_broker
 
@@ -105,7 +97,8 @@ def extraction_worker(monkeypatch):
         yield
 
     webhook = SimpleNamespace(notify_job_completion=AsyncMock())
-    monkeypatch.setattr(api, "AsyncWebCrawler", Crawler)
+    monkeypatch.setattr(crawler_pool, "get_crawler", AsyncMock(return_value=Crawler()))
+    monkeypatch.setattr(crawler_pool, "release_crawler", AsyncMock())
     monkeypatch.setattr(api, "llm_permit", permit)
     monkeypatch.setattr(api, "validate_llm_provider", lambda *_args: (True, None))
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)

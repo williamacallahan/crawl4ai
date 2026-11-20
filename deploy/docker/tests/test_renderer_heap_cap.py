@@ -22,5 +22,8 @@ def test_server_launch_args_cap_the_heap_above_the_renderer_watchdog(monkeypatch
 
     (js_flags,) = [arg for arg in launch_args if arg.startswith("--js-flags=")]
     heap_cap_mb = int(js_flags.rsplit("=", 1)[1])
-    assert heap_cap_mb > BrowserWatchdogSettings.from_config(shipped).renderer_rss_mb
+    watchdog_mb = BrowserWatchdogSettings.from_config(shipped).renderer_rss_mb
+    # Above the watchdog so it, not V8, ends a heavy page; at most 1 GiB so
+    # renderers growing between watchdog samples stay inside the replica limit.
+    assert watchdog_mb < heap_cap_mb <= 1024
     assert "--aggressive-cache-discard" in launch_args

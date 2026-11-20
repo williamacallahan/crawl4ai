@@ -239,15 +239,6 @@ def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch, redis_u
     captured = {}
 
     class FakeCrawler:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
         async def arun(self, *, config, **_kwargs):
             captured["extra_args"] = config.extraction_strategy.extra_args
             captured["apply_chunking"] = config.extraction_strategy.apply_chunking
@@ -259,7 +250,8 @@ def test_llm_job_uses_async_budget_and_rejects_error_blocks(monkeypatch, redis_u
     config = load_config()
     webhook = SimpleNamespace(notify_job_completion=AsyncMock())
 
-    monkeypatch.setattr(api, "AsyncWebCrawler", FakeCrawler)
+    monkeypatch.setattr(crawler_pool, "get_crawler", AsyncMock(return_value=FakeCrawler()))
+    monkeypatch.setattr(crawler_pool, "release_crawler", AsyncMock())
     monkeypatch.setattr(api, "validate_url_destination", lambda _url: None)
     monkeypatch.setattr(api, "WebhookDeliveryService", lambda _config: webhook)
     monkeypatch.setattr(utils, "load_config", lambda: config)

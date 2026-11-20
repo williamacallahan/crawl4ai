@@ -214,9 +214,11 @@ crawler:
       - "--disable-gpu"
       - "--disable-software-rasterizer"
       - "--aggressive-cache-discard"
-      # Backstop only: the watchdog samples every 5 s, and a heap growing past
-      # 768 MiB is ended there long before it reaches twice that.
-      - "--js-flags=--max-old-space-size=1536"
+      # Limits V8 old space, not renderer RSS or total replica memory. Above the
+      # 768 MiB watchdog so a heavy page (callosum.com/product, ~906 MiB heap)
+      # ends as renderer_memory_limit, yet low enough that pages growing between
+      # watchdog samples stay well inside the 4 GiB replica limit.
+      - "--js-flags=--max-old-space-size=1024"
       # --disable-web-security removed for security (enables cross-origin access)
       # --allow-insecure-localhost / --ignore-certificate-errors removed: they
       # disabled TLS verification for every crawl (MITM / SSRF-to-internal-TLS).

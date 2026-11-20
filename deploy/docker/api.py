@@ -853,18 +853,25 @@ async def process_llm_extraction(
         )
         from egress_broker import enforce_egress
         enforce_egress(worker_browser_cfg)
+        from crawler_pool import get_crawler, release_crawler
         async with llm_permit(redis, config):
-            async with AsyncWebCrawler(config=worker_browser_cfg) as crawler:
+            # The pool admits this browser and its renderer watchdog samples it;
+            # a private AsyncWebCrawler would run outside both.
+            crawler = await get_crawler(worker_browser_cfg)
+            try:
                 crawler_config = server_crawler_config(
                     _wcfg,
                     extraction_strategy=llm_strategy,
                     scraping_strategy=LXMLWebScrapingStrategy(),
                     cache_mode=cache_mode,
                 )
-                result = await crawler.arun(
+                result = await _crawler_arun(
+                    crawler,
                     url=url,
                     config=crawler_config,
                 )
+            finally:
+                await release_crawler(crawler)
 
         if not result.success:
             error_message = public_crawl_error(result.error_message, url)
@@ -920,7 +927,9 @@ async def process_llm_extraction(
         # This runs as a background task, so the central 500 handler never sees
         # it: str(e) would land verbatim in the task hash that /llm/job/{id}
         # returns and in the caller-supplied webhook.
-        level = logging.WARNING if isinstance(e, (LlmCapacityBusy, TargetResolutionUnavailable)) else logging.ERROR
+        from crawler_pool import BrowserCapacityError
+        expected = (LlmCapacityBusy, BrowserCapacityError, TargetResolutionUnavailable)
+        level = logging.WARNING if isinstance(e, expected) else logging.ERROR
         error_message = (
             str(e)
             if isinstance(e, LlmExtractionRejected)
