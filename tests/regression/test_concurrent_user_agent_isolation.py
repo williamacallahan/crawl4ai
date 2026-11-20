@@ -1,36 +1,15 @@
-"""Regression tests for concurrent per-crawl User-Agent / sec-ch-ua isolation.
+"""Regression tests for per-crawl User-Agent / sec-ch-ua isolation.
 
-Bug (introduced in commit fdd989785): ``AsyncPlaywrightCrawlerStrategy._crawl_web``
-wrote the per-crawl UA / sec-ch-ua onto the shared mutable ``self.browser_config``
-object, then - after an ``await self.browser_manager.get_page(...)`` that yields
-to the event loop - read those same shared fields back to set the page-level
-HTTP headers via ``page.set_extra_http_headers(...)``. A single strategy
-instance and a single ``BrowserConfig`` are shared across every concurrent
-crawl issued by ``AsyncWebCrawler.arun`` / ``arun_many``; nothing serializes
-``_crawl_web``. Two concurrent crawls that each request a distinct UA interleave
-at the ``await``, so the first crawl's post-``await`` ``set_extra_http_headers``
-ships the second crawl's UA on the wire (TOCTOU on the page-level HTTP
-User-Agent / sec-ch-ua headers).
+One strategy and one ``BrowserConfig`` serve every concurrent crawl, and
+``_crawl_web`` yields at ``await browser_manager.get_page(...)``. Reading the
+per-crawl UA back from shared state after that await let one crawl ship
+another's UA (commit fdd989785). The fix captures the UA and client hint
+before the await, threads the UA through ``get_page`` into the context
+signature and ``new_context(user_agent=...)`` (the on-wire value), and never
+writes it into the shared config, which the Docker pool reuses across requests.
 
-The fix has two coordinated layers. (1) The per-crawl UA and client hint are
-captured into local variables BEFORE the await and used for the post-await
-``set_extra_http_headers`` (the shared ``browser_config`` is still mutated
-because it is load-bearing for ``navigator.userAgent`` / context-level
-headers at context creation, but that mutation no longer feeds the racy
-page-level read). (2) The per-crawl UA is threaded through
-``BrowserManager.get_page`` -> ``_acquire_context`` ->
-``_make_config_signature`` (which now includes the UA, so distinct UAs get
-distinct cached contexts) + ``_new_context`` / ``create_browser_context``
-(which bakes the crawl's own UA via ``new_context(user_agent=...)`` - the
-value that actually goes on the wire, since Playwright's context-level
-``user_agent`` overrides ``page.set_extra_http_headers`` for the on-wire
-``User-Agent``) + ``setup_context`` (context-level ``sec-ch-ua`` header).
-
-Most tests here are offline (browser-free) using a mocked browser surface
-modeled on ``tests/regression/test_ssl_certificate_http_scheme_guard.py`` and
-``tests/regression/test_browser_lifecycle_residuals.py``. The end-to-end test at
-the bottom is ``@pytest.mark.browser`` and uses a real Chromium against a
-small UA-echoing local server.
+Offline tests mock the browser surface; the ``@pytest.mark.browser`` tests at
+the bottom run real Chromium against a local UA-echo server.
 """
 
 import asyncio
