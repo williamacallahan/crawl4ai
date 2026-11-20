@@ -88,6 +88,21 @@ PLAYWRIGHT_DISABLED_FEATURES = (
 PATCHRIGHT_DISABLED_FEATURES = PLAYWRIGHT_DISABLED_FEATURES
 
 
+def merge_headers(base: Dict[str, str], overrides: Dict[str, str]) -> Dict[str, str]:
+    """Return ``base`` with ``overrides`` applied by case-insensitive name.
+
+    HTTP header names ignore case, but a dict does not: merging
+    ``{"user-agent": ...}`` over ``{"User-Agent": ...}`` keeps both, and the
+    browser then picks one of them regardless of which was meant to win.
+    """
+    merged = dict(base)
+    for name, value in overrides.items():
+        for existing in [key for key in merged if key.lower() == name.lower()]:
+            del merged[existing]
+        merged[name] = value
+    return merged
+
+
 def _merge_disabled_features(args, defaults=()):
     """Keep one effective feature switch, preserving caller additions."""
     features = list(defaults)
@@ -1507,20 +1522,22 @@ class BrowserManager:
             browser_hint if browser_hint is not None else self.config.browser_hint
         )
         if effective_ua:
-            combined_headers = {
-                "User-Agent": effective_ua,
-                "sec-ch-ua": effective_hint,
-            }
-            combined_headers.update(self.config.headers)
+            combined_headers = merge_headers(
+                {"User-Agent": effective_ua, "sec-ch-ua": effective_hint},
+                self.config.headers,
+            )
             # config.headers carries the browser default's sec-ch-ua, so a
             # per-crawl override must be applied after it. The page-level
             # headers carry the same override, but a hook that replaces them
             # (set_extra_http_headers) falls back to these context headers.
+            overrides = {}
             if user_agent is not None:
-                combined_headers["User-Agent"] = user_agent
+                overrides["User-Agent"] = user_agent
             if browser_hint is not None:
-                combined_headers["sec-ch-ua"] = browser_hint
-            await context.set_extra_http_headers(combined_headers)
+                overrides["sec-ch-ua"] = browser_hint
+            await context.set_extra_http_headers(
+                merge_headers(combined_headers, overrides)
+            )
 
         # Add default cookie (skip for raw:/file:// URLs which are not valid cookie URLs)
         cookie_url = None

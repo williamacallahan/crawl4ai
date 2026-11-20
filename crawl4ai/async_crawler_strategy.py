@@ -33,7 +33,7 @@ from .async_configs import (
 )
 from .async_logger import AsyncLogger
 from .browser_adapter import BrowserAdapter, PlaywrightAdapter, UndetectedAdapter
-from .browser_manager import BrowserManager, PAGE_CLOSE_SECONDS, RendererKill
+from .browser_manager import BrowserManager, PAGE_CLOSE_SECONDS, RendererKill, merge_headers
 from .browser_budget import page_deadline, within_page_budget
 from .config import SCREENSHOT_HEIGHT_TRESHOLD
 from .js_snippet import load_js_script
@@ -803,8 +803,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             if ua_changed or getattr(self, "_custom_headers_set", False):
                 combined_headers = dict(configured_headers)
                 if ua_changed:
-                    combined_headers["User-Agent"] = override_ua
-                    combined_headers["sec-ch-ua"] = override_hint
+                    combined_headers = merge_headers(
+                        combined_headers,
+                        {"User-Agent": override_ua, "sec-ch-ua": override_hint},
+                    )
                 await page.set_extra_http_headers(combined_headers)
 
             # await page.goto(URL)

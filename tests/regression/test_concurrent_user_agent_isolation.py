@@ -224,6 +224,38 @@ async def test_context_headers_carry_the_per_crawl_hint_over_the_default():
     assert sent["Accept-Language"] == "fr"
 
 
+@pytest.mark.asyncio
+async def test_per_crawl_agent_wins_over_configured_headers_in_any_case():
+    """Header names ignore case, so configured ``user-agent`` / ``Sec-CH-UA``
+    are the same headers as the override's ``User-Agent`` / ``sec-ch-ua``.
+    The context and page headers must each carry one value per name: the
+    crawl's own, never the configured one beside it."""
+    from crawl4ai.browser_manager import BrowserManager
+
+    configured = {"user-agent": UA_CHROME_122, "Sec-CH-UA": HINT_122}
+    manager = BrowserManager(BrowserConfig(headers=dict(configured)))
+    context = MagicMock()
+    context.set_extra_http_headers = AsyncMock()
+    context.add_cookies = AsyncMock()
+    context.add_init_script = AsyncMock()
+    await manager.setup_context(
+        context, None, user_agent=UA_CHROME_121, browser_hint=HINT_121
+    )
+    context_sent = context.set_extra_http_headers.await_args_list[-1].args[0]
+
+    strategy, captured, queue = _build_strategy_with_capturing_pages()
+    strategy.browser_config.headers = dict(configured)
+    await _run_crawl(strategy, queue, "A", "https://example.test/a", user_agent=UA_CHROME_121)
+    page_sent = captured["A"].captured_headers
+
+    for sent in (context_sent, page_sent):
+        by_name = {}
+        for name, header_value in sent.items():
+            by_name.setdefault(name.lower(), []).append(header_value)
+        assert by_name["user-agent"] == [UA_CHROME_121]
+        assert by_name["sec-ch-ua"] == [HINT_121]
+
+
 # ---------------------------------------------------------------------------
 # Offline tests: single-crawl happy paths (no regression on the non-racy path)
 # ---------------------------------------------------------------------------

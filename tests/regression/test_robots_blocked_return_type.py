@@ -171,3 +171,45 @@ async def test_robots_allowed_path_still_returns_crawl_result_container():
             assert result.success is True
     finally:
         await runner.cleanup()
+
+
+_DENY_ALTERNATE_ROBOTS = (
+    "User-agent: Alternate\nDisallow: /\n\nUser-agent: *\nAllow: /\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_robots_checks_the_agent_the_crawl_sends(persistent, tmp_path):
+    """robots.txt is judged under the agent the request goes out with. An
+    isolated context sends the crawl's own user_agent, so rules denying it
+    block the crawl. A persistent context keeps its launch agent and ignores
+    the crawl's, so the same rules must not block it."""
+    port = _free_port()
+    runner = await _start_server(port, _DENY_ALTERNATE_ROBOTS)
+    browser_config = BrowserConfig(
+        headless=True,
+        verbose=False,
+        extra_args=["--no-sandbox"],
+        user_agent="BrowserDefault/1",
+        use_persistent_context=persistent,
+        user_data_dir=str(tmp_path / "profile") if persistent else None,
+    )
+    try:
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            crawler.robots_parser.clear_cache()
+            result = await crawler.arun(
+                url=f"http://127.0.0.1:{port}/",
+                config=CrawlerRunConfig(
+                    cache_mode=CacheMode.BYPASS,
+                    check_robots_txt=True,
+                    user_agent="Alternate/1",
+                    verbose=False,
+                ),
+            )
+            if persistent:
+                assert result.success is True
+            else:
+                assert result.status_code == 403
+    finally:
+        await runner.cleanup()

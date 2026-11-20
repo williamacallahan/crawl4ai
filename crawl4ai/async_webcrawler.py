@@ -392,12 +392,14 @@ class AsyncWebCrawler:
                 if not cached_result or not html:
                     from urllib.parse import urlparse
 
-                    # Check robots.txt if enabled (once, before any attempts)
+                    # Check robots.txt if enabled (once, before any attempts),
+                    # under the agent the crawl will send: a persistent context
+                    # keeps its launch agent and ignores a per-crawl one.
                     if config and config.check_robots_txt:
-                        if not await self.robots_parser.can_fetch(
-                            url,
-                            config.user_agent or self.browser_config.user_agent,
-                        ):
+                        robots_agent = self.browser_config.user_agent
+                        if config.user_agent and not self.browser_config.use_persistent_context:
+                            robots_agent = config.user_agent
+                        if not await self.robots_parser.can_fetch(url, robots_agent):
                             return CrawlResultContainer(
                                 CrawlResult(
                                     url=url,
