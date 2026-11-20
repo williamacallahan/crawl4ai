@@ -234,6 +234,15 @@ def test_configured_client_hint_is_not_joined_by_the_generated_one():
     assert [v for n, v in headers.items() if n.lower() == "sec-ch-ua"] == [HINT_122]
 
 
+def test_robots_agent_is_the_casing_the_context_headers_keep():
+    """Of two configured casings the context headers keep the last, so robots
+    and the baked agent must judge that one, not the first."""
+    from crawl4ai.browser_manager import configured_user_agent, merge_headers
+
+    config = BrowserConfig(headers={"User-Agent": UA_CHROME_121, "user-agent": UA_CHROME_122})
+    assert configured_user_agent(config) == merge_headers({}, config.headers)["user-agent"]
+
+
 # ---------------------------------------------------------------------------
 # Offline tests: single-crawl happy paths (no regression on the non-racy path)
 # ---------------------------------------------------------------------------

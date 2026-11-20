@@ -105,11 +105,13 @@ def merge_headers(base: Dict[str, str], overrides: Dict[str, str]) -> Dict[str, 
 
 def configured_user_agent(config) -> str:
     """The agent a fresh context sends when the crawl sets none of its own:
-    a configured ``User-Agent`` header in any casing, else ``user_agent``."""
+    a configured ``User-Agent`` header in any casing, else ``user_agent``.
+    Of several casings the last wins, as it does in ``merge_headers``."""
+    agent = config.user_agent
     for name, value in config.headers.items():
         if name.lower() == "user-agent":
-            return value
-    return config.user_agent
+            agent = value
+    return agent
 
 
 def _merge_disabled_features(args, defaults=()):

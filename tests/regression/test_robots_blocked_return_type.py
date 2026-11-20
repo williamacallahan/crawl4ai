@@ -181,17 +181,18 @@ _DENY_ALTERNATE_ROBOTS = (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "persistent, headers, blocked",
+    "persistent, headers, sent",
     [
-        # An isolated context sends the crawl's own user_agent.
-        (False, {}, True),
+        # An isolated context sends the crawl's own user_agent (blocked).
+        (False, {}, None),
         # A persistent browser ignores it and sends its launch agent...
-        (True, {}, False),
+        (True, {}, "BrowserDefault/1"),
         # ...or a configured User-Agent header, in any casing.
-        (True, {"user-agent": "Alternate/1"}, True),
+        (True, {"user-agent": "Alternate/1"}, None),
+        (True, {"user-agent": "Allowed/1"}, "Allowed/1"),
     ],
 )
-async def test_robots_checks_the_agent_the_crawl_sends(persistent, headers, blocked, tmp_path):
+async def test_robots_checks_the_agent_the_crawl_sends(persistent, headers, sent, tmp_path):
     """robots.txt is judged under the agent the request goes out with, so
     rules denying Alternate block exactly the crawls that send it."""
     port = _free_port()
@@ -217,10 +218,10 @@ async def test_robots_checks_the_agent_the_crawl_sends(persistent, headers, bloc
                     verbose=False,
                 ),
             )
-            if blocked:
+            if sent is None:
                 assert result.status_code == 403
             else:
                 assert result.success is True
-                assert '<p id="agent">BrowserDefault/1</p>' in result.html
+                assert f'<p id="agent">{sent}</p>' in result.html
     finally:
         await runner.cleanup()
